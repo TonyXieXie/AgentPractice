@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+// import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
 // Interface for messages
@@ -24,17 +24,28 @@ function App() {
     setInputMsg("");
 
     try {
-      // 2. Call Rust Backend (Simulating AI processing)
-      // The default template has a 'greet' command. We'll use it to simulate a response.
-      // In a real app, this would call 'chat_with_llm'
-      const response = await invoke<string>("greet", { name: inputMsg });
+      // 2. Call Python FastAPI Backend (Sidecar Mode Simulation)
+      // fetch is standard JS API. We call localhost:8000 where our Python server is running.
+      const response = await fetch("http://127.0.0.1:8000/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ message: inputMsg }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
 
       // 3. Add Agent Response
-      const agentMsg: Message = { id: Date.now() + 1, role: 'agent', content: response + " (Processed by Rust Core)" };
+      const agentMsg: Message = { id: Date.now() + 1, role: 'agent', content: data.reply };
       setMessages(prev => [...prev, agentMsg]);
     } catch (e) {
       console.error(e);
-      const errorMsg: Message = { id: Date.now() + 1, role: 'agent', content: "Error connecting to Rust backend." };
+      const errorMsg: Message = { id: Date.now() + 1, role: 'agent', content: "Error connecting to Python backend. Is main.py running?" };
       setMessages(prev => [...prev, errorMsg]);
     }
   }
