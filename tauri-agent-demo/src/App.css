@@ -1,0 +1,149 @@
+:root {
+  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 400;
+
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  place-items: center;
+  min-width: 320px;
+  min-height: 100vh;
+  justify-content: center;
+}
+
+#root {
+  max-width: 1280px;
+  width: 100%;
+  margin: 0 auto;
+  text-align: center;
+  padding: 2rem;
+}
+
+/* Chat Container */
+.chat-container {
+  border: 1px solid #3a3a3a;
+  border-radius: 12px;
+  height: 500px;
+  display: flex;
+  flex-direction: column;
+  background: #1a1a1a;
+  overflow: hidden;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+}
+
+.chat-header {
+  padding: 20px;
+  background: #2a2a2a;
+  border-bottom: 1px solid #3a3a3a;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.chat-header h1 {
+  margin: 0;
+  font-size: 1.2rem;
+  background: linear-gradient(to right, #646cff, #42b883);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  background: #42b883;
+  border-radius: 50%;
+  box-shadow: 0 0 10px #42b883;
+}
+
+.messages {
+  flex: 1;
+  padding: 20px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.message {
+  padding: 10px 16px;
+  border-radius: 12px;
+  max-width: 80%;
+  text-align: left;
+  animation: popIn 0.3s ease;
+}
+
+@keyframes popIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.message.user {
+  background: #646cff;
+  color: white;
+  align-self: flex-end;
+  border-bottom-right-radius: 2px;
+}
+
+.message.agent {
+  background: #3a3a3a;
+  color: #eee;
+  align-self: flex-start;
+  border-bottom-left-radius: 2px;
+}
+
+.input-area {
+  padding: 20px;
+  background: #2a2a2a;
+  border-top: 1px solid #3a3a3a;
+  display: flex;
+  gap: 10px;
+}
+
+input {
+  flex: 1;
+  border-radius: 8px;
+  border: 1px solid #3a3a3a;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-family: inherit;
+  background-color: #1a1a1a;
+  color: white;
+  transition: border-color 0.25s;
+}
+
+input:focus {
+  outline: none;
+  border-color: #646cff;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: #646cff;
+  cursor: pointer;
+  transition: border-color 0.25s;
+  color: white;
+}
+
+button:hover {
+  background-color: #535bf2;
+}
