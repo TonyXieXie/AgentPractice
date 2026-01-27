@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import json
@@ -248,6 +249,106 @@ async def chat(request: ChatRequest):
     except Exception as e:
         print(f"聊天错误: {str(e)}")
         raise HTTPException(status_code=500, detail=f"处理消息时出错: {str(e)}")
+
+@app.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """流式聊天接口 - 使用SSE逐个返回生成的文本片段"""
+    try:
+        # 1. 处理会话
+        if request.session_id:
+            session = db.get_session(request.session_id)
+            if not session:
+                raise HTTPException(status_code=404, detail="会话不存在")
+        else:
+            config_id = request.config_id if request.config_id else db.get_all_configs()[0].id
+            session = db.create_session(ChatSessionCreate(
+                title="新对话",
+                config_id=config_id
+            ))
+        
+        # 2. 获取配置
+        config = db.get_config(session.config_id)
+        if not config:
+            raise HTTPException(status_code=404, detail="配置不存在")
+        
+        # 3. 预处理并保存用户消息
+        processed_message = message_processor.preprocess_user_message(request.message)
+        user_msg = db.create_message(ChatMessageCreate(
+            session_id=session.id,
+            role="user",
+            content=processed_message
+        ))
+        
+        # 4. 获取历史并构建消息
+        history = db.get_session_messages(session.id, limit=20)
+        history_for_llm = [
+            {"role": msg.role, "content": msg.content}
+            for msg in history[:-1]
+        ]
+        
+        llm_messages = message_processor.build_messages_for_llm(
+            user_message=processed_message,
+            history=history_for_llm,
+            system_prompt="你是一个有帮助的AI助手。"
+        )
+        
+        raw_request_data = {
+            "model": config.model,
+            "messages": llm_messages,
+            "temperature": config.temperature,
+            "max_tokens": config.max_tokens,
+            "stream": True,
+            "api_type": config.api_type
+        }
+        
+        # 5. 流式生成函数
+        async def generate():
+            full_response = ""
+            
+            try:
+                llm_client = create_llm_client(config)
+                
+                async for chunk in llm_client.chat_stream(llm_messages):
+                    full_response += chunk
+                    # 修复：使用真实换行符，不是转义字符
+                    yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
+                
+                processed_response = message_processor.postprocess_llm_response(full_response)
+                
+                # 流式结束后保存助手消息
+                assistant_msg = db.create_message(ChatMessageCreate(
+                    session_id=session.id,
+                    role="assistant",
+                    content=processed_response,
+                    raw_request=raw_request_data,
+                    raw_response={
+                        "content": processed_response,
+                        "model": config.model,
+                        "finish_reason": "stop"
+                    }
+                ))
+                
+                yield f"data: {json.dumps({'done': True, 'message_id': assistant_msg.id})}\n\n"
+                
+            except Exception as e:
+                if full_response:
+                    db.create_message(ChatMessageCreate(
+                        session_id=session.id,
+                        role="assistant",
+                        content=full_response + "\n\n[流式中断]",
+                        metadata={"error": str(e), "partial": True}
+                    ))
+                
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== 导出功能 ====================
 

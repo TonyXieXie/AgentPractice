@@ -198,39 +198,6 @@ function App() {
             </div>
 
             <div className="header-right">
-              {currentConfig ? (
-                <div className="config-selector-wrapper">
-                  <button
-                    className="config-info clickable"
-                    onClick={() => setShowConfigSelector(!showConfigSelector)}
-                    title="切换模型"
-                  >
-                    🤖 {currentConfig.name}
-                  </button>
-
-                  {showConfigSelector && (
-                    <div className="config-dropdown">
-                      {allConfigs.map((config) => (
-                        <div
-                          key={config.id}
-                          className={`config-option ${config.id === currentConfig.id ? 'active' : ''}`}
-                          onClick={() => handleSwitchConfig(config.id)}
-                        >
-                          <div className="config-option-name">{config.name}</div>
-                          <div className="config-option-meta">
-                            {config.api_type.toUpperCase()} · {config.model}
-                          </div>
-                        </div>
-                      ))}
-                      {allConfigs.length === 0 && (
-                        <div className="config-option disabled">暂无配置</div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="config-info">⚠️ 未配置</div>
-              )}
 
               <button
                 className="header-btn"
@@ -301,6 +268,43 @@ function App() {
               placeholder={currentConfig ? "输入消息..." : "请先配置 LLM"}
               disabled={!currentConfig || loading}
             />
+
+            {/* Model Selector Below Input - Left Side */}
+            {currentConfig && (
+              <div className="model-selector-inline">
+                <button
+                  className="model-selector-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowConfigSelector(!showConfigSelector);
+                  }}
+                >
+                  <span>🤖</span>
+                  <span>{currentConfig.name}</span>
+                  <span>{showConfigSelector ? '▲' : '▼'}</span>
+                </button>
+
+                {showConfigSelector && (
+                  <div className="config-dropdown-inline">
+                    {allConfigs.map((config) => (
+                      <div
+                        key={config.id}
+                        className={`config-option ${config.id === currentConfig.id ? 'active' : ''}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleSwitchConfig(config.id);
+                          setShowConfigSelector(false);
+                        }}
+                      >
+                        <div className="config-name">{config.name}</div>
+                        <div className="config-meta">{config.api_type.toUpperCase()} · {config.model}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
             <button
               type="button"
               onClick={handleSend}
@@ -310,10 +314,6 @@ function App() {
             </button>
           </div>
         </div>
-
-        <p className="footer-text">
-          Powered by Tauri + React + FastAPI
-        </p>
       </div>
 
       {showDebugPanel && (
