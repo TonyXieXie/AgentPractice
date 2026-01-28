@@ -16,6 +16,12 @@ from database import db
 from llm_client import create_llm_client
 from message_processor import message_processor
 
+# Agent framework imports
+from agents.executor import create_agent_executor
+from agents.base import AgentStep
+from tools.builtin import register_builtin_tools
+from tools.base import ToolRegistry
+
 app = FastAPI(title="Tauri Agent Chat Backend")
 
 # 允许跨域
@@ -26,6 +32,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register builtin tools
+register_builtin_tools()
 
 # ==================== 基础路由 ====================
 
@@ -271,19 +280,14 @@ async def chat_stream(request: ChatRequest):
         if not config:
             raise HTTPException(status_code=404, detail="配置不存在")
         
-        # 3. 预处理并保存用户消息
+        # 3. 预处理用户消息
         processed_message = message_processor.preprocess_user_message(request.message)
-        user_msg = db.create_message(ChatMessageCreate(
-            session_id=session.id,
-            role="user",
-            content=processed_message
-        ))
         
-        # 4. 获取历史并构建消息
+        # 4. 先获取历史并构建消息（在保存用户消息之前）
         history = db.get_session_messages(session.id, limit=20)
         history_for_llm = [
             {"role": msg.role, "content": msg.content}
-            for msg in history[:-1]
+            for msg in history
         ]
         
         llm_messages = message_processor.build_messages_for_llm(
@@ -301,8 +305,19 @@ async def chat_stream(request: ChatRequest):
             "api_type": config.api_type
         }
         
+        # 现在保存用户消息，包含raw_request
+        user_msg = db.create_message(ChatMessageCreate(
+            session_id=session.id,
+            role="user",
+            content=processed_message,
+            raw_request=raw_request_data
+        ))
+        
         # 5. 流式生成函数
         async def generate():
+            # 立即发送session_id和user_message_id
+            yield f"data: {json.dumps({'session_id': session.id, 'user_message_id': user_msg.id})}\n\n"
+            
             full_response = ""
             
             try:
@@ -315,12 +330,11 @@ async def chat_stream(request: ChatRequest):
                 
                 processed_response = message_processor.postprocess_llm_response(full_response)
                 
-                # 流式结束后保存助手消息
+                # 流式结束后保存助手消息（只保存raw_response）
                 assistant_msg = db.create_message(ChatMessageCreate(
                     session_id=session.id,
                     role="assistant",
                     content=processed_response,
-                    raw_request=raw_request_data,
                     raw_response={
                         "content": processed_response,
                         "model": config.model,
@@ -447,6 +461,173 @@ def export_chat_history(request: ExportRequest):
     except Exception as e:
         print(f"导出错误: {str(e)}")
         raise HTTPException(status_code=500, detail=f"导出时出错: {str(e)}")
+
+# ==================== Agent Chat (Streaming) ====================
+
+@app.post("/chat/agent/stream")
+async def chat_agent_stream(request: ChatRequest):
+    """
+    Agent模式的流式对话
+    
+    支持：
+    - Simple agent (传统对话)
+    - ReAct agent (带工具的推理-行动循环)
+    - 流式返回thought, action, observation, answer步骤
+    """
+    try:
+        # 1. 处理会话
+        if request.session_id:
+            session = db.get_session(request.session_id)
+            if not session:
+                raise HTTPException(status_code=404, detail="会话不存在")
+        else:
+            # 创建新会话
+            config_id = request.config_id or db.get_default_config().id
+            session = db.create_session(ChatSessionCreate(
+                title="新对话",
+                config_id=config_id
+            ))
+        
+        # 2. 获取配置
+        config = db.get_config(session.config_id)
+        if not config:
+            raise HTTPException(status_code=404, detail="LLM配置不存在")
+        
+        # 3. 预处理用户消息
+        processed_message = message_processor.preprocess_user_message(request.message)
+        
+        # 4. 保存用户消息
+        user_msg = db.create_message(ChatMessageCreate(
+            session_id=session.id,
+            role="user",
+            content=processed_message
+        ))
+        
+        # 5. 获取历史消息
+        history = db.get_session_messages(session.id, limit=20)
+        history_for_llm = [
+            {"role": msg.role, "content": msg.content}
+            for msg in history[:-1]  # 排除刚添加的用户消息
+        ]
+        
+        # 6. 确定Agent类型 (session级别或request级别override)
+        agent_type = request.agent_type_override if hasattr(request, 'agent_type_override') else getattr(session, 'agent_type', 'simple')
+        
+        # 7. 获取可用工具
+        tools = ToolRegistry.get_all()
+        
+        # 8. 创建LLM客户端
+        llm_client = create_llm_client(config)
+        
+        # 9. 创建Agent执行器
+        try:
+            executor = create_agent_executor(
+                agent_type=agent_type,
+                llm_client=llm_client,
+                tools=tools,
+                max_iterations=5  # ReAct max iterations
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        
+        # 10. 执行Agent并流式返回
+        async def event_generator():
+            sequence = 0
+            final_answer = None
+            assistant_msg_id = None
+            
+            try:
+                # First create a placeholder assistant message
+                temp_assistant_msg = db.create_message(ChatMessageCreate(
+                    session_id=session.id,
+                    role="assistant",
+                    content=""  # Will be updated with final answer
+                ))
+                assistant_msg_id = temp_assistant_msg.id
+                
+                # Stream agent execution
+                async for step in executor.run(
+                    user_input=processed_message,
+                    history=history_for_llm,
+                    session_id=session.id
+                ):
+                    # Save step to database
+                    db.save_agent_step(
+                        message_id=assistant_msg_id,
+                        step_type=step.step_type,
+                        content=step.content,
+                        sequence=sequence,
+                        metadata=step.metadata
+                    )
+                    
+                    # Save tool calls separately
+                    if step.step_type == "action" and "tool" in step.metadata:
+                        db.save_tool_call(
+                            message_id=assistant_msg_id,
+                            tool_name=step.metadata["tool"],
+                            tool_input=step.metadata.get("input", ""),
+                            tool_output=""  # Will be filled by observation
+                        )
+                    
+                    # Track final answer
+                    if step.step_type == "answer":
+                        final_answer = step.content
+                    
+                    # Stream to frontend
+                    yield f"data: {json.dumps(step.to_dict())}\n\n"
+                    
+                    sequence += 1
+                
+                # Update assistant message with final answer
+                if final_answer and assistant_msg_id:
+                    # Update message content
+                    conn = db.get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        UPDATE chat_messages
+                        SET content = ?
+                        WHERE id = ?
+                    ''', (final_answer, assistant_msg_id))
+                    conn.commit()
+                    conn.close()
+                
+                # Send done signal
+                yield f"data: {json.dumps({'done': True, 'session_id': session.id})}\n\n"
+                
+            except Exception as e:
+                # Send error
+                error_step = AgentStep(
+                    step_type="error",
+                    content=f"Agent执行失败: {str(e)}",
+                    metadata={"error": str(e)}
+                )
+                yield f"data: {json.dumps(error_step.to_dict())}\n\n"
+        
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"  # Disable nginx buffering
+            }
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Agent聊天错误: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Agent聊天时出错: {str(e)}")
+
+# ==================== Tools Management ====================
+
+@app.get("/tools")
+def get_tools():
+    """获取所有可用工具"""
+    tools = ToolRegistry.get_all()
+    return [tool.to_dict() for tool in tools]
 
 if __name__ == "__main__":
     print("🚀 启动 FastAPI 服务器...")

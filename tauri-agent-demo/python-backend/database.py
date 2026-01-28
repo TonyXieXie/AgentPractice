@@ -51,6 +51,12 @@ class Database:
             )
         ''')
         
+        # 添加 agent_type 字段迁移
+        try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN agent_type TEXT DEFAULT "simple"')
+        except sqlite3.OperationalError:
+            pass  # 字段已存在
+        
         # 创建消息表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chat_messages (
@@ -63,6 +69,33 @@ class Database:
                 raw_request TEXT,
                 raw_response TEXT,
                 FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+            )
+        ''')
+        
+        # 创建 Agent 步骤表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS agent_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                step_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata TEXT,
+                sequence INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
+            )
+        ''')
+        
+        # 创建工具调用记录表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tool_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_input TEXT,
+                tool_output TEXT,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
             )
         ''')
         
@@ -80,6 +113,8 @@ class Database:
         # 创建索引
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_config ON chat_sessions(config_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_steps_message ON agent_steps(message_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id)')
         
         conn.commit()
         conn.close()
@@ -369,6 +404,86 @@ class Database:
             messages.reverse()
         
         return messages
+    
+    # ==================== Agent Steps 和 Tool Calls 管理 ====================
+    
+    def save_agent_step(self, message_id: int, step_type: str, content: str, sequence: int, metadata: Dict[str, Any] = None) -> int:
+        """保存Agent执行步骤"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        timestamp = datetime.now().isoformat()
+        metadata_json = json.dumps(metadata) if metadata else None
+        
+        cursor.execute('''
+            INSERT INTO agent_steps (message_id, step_type, content, metadata, sequence, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (message_id, step_type, content, metadata_json, sequence, timestamp))
+        
+        step_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        return step_id
+    
+    def get_agent_steps(self, message_id: int) -> List[Dict[str, Any]]:
+        """获取消息的所有Agent步骤"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, step_type, content, metadata, sequence, timestamp
+            FROM agent_steps
+            WHERE message_id = ?
+            ORDER BY sequence ASC
+        ''', (message_id,))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                "id": row["id"],
+                "step_type": row["step_type"],
+                "content": row["content"],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                "sequence": row["sequence"],
+                "timestamp": row["timestamp"]
+            }
+            for row in rows
+        ]
+    
+    def save_tool_call(self, message_id: int, tool_name: str, tool_input: str, tool_output: str) -> int:
+        """保存工具调用记录"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        timestamp = datetime.now().isoformat()
+        
+        cursor.execute('''
+            INSERT INTO tool_calls (message_id, tool_name, tool_input, tool_output, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (message_id, tool_name, tool_input, tool_output, timestamp))
+        
+        tool_call_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        return tool_call_id
+    
+    def update_session_agent_type(self, session_id: str, agent_type: str):
+        """更新会话的Agent类型"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE chat_sessions
+            SET agent_type = ?, updated_at = ?
+            WHERE id = ?
+        ''', (agent_type, datetime.now().isoformat(), session_id))
+        
+        conn.commit()
+        conn.close()
 
 # 创建全局数据库实例
 db = Database()

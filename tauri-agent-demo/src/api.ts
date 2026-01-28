@@ -146,9 +146,23 @@ export async function* sendMessageStream(request: ChatRequest): AsyncGenerator<s
                 const data = line.slice(6);
                 try {
                     const parsed = JSON.parse(data);
-                    if (parsed.done) return;
-                    if (parsed.content) yield parsed.content;
-                    if (parsed.error) throw new Error(parsed.error);
+
+                    // 如果包含session_id，yield整个对象
+                    if (parsed.session_id || parsed.user_message_id) {
+                        yield parsed;
+                    }
+                    // 如果标记done，结束
+                    else if (parsed.done) {
+                        return;
+                    }
+                    // 如果有content，yield内容字符串
+                    else if (parsed.content) {
+                        yield parsed.content;
+                    }
+                    // 如果有error，抛出异常
+                    else if (parsed.error) {
+                        throw new Error(parsed.error);
+                    }
                 } catch (e) {
                     if (e instanceof Error && e.message !== 'Unexpected end of JSON input') {
                         throw e;

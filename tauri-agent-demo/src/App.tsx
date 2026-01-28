@@ -89,13 +89,27 @@ function App() {
     // 捕获当前会话ID
     const targetSessionId = currentSessionId;
 
-    // 乐观更新：立即显示用户消息
+    // 构建将要发送的请求（用于debug显示）
+    const raw_request = {
+      model: currentConfig?.model || "unknown",
+      messages: [
+        { role: "system", content: "你是一个有帮助的AI助手。" },
+        { role: "user", content: userMessage }
+      ],
+      temperature: currentConfig?.temperature || 0.7,
+      max_tokens: currentConfig?.max_tokens || 2000,
+      stream: true,
+      api_type: currentConfig?.api_type || "unknown"
+    };
+
+    // 乐观更新：立即显示用户消息（包含raw_request用于debug）
     const tempUserMsg: Message = {
       id: Date.now(),
       session_id: targetSessionId || '',
       role: 'user',
       content: userMessage,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      raw_request: raw_request  // 添加原始请求数据
     };
     setMessages(prev => [...prev, tempUserMsg]);
 
@@ -119,6 +133,7 @@ function App() {
 
       let fullContent = '';
       let newSessionId = targetSessionId;
+      let userMessageLoaded = false;
 
       for await (const chunk of streamGenerator) {
         // chunk可能包含session_id（首次chunk）
@@ -128,6 +143,16 @@ function App() {
             setCurrentSessionId(newSessionId);
             setSessionRefreshTrigger(prev => prev + 1);
           }
+
+          // 如果包含user_message_id，立即重新加载消息（获取完整的用户消息包括raw_request）
+          if (!userMessageLoaded && (chunk as any).user_message_id && newSessionId) {
+            userMessageLoaded = true;
+            const messages = await getSessionMessages(newSessionId);
+            setMessages(messages);
+            // 重新添加临时助手消息
+            setMessages(prev => [...prev, tempAssistantMsg]);
+          }
+
           continue;
         }
 
