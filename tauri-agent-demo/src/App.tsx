@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import "./App.css";
 import { Message, LLMConfig, ChatSession } from './types';
-import { sendMessage, getDefaultConfig, getConfig, getSessionMessages, exportChatHistory } from './api';
+import { sendMessageStream, getDefaultConfig, getConfig, getSessionMessages, exportChatHistory } from "./api";
 import ConfigManager from './components/ConfigManager';
 import SessionList from './components/SessionList';
 import DebugPanel from './components/DebugPanel';
@@ -86,44 +86,80 @@ function App() {
     setInputMsg("");
     setLoading(true);
 
+    // 捕获当前会话ID
+    const targetSessionId = currentSessionId;
+
     // 乐观更新：立即显示用户消息
     const tempUserMsg: Message = {
       id: Date.now(),
-      session_id: currentSessionId || '',
+      session_id: targetSessionId || '',
       role: 'user',
       content: userMessage,
       timestamp: new Date().toISOString()
     };
     setMessages(prev => [...prev, tempUserMsg]);
 
+    // 临时助手消息（流式更新）
+    const tempAssistantId = Date.now() + 1;
+    const tempAssistantMsg: Message = {
+      id: tempAssistantId,
+      session_id: targetSessionId || '',
+      role: 'assistant',
+      content: '',
+      timestamp: new Date().toISOString()
+    };
+    setMessages(prev => [...prev, tempAssistantMsg]);
+
     try {
-      const response = await sendMessage({
+      const streamGenerator = sendMessageStream({
         message: userMessage,
-        session_id: currentSessionId || undefined,
+        session_id: targetSessionId || undefined,
         config_id: currentConfig?.id
       });
 
-      // 如果是新会话，设置会话ID
-      if (!currentSessionId) {
-        setCurrentSessionId(response.session_id);
+      let fullContent = '';
+      let newSessionId = targetSessionId;
+
+      for await (const chunk of streamGenerator) {
+        // chunk可能包含session_id（首次chunk）
+        if (typeof chunk === 'object' && chunk && 'session_id' in chunk) {
+          newSessionId = (chunk as any).session_id;
+          if (!targetSessionId) {
+            setCurrentSessionId(newSessionId);
+            setSessionRefreshTrigger(prev => prev + 1);
+          }
+          continue;
+        }
+
+        // 流式内容chunk
+        if (typeof chunk === 'string') {
+          fullContent += chunk;
+          setMessages(prev => prev.map(msg =>
+            msg.id === tempAssistantId
+              ? { ...msg, content: fullContent }
+              : msg
+          ));
+        }
+      }
+
+      // 流式结束后，从服务器重新加载完整的消息列表
+      const finalSessionId = newSessionId || targetSessionId;
+      if (finalSessionId) {
+        const updatedMessages = await getSessionMessages(finalSessionId);
+        setMessages(updatedMessages);
         setSessionRefreshTrigger(prev => prev + 1);
       }
 
-      // 重新加载完整的消息列表（包含调试数据）
-      const updatedMessages = await getSessionMessages(response.session_id);
-      setMessages(updatedMessages);
-
-      setSessionRefreshTrigger(prev => prev + 1);
     } catch (error: any) {
       console.error('Failed to send message:', error);
       const errorMsg: Message = {
-        id: Date.now() + 1,
-        session_id: currentSessionId || '',
+        id: Date.now() + 2,
+        session_id: targetSessionId || '',
         role: 'assistant',
-        content: `❌ 发送失败: ${error.message || '请检查后端服务是否运行，以及配置是否正确'}`,
+        content: `❌ 聊天错误: ${error.message || '请检查后端服务是否运行'}`,
         timestamp: new Date().toISOString()
       };
-      setMessages(prev => [...prev, errorMsg]);
+      setMessages(prev => [...prev.filter(m => m.id !== tempAssistantId), errorMsg]);
     } finally {
       setLoading(false);
     }
