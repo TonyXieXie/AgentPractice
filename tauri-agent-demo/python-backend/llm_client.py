@@ -65,6 +65,23 @@ class LLMClient:
             "max_tokens": self.config.max_tokens
         }
         
+        # 🔥 如果是推理模型（O1/GPT-5 系列），添加 reasoning 参数
+        model_lower = self.config.model.lower()
+        if "o1" in model_lower or "gpt-5" in model_lower:
+            # 推理模型不支持 temperature
+            request_payload.pop("temperature", None)
+            
+            # 使用新的 reasoning 对象格式
+            reasoning_effort = getattr(self.config, 'reasoning_effort', 'medium')
+            reasoning_summary = getattr(self.config, 'reasoning_summary', 'detailed')
+            
+            request_payload["reasoning"] = {
+                "effort": reasoning_effort,
+                "summary": reasoning_summary
+            }
+            
+            print(f"🧠 [Reasoning Mode] effort={reasoning_effort}, summary={reasoning_summary}")
+        
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 f"{base_url}/chat/completions",
@@ -76,9 +93,18 @@ class LLMClient:
             )
             response.raise_for_status()
             data = response.json()
+            
+            # 提取推理 tokens 信息（如果有）
+            usage = data.get("usage", {})
+            reasoning_tokens = usage.get("reasoning_tokens", 0)
+            
+            if reasoning_tokens > 0:
+                print(f"🧠 [Reasoning Tokens] {reasoning_tokens} tokens used for reasoning")
+            
             return {
                 "content": data["choices"][0]["message"]["content"],
-                "raw_response": data
+                "raw_response": data,
+                "reasoning_tokens": reasoning_tokens
             }
     
     async def _chat_openai_stream(self, messages: List[Dict[str, str]]):
@@ -94,6 +120,23 @@ class LLMClient:
             "max_tokens": self.config.max_tokens,
             "stream": True
         }
+        
+        # 🔥 如果是推理模型（O1/GPT-5 系列），添加 reasoning 参数
+        model_lower = self.config.model.lower()
+        if "o1" in model_lower or "gpt-5" in model_lower:
+            # 推理模型不支持 temperature
+            request_payload.pop("temperature", None)
+            
+            # 使用新的 reasoning 对象格式
+            reasoning_effort = getattr(self.config, 'reasoning_effort', 'medium')
+            reasoning_summary = getattr(self.config, 'reasoning_summary', 'detailed')
+            
+            request_payload["reasoning"] = {
+                "effort": reasoning_effort,
+                "summary": reasoning_summary
+            }
+            
+            print(f"🧠 [Reasoning Mode Stream] effort={reasoning_effort}, summary={reasoning_summary}")
         
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             async with client.stream(
@@ -195,6 +238,10 @@ class LLMClient:
             "max_tokens": self.config.max_tokens
         }
         
+        # 🔥 如果是 deepseek-reasoner 模型，不要设置 temperature
+        if "reasoner" in self.config.model.lower():
+            request_payload.pop("temperature", None)
+        
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 f"{base_url}/chat/completions",
@@ -206,8 +253,20 @@ class LLMClient:
             )
             response.raise_for_status()
             data = response.json()
+            
+            # 提取内容（可能包含 reasoning_content）
+            message = data["choices"][0]["message"]
+            content = message.get("content", "")
+            reasoning_content = message.get("reasoning_content", "")
+            
+            # 如果有推理内容，合并显示
+            if reasoning_content:
+                full_content = f"[推理过程]\n{reasoning_content}\n\n[回答]\n{content}"
+            else:
+                full_content = content
+            
             return {
-                "content": data["choices"][0]["message"]["content"],
+                "content": full_content,
                 "raw_response": data
             }
     

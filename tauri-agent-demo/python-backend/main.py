@@ -511,7 +511,8 @@ async def chat_agent_stream(request: ChatRequest):
         ]
         
         # 6. 确定Agent类型 (session级别或request级别override)
-        agent_type = request.agent_type_override if hasattr(request, 'agent_type_override') else getattr(session, 'agent_type', 'simple')
+        # 🔥 默认使用 react agent（带工具调用）
+        agent_type = request.agent_type_override if hasattr(request, 'agent_type_override') else getattr(session, 'agent_type', 'react')
         
         # 7. 获取可用工具
         tools = ToolRegistry.get_all()

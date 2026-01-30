@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import "./App.css";
 import { Message, LLMConfig, ChatSession } from './types';
-import { sendMessageStream, getDefaultConfig, getConfig, getSessionMessages, exportChatHistory } from "./api";
+import { sendMessageAgentStream, getDefaultConfig, getConfig, getSessionMessages, exportChatHistory, AgentStep } from "./api";
 import ConfigManager from './components/ConfigManager';
 import SessionList from './components/SessionList';
 import DebugPanel from './components/DebugPanel';
@@ -99,7 +99,8 @@ function App() {
       temperature: currentConfig?.temperature || 0.7,
       max_tokens: currentConfig?.max_tokens || 2000,
       stream: true,
-      api_type: currentConfig?.api_type || "unknown"
+      api_type: currentConfig?.api_type || "unknown",
+      agent_type: "react"  // 标记使用 Agent 模式
     };
 
     // 乐观更新：立即显示用户消息（包含raw_request用于debug）
@@ -125,7 +126,8 @@ function App() {
     setMessages(prev => [...prev, tempAssistantMsg]);
 
     try {
-      const streamGenerator = sendMessageStream({
+      // 🔥 使用 Agent 流式接口
+      const streamGenerator = sendMessageAgentStream({
         message: userMessage,
         session_id: targetSessionId || undefined,
         config_id: currentConfig?.id
@@ -133,32 +135,83 @@ function App() {
 
       let fullContent = '';
       let newSessionId = targetSessionId;
-      let userMessageLoaded = false;
+      let agentSteps: string[] = []; // 收集 Agent 步骤用于显示
+      let allStepsMetadata: any[] = []; // 收集所有步骤的元数据用于 debug
 
       for await (const chunk of streamGenerator) {
-        // chunk可能包含session_id（首次chunk）
-        if (typeof chunk === 'object' && chunk && 'session_id' in chunk) {
-          newSessionId = (chunk as any).session_id;
+        // 处理 session_id
+        if ('session_id' in chunk && typeof chunk.session_id === 'string') {
+          newSessionId = chunk.session_id;
           if (!targetSessionId) {
             setCurrentSessionId(newSessionId);
             setSessionRefreshTrigger(prev => prev + 1);
           }
-
-          // 如果包含user_message_id，立即重新加载消息（获取完整的用户消息包括raw_request）
-          if (!userMessageLoaded && (chunk as any).user_message_id && newSessionId) {
-            userMessageLoaded = true;
-            const messages = await getSessionMessages(newSessionId);
-            setMessages(messages);
-            // 重新添加临时助手消息
-            setMessages(prev => [...prev, tempAssistantMsg]);
-          }
-
           continue;
         }
 
-        // 流式内容chunk
-        if (typeof chunk === 'string') {
-          fullContent += chunk;
+        // 处理 done 信号
+        if ('done' in chunk) {
+          break;
+        }
+
+        // 处理 Agent 步骤
+        const step = chunk as AgentStep;
+        allStepsMetadata.push(step); // 保存步骤元数据
+        
+        if (step.step_type === 'thought') {
+          // 💭 思考步骤
+          const thoughtText = `💭 **思考**: ${step.content}\n\n`;
+          agentSteps.push(thoughtText);
+          fullContent = agentSteps.join('') + '⏳ 正在处理...';
+          
+          setMessages(prev => prev.map(msg =>
+            msg.id === tempAssistantId
+              ? { ...msg, content: fullContent }
+              : msg
+          ));
+        } 
+        else if (step.step_type === 'action') {
+          // 🔧 行动步骤
+          const actionText = `🔧 **行动**: ${step.content}\n\n`;
+          agentSteps.push(actionText);
+          fullContent = agentSteps.join('') + '⏳ 执行工具...';
+          
+          setMessages(prev => prev.map(msg =>
+            msg.id === tempAssistantId
+              ? { ...msg, content: fullContent }
+              : msg
+          ));
+        } 
+        else if (step.step_type === 'observation') {
+          // 👁️ 观察步骤
+          const observationText = `👁️ **观察**: ${step.content}\n\n`;
+          agentSteps.push(observationText);
+          fullContent = agentSteps.join('') + '⏳ 继续推理...';
+          
+          setMessages(prev => prev.map(msg =>
+            msg.id === tempAssistantId
+              ? { ...msg, content: fullContent }
+              : msg
+          ));
+        } 
+        else if (step.step_type === 'answer') {
+          // ✅ 最终答案
+          const answerText = `\n---\n\n✅ **最终答案**:\n\n${step.content}`;
+          agentSteps.push(answerText);
+          fullContent = agentSteps.join('');
+          
+          setMessages(prev => prev.map(msg =>
+            msg.id === tempAssistantId
+              ? { ...msg, content: fullContent }
+              : msg
+          ));
+        } 
+        else if (step.step_type === 'error') {
+          // ❌ 错误
+          const errorText = `❌ **错误**: ${step.content}\n\n`;
+          agentSteps.push(errorText);
+          fullContent = agentSteps.join('');
+          
           setMessages(prev => prev.map(msg =>
             msg.id === tempAssistantId
               ? { ...msg, content: fullContent }
@@ -167,11 +220,23 @@ function App() {
         }
       }
 
-      // 流式结束后，从服务器重新加载完整的消息列表
-      const finalSessionId = newSessionId || targetSessionId;
-      if (finalSessionId) {
-        const updatedMessages = await getSessionMessages(finalSessionId);
-        setMessages(updatedMessages);
+      // 🔥 流式结束后，添加 raw_response 用于 debug，但保持前端显示的格式化内容
+      const raw_response = {
+        agent_type: "react",
+        steps: allStepsMetadata,
+        final_content: fullContent,
+        model: currentConfig?.model || "unknown"
+      };
+
+      // 更新助手消息，添加 raw_response
+      setMessages(prev => prev.map(msg =>
+        msg.id === tempAssistantId
+          ? { ...msg, raw_response: raw_response }
+          : msg
+      ));
+
+      // 更新会话刷新触发器
+      if (newSessionId) {
         setSessionRefreshTrigger(prev => prev + 1);
       }
 

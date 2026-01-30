@@ -73,8 +73,29 @@ class ReActAgent(AgentStrategy):
                     {"role": "user", "content": user_input}
                 ]
                 
+                # 🔥 调试：打印发送给 LLM 的详细信息
+                print(f"\n{'='*80}")
+                print(f"[ReAct Agent] Iteration {iteration + 1}/{self.max_iterations}")
+                print(f"{'='*80}")
+                print(f"📤 发送给 LLM 的消息:")
+                print(f"\n[System Prompt]")
+                print(f"{'-'*80}")
+                print(prompt)
+                print(f"{'-'*80}")
+                print(f"\n[User Input]")
+                print(f"{'-'*80}")
+                print(user_input)
+                print(f"{'-'*80}")
+                print(f"\n⏳ 等待 LLM 响应...\n")
+                
                 response = await llm_client.chat(messages)
                 llm_output = response.get("content", "")
+                
+                # 🔥 调试：打印 LLM 原始输出
+                print(f"📥 LLM 原始输出:")
+                print(f"{'-'*80}")
+                print(llm_output)
+                print(f"{'-'*80}\n")
                 
             except Exception as e:
                 yield AgentStep(
@@ -86,6 +107,16 @@ class ReActAgent(AgentStrategy):
             
             # Parse LLM output
             thought, action, action_input, final_answer = self._parse_reaction(llm_output)
+            
+            # 🔥 调试：打印解析结果
+            print(f"🔍 解析结果:")
+            print(f"{'-'*80}")
+            print(f"  💭 Thought: {thought if thought else '❌ 未找到'}")
+            print(f"  🔧 Action: {action if action else '❌ 未找到'}")
+            print(f"  📝 Action Input: {action_input if action_input else '❌ 未找到'}")
+            print(f"  ✅ Final Answer: {final_answer if final_answer else '❌ 未找到'}")
+            print(f"{'-'*80}")
+            print(f"{'='*80}\n")
             
             # Check for final answer first
             if final_answer:
@@ -198,51 +229,79 @@ class ReActAgent(AgentStrategy):
         scratchpad = additional_context.get("scratchpad", []) if additional_context else []
         scratchpad_text = "\n".join(scratchpad) if scratchpad else ""
         
-        prompt = f"""你是一个具有推理和行动能力的AI助手。你可以通过以下步骤解决问题：
+        prompt = f"""你是一个具有推理和行动能力的AI助手。你需要通过"思考-行动-观察"的循环来解决问题。
 
-可用工具：
+## 可用工具
 {tool_descriptions if tool_descriptions else "（当前没有可用工具）"}
 
-请严格按照以下格式回答问题：
+## 回答格式（必须严格遵守）
 
-Thought: 你对问题的思考和推理
-Action: 工具名称
-Action Input: 工具的输入参数
-Observation: 工具返回的结果
+你必须按照以下格式输出，每个步骤都要写：
 
-（重复以上步骤直到你知道答案）
+```
+Thought: [你的思考过程，分析问题需要什么]
+Action: [工具名称]
+Action Input: [工具的输入参数]
+```
 
+然后系统会返回：
+```
+Observation: [工具执行结果]
+```
+
+你可以重复上述步骤多次，直到获得足够信息。最后输出：
+```
 Thought: 我现在知道最终答案了
-Final Answer: 最终答案
+Final Answer: [你的最终答案]
+```
 
-**重要规则：**
-1. 每次只能使用一个工具
-2. Action必须是上面列出的工具之一
-3. Action Input应该是简洁明确的参数
-4. 在得出Final Answer之前，必须先说"我现在知道最终答案了"
+## 重要规则
+1. **必须先 Thought，再 Action** - 每次行动前都要思考
+2. **Action 必须是上面列出的工具之一** - 不能编造工具
+3. **Action Input 要简洁明确** - 直接给出参数，不要多余解释
+4. **不要自己写 Observation** - Observation 由系统提供
+5. **得出答案前必须说"我现在知道最终答案了"**
 
-**示例1（使用计算器）：**
+## 示例
+
+### 示例1：计算问题
 Question: 15乘以23加100等于多少？
-Thought: 我需要计算15*23+100
+
+Thought: 我需要计算15*23+100这个数学表达式
 Action: calculator
 Action Input: 15*23+100
 Observation: 445
 Thought: 我现在知道最终答案了
 Final Answer: 15乘以23加100等于445
 
-**示例2（查询天气）：**
+### 示例2：天气查询
 Question: 北京今天天气怎么样？
-Thought: 我需要查询北京的天气
+
+Thought: 我需要查询北京的天气信息
 Action: weather
 Action Input: 北京
 Observation: Beijing: Sunny, Temperature: 18°C, Humidity: 45%, Wind: 10 km/h
 Thought: 我现在知道最终答案了
-Final Answer: 北京今天天气晴朗，温度18°C，湿度45%，风速10公里/小时。
+Final Answer: 北京今天天气晴朗，温度18°C，湿度45%，风速10公里/小时
 
-之前的推理过程：
-{scratchpad_text if scratchpad_text else "（这是第一次推理）"}
+### 示例3：多步骤问题
+Question: 搜索一下人工智能，然后告诉我主要应用
 
-现在开始！严格遵循格式。"""
+Thought: 我需要先搜索人工智能的相关信息
+Action: search
+Action Input: 人工智能
+Observation: Search results for '人工智能': 1. AI技术包括机器学习、深度学习... 2. 应用领域：医疗、金融、教育...
+Thought: 我现在知道最终答案了
+Final Answer: 人工智能的主要应用包括：医疗诊断、金融风控、智能教育、自动驾驶等领域
+
+---
+
+## 你之前的推理过程
+{scratchpad_text if scratchpad_text else "（这是第一次推理，请开始思考）"}
+
+---
+
+现在请开始！记住：先 Thought，再 Action，严格遵循格式！"""
         
         return prompt
     

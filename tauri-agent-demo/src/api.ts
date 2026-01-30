@@ -173,6 +173,68 @@ export async function* sendMessageStream(request: ChatRequest): AsyncGenerator<s
     }
 }
 
+// ==================== Agent 聊天 API ====================
+
+export interface AgentStep {
+    step_type: 'thought' | 'action' | 'observation' | 'answer' | 'error';
+    content: string;
+    metadata?: Record<string, any>;
+}
+
+export async function* sendMessageAgentStream(
+    request: ChatRequest
+): AsyncGenerator<AgentStep | { session_id: string; user_message_id?: number } | { done: true }, void, unknown> {
+    const response = await fetch(`${API_BASE_URL}/chat/agent/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+    });
+
+    if (!response.ok) throw new Error('Failed to send agent stream');
+
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+            if (line.startsWith('data: ')) {
+                const data = line.slice(6);
+                try {
+                    const parsed = JSON.parse(data);
+
+                    // 如果包含session_id，yield整个对象
+                    if (parsed.session_id) {
+                        yield parsed;
+                    }
+                    // 如果标记done，yield并结束
+                    else if (parsed.done) {
+                        yield parsed;
+                        return;
+                    }
+                    // Agent步骤
+                    else if (parsed.step_type) {
+                        yield parsed as AgentStep;
+                    }
+                    // 如果有error，抛出异常
+                    else if (parsed.error) {
+                        throw new Error(parsed.error);
+                    }
+                } catch (e) {
+                    if (e instanceof Error && e.message !== 'Unexpected end of JSON input') {
+                        throw e;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ==================== 导出 API ====================
 
 export async function exportChatHistory(request: ExportRequest): Promise<Blob> {

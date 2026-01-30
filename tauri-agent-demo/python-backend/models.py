@@ -17,6 +17,9 @@ class LLMConfig(BaseModel):
     max_tokens: int = Field(default=2000, ge=1, le=32000)
     is_default: bool = False
     created_at: Optional[str] = None
+    # 🔥 Reasoning 参数（用于 O1/GPT-5 系列模型）
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = "medium"
+    reasoning_summary: Optional[Literal["auto", "concise", "detailed"]] = "detailed"
 
 class LLMConfigCreate(BaseModel):
     name: str
@@ -27,6 +30,9 @@ class LLMConfigCreate(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 2000
     is_default: bool = False
+    # 🔥 Reasoning 参数（用于 O1/GPT-5 系列模型）
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = "medium"
+    reasoning_summary: Optional[Literal["auto", "concise", "detailed"]] = "detailed"
 
 class LLMConfigUpdate(BaseModel):
     name: Optional[str] = None
@@ -36,6 +42,9 @@ class LLMConfigUpdate(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     is_default: Optional[bool] = None
+    # 🔥 Reasoning 参数（用于 O1/GPT-5 系列模型）
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = None
+    reasoning_summary: Optional[Literal["auto", "concise", "detailed"]] = None
 
 # 聊天消息模型
 class ChatMessage(BaseModel):

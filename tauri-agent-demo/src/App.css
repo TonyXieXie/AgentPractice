@@ -311,6 +311,32 @@ body {
   border-bottom-left-radius: 4px;
 }
 
+/* Agent 步骤样式 */
+.message-content strong {
+  color: #667eea;
+  font-weight: 600;
+}
+
+.message-content hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.2);
+  margin: 16px 0;
+}
+
+/* 为不同的 emoji 添加动画效果 */
+.message-content {
+  animation: fadeIn 0.3s ease-in;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 .message-time {
   font-size: 0.7rem;
   color: #888;
