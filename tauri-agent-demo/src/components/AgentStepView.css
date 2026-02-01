@@ -1,0 +1,242 @@
+﻿.agent-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.agent-steps.empty {
+    color: #9ca3af;
+    font-size: 0.85rem;
+    padding: 8px 0;
+}
+
+.agent-step {
+    border-radius: 12px;
+    padding: 12px 14px;
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    box-shadow: 0 8px 18px rgba(15, 23, 42, 0.2);
+}
+
+.agent-step.thought {
+    border-left: 3px solid #60a5fa;
+}
+
+.agent-step.tool {
+    border-left: 3px solid #34d399;
+    background: rgba(6, 78, 59, 0.2);
+}
+
+.agent-step.final {
+    border-left: 3px solid #f59e0b;
+    background: rgba(120, 53, 15, 0.2);
+}
+
+.agent-step.error {
+    border-left: 3px solid #f87171;
+    background: rgba(127, 29, 29, 0.25);
+}
+
+.agent-step.status {
+    border-left: 3px solid #94a3b8;
+    background: rgba(71, 85, 105, 0.2);
+}
+
+.agent-step-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+    font-size: 0.75rem;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: #94a3b8;
+}
+
+.agent-step-category {
+    font-weight: 600;
+}
+
+.agent-step-type {
+    font-weight: 500;
+}
+
+.agent-step-content {
+    color: #e2e8f0;
+    font-size: 0.9rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+}
+
+.content-block {
+    margin: 8px 0;
+}
+
+.code-block {
+    background: rgba(15, 23, 42, 0.9);
+    border-radius: 10px;
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    overflow: hidden;
+}
+
+.code-block pre {
+    margin: 0;
+    padding: 12px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.85rem;
+    color: #e2e8f0;
+    overflow-x: auto;
+}
+
+.code-lang {
+    padding: 6px 12px;
+    background: rgba(15, 23, 42, 0.85);
+    font-size: 0.7rem;
+    color: #7dd3fc;
+    border-bottom: 1px solid rgba(56, 189, 248, 0.2);
+}
+
+.latex-block {
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px dashed rgba(248, 250, 252, 0.4);
+    background: rgba(30, 41, 59, 0.6);
+    color: #f8fafc;
+}
+
+.latex-inline {
+    padding: 0 4px;
+    border-radius: 4px;
+    background: rgba(148, 163, 184, 0.2);
+    display: inline-flex;
+}
+
+.latex-block .katex {
+    color: #f8fafc;
+}
+
+.latex-inline .katex {
+    color: #e2e8f0;
+}
+
+.content-text {
+    white-space: pre-wrap;
+}
+
+.text-span {
+    white-space: pre-wrap;
+}
+
+.content-markdown {
+    white-space: normal;
+}
+
+.content-markdown > * {
+    margin: 0 0 8px 0;
+}
+
+.content-markdown section {
+    margin: 8px 0;
+}
+
+.content-markdown eqn {
+    display: block;
+}
+
+.content-markdown eq {
+    display: inline;
+}
+
+.content-markdown p {
+    margin: 0 0 8px 0;
+}
+
+.content-markdown h1 {
+    font-size: 1.35rem;
+    font-weight: 600;
+    color: inherit;
+    margin: 12px 0 8px 0;
+}
+
+.content-markdown h2 {
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: inherit;
+    margin: 12px 0 8px 0;
+}
+
+.content-markdown h3,
+.content-markdown h4,
+.content-markdown h5,
+.content-markdown h6 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: inherit;
+    margin: 10px 0 6px 0;
+}
+
+.content-markdown strong {
+    font-weight: 600;
+    color: inherit;
+}
+
+.content-markdown em {
+    font-style: italic;
+    color: #e2e8f0;
+}
+
+.content-markdown a {
+    color: #7dd3fc;
+    text-decoration: underline;
+}
+
+.content-markdown ul,
+.content-markdown ol {
+    padding-left: 20px;
+}
+
+.content-markdown li {
+    margin: 4px 0;
+}
+
+.content-markdown blockquote {
+    border-left: 3px solid rgba(148, 163, 184, 0.5);
+    padding-left: 10px;
+    color: #cbd5f5;
+    margin: 8px 0;
+}
+
+.content-markdown pre {
+    background: rgba(15, 23, 42, 0.9);
+    border-radius: 10px;
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    padding: 12px;
+    overflow-x: auto;
+}
+
+.content-markdown .katex {
+    color: inherit;
+    font-size: 1rem;
+}
+
+.content-markdown .katex-display {
+    margin: 10px 0;
+    text-align: center;
+}
+
+.content-markdown .katex-display .katex {
+    font-size: 1.05rem;
+}
+
+.content-markdown code {
+    font-family: 'Courier New', monospace;
+    font-size: 0.85rem;
+    background: rgba(148, 163, 184, 0.2);
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+
+.content-markdown pre code {
+    background: transparent;
+    padding: 0;
+}

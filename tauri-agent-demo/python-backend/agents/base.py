@@ -48,7 +48,8 @@ class AgentStrategy(ABC):
         history: List[Dict[str, str]],
         tools: List["Tool"],
         llm_client: "LLMClient",
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None
     ) -> AsyncGenerator[AgentStep, None]:
         """
         Execute the agent strategy.
@@ -59,6 +60,7 @@ class AgentStrategy(ABC):
             tools: Available tools for the agent
             llm_client: LLM client for making API calls
             session_id: Optional session ID for context
+            request_overrides: Optional per-request overrides (e.g. response_format)
         
         Yields:
             AgentStep: Each step of agent execution (thought, action, observation, etc.)

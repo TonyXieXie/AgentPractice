@@ -1,4 +1,4 @@
-.debug-panel {
+﻿.debug-panel {
     width: 400px;
     height: 100%;
     background: linear-gradient(180deg, #1a1a2e 0%, #16213e 100%);
@@ -43,6 +43,14 @@
     flex: 1;
     overflow-y: auto;
     padding: 12px;
+}
+
+.debug-group-title {
+    margin: 8px 4px 12px;
+    font-size: 0.7rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #9ca3af;
 }
 
 .empty-debug {
@@ -97,6 +105,11 @@
     color: #a78bfa;
 }
 
+.role-badge.call {
+    background: rgba(45, 212, 191, 0.2);
+    color: #2dd4bf;
+}
+
 .message-id {
     color: #888;
     font-size: 0.75rem;
@@ -136,6 +149,22 @@
 
 .debug-section {
     margin-top: 16px;
+}
+
+.debug-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 12px;
+}
+
+.meta-pill {
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    color: #cbd5f5;
+    background: rgba(102, 126, 234, 0.15);
+    border: 1px solid rgba(102, 126, 234, 0.2);
 }
 
 .debug-section h4 {
@@ -183,6 +212,10 @@
     word-break: break-all;
 }
 
+.json-viewer.text-viewer {
+    color: #e2e8f0;
+}
+
 .copy-btn {
     background: rgba(102, 126, 234, 0.2);
     border: 1px solid rgba(102, 126, 234, 0.3);
@@ -226,7 +259,7 @@
     padding: 20px;
 }
 
-/* 滚动条样式 */
+/* Scrollbar */
 .debug-content::-webkit-scrollbar,
 .json-viewer::-webkit-scrollbar,
 .content-preview::-webkit-scrollbar {

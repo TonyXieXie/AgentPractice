@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { LLMConfig, LLMConfigCreate } from '../types';
+﻿import { useState, useEffect } from 'react';
+import { LLMConfig, LLMConfigCreate, LLMApiFormat, LLMProfile } from '../types';
 import { getConfigs, createConfig, updateConfig, deleteConfig } from '../api';
 import './ConfigManager.css';
 
@@ -8,16 +8,28 @@ interface ConfigManagerProps {
     onConfigCreated?: () => void;
 }
 
+const FORMAT_OPTIONS: { value: LLMApiFormat; label: string }[] = [
+    { value: 'openai_chat_completions', label: 'OpenAI Chat Completions' },
+    { value: 'openai_responses', label: 'OpenAI Responses' }
+];
+
+const PROFILE_OPTIONS: { value: LLMProfile; label: string }[] = [
+    { value: 'openai', label: 'OpenAI' },
+    { value: 'openai_compatible', label: 'OpenAI-Compatible' },
+    { value: 'deepseek', label: 'DeepSeek' },
+    { value: 'zhipu', label: 'Zhipu (GLM)' }
+];
+
 export default function ConfigManager({ onClose, onConfigCreated }: ConfigManagerProps) {
     const [configs, setConfigs] = useState<LLMConfig[]>([]);
     const [showForm, setShowForm] = useState(false);
     const [editingConfig, setEditingConfig] = useState<LLMConfig | null>(null);
     const [loading, setLoading] = useState(false);
 
-    // Form state
     const [formData, setFormData] = useState<LLMConfigCreate>({
         name: '',
-        api_type: 'openai',
+        api_format: 'openai_chat_completions',
+        api_profile: 'openai',
         api_key: '',
         base_url: '',
         model: '',
@@ -36,7 +48,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             setConfigs(data);
         } catch (error) {
             console.error('Failed to load configs:', error);
-            alert('加载配置失败');
+            alert('Failed to load configs.');
         }
     };
 
@@ -55,13 +67,12 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             onConfigCreated?.();
         } catch (error: any) {
             console.error('Failed to save config:', error);
-            // 显示更详细的错误信息
-            let errorMessage = '保存配置失败';
+            let errorMessage = 'Failed to save config';
             if (error.message) {
-                errorMessage += ': ' + error.message;
+                errorMessage += `: ${error.message}`;
             }
             if (error.message?.includes('fetch')) {
-                errorMessage += '\n\n请检查：\n1. 后端服务是否正在运行？\n2. 访问 http://127.0.0.1:8000 确认后端可访问';
+                errorMessage += '\n\nPlease verify:\n1) Backend is running\n2) http://127.0.0.1:8000 is reachable';
             }
             alert(errorMessage);
         } finally {
@@ -73,7 +84,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         setEditingConfig(config);
         setFormData({
             name: config.name,
-            api_type: config.api_type,
+            api_format: config.api_format,
+            api_profile: config.api_profile,
             api_key: config.api_key,
             base_url: config.base_url || '',
             model: config.model,
@@ -85,7 +97,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     };
 
     const handleDelete = async (id: string) => {
-        if (!confirm('确定要删除这个配置吗？')) return;
+        if (!confirm('Delete this config?')) return;
 
         try {
             await deleteConfig(id);
@@ -93,14 +105,15 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             onConfigCreated?.();
         } catch (error: any) {
             console.error('Failed to delete config:', error);
-            alert(error.message || '删除配置失败');
+            alert(error.message || 'Failed to delete config.');
         }
     };
 
     const resetForm = () => {
         setFormData({
             name: '',
-            api_type: 'openai',
+            api_format: 'openai_chat_completions',
+            api_profile: 'openai',
             api_key: '',
             base_url: '',
             model: '',
@@ -113,69 +126,90 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     };
 
     const getModelPlaceholder = () => {
-        switch (formData.api_type) {
+        switch (formData.api_profile) {
             case 'openai':
-                return 'gpt-4, gpt-3.5-turbo';
+                return 'gpt-4o, gpt-4.1, gpt-3.5-turbo';
+            case 'deepseek':
+                return 'deepseek-chat, deepseek-reasoner';
             case 'zhipu':
                 return 'glm-4, glm-3-turbo';
-            case 'deepseek':
-                return 'deepseek-chat';
+            case 'openai_compatible':
             default:
-                return '';
+                return 'model-id';
         }
     };
 
     const getBaseUrlPlaceholder = () => {
-        switch (formData.api_type) {
+        switch (formData.api_profile) {
             case 'openai':
                 return 'https://api.openai.com/v1';
-            case 'zhipu':
-                return 'https://open.bigmodel.cn/api/paas/v4';
             case 'deepseek':
                 return 'https://api.deepseek.com/v1';
+            case 'zhipu':
+                return 'https://open.bigmodel.cn/api/paas/v4';
+            case 'openai_compatible':
             default:
-                return '';
+                return 'Provider base URL';
         }
+    };
+
+    const handleFormatChange = (value: LLMApiFormat) => {
+        const next: LLMConfigCreate = { ...formData, api_format: value };
+        if (value === 'openai_responses' && formData.api_profile !== 'openai' && formData.api_profile !== 'openai_compatible') {
+            next.api_profile = 'openai';
+        }
+        setFormData(next);
+    };
+
+    const handleProfileChange = (value: LLMProfile) => {
+        if (formData.api_format === 'openai_responses' && value !== 'openai' && value !== 'openai_compatible') {
+            setFormData({ ...formData, api_profile: 'openai' });
+            return;
+        }
+        setFormData({ ...formData, api_profile: value });
     };
 
     return (
         <div className="modal-overlay" onClick={onClose}>
             <div className="modal-content" onClick={(e) => e.stopPropagation()}>
                 <div className="modal-header">
-                    <h2>⚙️ LLM 配置管理</h2>
-                    <button className="close-btn" onClick={onClose}>✕</button>
+                    <h2>LLM Config Manager</h2>
+                    <button className="close-btn" onClick={onClose}>X</button>
                 </div>
 
                 <div className="modal-body">
                     {!showForm ? (
                         <>
                             <button className="add-btn" onClick={() => setShowForm(true)}>
-                                ➕ 添加新配置
+                                + Add Config
                             </button>
 
                             <div className="configs-list">
                                 {configs.length === 0 ? (
-                                    <p className="empty-message">暂无配置，请添加一个</p>
+                                    <p className="empty-message">No configs yet.</p>
                                 ) : (
                                     configs.map((config) => (
                                         <div key={config.id} className="config-item">
                                             <div className="config-info">
                                                 <h3>
                                                     {config.name}
-                                                    {config.is_default && <span className="badge">默认</span>}
+                                                    {config.is_default && <span className="badge">Default</span>}
                                                 </h3>
                                                 <p className="config-detail">
-                                                    <strong>类型:</strong> {config.api_type.toUpperCase()} |
-                                                    <strong> 模型:</strong> {config.model}
+                                                    <strong>Format:</strong> {config.api_format} |
+                                                    <strong> Profile:</strong> {config.api_profile}
                                                 </p>
                                                 <p className="config-detail">
-                                                    <strong>温度:</strong> {config.temperature} |
-                                                    <strong> 最大tokens:</strong> {config.max_tokens}
+                                                    <strong>Model:</strong> {config.model}
+                                                </p>
+                                                <p className="config-detail">
+                                                    <strong>Temp:</strong> {config.temperature} |
+                                                    <strong> Max Tokens:</strong> {config.max_tokens}
                                                 </p>
                                             </div>
                                             <div className="config-actions">
-                                                <button onClick={() => handleEdit(config)}>编辑</button>
-                                                <button onClick={() => handleDelete(config.id)} className="delete-btn">删除</button>
+                                                <button onClick={() => handleEdit(config)}>Edit</button>
+                                                <button onClick={() => handleDelete(config.id)} className="delete-btn">Delete</button>
                                             </div>
                                         </div>
                                     ))
@@ -184,30 +218,46 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                         </>
                     ) : (
                         <form onSubmit={handleSubmit} className="config-form">
-                            <h3>{editingConfig ? '编辑配置' : '新建配置'}</h3>
+                            <h3>{editingConfig ? 'Edit Config' : 'Create Config'}</h3>
 
                             <div className="form-group">
-                                <label>配置名称 *</label>
+                                <label>Name *</label>
                                 <input
                                     type="text"
                                     value={formData.name}
                                     onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                                    placeholder="例如: OpenAI GPT-4"
+                                    placeholder="Example: OpenAI GPT-4"
                                     required
                                 />
                             </div>
 
                             <div className="form-group">
-                                <label>API 类型 *</label>
+                                <label>Format *</label>
                                 <select
-                                    value={formData.api_type}
-                                    onChange={(e) => setFormData({ ...formData, api_type: e.target.value as any })}
+                                    value={formData.api_format}
+                                    onChange={(e) => handleFormatChange(e.target.value as LLMApiFormat)}
                                     required
                                 >
-                                    <option value="openai">OpenAI</option>
-                                    <option value="zhipu">智谱AI (GLM)</option>
-                                    <option value="deepseek">Deepseek</option>
+                                    {FORMAT_OPTIONS.map((option) => (
+                                        <option key={option.value} value={option.value}>{option.label}</option>
+                                    ))}
                                 </select>
+                            </div>
+
+                            <div className="form-group">
+                                <label>Profile *</label>
+                                <select
+                                    value={formData.api_profile}
+                                    onChange={(e) => handleProfileChange(e.target.value as LLMProfile)}
+                                    required
+                                >
+                                    {PROFILE_OPTIONS.map((option) => (
+                                        <option key={option.value} value={option.value}>{option.label}</option>
+                                    ))}
+                                </select>
+                                {formData.api_format === 'openai_responses' && formData.api_profile !== 'openai' && (
+                                    <small>Responses format requires an OpenAI-compatible profile.</small>
+                                )}
                             </div>
 
                             <div className="form-group">
@@ -216,24 +266,24 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     type="password"
                                     value={formData.api_key}
                                     onChange={(e) => setFormData({ ...formData, api_key: e.target.value })}
-                                    placeholder="输入 API Key"
+                                    placeholder="Enter API Key"
                                     required
                                 />
                             </div>
 
                             <div className="form-group">
-                                <label>Base URL (可选)</label>
+                                <label>Base URL (Optional)</label>
                                 <input
                                     type="text"
                                     value={formData.base_url}
                                     onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
                                     placeholder={getBaseUrlPlaceholder()}
                                 />
-                                <small>留空使用默认地址</small>
+                                <small>Leave empty to use default base URL.</small>
                             </div>
 
                             <div className="form-group">
-                                <label>模型名称 *</label>
+                                <label>Model *</label>
                                 <input
                                     type="text"
                                     value={formData.model}
@@ -245,7 +295,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
 
                             <div className="form-row">
                                 <div className="form-group">
-                                    <label>温度 (0-2)</label>
+                                    <label>Temperature (0-2)</label>
                                     <input
                                         type="number"
                                         step="0.1"
@@ -257,7 +307,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                 </div>
 
                                 <div className="form-group">
-                                    <label>最大 Tokens</label>
+                                    <label>Max Tokens</label>
                                     <input
                                         type="number"
                                         min="1"
@@ -275,16 +325,16 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                         checked={formData.is_default}
                                         onChange={(e) => setFormData({ ...formData, is_default: e.target.checked })}
                                     />
-                                    设为默认配置
+                                    Set as default
                                 </label>
                             </div>
 
                             <div className="form-actions">
                                 <button type="button" onClick={resetForm} disabled={loading}>
-                                    取消
+                                    Cancel
                                 </button>
                                 <button type="submit" disabled={loading}>
-                                    {loading ? '保存中...' : '保存'}
+                                    {loading ? 'Saving...' : 'Save'}
                                 </button>
                             </div>
                         </form>

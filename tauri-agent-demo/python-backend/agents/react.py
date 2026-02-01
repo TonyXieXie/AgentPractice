@@ -1,137 +1,431 @@
-"""
+﻿"""
 ReActAgent - Reasoning + Acting Agent
 
-Implements the ReAct pattern (Yao et al., 2022):
-1. Thought: LLM reasons about the problem
-2. Action: LLM decides which tool to use
-3. Observation: Tool execution result
-4. Repeat until final answer is reached
-
-Paper: https://arxiv.org/abs/2210.03629
+Implements a ReAct-style loop with tool calling.
+- OpenAI: uses native tool calling (tool_calls / function_call)
+- Other providers: uses text-based Action/Action Input parsing
 """
 
+import json
 import re
-from typing import List, Dict, Any, AsyncGenerator, Optional
+from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
 from .base import AgentStrategy, AgentStep
-from tools.base import Tool
+from tools.base import Tool, tool_to_openai_function, tool_to_openai_responses_tool
 
 
 class ReActAgent(AgentStrategy):
     """
     ReAct (Reasoning + Acting) Agent.
-    
+
     Iteratively:
     - Thinks about the next step
     - Takes an action (uses a tool)
     - Observes the result
     - Continues until reaching a final answer
     """
-    
+
     def __init__(self, max_iterations: int = 5):
-        """
-        Initialize ReActAgent.
-        
-        Args:
-            max_iterations: Maximum number of thought-action-observation cycles
-        """
         self.max_iterations = max_iterations
     
+    def _merge_debug_context(
+        self,
+        session_id: Optional[str],
+        request_overrides: Optional[Dict[str, Any]],
+        agent_type: str,
+        iteration: int
+    ) -> Optional[Dict[str, Any]]:
+        debug_ctx: Dict[str, Any] = {}
+        if request_overrides and isinstance(request_overrides.get("_debug"), dict):
+            debug_ctx.update(request_overrides.get("_debug", {}))
+        if session_id:
+            debug_ctx["session_id"] = session_id
+        if "message_id" not in debug_ctx:
+            debug_ctx["message_id"] = None
+        debug_ctx["agent_type"] = agent_type
+        debug_ctx["iteration"] = iteration
+        return debug_ctx if debug_ctx else None
+
     async def execute(
         self,
         user_input: str,
         history: List[Dict[str, str]],
         tools: List[Tool],
         llm_client: "LLMClient",
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None
     ) -> AsyncGenerator[AgentStep, None]:
-        """
-        Execute ReAct loop.
-        
-        Args:
-            user_input: User's question/request
-            history: Conversation history
-            tools: Available tools
-            llm_client: LLM client
-            session_id: Optional session ID
-        
-        Yields:
-            AgentStep for each thought, action, observation, and final answer
-        """
-        scratchpad = []  # Track reasoning history
-        
+        profile = getattr(llm_client.config, "api_profile", None) or getattr(llm_client.config, "api_type", None)
+        profile = (profile or "openai").lower()
+        if profile in ("openai", "openai_compatible", "deepseek"):
+            async for step in self._execute_openai_tool_calling(
+                user_input=user_input,
+                history=history,
+                tools=tools,
+                llm_client=llm_client,
+                session_id=session_id,
+                request_overrides=request_overrides
+            ):
+                yield step
+            return
+
+        async for step in self._execute_text_react(
+            user_input=user_input,
+            history=history,
+            tools=tools,
+            llm_client=llm_client,
+            session_id=session_id,
+            request_overrides=request_overrides
+        ):
+            yield step
+
+    async def _execute_openai_tool_calling(
+        self,
+        user_input: str,
+        history: List[Dict[str, str]],
+        tools: List[Tool],
+        llm_client: "LLMClient",
+        session_id: Optional[str],
+        request_overrides: Optional[Dict[str, Any]]
+    ) -> AsyncGenerator[AgentStep, None]:
+        prompt = self.build_prompt(user_input, history, tools, {"tool_calling": True})
+        profile = getattr(llm_client.config, "api_profile", None) or getattr(llm_client.config, "api_type", None)
+        profile = (profile or "openai").lower()
+        prompt_role = "developer" if profile == "openai" else "system"
+
+        messages: List[Dict[str, Any]] = [{"role": prompt_role, "content": prompt}]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_input})
+
+        openai_format = "openai_chat_completions"
+        if hasattr(llm_client, "_get_format"):
+            openai_format = llm_client._get_format()
+
+        if openai_format == "openai_responses":
+            openai_tools = [tool_to_openai_responses_tool(t) for t in tools] if tools else []
+        else:
+            openai_tools = [tool_to_openai_function(t) for t in tools] if tools else []
+
+        response_input = self._build_responses_input(messages)
+
         for iteration in range(self.max_iterations):
-            # Build prompt with current scratchpad
+            llm_overrides = dict(request_overrides) if request_overrides else {}
+            if openai_tools:
+                llm_overrides.setdefault("tools", openai_tools)
+                if openai_format != "openai_responses":
+                    llm_overrides.setdefault("tool_choice", "auto")
+
+            debug_ctx = self._merge_debug_context(session_id, request_overrides, "react", iteration)
+            if debug_ctx:
+                llm_overrides["_debug"] = debug_ctx
+
+            if openai_format == "openai_responses":
+                llm_overrides["input"] = response_input
+
+            if openai_format == "openai_responses":
+                content_buffer = ""
+                tool_calls = []
+                response_output_items: List[Dict[str, Any]] = []
+                thought_stream_key = f"assistant_content_{iteration}"
+                stream_mode = "answer"
+
+                async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
+                    event_type = event.get("type")
+                    if event_type == "content":
+                        delta = event.get("delta", "")
+                        if delta:
+                            content_buffer += delta
+                            step_type = "answer_delta" if stream_mode == "answer" else "thought_delta"
+                            yield AgentStep(
+                                step_type=step_type,
+                                content=delta,
+                                metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                            )
+                    elif event_type == "tool_call_delta":
+                        if stream_mode != "thought":
+                            stream_mode = "thought"
+                        call_index = event.get("index", 0)
+                        call_key = f"tool-{iteration}-{call_index}"
+                        tool_name = event.get("name") or ""
+                        args_delta = event.get("arguments_delta", "")
+                        if args_delta or tool_name:
+                            yield AgentStep(
+                                step_type="action_delta",
+                                content=args_delta,
+                                metadata={
+                                    "iteration": iteration,
+                                    "stream_key": call_key,
+                                    "tool": tool_name,
+                                    "call_index": call_index
+                                }
+                            )
+                    elif event_type == "done":
+                        content_buffer = event.get("content", "") or ""
+                        tool_calls = event.get("tool_calls", []) or []
+                        response_obj = event.get("response") or {}
+                        if isinstance(response_obj, dict):
+                            response_output_items = response_obj.get("output", []) or []
+
+                llm_call_id = None
+                if llm_overrides.get("_debug"):
+                    llm_call_id = llm_overrides.get("_debug", {}).get("llm_call_id")
+
+                output_items = response_output_items
+                if not output_items:
+                    synthetic_items: List[Dict[str, Any]] = []
+                    if content_buffer.strip():
+                        synthetic_items.append({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": content_buffer}]
+                        })
+                    for idx, call in enumerate(tool_calls):
+                        call_id = call.get("call_id") or call.get("id") or f"call_{iteration}_{idx}"
+                        call["call_id"] = call_id
+                        synthetic_items.append({
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": call.get("name", ""),
+                            "arguments": call.get("arguments", "")
+                        })
+                    output_items = synthetic_items
+
+                if output_items:
+                    response_input += output_items
+
+                if tool_calls:
+                    if llm_call_id:
+                        self._update_llm_processed(llm_call_id, {
+                            "tool_calls": tool_calls,
+                            "content": content_buffer
+                        })
+                    if content_buffer.strip():
+                        yield AgentStep(
+                            step_type="thought",
+                            content=content_buffer,
+                            metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                        )
+
+                    for call_index, call in enumerate(tool_calls):
+                        call_index = call.get("index", call_index)
+                        tool_name = call.get("name")
+                        call_id = call.get("call_id") or call.get("id") or f"call_{iteration}_{call_index}"
+                        args_text = call.get("arguments", "")
+                        call_key = f"tool-{iteration}-{call_index}"
+
+                        tool_input, tool_output = await self._execute_tool_call(tools, tool_name, args_text)
+
+                        yield AgentStep(
+                            step_type="action",
+                            content=f"{tool_name}[{tool_input}]",
+                            metadata={"tool": tool_name, "input": tool_input, "iteration": iteration, "stream_key": call_key}
+                        )
+                        yield AgentStep(
+                            step_type="observation",
+                            content=tool_output,
+                            metadata={"tool": tool_name, "iteration": iteration}
+                        )
+
+                        response_input.append({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": tool_output
+                        })
+
+                    continue
+
+                if llm_call_id:
+                    self._update_llm_processed(llm_call_id, {"final_answer": content_buffer})
+
+                if content_buffer.strip():
+                    yield AgentStep(
+                        step_type="answer",
+                        content=content_buffer,
+                        metadata={"agent_type": "react", "iterations": iteration + 1, "stream_key": thought_stream_key}
+                    )
+                    return
+
+                yield AgentStep(
+                    step_type="error",
+                    content="LLM returned no content.",
+                    metadata={"iteration": iteration}
+                )
+                return
+
+            content_buffer = ""
+            tool_calls = []
+            thought_stream_key = f"assistant_content_{iteration}"
+            stream_mode = "answer"
+
+            async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
+                event_type = event.get("type")
+                if event_type == "content":
+                    delta = event.get("delta", "")
+                    if delta:
+                        content_buffer += delta
+                        step_type = "answer_delta" if stream_mode == "answer" else "thought_delta"
+                        yield AgentStep(
+                            step_type=step_type,
+                            content=delta,
+                            metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                        )
+                elif event_type == "tool_call_delta":
+                    if stream_mode != "thought":
+                        stream_mode = "thought"
+                    call_index = event.get("index", 0)
+                    call_key = f"tool-{iteration}-{call_index}"
+                    tool_name = event.get("name") or ""
+                    args_delta = event.get("arguments_delta", "")
+                    if args_delta or tool_name:
+                        yield AgentStep(
+                            step_type="action_delta",
+                            content=args_delta,
+                            metadata={
+                                "iteration": iteration,
+                                "stream_key": call_key,
+                                "tool": tool_name,
+                                "call_index": call_index
+                            }
+                        )
+                elif event_type == "done":
+                    content_buffer = event.get("content", "") or ""
+                    tool_calls = event.get("tool_calls", []) or []
+
+            llm_call_id = None
+            if llm_overrides.get("_debug"):
+                llm_call_id = llm_overrides.get("_debug", {}).get("llm_call_id")
+
+            if tool_calls:
+                if llm_call_id:
+                    self._update_llm_processed(llm_call_id, {
+                        "tool_calls": tool_calls,
+                        "content": content_buffer
+                    })
+
+                if content_buffer.strip():
+                    yield AgentStep(
+                        step_type="thought",
+                        content=content_buffer,
+                        metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                    )
+
+                messages.append({
+                    "role": "assistant",
+                    "content": content_buffer,
+                    "tool_calls": tool_calls
+                })
+
+                for call in tool_calls:
+                    function = call.get("function", {}) or {}
+                    tool_name = function.get("name")
+                    args_text = function.get("arguments", "")
+                    call_id = call.get("id")
+                    call_index = call.get("index", 0) if isinstance(call, dict) else 0
+                    call_key = f"tool-{iteration}-{call_index}"
+
+                    tool_input, tool_output = await self._execute_tool_call(tools, tool_name, args_text)
+
+                    yield AgentStep(
+                        step_type="action",
+                        content=f"{tool_name}[{tool_input}]",
+                        metadata={"tool": tool_name, "input": tool_input, "iteration": iteration, "stream_key": call_key}
+                    )
+                    yield AgentStep(
+                        step_type="observation",
+                        content=tool_output,
+                        metadata={"tool": tool_name, "iteration": iteration}
+                    )
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": tool_output
+                    })
+
+                continue
+
+            if llm_call_id:
+                self._update_llm_processed(llm_call_id, {"final_answer": content_buffer})
+
+            if content_buffer.strip():
+                yield AgentStep(
+                    step_type="answer",
+                    content=content_buffer,
+                    metadata={"agent_type": "react", "iterations": iteration + 1, "stream_key": thought_stream_key}
+                )
+                return
+
+            yield AgentStep(
+                step_type="error",
+                content="LLM returned no content.",
+                metadata={"iteration": iteration}
+            )
+            return
+
+        yield AgentStep(
+            step_type="answer",
+            content="Sorry, I could not complete the task within the limit.",
+            metadata={"agent_type": "react", "iterations": self.max_iterations, "max_iterations_reached": True}
+        )
+
+    async def _execute_text_react(
+        self,
+        user_input: str,
+        history: List[Dict[str, str]],
+        tools: List[Tool],
+        llm_client: "LLMClient",
+        session_id: Optional[str],
+        request_overrides: Optional[Dict[str, Any]]
+    ) -> AsyncGenerator[AgentStep, None]:
+        scratchpad: List[str] = []
+
+        for iteration in range(self.max_iterations):
             prompt = self.build_prompt(user_input, history, tools, {
                 "scratchpad": scratchpad,
-                "iteration": iteration
+                "iteration": iteration,
+                "tool_calling": False
             })
-            
-            # Call LLM
+
             try:
                 messages = [
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": user_input}
                 ]
-                
-                # 🔥 调试：打印发送给 LLM 的详细信息
-                print(f"\n{'='*80}")
-                print(f"[ReAct Agent] Iteration {iteration + 1}/{self.max_iterations}")
-                print(f"{'='*80}")
-                print(f"📤 发送给 LLM 的消息:")
-                print(f"\n[System Prompt]")
-                print(f"{'-'*80}")
-                print(prompt)
-                print(f"{'-'*80}")
-                print(f"\n[User Input]")
-                print(f"{'-'*80}")
-                print(user_input)
-                print(f"{'-'*80}")
-                print(f"\n⏳ 等待 LLM 响应...\n")
-                
-                response = await llm_client.chat(messages)
+
+                llm_overrides = dict(request_overrides) if request_overrides else {}
+                debug_ctx = self._merge_debug_context(session_id, request_overrides, "react", iteration)
+                if debug_ctx:
+                    llm_overrides["_debug"] = debug_ctx
+
+                response = await llm_client.chat(messages, llm_overrides if llm_overrides else None)
                 llm_output = response.get("content", "")
-                
-                # 🔥 调试：打印 LLM 原始输出
-                print(f"📥 LLM 原始输出:")
-                print(f"{'-'*80}")
-                print(llm_output)
-                print(f"{'-'*80}\n")
-                
+
             except Exception as e:
                 yield AgentStep(
                     step_type="error",
-                    content=f"LLM调用失败: {str(e)}",
+                    content=f"LLM call failed: {str(e)}",
                     metadata={"iteration": iteration, "error": str(e)}
                 )
                 return
-            
-            # Parse LLM output
+
             thought, action, action_input, final_answer = self._parse_reaction(llm_output)
-            
-            # 🔥 调试：打印解析结果
-            print(f"🔍 解析结果:")
-            print(f"{'-'*80}")
-            print(f"  💭 Thought: {thought if thought else '❌ 未找到'}")
-            print(f"  🔧 Action: {action if action else '❌ 未找到'}")
-            print(f"  📝 Action Input: {action_input if action_input else '❌ 未找到'}")
-            print(f"  ✅ Final Answer: {final_answer if final_answer else '❌ 未找到'}")
-            print(f"{'-'*80}")
-            print(f"{'='*80}\n")
-            
-            # Check for final answer first
+            llm_call_id = response.get("llm_call_id")
+            if llm_call_id:
+                self._update_llm_processed(llm_call_id, {
+                    "thought": thought,
+                    "action": action,
+                    "action_input": action_input,
+                    "final_answer": final_answer
+                })
+
             if final_answer:
                 yield AgentStep(
                     step_type="answer",
                     content=final_answer,
-                    metadata={
-                        "agent_type": "react",
-                        "iterations": iteration + 1,
-                        "scratchpad": scratchpad
-                    }
+                    metadata={"agent_type": "react", "iterations": iteration + 1, "scratchpad": scratchpad}
                 )
                 return
-            
-            # Emit thought step
+
             if thought:
                 yield AgentStep(
                     step_type="thought",
@@ -139,10 +433,8 @@ class ReActAgent(AgentStrategy):
                     metadata={"iteration": iteration}
                 )
                 scratchpad.append(f"Thought: {thought}")
-            
-            # Handle action
+
             if action and action_input:
-                # Emit action step
                 yield AgentStep(
                     step_type="action",
                     content=f"{action}[{action_input}]",
@@ -150,23 +442,19 @@ class ReActAgent(AgentStrategy):
                 )
                 scratchpad.append(f"Action: {action}")
                 scratchpad.append(f"Action Input: {action_input}")
-                
-                # Execute tool
+
                 tool = self._get_tool(tools, action)
                 if tool:
                     try:
                         observation = await tool.execute(action_input)
-                        
-                        # Emit observation step
                         yield AgentStep(
                             step_type="observation",
                             content=observation,
                             metadata={"tool": action, "iteration": iteration}
                         )
                         scratchpad.append(f"Observation: {observation}")
-                        
                     except Exception as e:
-                        error_msg = f"工具执行失败: {str(e)}"
+                        error_msg = f"Tool execution failed: {str(e)}"
                         yield AgentStep(
                             step_type="observation",
                             content=error_msg,
@@ -174,7 +462,7 @@ class ReActAgent(AgentStrategy):
                         )
                         scratchpad.append(f"Observation: {error_msg}")
                 else:
-                    error_msg = f"未找到工具 '{action}'"
+                    error_msg = f"Tool not found: '{action}'"
                     yield AgentStep(
                         step_type="error",
                         content=error_msg,
@@ -182,24 +470,18 @@ class ReActAgent(AgentStrategy):
                     )
                     scratchpad.append(f"Observation: {error_msg}")
             else:
-                # LLM didn't provide action - might be confused
                 yield AgentStep(
                     step_type="thought",
-                    content="(Agent未能确定下一步行动)",
+                    content="(Agent could not determine next action)",
                     metadata={"iteration": iteration, "warning": "no_action"}
                 )
-        
-        # Reached max iterations without final answer
+
         yield AgentStep(
             step_type="answer",
-            content="抱歉，我在有限的步骤内未能完成任务。请尝试重新表述您的问题或将其分解为更简单的子问题。",
-            metadata={
-                "agent_type": "react",
-                "iterations": self.max_iterations,
-                "max_iterations_reached": True
-            }
+            content="Sorry, I could not complete the task within the limit.",
+            metadata={"agent_type": "react", "iterations": self.max_iterations, "max_iterations_reached": True}
         )
-    
+
     def build_prompt(
         self,
         user_input: str,
@@ -207,140 +489,123 @@ class ReActAgent(AgentStrategy):
         tools: List[Tool],
         additional_context: Optional[Dict[str, Any]] = None
     ) -> str:
-        """
-        Build ReAct prompt with tool descriptions and examples.
-        
-        Args:
-            user_input: User's question
-            history: Conversation history (not used in basic ReAct)
-            tools: Available tools
-            additional_context: Dict with 'scratchpad' and 'iteration'
-        
-        Returns:
-            Formatted ReAct prompt
-        """
-        # Build tool descriptions
-        tool_descriptions = "\n".join([
-            f"- {tool.name}: {tool.description}"
-            for tool in tools
-        ])
-        
-        # Get scratchpad if available
+        tool_names = ", ".join([tool.name for tool in tools]) if tools else "(no tools available)"
+        tool_calling = bool(additional_context and additional_context.get("tool_calling"))
+
+        if tool_calling:
+            return (
+                "You are a reasoning + acting assistant. Use tools via function/tool calling when needed.\n\n"
+                "## Tools\n"
+                f"Available tool names: {tool_names}\n"
+                "Tool definitions are provided separately via the API tools field.\n\n"
+                "Guidelines:\n"
+                "- If a tool is needed, call it with JSON arguments that match its schema.\n"
+                "- If no tool is needed, answer directly.\n"
+            )
+
         scratchpad = additional_context.get("scratchpad", []) if additional_context else []
-        scratchpad_text = "\n".join(scratchpad) if scratchpad else ""
-        
-        prompt = f"""你是一个具有推理和行动能力的AI助手。你需要通过"思考-行动-观察"的循环来解决问题。
+        scratchpad_text = "\n".join(scratchpad) if scratchpad else "(first iteration)"
 
-## 可用工具
-{tool_descriptions if tool_descriptions else "（当前没有可用工具）"}
+        prompt = f"""You are a reasoning + acting assistant. Follow the format exactly.
 
-## 回答格式（必须严格遵守）
+## Tools
+Available tool names: {tool_names}
+Tool definitions are provided separately via the API tools field.
 
-你必须按照以下格式输出，每个步骤都要写：
+## Output Format (strict)
+Thought: <your reasoning>
+Action: <tool name>
+Action Input: <tool input>
 
-```
-Thought: [你的思考过程，分析问题需要什么]
-Action: [工具名称]
-Action Input: [工具的输入参数]
-```
+System will reply with:
+Observation: <tool output>
 
-然后系统会返回：
-```
-Observation: [工具执行结果]
-```
+Repeat as needed, then finish with:
+Thought: I now know the final answer.
+Final Answer: <your final answer>
 
-你可以重复上述步骤多次，直到获得足够信息。最后输出：
-```
-Thought: 我现在知道最终答案了
-Final Answer: [你的最终答案]
-```
-
-## 重要规则
-1. **必须先 Thought，再 Action** - 每次行动前都要思考
-2. **Action 必须是上面列出的工具之一** - 不能编造工具
-3. **Action Input 要简洁明确** - 直接给出参数，不要多余解释
-4. **不要自己写 Observation** - Observation 由系统提供
-5. **得出答案前必须说"我现在知道最终答案了"**
-
-## 示例
-
-### 示例1：计算问题
-Question: 15乘以23加100等于多少？
-
-Thought: 我需要计算15*23+100这个数学表达式
-Action: calculator
-Action Input: 15*23+100
-Observation: 445
-Thought: 我现在知道最终答案了
-Final Answer: 15乘以23加100等于445
-
-### 示例2：天气查询
-Question: 北京今天天气怎么样？
-
-Thought: 我需要查询北京的天气信息
-Action: weather
-Action Input: 北京
-Observation: Beijing: Sunny, Temperature: 18°C, Humidity: 45%, Wind: 10 km/h
-Thought: 我现在知道最终答案了
-Final Answer: 北京今天天气晴朗，温度18°C，湿度45%，风速10公里/小时
-
-### 示例3：多步骤问题
-Question: 搜索一下人工智能，然后告诉我主要应用
-
-Thought: 我需要先搜索人工智能的相关信息
-Action: search
-Action Input: 人工智能
-Observation: Search results for '人工智能': 1. AI技术包括机器学习、深度学习... 2. 应用领域：医疗、金融、教育...
-Thought: 我现在知道最终答案了
-Final Answer: 人工智能的主要应用包括：医疗诊断、金融风控、智能教育、自动驾驶等领域
-
----
-
-## 你之前的推理过程
-{scratchpad_text if scratchpad_text else "（这是第一次推理，请开始思考）"}
-
----
-
-现在请开始！记住：先 Thought，再 Action，严格遵循格式！"""
-        
+## Scratchpad
+{scratchpad_text}
+"""
         return prompt
-    
-    def _parse_reaction(self, text: str):
-        """
-        Parse LLM output to extract thought, action, action_input, and final_answer.
-        
-        Args:
-            text: LLM output text
-        
-        Returns:
-            Tuple of (thought, action, action_input, final_answer)
-        """
-        # Extract components using regex
+
+    def _parse_reaction(self, text: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
         thought_match = re.search(r"Thought:\s*(.+?)(?=\n(?:Action|Final Answer):|$)", text, re.DOTALL | re.IGNORECASE)
         action_match = re.search(r"Action:\s*(\w+)", text, re.IGNORECASE)
         action_input_match = re.search(r"Action Input:\s*(.+?)(?=\nObservation:|$)", text, re.DOTALL | re.IGNORECASE)
         final_answer_match = re.search(r"Final Answer:\s*(.+?)$", text, re.DOTALL | re.IGNORECASE)
-        
+
         thought = thought_match.group(1).strip() if thought_match else None
         action = action_match.group(1).strip() if action_match else None
         action_input = action_input_match.group(1).strip() if action_input_match else None
         final_answer = final_answer_match.group(1).strip() if final_answer_match else None
-        
+
         return thought, action, action_input, final_answer
-    
-    def _get_tool(self, tools: List[Tool], name: str) -> Optional[Tool]:
-        """
-        Get tool by name.
-        
-        Args:
-            tools: List of available tools
-            name: Tool name to find
-        
-        Returns:
-            Tool instance or None if not found
-        """
+
+    def _get_tool(self, tools: List[Tool], name: Optional[str]) -> Optional[Tool]:
+        if not name:
+            return None
         return next((t for t in tools if t.name.lower() == name.lower()), None)
-    
+
+    def _safe_json_loads(self, value: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        if not value:
+            return {}, None
+        try:
+            data = json.loads(value)
+            if isinstance(data, dict):
+                return data, None
+            return None, "Tool arguments must be a JSON object."
+        except json.JSONDecodeError as e:
+            return None, f"Invalid JSON arguments: {e}"
+
+    def _extract_tool_input(self, tool: Tool, args: Dict[str, Any]) -> str:
+        if not tool.parameters:
+            return json.dumps(args) if args else ""
+        if len(tool.parameters) == 1:
+            key = tool.parameters[0].name
+            value = args.get(key, "")
+            return str(value)
+        return json.dumps(args)
+
+    async def _execute_tool_call(self, tools: List[Tool], tool_name: Optional[str], args_text: str) -> Tuple[str, str]:
+        tool = self._get_tool(tools, tool_name)
+        args, parse_error = self._safe_json_loads(args_text)
+
+        if tool is None:
+            return "", f"Tool not found: '{tool_name}'"
+
+        if parse_error:
+            return "", parse_error
+
+        tool_input = self._extract_tool_input(tool, args or {})
+        try:
+            output = await tool.execute(tool_input)
+            return tool_input, output
+        except Exception as e:
+            return tool_input, f"Tool execution failed: {str(e)}"
+
+    def _build_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        input_items: List[Dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "assistant":
+                content_items = [{"type": "output_text", "text": content}]
+            else:
+                content_items = [{"type": "input_text", "text": content}]
+            input_items.append({
+                "type": "message",
+                "role": role,
+                "content": content_items
+            })
+        return input_items
+
+    def _update_llm_processed(self, llm_call_id: int, payload: Dict[str, Any]) -> None:
+        try:
+            from database import db
+            db.update_llm_call_processed(llm_call_id, payload)
+        except Exception:
+            pass
+
     def get_max_iterations(self) -> int:
-        """Get max iterations for ReAct"""
         return self.max_iterations

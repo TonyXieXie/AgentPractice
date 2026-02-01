@@ -1,7 +1,7 @@
-"""
+﻿"""
 SimpleAgent - Backward Compatible Chat Agent
 
-This agent maintains the existing simple conversational behavior:
+This agent maintains simple conversational behavior:
 - No tool use
 - Direct LLM conversation
 - Simple message history
@@ -15,63 +15,93 @@ from message_processor import message_processor
 class SimpleAgent(AgentStrategy):
     """
     Simple conversational agent (backward compatible).
-    
+
     This agent provides the same behavior as the original chat system:
     - Builds messages from history + user input
     - Single LLM API call
     - Returns complete response
     - No tool usage
     """
-    
+
     def __init__(self, system_prompt: Optional[str] = None, max_history: int = 10):
         """
         Initialize SimpleAgent.
-        
+
         Args:
             system_prompt: Optional system prompt
             max_history: Maximum number of history messages to include
         """
-        self.system_prompt = system_prompt or "你是一个有帮助的AI助手。"
+        self.system_prompt = system_prompt or "You are a helpful AI assistant."
         self.max_history = max_history
     
+    def _merge_debug_context(
+        self,
+        session_id: Optional[str],
+        request_overrides: Optional[Dict[str, Any]],
+        agent_type: str,
+        iteration: int
+    ) -> Optional[Dict[str, Any]]:
+        debug_ctx: Dict[str, Any] = {}
+        if request_overrides and isinstance(request_overrides.get("_debug"), dict):
+            debug_ctx.update(request_overrides.get("_debug", {}))
+        if session_id:
+            debug_ctx["session_id"] = session_id
+        if "message_id" not in debug_ctx:
+            debug_ctx["message_id"] = None
+        debug_ctx["agent_type"] = agent_type
+        debug_ctx["iteration"] = iteration
+        return debug_ctx if debug_ctx else None
+
     async def execute(
         self,
         user_input: str,
         history: List[Dict[str, str]],
         tools: List["Tool"],
         llm_client: "LLMClient",
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None
     ) -> AsyncGenerator[AgentStep, None]:
         """
         Execute simple conversation.
-        
+
         Args:
             user_input: User's message
             history: Conversation history
             tools: Available tools (ignored for simple agent)
             llm_client: LLM client
             session_id: Optional session ID
-        
+            request_overrides: Optional per-request overrides (e.g. response_format)
+
         Yields:
             AgentStep with type "answer" containing LLM response
         """
-        # Build messages using existing logic
+        profile = getattr(llm_client.config, "api_profile", None) or getattr(llm_client.config, "api_type", None)
+        profile = (profile or "openai").lower()
+        system_role = "developer" if profile == "openai" else "system"
         messages = message_processor.build_messages_for_llm(
             user_message=user_input,
             history=history,
             system_prompt=self.system_prompt,
-            max_history=self.max_history
+            max_history=self.max_history,
+            system_role=system_role
         )
-        
-        # Call LLM
+
         try:
-            response = await llm_client.chat(messages)
+            llm_overrides = dict(request_overrides) if request_overrides else {}
+            debug_ctx = self._merge_debug_context(session_id, request_overrides, "simple", 0)
+            if debug_ctx:
+                llm_overrides["_debug"] = debug_ctx
+
+            response = await llm_client.chat(messages, llm_overrides if llm_overrides else None)
             content = response.get("content", "")
-            
-            # Post-process response
+
             processed_content = message_processor.postprocess_llm_response(content)
-            
-            # Yield final answer
+
+            llm_call_id = response.get("llm_call_id")
+            if llm_call_id:
+                from database import db
+                db.update_llm_call_processed(llm_call_id, {"content": processed_content})
+
             yield AgentStep(
                 step_type="answer",
                 content=processed_content,
@@ -81,13 +111,12 @@ class SimpleAgent(AgentStrategy):
                 }
             )
         except Exception as e:
-            # Yield error step
             yield AgentStep(
                 step_type="error",
-                content=f"LLM调用失败: {str(e)}",
+                content=f"LLM call failed: {str(e)}",
                 metadata={"error": str(e)}
             )
-    
+
     def build_prompt(
         self,
         user_input: str,
@@ -97,12 +126,12 @@ class SimpleAgent(AgentStrategy):
     ) -> str:
         """
         Build prompt (not used for SimpleAgent as it uses message_processor).
-        
+
         Returns:
             System prompt
         """
         return self.system_prompt
-    
+
     def get_max_iterations(self) -> int:
         """SimpleAgent only needs 1 iteration"""
         return 1

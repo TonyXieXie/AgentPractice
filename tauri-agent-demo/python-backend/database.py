@@ -1,7 +1,7 @@
-import sqlite3
+﻿from typing import List, Optional, Dict, Any
 import json
-from typing import List, Optional, Dict, Any
 from datetime import datetime
+import sqlite3
 import uuid
 from models import LLMConfig, LLMConfigCreate, LLMConfigUpdate, ChatMessage, ChatMessageCreate, ChatSession, ChatSessionCreate, ChatSessionUpdate
 
@@ -13,22 +13,23 @@ class Database:
         self.init_database()
     
     def get_connection(self):
-        """获取数据库连接"""
+        """Get database connection"""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
     
     def init_database(self):
-        """初始化数据库表"""
+        """Initialize database tables"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        # 创建 LLM 配置表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS llm_configs (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                api_type TEXT NOT NULL,
+                api_type TEXT,
+                api_format TEXT,
+                api_profile TEXT,
                 api_key TEXT NOT NULL,
                 base_url TEXT,
                 model TEXT NOT NULL,
@@ -38,8 +39,40 @@ class Database:
                 created_at TEXT NOT NULL
             )
         ''')
+
+        try:
+            cursor.execute('ALTER TABLE llm_configs ADD COLUMN api_format TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE llm_configs ADD COLUMN api_profile TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('''
+                UPDATE llm_configs
+                SET api_format = ?
+                WHERE api_format IS NULL
+            ''', ("openai_chat_completions",))
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('''
+                UPDATE llm_configs
+                SET api_profile = api_type
+                WHERE api_profile IS NULL AND api_type IS NOT NULL
+            ''')
+            cursor.execute('''
+                UPDATE llm_configs
+                SET api_profile = ?
+                WHERE api_profile IS NULL
+            ''', ("openai",))
+        except sqlite3.OperationalError:
+            pass
         
-        # 创建会话表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chat_sessions (
                 id TEXT PRIMARY KEY,
@@ -51,13 +84,11 @@ class Database:
             )
         ''')
         
-        # 添加 agent_type 字段迁移
         try:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN agent_type TEXT DEFAULT "simple"')
         except sqlite3.OperationalError:
-            pass  # 字段已存在
+            pass
         
-        # 创建消息表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chat_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,7 +103,6 @@ class Database:
             )
         ''')
         
-        # 创建 Agent 步骤表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS agent_steps (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,7 +116,6 @@ class Database:
             )
         ''')
         
-        # 创建工具调用记录表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS tool_calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,45 +127,70 @@ class Database:
                 FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
             )
         ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS llm_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                message_id INTEGER,
+                agent_type TEXT,
+                iteration INTEGER,
+                stream INTEGER NOT NULL,
+                api_type TEXT,
+                api_profile TEXT,
+                api_format TEXT,
+                model TEXT,
+                request_json TEXT,
+                response_json TEXT,
+                response_text TEXT,
+                processed_json TEXT,
+                created_at TEXT NOT NULL
+            )
+        ''')
+
+        try:
+            cursor.execute('ALTER TABLE llm_calls ADD COLUMN api_profile TEXT')
+        except sqlite3.OperationalError:
+            pass
         
-        # 添加字段迁移逻辑（如果表已存在但缺少新字段）
         try:
             cursor.execute('ALTER TABLE chat_messages ADD COLUMN raw_request TEXT')
         except sqlite3.OperationalError:
-            pass  # 字段已存在
+            pass
         
         try:
             cursor.execute('ALTER TABLE chat_messages ADD COLUMN raw_response TEXT')
         except sqlite3.OperationalError:
-            pass  # 字段已存在
+            pass
         
-        # 创建索引
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_config ON chat_sessions(config_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_steps_message ON agent_steps(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_llm_calls_session ON llm_calls(session_id)')
         
         conn.commit()
         conn.close()
     
-    # ==================== LLM 配置管理 ====================
+    # ==================== LLM Configs ====================
     
     def create_config(self, config: LLMConfigCreate) -> LLMConfig:
-        """创建新的 LLM 配置"""
+        """Create LLM config"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
         config_id = str(uuid.uuid4())
         created_at = datetime.now().isoformat()
+        api_format = config.api_format or "openai_chat_completions"
+        api_profile = config.api_profile or config.api_type or "openai"
         
-        # 如果设置为默认，先取消其他配置的默认状态
         if config.is_default:
             cursor.execute('UPDATE llm_configs SET is_default = 0')
         
         cursor.execute('''
-            INSERT INTO llm_configs (id, name, api_type, api_key, base_url, model, temperature, max_tokens, is_default, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (config_id, config.name, config.api_type, config.api_key, config.base_url, 
+            INSERT INTO llm_configs (id, name, api_type, api_format, api_profile, api_key, base_url, model, temperature, max_tokens, is_default, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (config_id, config.name, api_profile, api_format, api_profile, config.api_key, config.base_url,
               config.model, config.temperature, config.max_tokens, int(config.is_default), created_at))
         
         conn.commit()
@@ -145,7 +199,7 @@ class Database:
         return self.get_config(config_id)
     
     def get_config(self, config_id: str) -> Optional[LLMConfig]:
-        """获取指定配置"""
+        """Get config"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM llm_configs WHERE id = ?', (config_id,))
@@ -153,10 +207,16 @@ class Database:
         conn.close()
         
         if row:
+            api_profile = row['api_profile'] if 'api_profile' in row.keys() else None
+            if not api_profile:
+                api_profile = row['api_type'] if 'api_type' in row.keys() else None
+            if not api_profile:
+                api_profile = "openai"
             return LLMConfig(
                 id=row['id'],
                 name=row['name'],
-                api_type=row['api_type'],
+                api_format=row['api_format'] or "openai_chat_completions",
+                api_profile=api_profile,
                 api_key=row['api_key'],
                 base_url=row['base_url'],
                 model=row['model'],
@@ -168,17 +228,23 @@ class Database:
         return None
     
     def get_all_configs(self) -> List[LLMConfig]:
-        """获取所有配置"""
+        """Get all configs"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM llm_configs ORDER BY is_default DESC, created_at DESC')
         rows = cursor.fetchall()
         conn.close()
         
-        return [LLMConfig(**dict(row)) for row in rows]
+        configs = []
+        for row in rows:
+            data = dict(row)
+            data["api_profile"] = data.get("api_profile") or data.get("api_type") or "openai"
+            data["api_format"] = data.get("api_format") or "openai_chat_completions"
+            configs.append(LLMConfig(**data))
+        return configs
     
     def get_default_config(self) -> Optional[LLMConfig]:
-        """获取默认配置"""
+        """Get default config"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM llm_configs WHERE is_default = 1 LIMIT 1')
@@ -186,11 +252,14 @@ class Database:
         conn.close()
         
         if row:
-            return LLMConfig(**dict(row))
+            data = dict(row)
+            data["api_profile"] = data.get("api_profile") or data.get("api_type") or "openai"
+            data["api_format"] = data.get("api_format") or "openai_chat_completions"
+            return LLMConfig(**data)
         return None
     
     def update_config(self, config_id: str, update: LLMConfigUpdate) -> Optional[LLMConfig]:
-        """更新配置"""
+        """Update config"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -209,6 +278,19 @@ class Database:
         if update.model is not None:
             update_fields.append('model = ?')
             values.append(update.model)
+        if update.api_format is not None:
+            update_fields.append('api_format = ?')
+            values.append(update.api_format)
+        if update.api_profile is not None:
+            update_fields.append('api_profile = ?')
+            values.append(update.api_profile)
+            update_fields.append('api_type = ?')
+            values.append(update.api_profile)
+        elif update.api_type is not None:
+            update_fields.append('api_profile = ?')
+            values.append(update.api_type)
+            update_fields.append('api_type = ?')
+            values.append(update.api_type)
         if update.temperature is not None:
             update_fields.append('temperature = ?')
             values.append(update.temperature)
@@ -234,7 +316,7 @@ class Database:
         return self.get_config(config_id)
     
     def delete_config(self, config_id: str) -> bool:
-        """删除配置"""
+        """Delete config"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('DELETE FROM llm_configs WHERE id = ?', (config_id,))
@@ -243,10 +325,10 @@ class Database:
         conn.close()
         return deleted
     
-    # ==================== 会话管理 ====================
+    # ==================== Sessions ====================
     
     def create_session(self, session: ChatSessionCreate) -> ChatSession:
-        """创建新会话"""
+        """Create session"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -264,7 +346,7 @@ class Database:
         return self.get_session(session_id)
     
     def get_session(self, session_id: str) -> Optional[ChatSession]:
-        """获取指定会话"""
+        """Get session"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
@@ -282,7 +364,7 @@ class Database:
         return None
     
     def get_all_sessions(self) -> List[ChatSession]:
-        """获取所有会话"""
+        """Get all sessions"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
@@ -298,7 +380,7 @@ class Database:
         return [ChatSession(**dict(row)) for row in rows]
     
     def update_session(self, session_id: str, update: ChatSessionUpdate) -> Optional[ChatSession]:
-        """更新会话"""
+        """Update session"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -314,7 +396,7 @@ class Database:
         return self.get_session(session_id)
     
     def delete_session(self, session_id: str) -> bool:
-        """删除会话及其所有消息"""
+        """Delete session and its messages"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('DELETE FROM chat_messages WHERE session_id = ?', (session_id,))
@@ -324,10 +406,10 @@ class Database:
         conn.close()
         return deleted
     
-    # ==================== 消息管理 ====================
+    # ==================== Messages ====================
     
     def create_message(self, message: ChatMessageCreate) -> ChatMessage:
-        """创建新消息"""
+        """Create message"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -343,7 +425,6 @@ class Database:
         
         message_id = cursor.lastrowid
         
-        # 更新会话的 updated_at
         cursor.execute('''
             UPDATE chat_sessions SET updated_at = ? WHERE id = ?
         ''', (timestamp, message.session_id))
@@ -363,7 +444,7 @@ class Database:
         )
     
     def get_session_messages(self, session_id: str, limit: Optional[int] = None) -> List[ChatMessage]:
-        """获取会话的消息历史"""
+        """Get session messages"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -405,10 +486,10 @@ class Database:
         
         return messages
     
-    # ==================== Agent Steps 和 Tool Calls 管理 ====================
+    # ==================== Agent Steps + Tool Calls ====================
     
     def save_agent_step(self, message_id: int, step_type: str, content: str, sequence: int, metadata: Dict[str, Any] = None) -> int:
-        """保存Agent执行步骤"""
+        """Save agent step"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -427,7 +508,7 @@ class Database:
         return step_id
     
     def get_agent_steps(self, message_id: int) -> List[Dict[str, Any]]:
-        """获取消息的所有Agent步骤"""
+        """Get agent steps for message"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -452,9 +533,35 @@ class Database:
             }
             for row in rows
         ]
+
+    def get_session_agent_steps(self, session_id: str) -> List[Dict[str, Any]]:
+        """Get agent steps for all messages in a session"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT s.message_id, s.step_type, s.content, s.metadata, s.sequence, s.timestamp
+            FROM agent_steps s
+            JOIN chat_messages m ON s.message_id = m.id
+            WHERE m.session_id = ?
+            ORDER BY s.message_id ASC, s.sequence ASC
+        ''', (session_id,))
+        rows = cursor.fetchall()
+        conn.close()
+
+        return [
+            {
+                "message_id": row["message_id"],
+                "step_type": row["step_type"],
+                "content": row["content"],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                "sequence": row["sequence"],
+                "timestamp": row["timestamp"]
+            }
+            for row in rows
+        ]
     
     def save_tool_call(self, message_id: int, tool_name: str, tool_input: str, tool_output: str) -> int:
-        """保存工具调用记录"""
+        """Save tool call record"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -470,9 +577,98 @@ class Database:
         conn.close()
         
         return tool_call_id
-    
+
+    # ==================== LLM Calls Debug ====================
+
+    def save_llm_call(
+        self,
+        session_id: str,
+        message_id: int,
+        agent_type: str,
+        iteration: int,
+        stream: bool,
+        api_profile: str,
+        api_format: str,
+        model: str,
+        request_json: Dict[str, Any],
+        response_json: Dict[str, Any],
+        response_text: str,
+        processed_json: Optional[Dict[str, Any]] = None
+    ) -> int:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        timestamp = datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO llm_calls (
+                session_id, message_id, agent_type, iteration, stream,
+                api_type, api_profile, api_format, model, request_json, response_json,
+                response_text, processed_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            session_id,
+            message_id,
+            agent_type,
+            iteration,
+            int(bool(stream)),
+            api_profile,
+            api_profile,
+            api_format,
+            model,
+            json.dumps(request_json) if request_json is not None else None,
+            json.dumps(response_json) if response_json is not None else None,
+            response_text,
+            json.dumps(processed_json) if processed_json is not None else None,
+            timestamp
+        ))
+        llm_call_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return llm_call_id
+
+    def update_llm_call_processed(self, llm_call_id: int, processed_json: Dict[str, Any]):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE llm_calls
+            SET processed_json = ?
+            WHERE id = ?
+        ''', (json.dumps(processed_json) if processed_json is not None else None, llm_call_id))
+        conn.commit()
+        conn.close()
+
+    def get_session_llm_calls(self, session_id: str) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM llm_calls
+            WHERE session_id = ?
+            ORDER BY created_at ASC
+        ''', (session_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        results = []
+        for row in rows:
+            results.append({
+                "id": row["id"],
+                "session_id": row["session_id"],
+                "message_id": row["message_id"],
+                "agent_type": row["agent_type"],
+                "iteration": row["iteration"],
+                "stream": bool(row["stream"]),
+                "api_type": row["api_type"],
+                "api_profile": row["api_profile"] if "api_profile" in row.keys() else None,
+                "api_format": row["api_format"],
+                "model": row["model"],
+                "request_json": json.loads(row["request_json"]) if row["request_json"] else None,
+                "response_json": json.loads(row["response_json"]) if row["response_json"] else None,
+                "response_text": row["response_text"],
+                "processed_json": json.loads(row["processed_json"]) if row["processed_json"] else None,
+                "created_at": row["created_at"],
+            })
+        return results
+
     def update_session_agent_type(self, session_id: str, agent_type: str):
-        """更新会话的Agent类型"""
+        """Update session agent type"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -485,5 +681,6 @@ class Database:
         conn.commit()
         conn.close()
 
-# 创建全局数据库实例
+# Create global database instance
+
 db = Database()

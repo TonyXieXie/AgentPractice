@@ -67,6 +67,68 @@ class Tool(ABC):
             "description": self.description,
             "parameters": [p.dict() for p in self.parameters]
         }
+
+
+def _build_tool_parameters_schema(tool: "Tool") -> Dict[str, Any]:
+    properties: Dict[str, Any] = {}
+    required: List[str] = []
+
+    for param in tool.parameters:
+        param_type = param.type if param.type in ("string", "number", "boolean", "object", "array") else "string"
+        schema: Dict[str, Any] = {
+            "type": param_type,
+            "description": param.description
+        }
+        if param.default is not None:
+            schema["default"] = param.default
+        properties[param.name] = schema
+        if param.required:
+            required.append(param.name)
+
+    parameters_schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False
+    }
+    if required:
+        parameters_schema["required"] = required
+
+    return parameters_schema
+
+
+def tool_to_openai_function(tool: "Tool") -> Dict[str, Any]:
+    """
+    Convert a Tool to OpenAI Chat Completions tool schema.
+
+    Returns:
+        {"type": "function", "function": {"name", "description", "parameters"}}
+    """
+    parameters_schema = _build_tool_parameters_schema(tool)
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": parameters_schema
+        }
+    }
+
+
+def tool_to_openai_responses_tool(tool: "Tool") -> Dict[str, Any]:
+    """
+    Convert a Tool to OpenAI Responses tool schema.
+
+    Returns:
+        {"type": "function", "name", "description", "parameters", "strict"}
+    """
+    parameters_schema = _build_tool_parameters_schema(tool)
+    return {
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": parameters_schema,
+        "strict": True
+    }
     
     def validate_input(self, input_data: str) -> bool:
         """

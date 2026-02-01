@@ -34,7 +34,8 @@ class MessageProcessor:
         user_message: str,
         history: List[Dict[str, str]] = None,
         system_prompt: str = None,
-        max_history: int = 10
+        max_history: int = 10,
+        system_role: str = "system"
     ) -> List[Dict[str, str]]:
         """
         构建发送给 LLM 的消息列表
@@ -52,7 +53,7 @@ class MessageProcessor:
         
         # 添加系统提示词
         if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": system_role, "content": system_prompt})
         
         # 添加历史消息（限制数量）
         if history:

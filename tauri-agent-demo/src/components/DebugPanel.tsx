@@ -1,31 +1,46 @@
-import { useState } from 'react';
-import { Message } from '../types';
+﻿import { useMemo, useState } from 'react';
+import { Message, LLMCall } from '../types';
 import './DebugPanel.css';
 
 interface DebugPanelProps {
     messages: Message[];
+    llmCalls: LLMCall[];
     onClose: () => void;
 }
 
-function DebugPanel({ messages, onClose }: DebugPanelProps) {
-    const [expandedId, setExpandedId] = useState<number | null>(null);
+function DebugPanel({ messages, llmCalls, onClose }: DebugPanelProps) {
+    const [expandedMessageId, setExpandedMessageId] = useState<string | null>(null);
+    const [expandedCallId, setExpandedCallId] = useState<string | null>(null);
 
-    const toggleExpand = (id: number) => {
-        setExpandedId(expandedId === id ? null : id);
+    const toggleExpandMessage = (id: string) => {
+        setExpandedMessageId(expandedMessageId === id ? null : id);
     };
 
-    const copyToClipboard = (text: string) => {
-        navigator.clipboard.writeText(text);
-        alert('已复制到剪贴板');
+    const toggleExpandCall = (id: string) => {
+        setExpandedCallId(expandedCallId === id ? null : id);
     };
 
-    const formatJson = (obj: any) => {
-        return JSON.stringify(obj, null, 2);
+    const copyToClipboard = async (text: string) => {
+        try {
+            await navigator.clipboard.writeText(text);
+            alert('Copied to clipboard.');
+        } catch (error) {
+            console.error('Copy failed:', error);
+            alert('Copy failed.');
+        }
     };
 
-    const getTokenUsage = (msg: Message) => {
-        if (!msg.raw_response || !msg.raw_response.usage) return null;
-        const usage = msg.raw_response.usage;
+    const formatJson = (obj: any) => JSON.stringify(obj, null, 2);
+
+    const formatTime = (value?: string) => {
+        if (!value) return '';
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+    };
+
+    const getTokenUsage = (raw: any) => {
+        if (!raw || !raw.usage) return null;
+        const usage = raw.usage;
         return {
             prompt: usage.prompt_tokens || 0,
             completion: usage.completion_tokens || 0,
@@ -33,102 +48,187 @@ function DebugPanel({ messages, onClose }: DebugPanelProps) {
         };
     };
 
+    const renderJsonSection = (title: string, data: any) => {
+        if (!data) return null;
+        const text = formatJson(data);
+        return (
+            <div className="debug-section">
+                <div className="section-header">
+                    <h4>{title}</h4>
+                    <button className="copy-btn" onClick={() => copyToClipboard(text)}>
+                        Copy
+                    </button>
+                </div>
+                <pre className="json-viewer">{text}</pre>
+            </div>
+        );
+    };
+
+    const renderTextSection = (title: string, data?: string | null) => {
+        if (!data) return null;
+        return (
+            <div className="debug-section">
+                <div className="section-header">
+                    <h4>{title}</h4>
+                    <button className="copy-btn" onClick={() => copyToClipboard(data)}>
+                        Copy
+                    </button>
+                </div>
+                <pre className="json-viewer text-viewer">{data}</pre>
+            </div>
+        );
+    };
+
+    const callsByMessage = useMemo(() => {
+        const map = new Map<number, LLMCall[]>();
+        const orphan: LLMCall[] = [];
+        for (const call of llmCalls) {
+            if (typeof call.message_id === 'number') {
+                if (!map.has(call.message_id)) {
+                    map.set(call.message_id, []);
+                }
+                map.get(call.message_id)!.push(call);
+            } else {
+                orphan.push(call);
+            }
+        }
+        return { map, orphan };
+    }, [llmCalls]);
+
+    const renderLLMCall = (call: LLMCall) => {
+        const callKey = `call-${call.id}`;
+        const usage = getTokenUsage(call.response_json);
+        const hasRawEvents = Boolean(call.response_json && (call.response_json as any).events);
+        const hasProcessed = Boolean(call.processed_json);
+        const responseJsonDisplay = hasRawEvents && hasProcessed ? call.processed_json : call.response_json;
+        const responseTitle = hasRawEvents && hasProcessed ? 'Response JSON (processed)' : 'Response JSON';
+        const showProcessedSection = !(hasRawEvents && hasProcessed);
+        return (
+            <div key={call.id} className="debug-message">
+                <div className="debug-message-header" onClick={() => toggleExpandCall(callKey)}>
+                    <div className="message-title">
+                        <span className="role-badge call">LLM</span>
+                        <span className="message-id">Call {call.id}</span>
+                        <span className="message-time">{formatTime(call.created_at)}</span>
+                    </div>
+                    <button className="expand-btn">{expandedCallId === callKey ? '-' : '+'}</button>
+                </div>
+
+                {expandedCallId === callKey && (
+                    <div className="debug-message-body">
+                        <div className="debug-meta">
+                            <span className="meta-pill">agent: {call.agent_type || 'unknown'}</span>
+                            <span className="meta-pill">iteration: {call.iteration ?? 0}</span>
+                            <span className="meta-pill">stream: {call.stream ? 'yes' : 'no'}</span>
+                            <span className="meta-pill">profile: {call.api_profile || 'unknown'}</span>
+                            <span className="meta-pill">format: {call.api_format || 'unknown'}</span>
+                            <span className="meta-pill">model: {call.model || 'unknown'}</span>
+                        </div>
+
+                        {renderJsonSection('Request JSON', call.request_json)}
+                        {renderJsonSection(responseTitle, responseJsonDisplay)}
+                        {renderTextSection('Response Text', call.response_text)}
+                        {showProcessedSection && renderJsonSection('Processed JSON', call.processed_json)}
+
+                        {usage && (
+                            <div className="token-usage">
+                                <h5>Token Usage</h5>
+                                <div className="token-stats">
+                                    <span>Prompt: {usage.prompt}</span>
+                                    <span>Completion: {usage.completion}</span>
+                                    <span>Total: {usage.total}</span>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+        );
+    };
+
     return (
         <div className="debug-panel">
             <div className="debug-header">
-                <h2>🐛 Debug 面板</h2>
-                <button className="close-btn" onClick={onClose}>✕</button>
+                <h2>Debug</h2>
+                <button className="close-btn" onClick={onClose}>
+                    X
+                </button>
             </div>
 
             <div className="debug-content">
                 {messages.length === 0 ? (
                     <div className="empty-debug">
-                        <p>暂无消息</p>
+                        <p>No messages.</p>
                     </div>
                 ) : (
-                    messages.map((msg) => (
-                        <div key={msg.id} className="debug-message">
-                            <div
-                                className="debug-message-header"
-                                onClick={() => toggleExpand(msg.id)}
-                            >
-                                <div className="message-title">
-                                    <span className={`role-badge ${msg.role}`}>
-                                        {msg.role === 'user' ? '👤 用户' : '🤖 助手'}
-                                    </span>
-                                    <span className="message-id">ID: {msg.id}</span>
-                                    <span className="message-time">
-                                        {new Date(msg.timestamp).toLocaleTimeString('zh-CN')}
-                                    </span>
-                                </div>
-                                <button className="expand-btn">
-                                    {expandedId === msg.id ? '▼' : '▶'}
-                                </button>
-                            </div>
-
-                            {expandedId === msg.id && (
-                                <div className="debug-message-body">
-                                    <div className="debug-section">
-                                        <h4>📝 内容</h4>
-                                        <div className="content-preview">
-                                            {msg.content}
-                                        </div>
+                    messages.map((msg) => {
+                        const msgKey = `msg-${msg.id}`;
+                        const usage = getTokenUsage(msg.raw_response);
+                        const linkedCalls = callsByMessage.map.get(msg.id) || [];
+                        return (
+                            <div key={msg.id} className="debug-message">
+                                <div className="debug-message-header" onClick={() => toggleExpandMessage(msgKey)}>
+                                    <div className="message-title">
+                                        <span className={`role-badge ${msg.role}`}>
+                                            {msg.role === 'user' ? 'User' : msg.role === 'assistant' ? 'Assistant' : 'System'}
+                                        </span>
+                                        <span className="message-id">ID: {msg.id}</span>
+                                        <span className="message-time">
+                                            {new Date(msg.timestamp).toLocaleTimeString()}
+                                        </span>
                                     </div>
+                                    <button className="expand-btn">{expandedMessageId === msgKey ? '-' : '+'}</button>
+                                </div>
 
-                                    {msg.raw_request && (
+                                {expandedMessageId === msgKey && (
+                                    <div className="debug-message-body">
                                         <div className="debug-section">
-                                            <div className="section-header">
-                                                <h4>📤 原始请求</h4>
-                                                <button
-                                                    className="copy-btn"
-                                                    onClick={() => copyToClipboard(formatJson(msg.raw_request))}
-                                                >
-                                                    📋 复制
-                                                </button>
-                                            </div>
-                                            <pre className="json-viewer">
-                                                {formatJson(msg.raw_request)}
-                                            </pre>
+                                            <h4>Content</h4>
+                                            <div className="content-preview">{msg.content}</div>
                                         </div>
-                                    )}
 
-                                    {msg.raw_response && (
+                                        {renderJsonSection('Raw Request', msg.raw_request)}
+                                        {renderJsonSection('Raw Response', msg.raw_response)}
+
+                                        {usage && (
+                                            <div className="token-usage">
+                                                <h5>Token Usage</h5>
+                                                <div className="token-stats">
+                                                    <span>Prompt: {usage.prompt}</span>
+                                                    <span>Completion: {usage.completion}</span>
+                                                    <span>Total: {usage.total}</span>
+                                                </div>
+                                            </div>
+                                        )}
+
                                         <div className="debug-section">
                                             <div className="section-header">
-                                                <h4>📥 原始响应</h4>
-                                                <button
-                                                    className="copy-btn"
-                                                    onClick={() => copyToClipboard(formatJson(msg.raw_response))}
-                                                >
-                                                    📋 复制
-                                                </button>
+                                                <h4>LLM Calls</h4>
                                             </div>
-                                            <pre className="json-viewer">
-                                                {formatJson(msg.raw_response)}
-                                            </pre>
-
-                                            {getTokenUsage(msg) && (
-                                                <div className="token-usage">
-                                                    <h5>Token 使用统计</h5>
-                                                    <div className="token-stats">
-                                                        <span>Prompt: {getTokenUsage(msg)!.prompt}</span>
-                                                        <span>Completion: {getTokenUsage(msg)!.completion}</span>
-                                                        <span>Total: {getTokenUsage(msg)!.total}</span>
-                                                    </div>
-                                                </div>
+                                            {linkedCalls.length === 0 ? (
+                                                <p className="no-debug-data">No LLM calls linked to this message.</p>
+                                            ) : (
+                                                linkedCalls.map(renderLLMCall)
                                             )}
                                         </div>
-                                    )}
 
-                                    {!msg.raw_request && !msg.raw_response && (
-                                        <div className="debug-section">
-                                            <p className="no-debug-data">该消息无调试数据</p>
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-                        </div>
-                    ))
+                                        {!msg.raw_request && !msg.raw_response && linkedCalls.length === 0 && (
+                                            <div className="debug-section">
+                                                <p className="no-debug-data">No debug data for this message.</p>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        );
+                    })
+                )}
+
+                {callsByMessage.orphan.length > 0 && (
+                    <>
+                        <div className="debug-group-title">Unlinked LLM Calls</div>
+                        {callsByMessage.orphan.map(renderLLMCall)}
+                    </>
                 )}
             </div>
         </div>

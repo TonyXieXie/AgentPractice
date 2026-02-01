@@ -1,4 +1,4 @@
-import {
+﻿import {
     LLMConfig,
     LLMConfigCreate,
     LLMConfigUpdate,
@@ -8,12 +8,13 @@ import {
     Message,
     ChatRequest,
     ChatResponse,
-    ExportRequest
+    ExportRequest,
+    LLMCall
 } from './types';
 
 const API_BASE_URL = 'http://127.0.0.1:8000';
 
-// ==================== LLM 配置 API ====================
+// ==================== Config API ====================
 
 export async function getConfigs(): Promise<LLMConfig[]> {
     const response = await fetch(`${API_BASE_URL}/configs`);
@@ -60,7 +61,7 @@ export async function deleteConfig(configId: string): Promise<void> {
     if (!response.ok) throw new Error('Failed to delete config');
 }
 
-// ==================== 会话 API ====================
+// ==================== Session API ====================
 
 export async function getSessions(): Promise<ChatSession[]> {
     const response = await fetch(`${API_BASE_URL}/sessions`);
@@ -110,7 +111,19 @@ export async function getSessionMessages(sessionId: string, limit?: number): Pro
     return response.json();
 }
 
-// ==================== 聊天 API ====================
+export async function getSessionLLMCalls(sessionId: string): Promise<LLMCall[]> {
+    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/llm_calls`);
+    if (!response.ok) throw new Error('Failed to fetch LLM calls');
+    return response.json();
+}
+
+export async function getSessionAgentSteps(sessionId: string): Promise<AgentStepWithMessage[]> {
+    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/agent_steps`);
+    if (!response.ok) throw new Error('Failed to fetch agent steps');
+    return response.json();
+}
+
+// ==================== Chat API ====================
 
 export async function sendMessage(request: ChatRequest): Promise<ChatResponse> {
     const response = await fetch(`${API_BASE_URL}/chat`, {
@@ -133,13 +146,15 @@ export async function* sendMessageStream(request: ChatRequest): AsyncGenerator<s
 
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
+    let buffer = '';
 
     while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() || '';
 
         for (const line of lines) {
             if (line.startsWith('data: ')) {
@@ -147,20 +162,13 @@ export async function* sendMessageStream(request: ChatRequest): AsyncGenerator<s
                 try {
                     const parsed = JSON.parse(data);
 
-                    // 如果包含session_id，yield整个对象
                     if (parsed.session_id || parsed.user_message_id) {
                         yield parsed;
-                    }
-                    // 如果标记done，结束
-                    else if (parsed.done) {
+                    } else if (parsed.done) {
                         return;
-                    }
-                    // 如果有content，yield内容字符串
-                    else if (parsed.content) {
+                    } else if (parsed.content) {
                         yield parsed.content;
-                    }
-                    // 如果有error，抛出异常
-                    else if (parsed.error) {
+                    } else if (parsed.error) {
                         throw new Error(parsed.error);
                     }
                 } catch (e) {
@@ -173,17 +181,27 @@ export async function* sendMessageStream(request: ChatRequest): AsyncGenerator<s
     }
 }
 
-// ==================== Agent 聊天 API ====================
+// ==================== Agent Chat API ====================
 
 export interface AgentStep {
-    step_type: 'thought' | 'action' | 'observation' | 'answer' | 'error';
+    step_type: 'thought' | 'thought_delta' | 'action' | 'action_delta' | 'observation' | 'answer' | 'answer_delta' | 'error';
     content: string;
     metadata?: Record<string, any>;
 }
 
+export interface AgentStepWithMessage extends AgentStep {
+    message_id: number;
+    sequence?: number;
+    timestamp?: string;
+}
+
 export async function* sendMessageAgentStream(
     request: ChatRequest
-): AsyncGenerator<AgentStep | { session_id: string; user_message_id?: number } | { done: true }, void, unknown> {
+): AsyncGenerator<
+    AgentStep | { session_id: string; user_message_id?: number; assistant_message_id?: number } | { done: true },
+    void,
+    unknown
+> {
     const response = await fetch(`${API_BASE_URL}/chat/agent/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -194,13 +212,15 @@ export async function* sendMessageAgentStream(
 
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
+    let buffer = '';
 
     while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() || '';
 
         for (const line of lines) {
             if (line.startsWith('data: ')) {
@@ -208,21 +228,14 @@ export async function* sendMessageAgentStream(
                 try {
                     const parsed = JSON.parse(data);
 
-                    // 如果包含session_id，yield整个对象
                     if (parsed.session_id) {
                         yield parsed;
-                    }
-                    // 如果标记done，yield并结束
-                    else if (parsed.done) {
+                    } else if (parsed.done) {
                         yield parsed;
                         return;
-                    }
-                    // Agent步骤
-                    else if (parsed.step_type) {
+                    } else if (parsed.step_type) {
                         yield parsed as AgentStep;
-                    }
-                    // 如果有error，抛出异常
-                    else if (parsed.error) {
+                    } else if (parsed.error) {
                         throw new Error(parsed.error);
                     }
                 } catch (e) {
@@ -235,7 +248,7 @@ export async function* sendMessageAgentStream(
     }
 }
 
-// ==================== 导出 API ====================
+// ==================== Export API ====================
 
 export async function exportChatHistory(request: ExportRequest): Promise<Blob> {
     const response = await fetch(`${API_BASE_URL}/export`, {

@@ -1,11 +1,11 @@
-// LLM API 类型
-export type LLMApiType = 'openai' | 'zhipu' | 'deepseek';
+﻿export type LLMApiFormat = 'openai_chat_completions' | 'openai_responses';
+export type LLMProfile = 'openai' | 'openai_compatible' | 'deepseek' | 'zhipu';
 
-// LLM 配置
 export interface LLMConfig {
     id: string;
     name: string;
-    api_type: LLMApiType;
+    api_format: LLMApiFormat;
+    api_profile: LLMProfile;
     api_key: string;
     base_url?: string;
     model: string;
@@ -17,7 +17,8 @@ export interface LLMConfig {
 
 export interface LLMConfigCreate {
     name: string;
-    api_type: LLMApiType;
+    api_format: LLMApiFormat;
+    api_profile: LLMProfile;
     api_key: string;
     base_url?: string;
     model: string;
@@ -31,12 +32,13 @@ export interface LLMConfigUpdate {
     api_key?: string;
     base_url?: string;
     model?: string;
+    api_format?: LLMApiFormat;
+    api_profile?: LLMProfile;
     temperature?: number;
     max_tokens?: number;
     is_default?: boolean;
 }
 
-// 聊天消息
 export interface Message {
     id: number;
     session_id: string;
@@ -44,8 +46,8 @@ export interface Message {
     content: string;
     timestamp: string;
     metadata?: Record<string, any>;
-    raw_request?: Record<string, any>;  // LLM原始请求数据
-    raw_response?: Record<string, any>; // LLM原始响应数据
+    raw_request?: Record<string, any>;
+    raw_response?: Record<string, any>;
 }
 
 export interface MessageCreate {
@@ -55,7 +57,6 @@ export interface MessageCreate {
     metadata?: Record<string, any>;
 }
 
-// 会话
 export interface ChatSession {
     id: string;
     title: string;
@@ -74,11 +75,28 @@ export interface ChatSessionUpdate {
     title?: string;
 }
 
-// API 请求/响应
+export interface LLMCall {
+    id: number;
+    session_id: string;
+    message_id?: number | null;
+    agent_type?: string | null;
+    iteration?: number | null;
+    stream: boolean;
+    api_profile?: string | null;
+    api_format?: string | null;
+    model?: string | null;
+    request_json?: Record<string, any> | null;
+    response_json?: Record<string, any> | null;
+    response_text?: string | null;
+    processed_json?: Record<string, any> | null;
+    created_at: string;
+}
+
 export interface ChatRequest {
     message: string;
     session_id?: string;
     config_id?: string;
+    response_format?: Record<string, any>;
 }
 
 export interface ChatResponse {
