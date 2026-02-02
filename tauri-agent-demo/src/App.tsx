@@ -33,6 +33,9 @@ function App() {
   const [showDebugPanel, setShowDebugPanel] = useState(false);
   const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const autoScrollRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
 
   useEffect(() => {
     loadDefaultConfig();
@@ -40,7 +43,9 @@ function App() {
   }, []);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (autoScrollRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
   }, [messages]);
 
   useEffect(() => {
@@ -111,6 +116,7 @@ function App() {
       alert('Please configure an LLM first.');
       return;
     }
+    autoScrollRef.current = true;
 
     const userMessage = inputMsg.trim();
     setInputMsg('');
@@ -449,6 +455,21 @@ function App() {
     }
   };
 
+  const handleMessagesScroll = () => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const threshold = 10;
+    const currentScrollTop = container.scrollTop;
+    const distanceToBottom = container.scrollHeight - currentScrollTop - container.clientHeight;
+    const nearBottom = distanceToBottom <= threshold;
+    if (currentScrollTop < lastScrollTopRef.current) {
+      autoScrollRef.current = false;
+    } else if (nearBottom) {
+      autoScrollRef.current = true;
+    }
+    lastScrollTopRef.current = currentScrollTop;
+  };
+
   return (
     <div className="app-container">
       {showSidebar && (
@@ -502,7 +523,7 @@ function App() {
             </div>
           </div>
 
-          <div className="messages">
+          <div className="messages" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
             {messages.length === 0 ? (
               <div className="welcome-message">
                 <h2>Welcome to Agent Chat</h2>
@@ -543,7 +564,10 @@ function App() {
 
           <div className="input-area">
             <input
-              onChange={(e) => setInputMsg(e.currentTarget.value)}
+              onChange={(e) => {
+                setInputMsg(e.currentTarget.value);
+                autoScrollRef.current = true;
+              }}
               onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
               value={inputMsg}
               placeholder={currentConfig ? 'Type a message...' : 'Please configure an LLM'}
