@@ -1,8 +1,10 @@
-﻿import MarkdownIt from 'markdown-it';
+import { useState } from 'react';
+import MarkdownIt from 'markdown-it';
 import texmath from 'markdown-it-texmath';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
 import { AgentStep } from '../api';
+import DiffView from './DiffView';
 import './AgentStepView.css';
 
 type Category = 'thought' | 'tool' | 'final' | 'error' | 'other';
@@ -56,7 +58,13 @@ function renderRichContent(content: string) {
     return <div className="content-markdown" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
+function looksLikeDiff(content: string) {
+    return /^diff --git /m.test(content) || /^@@\s+-\d+/m.test(content);
+}
+
 function AgentStepView({ steps, streaming }: AgentStepViewProps) {
+    const [expandedObservations, setExpandedObservations] = useState<Record<string, boolean>>({});
+
     if (!steps.length) {
         return (
             <div className="agent-steps empty">
@@ -69,13 +77,56 @@ function AgentStepView({ steps, streaming }: AgentStepViewProps) {
         <div className="agent-steps">
             {steps.map((step, index) => {
                 const category = STEP_CATEGORY[step.step_type] || 'other';
+                const stepKey = `${step.step_type}-${index}`;
+                const isObservation = step.step_type === 'observation';
+                let observationText = '';
+                let observationPreview = '';
+                let observationHasMore = false;
+                let observationIsDiff = false;
+                if (isObservation) {
+                    observationText = String(step.content || '').replace(/\r\n/g, '\n');
+                    const lines = observationText.split('\n');
+                    observationHasMore = lines.length > 1;
+                    observationPreview = observationHasMore ? `${lines[0]} ...` : lines[0] || '';
+                    observationIsDiff = looksLikeDiff(observationText);
+                }
+
                 return (
                     <div key={`${step.step_type}-${index}`} className={`agent-step ${category}`}>
                         <div className="agent-step-header">
                             <span className="agent-step-category">{CATEGORY_LABELS[category]}</span>
                             <span className="agent-step-type">{step.step_type}</span>
                         </div>
-                        <div className="agent-step-content">{renderRichContent(step.content || '')}</div>
+                        {isObservation ? (
+                            <div className="agent-step-content observation">
+                                {expandedObservations[stepKey] ? (
+                                    observationIsDiff ? (
+                                        <DiffView content={observationText} />
+                                    ) : (
+                                        <pre className="observation-text expanded">{observationText}</pre>
+                                    )
+                                ) : (
+                                    <pre className="observation-text">{observationPreview}</pre>
+                                )}
+                                {observationHasMore && (
+                                    <button
+                                        type="button"
+                                        className="observation-toggle"
+                                        aria-label={expandedObservations[stepKey] ? 'Collapse observation' : 'Expand observation'}
+                                        title={expandedObservations[stepKey] ? 'Collapse' : 'Expand'}
+                                        onClick={() =>
+                                            setExpandedObservations((prev) => ({ ...prev, [stepKey]: !prev[stepKey] }))
+                                        }
+                                    >
+                                        <span aria-hidden="true">
+                                            {expandedObservations[stepKey] ? '^' : 'v'}
+                                        </span>
+                                    </button>
+                                )}
+                            </div>
+                        ) : (
+                            <div className="agent-step-content">{renderRichContent(step.content || '')}</div>
+                        )}
                     </div>
                 );
             })}
