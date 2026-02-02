@@ -33,6 +33,101 @@ app.add_middleware(
 
 register_builtin_tools()
 
+# ==================== Title Generation ====================
+
+TITLE_MAX_CHARS = 40
+TITLE_FALLBACK_CHARS = 20
+TITLE_REQUEST_TIMEOUT = 15.0
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    value = (text or "").strip()
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars].rstrip()
+
+
+def _fallback_title(user_message: str) -> str:
+    base = (user_message or "").strip().splitlines()[0] if user_message else ""
+    if not base:
+        return "New Chat"
+    if len(base) > TITLE_FALLBACK_CHARS:
+        return base[:TITLE_FALLBACK_CHARS].rstrip() + "..."
+    return base
+
+
+def _clean_title(raw_title: str) -> str:
+    title = (raw_title or "").strip().strip('"').strip("'")
+    title = title.splitlines()[0].strip() if title else ""
+    for prefix in (
+        "\u6807\u9898\uff1a",
+        "\u6807\u9898:",
+        "Title:",
+        "title:",
+        "\u9898\u76ee\uff1a",
+        "\u9898\u76ee:",
+        "\u4e3b\u9898\uff1a",
+        "\u4e3b\u9898:"
+    ):
+        if title.lower().startswith(prefix.lower()):
+            title = title[len(prefix):].strip()
+            break
+    title = title.rstrip(" .,!?:;" + "\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A")
+    if len(title) > TITLE_MAX_CHARS:
+        title = title[:TITLE_MAX_CHARS].rstrip() + "..."
+    return title
+
+
+async def _generate_title(config: LLMConfig, user_message: str, assistant_message: str) -> Optional[str]:
+    system_role = "developer" if config.api_profile == "openai" else "system"
+    system_prompt = (
+        "You generate concise chat titles. "
+        "Output only the title. "
+        "Use the user's language. "
+        "3-12 words or <=20 Chinese characters. "
+        "No quotes, no emojis, no trailing punctuation."
+    )
+    user_excerpt = _truncate_text(user_message, 600)
+    assistant_excerpt = _truncate_text(assistant_message, 800)
+    user_prompt = (
+        "User message:\n"
+        f"{user_excerpt}\n\n"
+        "Assistant reply:\n"
+        f"{assistant_excerpt}\n\n"
+        "Title:"
+    )
+    messages = [
+        {"role": system_role, "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    client = create_llm_client(config)
+    client.timeout = TITLE_REQUEST_TIMEOUT
+    result = await client.chat(messages)
+    return _clean_title(result.get("content", ""))
+
+
+async def _maybe_update_session_title(
+    session_id: str,
+    config: LLMConfig,
+    user_message: str,
+    assistant_message: str,
+    is_first_turn: bool
+) -> None:
+    if not is_first_turn:
+        return
+    current = db.get_session(session_id)
+    if not current or current.title != "New Chat":
+        return
+    title = ""
+    try:
+        title = await _generate_title(config, user_message, assistant_message)
+    except Exception:
+        title = ""
+    if not title:
+        title = _fallback_title(user_message)
+    if title and title != current.title:
+        db.update_session(session_id, ChatSessionUpdate(title=title))
+
 # ==================== Base routes ====================
 
 @app.get("/")
@@ -162,6 +257,7 @@ async def chat(request: ChatRequest):
                 title="New Chat",
                 config_id=config_id
             ))
+        is_first_turn = (session.message_count or 0) == 0
 
         config = db.get_config(session.config_id)
         if not config:
@@ -228,9 +324,13 @@ async def chat(request: ChatRequest):
         if llm_call_id:
             db.update_llm_call_processed(llm_call_id, {"content": processed_response})
 
-        if session.message_count == 0:
-            title = processed_message[:20] + ("..." if len(processed_message) > 20 else "")
-            db.update_session(session.id, ChatSessionUpdate(title=title))
+        await _maybe_update_session_title(
+            session_id=session.id,
+            config=config,
+            user_message=processed_message,
+            assistant_message=processed_response,
+            is_first_turn=is_first_turn
+        )
 
         return ChatResponse(
             reply=processed_response,
@@ -256,6 +356,7 @@ async def chat_stream(request: ChatRequest):
                 title="New Chat",
                 config_id=config_id
             ))
+        is_first_turn = (session.message_count or 0) == 0
 
         config = db.get_config(session.config_id)
         if not config:
@@ -330,6 +431,14 @@ async def chat_stream(request: ChatRequest):
                 llm_call_id = llm_overrides.get("_debug", {}).get("llm_call_id")
                 if llm_call_id:
                     db.update_llm_call_processed(llm_call_id, {"content": processed_response})
+
+                await _maybe_update_session_title(
+                    session_id=session.id,
+                    config=config,
+                    user_message=processed_message,
+                    assistant_message=processed_response,
+                    is_first_turn=is_first_turn
+                )
 
                 yield f"data: {json.dumps({'done': True, 'message_id': assistant_msg.id})}\n\n"
             except Exception as e:
@@ -456,6 +565,7 @@ async def chat_agent_stream(request: ChatRequest):
                 title="New Chat",
                 config_id=config_id
             ))
+        is_first_turn = (session.message_count or 0) == 0
 
         config = db.get_config(session.config_id)
         if not config:
@@ -571,6 +681,14 @@ async def chat_agent_stream(request: ChatRequest):
                     ''', (final_answer, assistant_msg_id))
                     conn.commit()
                     conn.close()
+
+                    await _maybe_update_session_title(
+                        session_id=session.id,
+                        config=config,
+                        user_message=processed_message,
+                        assistant_message=final_answer,
+                        is_first_turn=is_first_turn
+                    )
 
                 yield f"data: {json.dumps({'done': True, 'session_id': session.id})}\n\n"
 
