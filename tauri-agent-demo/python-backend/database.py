@@ -148,6 +148,19 @@ class Database:
             )
         ''')
 
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tool_permission_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_name TEXT NOT NULL,
+                action TEXT NOT NULL,
+                path TEXT NOT NULL,
+                reason TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        ''')
+
         try:
             cursor.execute('ALTER TABLE llm_calls ADD COLUMN api_profile TEXT')
         except sqlite3.OperationalError:
@@ -168,6 +181,7 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_steps_message ON agent_steps(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_llm_calls_session ON llm_calls(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_permission_status ON tool_permission_requests(status)')
         
         conn.commit()
         conn.close()
@@ -577,6 +591,53 @@ class Database:
         conn.close()
         
         return tool_call_id
+
+    # ==================== Tool Permission Requests ====================
+
+    def create_permission_request(self, tool_name: str, action: str, path: str, reason: str = None) -> int:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        timestamp = datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO tool_permission_requests (tool_name, action, path, reason, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (tool_name, action, path, reason, "pending", timestamp, timestamp))
+        request_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return request_id
+
+    def get_permission_requests(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if status:
+            cursor.execute('''
+                SELECT * FROM tool_permission_requests
+                WHERE status = ?
+                ORDER BY created_at DESC
+            ''', (status,))
+        else:
+            cursor.execute('''
+                SELECT * FROM tool_permission_requests
+                ORDER BY created_at DESC
+            ''')
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def update_permission_request(self, request_id: int, status: str) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE tool_permission_requests
+            SET status = ?, updated_at = ?
+            WHERE id = ?
+        ''', (status, datetime.now().isoformat(), request_id))
+        conn.commit()
+        cursor.execute('SELECT * FROM tool_permission_requests WHERE id = ?', (request_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
 
     # ==================== LLM Calls Debug ====================
 

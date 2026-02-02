@@ -3,14 +3,15 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import json
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from models import (
     LLMConfig, LLMConfigCreate, LLMConfigUpdate,
     ChatMessage, ChatMessageCreate,
     ChatSession, ChatSessionCreate, ChatSessionUpdate,
-    ChatRequest, ChatResponse, ExportRequest
+    ChatRequest, ChatResponse, ExportRequest,
+    ToolPermissionRequest, ToolPermissionRequestUpdate
 )
 from database import db
 from llm_client import create_llm_client
@@ -20,6 +21,7 @@ from agents.executor import create_agent_executor
 from agents.base import AgentStep
 from tools.builtin import register_builtin_tools
 from tools.base import ToolRegistry
+from tools.config import get_tool_config, update_tool_config
 
 app = FastAPI(title="Tauri Agent Chat Backend")
 
@@ -840,6 +842,31 @@ async def chat_agent_stream(request: ChatRequest):
 def get_tools():
     tools = ToolRegistry.get_all()
     return [tool.to_dict() for tool in tools]
+
+@app.get("/tools/config")
+def get_tools_config():
+    return get_tool_config()
+
+@app.put("/tools/config")
+def set_tools_config(payload: Dict[str, Any]):
+    try:
+        updated = update_tool_config(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    ToolRegistry.clear()
+    register_builtin_tools()
+    return updated
+
+@app.get("/tools/permissions", response_model=List[ToolPermissionRequest])
+def get_tool_permissions(status: Optional[str] = None):
+    return db.get_permission_requests(status=status)
+
+@app.put("/tools/permissions/{request_id}", response_model=ToolPermissionRequest)
+def update_tool_permission(request_id: int, update: ToolPermissionRequestUpdate):
+    updated = db.update_permission_request(request_id, update.status)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Permission request not found")
+    return updated
 
 if __name__ == "__main__":
     print("Starting FastAPI server...")

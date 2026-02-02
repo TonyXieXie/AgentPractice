@@ -109,3 +109,18 @@ class ChatResponse(BaseModel):
 class ExportRequest(BaseModel):
     session_id: Optional[str] = None
     format: Literal["json", "txt", "markdown"] = "json"
+
+
+class ToolPermissionRequest(BaseModel):
+    id: Optional[int] = None
+    tool_name: str
+    action: str
+    path: str
+    reason: Optional[str] = None
+    status: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class ToolPermissionRequestUpdate(BaseModel):
+    status: str

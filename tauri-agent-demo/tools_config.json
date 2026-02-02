@@ -1,0 +1,34 @@
+{
+  "enabled": {
+    "calculator": true,
+    "weather": true,
+    "search": true,
+    "read_file": true,
+    "write_file": true,
+    "run_shell": true
+  },
+  "files": {
+    "max_bytes": 20000
+  },
+  "shell": {
+    "allowlist": [
+      "npm",
+      "npx",
+      "pnpm",
+      "yarn",
+      "node",
+      "python",
+      "pip",
+      "git",
+      "rg"
+    ],
+    "timeout_sec": 30,
+    "max_output": 20000
+  },
+  "search": {
+    "tavily_api_key": "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",
+    "provider": "tavily",
+    "max_results": 5,
+    "search_depth": "basic"
+  }
+}

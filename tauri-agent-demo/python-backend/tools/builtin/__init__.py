@@ -4,10 +4,14 @@ Built-in Tools
 This module provides basic tools that are included by default:
 - CalculatorTool: Mathematical calculations
 - WeatherTool: Weather information (mock)
-- SearchTool: Web search (mock)
+- TavilySearchTool: Web search (Tavily)
+- ReadFileTool / WriteFileTool: Project file access
+- RunShellTool: Shell execution with allowlist
 """
 
 from ..base import Tool, ToolParameter
+from ..config import is_tool_enabled
+from .system_tools import ReadFileTool, WriteFileTool, RunShellTool, TavilySearchTool
 
 
 class CalculatorTool(Tool):
@@ -98,46 +102,20 @@ class WeatherTool(Tool):
             return f"{city}: Partly cloudy, Temperature: 20°C, Humidity: 60%, Wind: 12 km/h (Mock data - API integration pending)"
 
 
-class SearchTool(Tool):
-    """
-    Tool for web search.
-    
-    NOTE: Currently returns mock data. Replace with real search API later.
-    """
-    
-    def __init__(self):
-        super().__init__()
-        self.name = "search"
-        self.description = "Search the web for information. Input should be the search query."
-        self.parameters = [
-            ToolParameter(
-                name="query",
-                type="string",
-                description="Search query",
-                required=True
-            )
-        ]
-    
-    async def execute(self, query: str) -> str:
-        """
-        Execute web search.
-        
-        Args:
-            query: Search query
-        
-        Returns:
-            Search results as string
-        """
-        # TODO: Replace with real search API (Google, Bing, or Perplexity)
-        # For now, return mock results
-        return f"Search results for '{query}':\n\n1. Mock result: Information about {query}\n2. Mock result: Latest updates on {query}\n3. Mock result: {query} - Wikipedia\n\n(Mock data - Search API integration pending)"
-
-
 # Register tools automatically on import
 from ..base import ToolRegistry
 
 def register_builtin_tools():
     """Register all built-in tools in the registry"""
-    ToolRegistry.register(CalculatorTool())
-    ToolRegistry.register(WeatherTool())
-    ToolRegistry.register(SearchTool())
+    if is_tool_enabled("calculator"):
+        ToolRegistry.register(CalculatorTool())
+    if is_tool_enabled("weather"):
+        ToolRegistry.register(WeatherTool())
+    if is_tool_enabled("search"):
+        ToolRegistry.register(TavilySearchTool())
+    if is_tool_enabled("read_file"):
+        ToolRegistry.register(ReadFileTool())
+    if is_tool_enabled("write_file"):
+        ToolRegistry.register(WriteFileTool())
+    if is_tool_enabled("run_shell"):
+        ToolRegistry.register(RunShellTool())
