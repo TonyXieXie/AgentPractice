@@ -742,6 +742,78 @@ class Database:
         conn.commit()
         conn.close()
 
+    # ==================== Rollback ====================
+
+    def rollback_session(self, session_id: str, message_id: int) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT id, role, content
+            FROM chat_messages
+            WHERE id = ? AND session_id = ?
+        ''', (message_id, session_id))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return None
+
+        if row["role"] != "user":
+            conn.close()
+            return {"error": "Rollback target must be a user message."}
+
+        input_message = row["content"]
+        timestamp = datetime.now().isoformat()
+
+        cursor.execute('''
+            DELETE FROM agent_steps
+            WHERE message_id IN (
+                SELECT id FROM chat_messages
+                WHERE session_id = ? AND id >= ?
+            )
+        ''', (session_id, message_id))
+
+        cursor.execute('''
+            DELETE FROM tool_calls
+            WHERE message_id IN (
+                SELECT id FROM chat_messages
+                WHERE session_id = ? AND id >= ?
+            )
+        ''', (session_id, message_id))
+
+        cursor.execute('''
+            DELETE FROM llm_calls
+            WHERE session_id = ? AND (message_id IS NULL OR message_id >= ?)
+        ''', (session_id, message_id))
+
+        cursor.execute('''
+            DELETE FROM chat_messages
+            WHERE session_id = ? AND id >= ?
+        ''', (session_id, message_id))
+
+        cursor.execute('''
+            UPDATE chat_sessions
+            SET updated_at = ?
+            WHERE id = ?
+        ''', (timestamp, session_id))
+
+        cursor.execute('''
+            SELECT COUNT(*) as count
+            FROM chat_messages
+            WHERE session_id = ?
+        ''', (session_id,))
+        count_row = cursor.fetchone()
+        remaining = count_row["count"] if count_row else 0
+
+        conn.commit()
+        conn.close()
+
+        return {
+            "session_id": session_id,
+            "input_message": input_message,
+            "remaining_messages": remaining
+        }
+
 # Create global database instance
 
 db = Database()

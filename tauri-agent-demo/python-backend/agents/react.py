@@ -128,6 +128,7 @@ class ReActAgent(AgentStrategy):
                 response_output_items: List[Dict[str, Any]] = []
                 thought_stream_key = f"assistant_content_{iteration}"
                 stream_mode = "answer"
+                stopped = False
 
                 async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
                     event_type = event.get("type")
@@ -165,10 +166,25 @@ class ReActAgent(AgentStrategy):
                         response_obj = event.get("response") or {}
                         if isinstance(response_obj, dict):
                             response_output_items = response_obj.get("output", []) or []
+                        stopped = bool(event.get("stopped"))
 
                 llm_call_id = None
                 if llm_overrides.get("_debug"):
                     llm_call_id = llm_overrides.get("_debug", {}).get("llm_call_id")
+
+                if stopped:
+                    stopped_text = self._append_stop_note(content_buffer)
+                    if llm_call_id:
+                        self._update_llm_processed(llm_call_id, {
+                            "stopped_by_user": True,
+                            "content": stopped_text
+                        })
+                    yield AgentStep(
+                        step_type="answer",
+                        content=stopped_text,
+                        metadata={"agent_type": "react", "iterations": iteration + 1, "stopped_by_user": True}
+                    )
+                    return
 
                 output_items = response_output_items
                 if not output_items:
@@ -256,6 +272,7 @@ class ReActAgent(AgentStrategy):
             tool_calls = []
             thought_stream_key = f"assistant_content_{iteration}"
             stream_mode = "answer"
+            stopped = False
 
             async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
                 event_type = event.get("type")
@@ -290,10 +307,25 @@ class ReActAgent(AgentStrategy):
                 elif event_type == "done":
                     content_buffer = event.get("content", "") or ""
                     tool_calls = event.get("tool_calls", []) or []
+                    stopped = bool(event.get("stopped"))
 
             llm_call_id = None
             if llm_overrides.get("_debug"):
                 llm_call_id = llm_overrides.get("_debug", {}).get("llm_call_id")
+
+            if stopped:
+                stopped_text = self._append_stop_note(content_buffer)
+                if llm_call_id:
+                    self._update_llm_processed(llm_call_id, {
+                        "stopped_by_user": True,
+                        "content": stopped_text
+                    })
+                yield AgentStep(
+                    step_type="answer",
+                    content=stopped_text,
+                    metadata={"agent_type": "react", "iterations": iteration + 1, "stopped_by_user": True}
+                )
+                return
 
             if tool_calls:
                 if llm_call_id:
@@ -541,6 +573,15 @@ Final Answer: <your final answer>
         final_answer = final_answer_match.group(1).strip() if final_answer_match else None
 
         return thought, action, action_input, final_answer
+
+    def _append_stop_note(self, content: str) -> str:
+        note = "[用户主动停止输出]"
+        base = (content or "").rstrip()
+        if not base:
+            return note
+        if base.endswith(note):
+            return base
+        return f"{base}\n\n{note}"
 
     def _get_tool(self, tools: List[Tool], name: Optional[str]) -> Optional[Tool]:
         if not name:

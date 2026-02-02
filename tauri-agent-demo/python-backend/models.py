@@ -124,3 +124,11 @@ class ToolPermissionRequest(BaseModel):
 
 class ToolPermissionRequestUpdate(BaseModel):
     status: str
+
+
+class ChatStopRequest(BaseModel):
+    message_id: int
+
+
+class RollbackRequest(BaseModel):
+    message_id: int

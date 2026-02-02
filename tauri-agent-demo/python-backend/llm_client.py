@@ -139,6 +139,11 @@ class LLMClient:
             return debug_ctx
         return None
 
+    def _get_stop_event(self, request_overrides: Optional[Dict[str, Any]]):
+        if not request_overrides:
+            return None
+        return request_overrides.get("_stop_event")
+
     def _should_store_raw(self, debug_ctx: Optional[Dict[str, Any]]) -> bool:
         if not debug_ctx:
             return True
@@ -263,6 +268,8 @@ class LLMClient:
         import json
 
         base_url = self._get_base_url()
+        stop_event = self._get_stop_event(request_overrides)
+        stopped = False
 
         request_payload = {
             "model": self.config.model,
@@ -296,6 +303,9 @@ class LLMClient:
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
+                    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                        stopped = True
+                        break
                     if line.startswith("data: "):
                         data = line[6:]
                         if data == "[DONE]":
@@ -312,6 +322,8 @@ class LLMClient:
                                 yield delta["content"]
                         except (json.JSONDecodeError, KeyError):
                             continue
+                if stopped:
+                    return
 
         if debug_ctx:
             self._save_llm_call(
@@ -327,6 +339,8 @@ class LLMClient:
         import json
 
         base_url = self._get_base_url()
+        stop_event = self._get_stop_event(request_overrides)
+        stopped = False
 
         request_payload = {
             "model": self.config.model,
@@ -361,6 +375,9 @@ class LLMClient:
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
+                    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                        stopped = True
+                        break
                     if not line.startswith("data: "):
                         continue
                     data = line[6:]
@@ -422,6 +439,8 @@ class LLMClient:
                                     "arguments_delta": "",
                                     "arguments": call["function"].get("arguments", "")
                                 }
+                if stopped:
+                    pass
 
         tool_calls_list = [tool_calls[idx] for idx in sorted(tool_calls.keys())]
 
@@ -434,7 +453,7 @@ class LLMClient:
                 response_text=full_text
             )
 
-        yield {"type": "done", "content": full_text, "tool_calls": tool_calls_list, "raw_events": events}
+        yield {"type": "done", "content": full_text, "tool_calls": tool_calls_list, "raw_events": events, "stopped": stopped}
 
     async def _chat_openai_responses(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """OpenAI Responses API."""
@@ -498,6 +517,8 @@ class LLMClient:
         import json
 
         base_url = self._get_base_url()
+        stop_event = self._get_stop_event(request_overrides)
+        stopped = False
 
         request_payload = {
             "model": self.config.model,
@@ -537,6 +558,9 @@ class LLMClient:
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
+                    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                        stopped = True
+                        break
                     if not line.startswith("data: "):
                         continue
                     data = line[6:]
@@ -556,6 +580,8 @@ class LLMClient:
                             yield delta
                     elif event_type in ("response.completed", "response.failed", "response.cancelled"):
                         break
+                if stopped:
+                    return
 
         if debug_ctx:
             self._save_llm_call(
@@ -571,6 +597,8 @@ class LLMClient:
         import json
 
         base_url = self._get_base_url()
+        stop_event = self._get_stop_event(request_overrides)
+        stopped = False
 
         request_payload = {
             "model": self.config.model,
@@ -613,6 +641,9 @@ class LLMClient:
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
+                    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                        stopped = True
+                        break
                     if not line.startswith("data: "):
                         continue
                     data = line[6:]
@@ -699,6 +730,8 @@ class LLMClient:
                     if event_type in ("response.completed", "response.done"):
                         last_response = event.get("response")
                         continue
+                if stopped:
+                    pass
 
         tool_calls_list = [tool_calls_by_index[idx] for idx in sorted(tool_calls_by_index.keys())]
 
@@ -725,7 +758,7 @@ class LLMClient:
                 response_text=full_text
             )
 
-        yield {"type": "done", "content": full_text, "tool_calls": tool_calls_list, "raw_events": events, "response": last_response}
+        yield {"type": "done", "content": full_text, "tool_calls": tool_calls_list, "raw_events": events, "response": last_response, "stopped": stopped}
 
 
 def create_llm_client(config: LLMConfig) -> LLMClient:

@@ -11,6 +11,8 @@ import {
   getSessionLLMCalls,
   getSessionAgentSteps,
   exportChatHistory,
+  stopAgentStream,
+  rollbackSession,
   AgentStep,
   AgentStepWithMessage,
 } from './api';
@@ -36,6 +38,10 @@ function App() {
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const lastScrollTopRef = useRef(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeAssistantIdRef = useRef<number | null>(null);
+  const stopRequestedRef = useRef(false);
 
   useEffect(() => {
     loadDefaultConfig();
@@ -121,6 +127,10 @@ function App() {
     const userMessage = inputMsg.trim();
     setInputMsg('');
     setLoading(true);
+    stopRequestedRef.current = false;
+    activeAssistantIdRef.current = null;
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
     const targetSessionId = currentSessionId;
 
@@ -155,15 +165,21 @@ function App() {
     setMessages((prev) => [...prev, tempUserMsg, tempAssistantMsg]);
 
     try {
-      const streamGenerator = sendMessageAgentStream({
-        message: userMessage,
-        session_id: targetSessionId || undefined,
-        config_id: currentConfig.id,
-      });
+      const streamGenerator = sendMessageAgentStream(
+        {
+          message: userMessage,
+          session_id: targetSessionId || undefined,
+          config_id: currentConfig.id,
+        },
+        abortController.signal
+      );
 
       let newSessionId = targetSessionId;
 
       for await (const chunk of streamGenerator) {
+        if (stopRequestedRef.current && !('session_id' in chunk)) {
+          continue;
+        }
         if ('session_id' in chunk && typeof chunk.session_id === 'string') {
           newSessionId = chunk.session_id;
           const incomingUserId = (chunk as any).user_message_id;
@@ -173,6 +189,10 @@ function App() {
           }
           if (typeof incomingAssistantId === 'number') {
             currentAssistantId = incomingAssistantId;
+            activeAssistantIdRef.current = incomingAssistantId;
+            if (stopRequestedRef.current) {
+              stopAgentStream(incomingAssistantId).catch(() => undefined);
+            }
           }
           if (incomingUserId || incomingAssistantId) {
             setMessages((prev) =>
@@ -377,18 +397,83 @@ function App() {
         await refreshSessionDebug(newSessionId);
       }
     } catch (error: any) {
-      console.error('Failed to send message:', error);
-      const errorMsg: Message = {
-        id: Date.now() + 2,
-        session_id: targetSessionId || '',
-        role: 'assistant',
-        content: `Chat error: ${error.message || 'Please check whether the backend is running.'}`,
-        timestamp: new Date().toISOString(),
-      };
-      setMessages((prev) => [...prev.filter((m) => m.id !== currentAssistantId), errorMsg]);
+      if (error?.name === 'AbortError' || stopRequestedRef.current) {
+        // User stopped streaming
+      } else {
+        console.error('Failed to send message:', error);
+        const errorMsg: Message = {
+          id: Date.now() + 2,
+          session_id: targetSessionId || '',
+          role: 'assistant',
+          content: `Chat error: ${error.message || 'Please check whether the backend is running.'}`,
+          timestamp: new Date().toISOString(),
+        };
+        setMessages((prev) => [...prev.filter((m) => m.id !== currentAssistantId), errorMsg]);
+      }
     } finally {
       setLoading(false);
+      abortControllerRef.current = null;
     }
+  };
+
+  const applyStopNoteToMessage = (msg: Message) => {
+    const note = '\n\n[用户主动停止输出]';
+    const nextMetadata = { ...(msg.metadata || {}) } as any;
+    const steps = (nextMetadata.agent_steps || []) as AgentStep[];
+    if (steps.length > 0) {
+      const lastIndex = [...steps].reverse().findIndex(
+        (step) => step.step_type === 'answer' || step.step_type === 'answer_delta'
+      );
+      const idx = lastIndex >= 0 ? steps.length - 1 - lastIndex : -1;
+      if (idx >= 0) {
+        const target = steps[idx];
+        steps[idx] = {
+          ...target,
+          content: `${target.content || ''}${note}`,
+          metadata: { ...(target.metadata || {}), stopped_by_user: true }
+        };
+      } else {
+        steps.push({ step_type: 'answer', content: note, metadata: { stopped_by_user: true } });
+      }
+      nextMetadata.agent_steps = steps;
+      nextMetadata.agent_streaming = false;
+      nextMetadata.agent_answer_buffers = {};
+      nextMetadata.agent_thought_buffers = {};
+      nextMetadata.agent_action_buffers = {};
+      return {
+        ...msg,
+        content: `${msg.content || ''}${note}`,
+        metadata: nextMetadata
+      };
+    }
+
+    return {
+      ...msg,
+      content: `${msg.content || ''}${note}`,
+      metadata: { ...nextMetadata, agent_streaming: false }
+    };
+  };
+
+  const handleStop = async () => {
+    if (!loading) return;
+    stopRequestedRef.current = true;
+    let assistantId = activeAssistantIdRef.current;
+    if (assistantId) {
+      try {
+        await stopAgentStream(assistantId);
+      } catch (error) {
+        console.error('Failed to stop stream:', error);
+      }
+    }
+    setMessages((prev) => {
+      if (!assistantId) {
+        const lastAssistant = [...prev].reverse().find((msg) => msg.role === 'assistant');
+        assistantId = lastAssistant?.id ?? null;
+      }
+      if (!assistantId) return prev;
+      return prev.map((msg) => (msg.id === assistantId ? applyStopNoteToMessage(msg) : msg));
+    });
+    setLoading(false);
   };
 
   const handleSelectSession = async (sessionId: string) => {
@@ -432,6 +517,27 @@ function App() {
     setCurrentSessionId(null);
     setMessages([]);
     setLlmCalls([]);
+  };
+
+  const handleRollback = async (messageId: number) => {
+    if (!currentSessionId) return;
+    if (loading) {
+      alert('请先停止当前输出再回撤。');
+      return;
+    }
+    if (!confirm('确定回撤到这条消息吗？')) return;
+
+    try {
+      const result = await rollbackSession(currentSessionId, messageId);
+      await handleSelectSession(currentSessionId);
+      setInputMsg(result.input_message || '');
+      inputRef.current?.focus();
+      setSessionRefreshTrigger((prev) => prev + 1);
+      await refreshSessionDebug(currentSessionId);
+    } catch (error) {
+      console.error('Failed to rollback session:', error);
+      alert('回撤失败');
+    }
   };
 
   const handleExportChat = async () => {
@@ -543,7 +649,18 @@ function App() {
                         msg.content
                       )}
                     </div>
-                    <div className="message-time">{new Date(msg.timestamp).toLocaleTimeString()}</div>
+                    <div className="message-time">
+                      {new Date(msg.timestamp).toLocaleTimeString()}
+                      {msg.role === 'user' && (
+                        <button
+                          className="message-action-btn"
+                          onClick={() => handleRollback(msg.id)}
+                          title="回撤到此消息"
+                        >
+                          回撤
+                        </button>
+                      )}
+                    </div>
                   </div>
                 );
               })
@@ -572,6 +689,7 @@ function App() {
               value={inputMsg}
               placeholder={currentConfig ? 'Type a message...' : 'Please configure an LLM'}
               disabled={!currentConfig || loading}
+              ref={inputRef}
             />
 
             {currentConfig && (
@@ -618,6 +736,15 @@ function App() {
             >
               {loading ? 'Sending...' : 'Send'}
             </button>
+            {loading && (
+              <button
+                type="button"
+                className="stop-btn"
+                onClick={handleStop}
+              >
+                Stop
+              </button>
+            )}
           </div>
         </div>
       </div>

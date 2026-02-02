@@ -343,10 +343,30 @@ body {
   color: #888;
   margin-top: 4px;
   padding: 0 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .message.user .message-time {
   text-align: right;
+  justify-content: flex-end;
+}
+
+.message-action-btn {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #ccc;
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.message-action-btn:hover {
+  border-color: rgba(255, 255, 255, 0.4);
+  color: #fff;
 }
 
 /* Loading indicator */
@@ -454,6 +474,17 @@ body {
   opacity: 0.5;
   cursor: not-allowed;
   transform: none;
+}
+
+.input-area .stop-btn {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+
+.input-area .stop-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+  box-shadow: none;
 }
 
 .footer-text {

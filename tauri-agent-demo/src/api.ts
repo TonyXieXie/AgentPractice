@@ -196,7 +196,8 @@ export interface AgentStepWithMessage extends AgentStep {
 }
 
 export async function* sendMessageAgentStream(
-    request: ChatRequest
+    request: ChatRequest,
+    signal?: AbortSignal
 ): AsyncGenerator<
     AgentStep | { session_id: string; user_message_id?: number; assistant_message_id?: number } | { done: true },
     void,
@@ -206,6 +207,7 @@ export async function* sendMessageAgentStream(
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(request),
+        signal,
     });
 
     if (!response.ok) throw new Error('Failed to send agent stream');
@@ -246,6 +248,32 @@ export async function* sendMessageAgentStream(
             }
         }
     }
+}
+
+export async function stopAgentStream(messageId: number): Promise<{ stopped: boolean }> {
+    const response = await fetch(`${API_BASE_URL}/chat/stop`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message_id: messageId })
+    });
+    if (!response.ok) throw new Error('Failed to stop stream');
+    return response.json();
+}
+
+export interface RollbackResponse {
+    session_id: string;
+    input_message: string;
+    remaining_messages: number;
+}
+
+export async function rollbackSession(sessionId: string, messageId: number): Promise<RollbackResponse> {
+    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/rollback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message_id: messageId })
+    });
+    if (!response.ok) throw new Error('Failed to rollback session');
+    return response.json();
 }
 
 // ==================== Export API ====================

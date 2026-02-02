@@ -11,7 +11,8 @@ from models import (
     ChatMessage, ChatMessageCreate,
     ChatSession, ChatSessionCreate, ChatSessionUpdate,
     ChatRequest, ChatResponse, ExportRequest,
-    ToolPermissionRequest, ToolPermissionRequestUpdate
+    ToolPermissionRequest, ToolPermissionRequestUpdate,
+    ChatStopRequest, RollbackRequest
 )
 from database import db
 from llm_client import create_llm_client
@@ -22,6 +23,7 @@ from agents.base import AgentStep
 from tools.builtin import register_builtin_tools
 from tools.base import ToolRegistry
 from tools.config import get_tool_config, update_tool_config
+from stream_control import stream_stop_registry
 
 app = FastAPI(title="Tauri Agent Chat Backend")
 
@@ -349,6 +351,15 @@ def get_session_agent_steps(session_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return db.get_session_agent_steps(session_id)
+
+@app.post("/sessions/{session_id}/rollback")
+def rollback_session(session_id: str, request: RollbackRequest):
+    result = db.rollback_session(session_id, request.message_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Message not found in session")
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
 
 # ==================== Chat ====================
 
@@ -715,7 +726,7 @@ async def chat_agent_stream(request: ChatRequest):
                 agent_type=agent_type,
                 llm_client=llm_client,
                 tools=tools,
-                max_iterations=5
+                max_iterations=50
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -739,6 +750,7 @@ async def chat_agent_stream(request: ChatRequest):
                     content=""
                 ))
                 assistant_msg_id = temp_assistant_msg.id
+                stop_event = stream_stop_registry.create(assistant_msg_id)
                 yield f"data: {json.dumps({'session_id': session.id, 'user_message_id': user_msg.id, 'assistant_message_id': assistant_msg_id})}\n\n"
                 request_overrides = {
                     "_debug": {
@@ -746,6 +758,7 @@ async def chat_agent_stream(request: ChatRequest):
                         "message_id": assistant_msg_id
                     }
                 }
+                request_overrides["_stop_event"] = stop_event
                 if request.response_format is not None:
                     request_overrides["response_format"] = request.response_format
 
@@ -820,6 +833,9 @@ async def chat_agent_stream(request: ChatRequest):
                     metadata={"error": str(e)}
                 )
                 yield f"data: {json.dumps(error_step.to_dict())}\n\n"
+            finally:
+                if assistant_msg_id:
+                    stream_stop_registry.clear(assistant_msg_id)
 
         return StreamingResponse(
             event_generator(),
@@ -842,6 +858,11 @@ async def chat_agent_stream(request: ChatRequest):
 def get_tools():
     tools = ToolRegistry.get_all()
     return [tool.to_dict() for tool in tools]
+
+@app.post("/chat/stop")
+def stop_chat(request: ChatStopRequest):
+    stopped = stream_stop_registry.stop(request.message_id)
+    return {"stopped": stopped}
 
 @app.get("/tools/config")
 def get_tools_config():
