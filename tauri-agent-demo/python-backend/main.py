@@ -78,7 +78,81 @@ def _clean_title(raw_title: str) -> str:
     return title
 
 
-async def _generate_title(config: LLMConfig, user_message: str, assistant_message: str) -> Optional[str]:
+def _strip_json_fence(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if len(lines) >= 3:
+            return "\n".join(lines[1:-1]).strip()
+    return cleaned
+
+
+def _extract_json_slice(text: str) -> str:
+    if not text:
+        return ""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start:end + 1]
+    return ""
+
+
+def _parse_title_json(raw: str) -> str:
+    if not raw:
+        return ""
+    import json as _json
+    candidate = _strip_json_fence(raw)
+    for chunk in (candidate, _extract_json_slice(candidate)):
+        if not chunk:
+            continue
+        try:
+            data = _json.loads(chunk)
+            if isinstance(data, dict):
+                title = data.get("title")
+                if isinstance(title, str) and title.strip():
+                    return title.strip()
+        except Exception:
+            continue
+    return ""
+
+
+def _looks_like_title(raw: str) -> bool:
+    if not raw:
+        return False
+    text = raw.strip()
+    if not text:
+        return False
+    if "\n" in text or "\r" in text:
+        return False
+    if len(text) > (TITLE_MAX_CHARS + 5):
+        return False
+    bad_markers = [
+        "\u5206\u6790",  # 分析
+        "\u6b65\u9aa4",  # 步骤
+        "\u6700\u7ec8",  # 最终
+        "\u7ed3\u8bba",  # 结论
+        "Reasoning",
+        "analysis",
+        "step",
+        "Title:",
+        "\u6807\u9898",
+        "\u9009\u9879"   # 选项
+    ]
+    for marker in bad_markers:
+        if marker in text:
+            return False
+    return True
+
+
+async def _generate_title(
+    config: LLMConfig,
+    user_message: str,
+    assistant_message: str,
+    session_id: Optional[str] = None,
+    message_id: Optional[int] = None
+) -> Optional[str]:
     system_role = "developer" if config.api_profile == "openai" else "system"
     system_prompt = (
         "You generate concise chat titles. "
@@ -102,8 +176,43 @@ async def _generate_title(config: LLMConfig, user_message: str, assistant_messag
     ]
     client = create_llm_client(config)
     client.timeout = TITLE_REQUEST_TIMEOUT
-    result = await client.chat(messages)
-    return _clean_title(result.get("content", ""))
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "chat_title",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": TITLE_MAX_CHARS
+                    }
+                },
+                "required": ["title"],
+                "additionalProperties": False
+            }
+        }
+    }
+    request_overrides = {
+        "response_format": response_format
+    }
+    if session_id:
+        request_overrides["_debug"] = {
+            "session_id": session_id,
+            "message_id": message_id,
+            "agent_type": "title",
+            "iteration": 0
+        }
+    result = await client.chat(messages, request_overrides)
+    raw_content = result.get("content", "") if isinstance(result, dict) else ""
+    parsed_title = _parse_title_json(raw_content)
+    if parsed_title:
+        return _clean_title(parsed_title)
+    if _looks_like_title(raw_content):
+        return _clean_title(raw_content)
+    return ""
 
 
 async def _maybe_update_session_title(
@@ -111,7 +220,8 @@ async def _maybe_update_session_title(
     config: LLMConfig,
     user_message: str,
     assistant_message: str,
-    is_first_turn: bool
+    is_first_turn: bool,
+    assistant_message_id: Optional[int] = None
 ) -> None:
     if not is_first_turn:
         return
@@ -120,7 +230,13 @@ async def _maybe_update_session_title(
         return
     title = ""
     try:
-        title = await _generate_title(config, user_message, assistant_message)
+        title = await _generate_title(
+            config,
+            user_message,
+            assistant_message,
+            session_id=session_id,
+            message_id=assistant_message_id
+        )
     except Exception:
         title = ""
     if not title:
@@ -329,7 +445,8 @@ async def chat(request: ChatRequest):
             config=config,
             user_message=processed_message,
             assistant_message=processed_response,
-            is_first_turn=is_first_turn
+            is_first_turn=is_first_turn,
+            assistant_message_id=assistant_msg.id
         )
 
         return ChatResponse(
@@ -437,7 +554,8 @@ async def chat_stream(request: ChatRequest):
                     config=config,
                     user_message=processed_message,
                     assistant_message=processed_response,
-                    is_first_turn=is_first_turn
+                    is_first_turn=is_first_turn,
+                    assistant_message_id=assistant_msg.id
                 )
 
                 yield f"data: {json.dumps({'done': True, 'message_id': assistant_msg.id})}\n\n"
@@ -687,7 +805,8 @@ async def chat_agent_stream(request: ChatRequest):
                         config=config,
                         user_message=processed_message,
                         assistant_message=final_answer,
-                        is_first_turn=is_first_turn
+                        is_first_turn=is_first_turn,
+                        assistant_message_id=assistant_msg_id
                     )
 
                 yield f"data: {json.dumps({'done': True, 'session_id': session.id})}\n\n"
