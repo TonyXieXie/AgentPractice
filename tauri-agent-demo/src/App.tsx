@@ -645,22 +645,32 @@ function App() {
                     <div className="message-content">
                       {msg.role === 'assistant' && steps.length > 0 ? (
                         <AgentStepView steps={steps} streaming={streaming} />
+                      ) : msg.role === 'user' ? (
+                        <>
+                          <div className="message-text">{msg.content}</div>
+                          <button
+                            className="message-action-btn icon inline"
+                            onClick={() => handleRollback(msg.id)}
+                            title="回撤到此消息"
+                            aria-label="回撤到此消息"
+                          >
+                            <svg className="icon-undo" viewBox="0 0 24 24" aria-hidden="true">
+                              <path
+                                d="M7 8L3 12l4 4M3 12h11a5 5 0 0 1 0 10h-4"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                              />
+                            </svg>
+                          </button>
+                        </>
                       ) : (
                         msg.content
                       )}
                     </div>
-                    <div className="message-time">
-                      {new Date(msg.timestamp).toLocaleTimeString()}
-                      {msg.role === 'user' && (
-                        <button
-                          className="message-action-btn"
-                          onClick={() => handleRollback(msg.id)}
-                          title="回撤到此消息"
-                        >
-                          回撤
-                        </button>
-                      )}
-                    </div>
+                    <div className="message-time">{new Date(msg.timestamp).toLocaleTimeString()}</div>
                   </div>
                 );
               })

@@ -300,6 +300,15 @@ body {
 }
 
 .message.user .message-content {
+  position: relative;
+  padding-right: 34px;
+}
+
+.message-text {
+  white-space: pre-wrap;
+}
+
+.message.user .message-content {
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   color: white;
   border-bottom-right-radius: 4px;
@@ -367,6 +376,43 @@ body {
 .message-action-btn:hover {
   border-color: rgba(255, 255, 255, 0.4);
   color: #fff;
+}
+
+.message-action-btn.icon {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  border-radius: 0;
+  border: none;
+}
+
+.message-action-btn.icon .icon-undo {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.message-action-btn.icon.inline {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  color: rgba(255, 255, 255, 0.85);
+  transform: translateY(-50%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.message-action-btn.icon.inline:hover {
+  color: #fff;
+}
+
+.message.user:hover .message-action-btn.icon.inline {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 /* Loading indicator */
