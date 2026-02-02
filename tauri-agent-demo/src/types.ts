@@ -104,8 +104,3 @@ export interface ChatResponse {
     session_id: string;
     message_id: number;
 }
-
-export interface ExportRequest {
-    session_id?: string;
-    format?: 'json' | 'txt' | 'markdown';
-}

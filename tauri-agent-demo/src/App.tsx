@@ -10,7 +10,6 @@ import {
   getSessionMessages,
   getSessionLLMCalls,
   getSessionAgentSteps,
-  exportChatHistory,
   stopAgentStream,
   rollbackSession,
   AgentStep,
@@ -540,27 +539,6 @@ function App() {
     }
   };
 
-  const handleExportChat = async () => {
-    try {
-      const blob = await exportChatHistory({
-        session_id: currentSessionId || undefined,
-        format: 'markdown',
-      });
-
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `chat_export_${new Date().getTime()}.md`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      window.URL.revokeObjectURL(url);
-    } catch (error) {
-      console.error('Failed to export:', error);
-      alert('Export failed.');
-    }
-  };
-
   const handleMessagesScroll = () => {
     const container = messagesContainerRef.current;
     if (!container) return;
@@ -602,15 +580,6 @@ function App() {
             </div>
 
             <div className="header-right">
-              <button
-                className="header-btn"
-                onClick={handleExportChat}
-                disabled={!currentSessionId}
-                title="Export current session"
-              >
-                Export
-              </button>
-
               <button
                 className="header-btn"
                 onClick={() => setShowConfigManager(true)}

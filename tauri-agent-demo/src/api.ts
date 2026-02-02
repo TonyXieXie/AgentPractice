@@ -8,7 +8,6 @@
     Message,
     ChatRequest,
     ChatResponse,
-    ExportRequest,
     LLMCall
 } from './types';
 
@@ -276,14 +275,3 @@ export async function rollbackSession(sessionId: string, messageId: number): Pro
     return response.json();
 }
 
-// ==================== Export API ====================
-
-export async function exportChatHistory(request: ExportRequest): Promise<Blob> {
-    const response = await fetch(`${API_BASE_URL}/export`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
-    });
-    if (!response.ok) throw new Error('Failed to export chat history');
-    return response.blob();
-}
