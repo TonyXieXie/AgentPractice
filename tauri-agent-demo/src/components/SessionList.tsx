@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { ChatSession } from '../types';
 import { getSessions, deleteSession, updateSession } from '../api';
+import ConfirmDialog from './ConfirmDialog';
 import './SessionList.css';
 
 interface SessionListProps {
@@ -19,6 +20,7 @@ export default function SessionList({
     const [sessions, setSessions] = useState<ChatSession[]>([]);
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editTitle, setEditTitle] = useState('');
+    const [deleteTarget, setDeleteTarget] = useState<ChatSession | null>(null);
 
     useEffect(() => {
         loadSessions();
@@ -33,19 +35,24 @@ export default function SessionList({
         }
     };
 
-    const handleDelete = async (id: string, e: React.MouseEvent) => {
+    const handleDelete = (session: ChatSession, e: React.MouseEvent) => {
         e.stopPropagation();
-        if (!confirm('确定要删除这个会话吗？')) return;
+        setDeleteTarget(session);
+    };
 
+    const handleConfirmDelete = async () => {
+        if (!deleteTarget) return;
         try {
-            await deleteSession(id);
+            await deleteSession(deleteTarget.id);
             await loadSessions();
-            if (currentSessionId === id) {
+            if (currentSessionId === deleteTarget.id) {
                 onNewChat();
             }
         } catch (error) {
             console.error('Failed to delete session:', error);
             alert('删除会话失败');
+        } finally {
+            setDeleteTarget(null);
         }
     };
 
@@ -132,7 +139,7 @@ export default function SessionList({
                                         </button>
                                         <button
                                             className="session-action-btn delete"
-                                            onClick={(e) => handleDelete(session.id, e)}
+                                            onClick={(e) => handleDelete(session, e)}
                                             title="删除"
                                         >
                                             🗑️
@@ -144,6 +151,16 @@ export default function SessionList({
                     ))
                 )}
             </div>
+            <ConfirmDialog
+                open={Boolean(deleteTarget)}
+                title="删除会话"
+                message={`确定要删除“${deleteTarget?.title || ''}”吗？此操作无法撤销。`}
+                confirmLabel="删除"
+                cancelLabel="取消"
+                danger
+                onCancel={() => setDeleteTarget(null)}
+                onConfirm={handleConfirmDelete}
+            />
         </div>
     );
 }

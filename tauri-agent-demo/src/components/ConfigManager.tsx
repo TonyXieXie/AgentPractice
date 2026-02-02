@@ -1,6 +1,7 @@
 ﻿import { useState, useEffect } from 'react';
 import { LLMConfig, LLMConfigCreate, LLMApiFormat, LLMProfile } from '../types';
 import { getConfigs, createConfig, updateConfig, deleteConfig } from '../api';
+import ConfirmDialog from './ConfirmDialog';
 import './ConfigManager.css';
 
 interface ConfigManagerProps {
@@ -25,6 +26,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const [showForm, setShowForm] = useState(false);
     const [editingConfig, setEditingConfig] = useState<LLMConfig | null>(null);
     const [loading, setLoading] = useState(false);
+    const [deleteTarget, setDeleteTarget] = useState<LLMConfig | null>(null);
 
     const [formData, setFormData] = useState<LLMConfigCreate>({
         name: '',
@@ -96,16 +98,21 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         setShowForm(true);
     };
 
-    const handleDelete = async (id: string) => {
-        if (!confirm('Delete this config?')) return;
+    const handleDelete = (config: LLMConfig) => {
+        setDeleteTarget(config);
+    };
 
+    const handleConfirmDelete = async () => {
+        if (!deleteTarget) return;
         try {
-            await deleteConfig(id);
+            await deleteConfig(deleteTarget.id);
             await loadConfigs();
             onConfigCreated?.();
         } catch (error: any) {
             console.error('Failed to delete config:', error);
             alert(error.message || 'Failed to delete config.');
+        } finally {
+            setDeleteTarget(null);
         }
     };
 
@@ -209,7 +216,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                             </div>
                                             <div className="config-actions">
                                                 <button onClick={() => handleEdit(config)}>Edit</button>
-                                                <button onClick={() => handleDelete(config.id)} className="delete-btn">Delete</button>
+                                                <button onClick={() => handleDelete(config)} className="delete-btn">Delete</button>
                                             </div>
                                         </div>
                                     ))
@@ -341,6 +348,16 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                     )}
                 </div>
             </div>
+            <ConfirmDialog
+                open={Boolean(deleteTarget)}
+                title="Delete config"
+                message={`Delete config "${deleteTarget?.name || ''}"? This cannot be undone.`}
+                confirmLabel="Delete"
+                cancelLabel="Cancel"
+                danger
+                onCancel={() => setDeleteTarget(null)}
+                onConfirm={handleConfirmDelete}
+            />
         </div>
     );
 }
