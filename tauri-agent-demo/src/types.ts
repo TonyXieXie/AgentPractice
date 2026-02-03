@@ -1,5 +1,8 @@
 ﻿export type LLMApiFormat = 'openai_chat_completions' | 'openai_responses';
 export type LLMProfile = 'openai' | 'openai_compatible' | 'deepseek' | 'zhipu';
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+export type ReasoningSummary = 'auto' | 'concise' | 'detailed';
+export type AgentMode = 'default' | 'shell_safe' | 'super';
 
 export interface LLMConfig {
     id: string;
@@ -13,6 +16,8 @@ export interface LLMConfig {
     max_tokens: number;
     is_default: boolean;
     created_at: string;
+    reasoning_effort?: ReasoningEffort;
+    reasoning_summary?: ReasoningSummary;
 }
 
 export interface LLMConfigCreate {
@@ -25,6 +30,8 @@ export interface LLMConfigCreate {
     temperature?: number;
     max_tokens?: number;
     is_default?: boolean;
+    reasoning_effort?: ReasoningEffort;
+    reasoning_summary?: ReasoningSummary;
 }
 
 export interface LLMConfigUpdate {
@@ -37,6 +44,8 @@ export interface LLMConfigUpdate {
     temperature?: number;
     max_tokens?: number;
     is_default?: boolean;
+    reasoning_effort?: ReasoningEffort;
+    reasoning_summary?: ReasoningSummary;
 }
 
 export interface Message {
@@ -107,7 +116,8 @@ export interface ChatRequest {
     message: string;
     session_id?: string;
     config_id?: string;
-    response_format?: Record<string, any>;
+    agent_mode?: AgentMode;
+    shell_unrestricted?: boolean;
 }
 
 export interface ChatResponse {

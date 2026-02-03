@@ -11,6 +11,7 @@ import httpx
 
 from ..base import Tool, ToolParameter
 from ..config import get_tool_config, update_tool_config
+from ..context import get_tool_context
 
 
 def _get_root_path() -> Path:
@@ -39,6 +40,12 @@ def _log_permission_request(tool_name: str, action: str, path: Path, reason: str
         return None
 
 
+def _get_agent_mode() -> str:
+    tool_ctx = get_tool_context()
+    mode = tool_ctx.get("agent_mode") or "default"
+    return str(mode).lower()
+
+
 def _resolve_path(raw_path: str, tool_name: str, action: str) -> Path:
     root = _get_root_path()
     path = Path(raw_path)
@@ -46,6 +53,8 @@ def _resolve_path(raw_path: str, tool_name: str, action: str) -> Path:
         path = root / path
     path = path.resolve()
     if not _is_within_root(path, root):
+        if _get_agent_mode() == "super":
+            return path
         request_id = _log_permission_request(
             tool_name=tool_name,
             action=action,
@@ -89,6 +98,54 @@ def _extract_command_name(command: str) -> str:
 def _contains_shell_operators(command: str) -> bool:
     for token in ("&", "|", ">", "<", ";"):
         if token in command:
+            return True
+    return False
+
+
+def _extract_path_candidates(command: str) -> list:
+    try:
+        parts = shlex.split(command, posix=False)
+    except Exception:
+        parts = command.strip().split()
+    candidates: list = []
+    for part in parts:
+        item = part.strip().strip('"').strip("'")
+        if not item:
+            continue
+        candidates.append(item)
+        if "=" in item:
+            _, value = item.split("=", 1)
+            value = value.strip().strip('"').strip("'")
+            if value:
+                candidates.append(value)
+    return candidates
+
+
+def _looks_like_path(candidate: str) -> bool:
+    if not candidate:
+        return False
+    if candidate.startswith(("\\\\", "/")):
+        return True
+    if len(candidate) > 2 and candidate[1] == ":":
+        return True
+    return "\\" in candidate or "/" in candidate
+
+
+def _command_targets_outside_root(command: str, root: Path) -> bool:
+    if ".." in command:
+        return True
+    for candidate in _extract_path_candidates(command):
+        if not _looks_like_path(candidate):
+            continue
+        try:
+            path = Path(candidate)
+        except Exception:
+            continue
+        if not path.is_absolute():
+            path = (root / path).resolve()
+        else:
+            path = path.resolve()
+        if not _is_within_root(path, root):
             return True
     return False
 
@@ -280,13 +337,20 @@ class RunShellTool(Tool):
         if not command:
             raise ValueError("Missing command.")
         cmd_name = _extract_command_name(command)
+        root = _get_root_path()
         allowlist = get_tool_config().get("shell", {}).get("allowlist", [])
         allowset = {str(item).lower() for item in allowlist}
+        tool_ctx = get_tool_context()
+        agent_mode = str(tool_ctx.get("agent_mode") or "default").lower()
+        shell_unrestricted = bool(tool_ctx.get("shell_unrestricted"))
         reasons = []
-        if _contains_shell_operators(command):
-            reasons.append("Shell operators detected.")
-        if cmd_name not in allowset:
-            reasons.append("Command not in allowlist.")
+        if agent_mode != "super":
+            if _contains_shell_operators(command):
+                reasons.append("Shell operators detected.")
+            if not shell_unrestricted and cmd_name not in allowset:
+                reasons.append("Command not in allowlist.")
+            if shell_unrestricted and _command_targets_outside_root(command, root):
+                reasons.append("Command may access paths outside project root.")
         if reasons:
             request_id = None
             try:
@@ -309,10 +373,9 @@ class RunShellTool(Tool):
                     return "Permission request timed out."
                 return "Permission required."
 
-            if cmd_name not in allowset:
+            if not shell_unrestricted and cmd_name not in allowset:
                 _ensure_shell_allowlist_entry(cmd_name)
 
-        root = _get_root_path()
         cwd = data.get("cwd")
         workdir = _resolve_path(cwd, self.name, "execute") if cwd else root
 

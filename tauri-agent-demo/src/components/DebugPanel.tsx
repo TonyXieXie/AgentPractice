@@ -1,4 +1,4 @@
-﻿import { useMemo, useState } from 'react';
+﻿import { useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { Message, LLMCall } from '../types';
 import './DebugPanel.css';
 
@@ -11,6 +11,9 @@ interface DebugPanelProps {
 function DebugPanel({ messages, llmCalls, onClose }: DebugPanelProps) {
     const [expandedMessageId, setExpandedMessageId] = useState<string | null>(null);
     const [expandedCallId, setExpandedCallId] = useState<string | null>(null);
+    const [rawStreamVisible, setRawStreamVisible] = useState<Record<string, boolean>>({});
+    const [panelWidth, setPanelWidth] = useState(400);
+    const panelRef = useRef<HTMLDivElement>(null);
 
     const toggleExpandMessage = (id: string) => {
         setExpandedMessageId(expandedMessageId === id ? null : id);
@@ -18,6 +21,30 @@ function DebugPanel({ messages, llmCalls, onClose }: DebugPanelProps) {
 
     const toggleExpandCall = (id: string) => {
         setExpandedCallId(expandedCallId === id ? null : id);
+    };
+    const handleResizeStart = (event: ReactMouseEvent) => {
+        event.preventDefault();
+        const startX = event.clientX;
+        const startWidth = panelRef.current?.getBoundingClientRect().width ?? panelWidth;
+
+        const handleMouseMove = (moveEvent: MouseEvent) => {
+            const delta = startX - moveEvent.clientX;
+            const maxWidth = Math.min(window.innerWidth * 0.8, window.innerWidth - 240);
+            const nextWidth = Math.max(320, Math.min(maxWidth, startWidth + delta));
+            setPanelWidth(nextWidth);
+        };
+
+        const handleMouseUp = () => {
+            window.removeEventListener('mousemove', handleMouseMove);
+            window.removeEventListener('mouseup', handleMouseUp);
+        };
+
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
+    };
+
+    const toggleRawStream = (id: string) => {
+        setRawStreamVisible((prev) => ({ ...prev, [id]: !prev[id] }));
     };
 
     const copyToClipboard = async (text: string) => {
@@ -100,9 +127,7 @@ function DebugPanel({ messages, llmCalls, onClose }: DebugPanelProps) {
         const usage = getTokenUsage(call.response_json);
         const hasRawEvents = Boolean(call.response_json && (call.response_json as any).events);
         const hasProcessed = Boolean(call.processed_json);
-        const responseJsonDisplay = hasRawEvents && hasProcessed ? call.processed_json : call.response_json;
-        const responseTitle = hasRawEvents && hasProcessed ? 'Response JSON (processed)' : 'Response JSON';
-        const showProcessedSection = !(hasRawEvents && hasProcessed);
+        const showRawStream = Boolean(rawStreamVisible[callKey]);
         return (
             <div key={call.id} className="debug-message">
                 <div className="debug-message-header" onClick={() => toggleExpandCall(callKey)}>
@@ -126,9 +151,37 @@ function DebugPanel({ messages, llmCalls, onClose }: DebugPanelProps) {
                         </div>
 
                         {renderJsonSection('Request JSON', call.request_json)}
-                        {renderJsonSection(responseTitle, responseJsonDisplay)}
+                        {hasRawEvents && hasProcessed ? (
+                            <div className="debug-section">
+                                <div className="section-header">
+                                    <h4>Response JSON (processed)</h4>
+                                    <div className="section-actions">
+                                        <button className="copy-btn" onClick={() => copyToClipboard(formatJson(call.processed_json))}>
+                                            Copy
+                                        </button>
+                                        <button className="copy-btn" onClick={() => toggleRawStream(callKey)}>
+                                            {showRawStream ? 'Hide raw stream' : 'Show raw stream'}
+                                        </button>
+                                    </div>
+                                </div>
+                                <pre className="json-viewer">{formatJson(call.processed_json)}</pre>
+                                {showRawStream && (
+                                    <div className="debug-section">
+                                        <div className="section-header">
+                                            <h4>Response JSON (raw stream)</h4>
+                                            <button className="copy-btn" onClick={() => copyToClipboard(formatJson(call.response_json))}>
+                                                Copy
+                                            </button>
+                                        </div>
+                                        <pre className="json-viewer">{formatJson(call.response_json)}</pre>
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            renderJsonSection('Response JSON', call.response_json)
+                        )}
                         {renderTextSection('Response Text', call.response_text)}
-                        {showProcessedSection && renderJsonSection('Processed JSON', call.processed_json)}
+                        {!hasRawEvents && renderJsonSection('Processed JSON', call.processed_json)}
 
                         {usage && (
                             <div className="token-usage">
@@ -147,7 +200,8 @@ function DebugPanel({ messages, llmCalls, onClose }: DebugPanelProps) {
     };
 
     return (
-        <div className="debug-panel">
+        <div className="debug-panel" ref={panelRef} style={{ width: `${panelWidth}px` }}>
+            <div className="debug-resize-handle" onMouseDown={handleResizeStart} />
             <div className="debug-header">
                 <h2>Debug</h2>
                 <button className="close-btn" onClick={onClose}>

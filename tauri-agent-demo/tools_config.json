@@ -30,7 +30,8 @@
       "ls",
       "cmd",
       "powershell",
-      "if"
+      "if",
+      "mkdir"
     ],
     "timeout_sec": 30,
     "max_output": 20000

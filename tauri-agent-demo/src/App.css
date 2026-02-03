@@ -1,4 +1,4 @@
-* {
+﻿* {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
@@ -31,8 +31,8 @@ body {
   max-width: 1200px;
   width: 100%;
   margin: 0 auto;
-  padding: 20px;
-  gap: 20px;
+  padding: 16px;
+  gap: 14px;
   min-height: 0;
   /* 关键：允许flex子项缩小 */
   overflow: hidden;
@@ -42,9 +42,9 @@ body {
 /* Header */
 .chat-header {
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-start;
   align-items: center;
-  padding: 16px 24px;
+  padding: 12px 18px;
   background: rgba(255, 255, 255, 0.05);
   backdrop-filter: blur(10px);
   border-radius: 16px;
@@ -54,7 +54,7 @@ body {
 .header-left {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
 }
 
 .sidebar-toggle {
@@ -85,7 +85,8 @@ body {
 .header-right {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
+  margin-left: auto;
 }
 
 .config-info {
@@ -194,24 +195,24 @@ body {
 }
 
 .header-btn {
-    background: rgba(255, 255, 255, 0.1);
-    border: none;
-    color: #fff;
-    min-width: 64px;
-    height: 36px;
-    padding: 0 12px;
-    border-radius: 10px;
-    cursor: pointer;
-    font-size: 0.85rem;
-    transition: all 0.2s;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  color: #e2e8f0;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: color 0.2s, background 0.2s, transform 0.2s, border-color 0.2s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .header-btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.2);
-  transform: translateY(-2px);
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  transform: translateY(-1px);
 }
 
 .header-btn:disabled {
@@ -220,8 +221,14 @@ body {
 }
 
 .header-btn.active {
-  background: rgba(102, 126, 234, 0.3);
-  border: 1px solid rgba(102, 126, 234, 0.5);
+  background: rgba(102, 126, 234, 0.2);
+  border-color: rgba(102, 126, 234, 0.5);
+  color: #c7d2fe;
+}
+
+.header-icon {
+  width: 18px;
+  height: 18px;
 }
 
 /* Messages */
@@ -230,13 +237,13 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
   /* 防止水平滚动 */
-  padding: 20px;
+  padding: 14px;
   background: rgba(0, 0, 0, 0.2);
   border-radius: 16px;
   border: 1px solid rgba(255, 255, 255, 0.05);
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
   min-height: 0;
   /* 关键：允许flex子项缩小 */
   scroll-behavior: smooth;
@@ -292,16 +299,16 @@ body {
 }
 
 .message-content {
-  padding: 14px 18px;
+  padding: 10px 14px;
   border-radius: 16px;
-  line-height: 1.6;
+  line-height: 1.5;
   word-wrap: break-word;
   white-space: pre-wrap;
 }
 
 .message.user .message-content {
   position: relative;
-  padding-right: 34px;
+  padding-right: 28px;
 }
 
 .message-text {
@@ -348,13 +355,13 @@ body {
 }
 
 .message-time {
-  font-size: 0.7rem;
+  font-size: 0.65rem;
   color: #888;
-  margin-top: 4px;
+  margin-top: 2px;
   padding: 0 4px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .message.user .message-time {
@@ -366,8 +373,8 @@ body {
   background: transparent;
   border: 1px solid rgba(255, 255, 255, 0.2);
   color: #ccc;
-  font-size: 0.7rem;
-  padding: 2px 8px;
+  font-size: 0.65rem;
+  padding: 1px 6px;
   border-radius: 8px;
   cursor: pointer;
   transition: all 0.2s;
@@ -418,7 +425,7 @@ body {
 /* Loading indicator */
 .message.loading .message-content {
   background: rgba(255, 255, 255, 0.05);
-  padding: 20px;
+  padding: 14px;
 }
 
 .typing-indicator {
@@ -461,10 +468,9 @@ body {
 /* Input Area */
 .input-area {
   display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 16px;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
   background: rgba(255, 255, 255, 0.05);
   backdrop-filter: blur(10px);
   border-radius: 16px;
@@ -472,9 +478,8 @@ body {
 }
 
 .input-area input {
-  flex: 1 1 100%;
-  /* 占满第一行 */
-  padding: 14px 18px;
+  flex: 0 0 auto;
+  padding: 10px 14px;
   background: rgba(255, 255, 255, 0.08);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 12px;
@@ -498,39 +503,95 @@ body {
   cursor: not-allowed;
 }
 
-.input-area button {
-  padding: 14px 32px;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
+.input-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.input-area .send-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background: transparent;
+  color: #e2e8f0;
   border: none;
-  border-radius: 12px;
-  font-size: 1rem;
-  font-weight: 600;
+  border-radius: 8px;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background 0.2s, transform 0.2s;
   white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
-.input-area button:hover:not(:disabled) {
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+.input-area .send-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  transform: translateY(-1px);
 }
 
-.input-area button:disabled {
+.input-area .send-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   transform: none;
 }
 
+.send-icon {
+  width: 16px;
+  height: 16px;
+}
+
 .input-area .stop-btn {
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  color: #fff;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background: transparent;
+  color: #f87171;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: color 0.2s, background 0.2s, transform 0.2s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .input-area .stop-btn:hover {
-  background: rgba(255, 255, 255, 0.15);
-  box-shadow: none;
+  background: rgba(248, 113, 113, 0.15);
+  color: #fecaca;
+  transform: translateY(-1px);
+}
+
+.input-area .stop-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.stop-icon {
+  width: 16px;
+  height: 16px;
+}
+
+.send-spinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #fff;
+  animation: send-spin 0.8s linear infinite;
+}
+
+@keyframes send-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .footer-text {
@@ -559,40 +620,137 @@ body {
 }
 
 /* Model Selector Inline (Below Input) */
+.input-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.input-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
 .model-selector-inline {
   flex: 0 0 auto;
   /* 不扩展，保持内容宽度 */
   position: relative;
-  min-width: 150px;
-  max-width: 300px;
+  min-width: auto;
+  max-width: none;
 }
 
 .model-selector-btn {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 8px;
-  color: #fff;
-  font-size: 0.85rem;
+  justify-content: flex-start;
+  gap: 6px;
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  color: #e2e8f0;
+  font-size: 0.86rem;
   cursor: pointer;
   transition: all 0.2s;
   white-space: nowrap;
-  width: 100%;
+  width: auto;
+  min-width: auto;
 }
 
 .model-selector-btn:hover {
-  background: rgba(255, 255, 255, 0.12);
-  border-color: rgba(255, 255, 255, 0.25);
+  color: #fff;
+}
+
+.agent-mode-selector-inline {
+  flex: 0 0 auto;
+  position: relative;
+  min-width: auto;
+}
+
+.agent-mode-selector-btn {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  color: #e2e8f0;
+  font-size: 0.86rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+  width: auto;
+  min-width: auto;
+}
+
+.agent-mode-selector-btn:hover:not(:disabled) {
+  color: #fff;
+}
+
+.agent-mode-selector-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.agent-mode-dropdown-inline {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: auto;
+  margin-bottom: 8px;
+  background: rgba(20, 20, 30, 0.95);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 12px;
+  padding: 6px;
+  z-index: 100;
+  max-height: 240px;
+  overflow-y: auto;
+  box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.3);
+  min-width: 220px;
+}
+
+.agent-mode-option {
+  padding: 10px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: #e2e8f0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agent-mode-option:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.agent-mode-option.active {
+  background: rgba(59, 130, 246, 0.2);
+  border: 1px solid rgba(59, 130, 246, 0.4);
+}
+
+.agent-mode-label {
+  font-weight: 600;
+}
+
+.agent-mode-desc {
+  font-size: 0.75rem;
+  color: #9ca3af;
 }
 
 .config-dropdown-inline {
   position: absolute;
   bottom: 100%;
   left: 0;
-  right: 0;
+  right: auto;
   margin-bottom: 8px;
   background: rgba(20, 20, 30, 0.95);
   backdrop-filter: blur(20px);
@@ -603,6 +761,7 @@ body {
   max-height: 300px;
   overflow-y: auto;
   box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.3);
+  min-width: 260px;
 }
 
 .config-dropdown-inline .config-option {
@@ -632,4 +791,106 @@ body {
 .config-dropdown-inline .config-meta {
   font-size: 0.75rem;
   color: #888;
+}
+
+.reasoning-selector-inline {
+  flex: 0 0 auto;
+  position: relative;
+  min-width: auto;
+}
+
+.reasoning-selector-btn {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  color: #e2e8f0;
+  font-size: 0.86rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+  width: auto;
+  min-width: auto;
+}
+
+.reasoning-selector-btn:hover:not(:disabled) {
+  color: #fff;
+}
+
+.reasoning-selector-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.selector-text {
+  font-size: 0.86rem;
+}
+
+.dropdown-arrow {
+  font-size: 0.7rem;
+  opacity: 0.7;
+}
+
+.reasoning-dropdown-inline {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: auto;
+  margin-bottom: 8px;
+  background: rgba(20, 20, 30, 0.95);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 12px;
+  padding: 6px;
+  z-index: 100;
+  max-height: 240px;
+  overflow-y: auto;
+  box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.3);
+  min-width: 160px;
+}
+
+.reasoning-dropdown-inline::-webkit-scrollbar,
+.agent-mode-dropdown-inline::-webkit-scrollbar,
+.config-dropdown-inline::-webkit-scrollbar {
+  width: 6px;
+}
+
+.reasoning-dropdown-inline::-webkit-scrollbar-track,
+.agent-mode-dropdown-inline::-webkit-scrollbar-track,
+.config-dropdown-inline::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.reasoning-dropdown-inline::-webkit-scrollbar-thumb,
+.agent-mode-dropdown-inline::-webkit-scrollbar-thumb,
+.config-dropdown-inline::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+}
+
+.reasoning-dropdown-inline::-webkit-scrollbar-thumb:hover,
+.agent-mode-dropdown-inline::-webkit-scrollbar-thumb:hover,
+.config-dropdown-inline::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.reasoning-option {
+  padding: 10px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: #e2e8f0;
+}
+
+.reasoning-option:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.reasoning-option.active {
+  background: rgba(59, 130, 246, 0.2);
+  border: 1px solid rgba(59, 130, 246, 0.4);
 }

@@ -4,8 +4,7 @@ from typing import Optional, Dict, Any, Literal
 # LLM API format and profile
 LLMApiFormat = Literal["openai_chat_completions", "openai_responses"]
 LLMProfile = Literal["openai", "openai_compatible", "deepseek", "zhipu"]
-
-
+AgentMode = Literal["default", "shell_safe", "super"]
 class LLMConfig(BaseModel):
     id: Optional[str] = None
     name: str
@@ -97,7 +96,8 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     config_id: Optional[str] = None
-    response_format: Optional[Dict[str, Any]] = None
+    agent_mode: Optional[AgentMode] = None
+    shell_unrestricted: Optional[bool] = None
 
 
 class ChatResponse(BaseModel):

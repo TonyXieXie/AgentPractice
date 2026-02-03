@@ -36,6 +36,8 @@ class Database:
                 temperature REAL DEFAULT 0.7,
                 max_tokens INTEGER DEFAULT 2000,
                 is_default INTEGER DEFAULT 0,
+                reasoning_effort TEXT DEFAULT "medium",
+                reasoning_summary TEXT DEFAULT "detailed",
                 created_at TEXT NOT NULL
             )
         ''')
@@ -49,6 +51,16 @@ class Database:
             cursor.execute('ALTER TABLE llm_configs ADD COLUMN api_profile TEXT')
         except sqlite3.OperationalError:
             pass
+        
+        try:
+            cursor.execute('ALTER TABLE llm_configs ADD COLUMN reasoning_effort TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE llm_configs ADD COLUMN reasoning_summary TEXT')
+        except sqlite3.OperationalError:
+            pass
 
         try:
             cursor.execute('''
@@ -56,6 +68,24 @@ class Database:
                 SET api_format = ?
                 WHERE api_format IS NULL
             ''', ("openai_chat_completions",))
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute('''
+                UPDATE llm_configs
+                SET reasoning_effort = ?
+                WHERE reasoning_effort IS NULL
+            ''', ("medium",))
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('''
+                UPDATE llm_configs
+                SET reasoning_summary = ?
+                WHERE reasoning_summary IS NULL
+            ''', ("detailed",))
         except sqlite3.OperationalError:
             pass
 
@@ -197,15 +227,17 @@ class Database:
         created_at = datetime.now().isoformat()
         api_format = config.api_format or "openai_chat_completions"
         api_profile = config.api_profile or config.api_type or "openai"
+        reasoning_effort = config.reasoning_effort or "medium"
+        reasoning_summary = config.reasoning_summary or "detailed"
         
         if config.is_default:
             cursor.execute('UPDATE llm_configs SET is_default = 0')
         
         cursor.execute('''
-            INSERT INTO llm_configs (id, name, api_type, api_format, api_profile, api_key, base_url, model, temperature, max_tokens, is_default, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO llm_configs (id, name, api_type, api_format, api_profile, api_key, base_url, model, temperature, max_tokens, is_default, reasoning_effort, reasoning_summary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (config_id, config.name, api_profile, api_format, api_profile, config.api_key, config.base_url,
-              config.model, config.temperature, config.max_tokens, int(config.is_default), created_at))
+              config.model, config.temperature, config.max_tokens, int(config.is_default), reasoning_effort, reasoning_summary, created_at))
         
         conn.commit()
         conn.close()
@@ -226,6 +258,12 @@ class Database:
                 api_profile = row['api_type'] if 'api_type' in row.keys() else None
             if not api_profile:
                 api_profile = "openai"
+            reasoning_effort = row['reasoning_effort'] if 'reasoning_effort' in row.keys() else None
+            if not reasoning_effort:
+                reasoning_effort = "medium"
+            reasoning_summary = row['reasoning_summary'] if 'reasoning_summary' in row.keys() else None
+            if not reasoning_summary:
+                reasoning_summary = "detailed"
             return LLMConfig(
                 id=row['id'],
                 name=row['name'],
@@ -237,6 +275,8 @@ class Database:
                 temperature=row['temperature'],
                 max_tokens=row['max_tokens'],
                 is_default=bool(row['is_default']),
+                reasoning_effort=reasoning_effort,
+                reasoning_summary=reasoning_summary,
                 created_at=row['created_at']
             )
         return None
@@ -254,6 +294,8 @@ class Database:
             data = dict(row)
             data["api_profile"] = data.get("api_profile") or data.get("api_type") or "openai"
             data["api_format"] = data.get("api_format") or "openai_chat_completions"
+            data["reasoning_effort"] = data.get("reasoning_effort") or "medium"
+            data["reasoning_summary"] = data.get("reasoning_summary") or "detailed"
             configs.append(LLMConfig(**data))
         return configs
     
@@ -269,6 +311,8 @@ class Database:
             data = dict(row)
             data["api_profile"] = data.get("api_profile") or data.get("api_type") or "openai"
             data["api_format"] = data.get("api_format") or "openai_chat_completions"
+            data["reasoning_effort"] = data.get("reasoning_effort") or "medium"
+            data["reasoning_summary"] = data.get("reasoning_summary") or "detailed"
             return LLMConfig(**data)
         return None
     
@@ -311,6 +355,12 @@ class Database:
         if update.max_tokens is not None:
             update_fields.append('max_tokens = ?')
             values.append(update.max_tokens)
+        if update.reasoning_effort is not None:
+            update_fields.append('reasoning_effort = ?')
+            values.append(update.reasoning_effort)
+        if update.reasoning_summary is not None:
+            update_fields.append('reasoning_summary = ?')
+            values.append(update.reasoning_summary)
         if update.is_default is not None:
             if update.is_default:
                 cursor.execute('UPDATE llm_configs SET is_default = 0')

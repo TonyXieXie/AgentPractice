@@ -1,4 +1,4 @@
-import { useState, Fragment } from 'react';
+import { useState, useEffect, useRef, Fragment, type MouseEventHandler } from 'react';
 import MarkdownIt from 'markdown-it';
 import texmath from 'markdown-it-texmath';
 import katex from 'katex';
@@ -49,7 +49,26 @@ markdown.use(texmath, {
     katexOptions: { throwOnError: false, errorColor: '#f87171' }
 });
 
-function renderRichContent(content: string) {
+markdown.renderer.rules.fence = (tokens, idx, options, env, self) => {
+    const token = tokens[idx];
+    const info = (token.info || '').trim();
+    const lang = info ? info.split(/\s+/g)[0] : '';
+    const safeLang = lang.replace(/[^a-zA-Z0-9_-]/g, '');
+    const label = safeLang || 'text';
+    const code = markdown.utils.escapeHtml(token.content || '');
+    const langClass = safeLang ? `language-${safeLang}` : '';
+    return [
+        '<div class="code-block-container">',
+        '<div class="code-block-header">',
+        `<span class="code-block-lang">${label}</span>`,
+        '<button class="copy-code-btn" type="button">Copy</button>',
+        '</div>',
+        `<pre><code class="${langClass}">${code}</code></pre>`,
+        '</div>'
+    ].join('');
+};
+
+function renderRichContent(content: string, onClick?: MouseEventHandler<HTMLDivElement>) {
     const normalized = (content || '')
         .replace(/\r\n/g, '\n')
         .replace(/\\\\\[/g, '\\[')
@@ -59,7 +78,7 @@ function renderRichContent(content: string) {
         .replace(/^\s*\\\[\s*$/gm, '\n\\[\n')
         .replace(/^\s*\\\]\s*$/gm, '\n\\]\n');
     const html = markdown.render(normalized);
-    return <div className="content-markdown" dangerouslySetInnerHTML={{ __html: html }} />;
+    return <div className="content-markdown" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 function looksLikeDiff(content: string) {
@@ -86,6 +105,61 @@ function AgentStepView({
 }: AgentStepViewProps) {
     const [expandedObservations, setExpandedObservations] = useState<Record<string, boolean>>({});
     const [translatedSearchSteps, setTranslatedSearchSteps] = useState<Record<string, boolean>>({});
+    const [expandedErrors, setExpandedErrors] = useState<Record<string, boolean>>({});
+    const [thoughtAutoScroll, setThoughtAutoScroll] = useState<Record<string, boolean>>({});
+    const thoughtRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+    useEffect(() => {
+        steps.forEach((step, index) => {
+            const category = STEP_CATEGORY[step.step_type] || 'other';
+            if (category !== 'thought') return;
+            const stepKey = `${step.step_type}-${index}`;
+            const el = thoughtRefs.current[stepKey];
+            if (!el) return;
+            const auto = thoughtAutoScroll[stepKey];
+            if (auto === false) return;
+            el.scrollTop = el.scrollHeight;
+        });
+    }, [steps, thoughtAutoScroll]);
+
+    const handleThoughtScroll = (stepKey: string) => (event: React.UIEvent<HTMLDivElement>) => {
+        const el = event.currentTarget;
+        const threshold = 8;
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+        setThoughtAutoScroll((prev) => {
+            if (prev[stepKey] === nearBottom) return prev;
+            return { ...prev, [stepKey]: nearBottom };
+        });
+    };
+
+    const handleMarkdownClick: MouseEventHandler<HTMLDivElement> = (event) => {
+        const target = event.target as HTMLElement;
+        const button = target.closest<HTMLButtonElement>('.copy-code-btn');
+        if (!button) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const container = button.closest<HTMLElement>('.code-block-container');
+        const codeEl = container?.querySelector('pre code');
+        const text = codeEl?.textContent ?? '';
+        if (!text) return;
+
+        navigator.clipboard.writeText(text).then(
+            () => {
+                button.textContent = 'Copied';
+                button.classList.add('copied');
+                window.setTimeout(() => {
+                    button.textContent = 'Copy';
+                    button.classList.remove('copied');
+                }, 1200);
+            },
+            () => {
+                button.textContent = 'Failed';
+                window.setTimeout(() => {
+                    button.textContent = 'Copy';
+                }, 1200);
+            }
+        );
+    };
 
     if (!steps.length && !pendingPermission) {
         return (
@@ -160,6 +234,8 @@ function AgentStepView({
                 const stepKey = `${step.step_type}-${index}`;
                 const isObservation = step.step_type === 'observation';
                 const isAction = step.step_type === 'action' || step.step_type === 'action_delta';
+                const isError = step.step_type === 'error';
+                const isThought = category === 'thought';
                 const rawContent = String(step.content || '');
                 const trimmedContent = rawContent.trimStart();
                 const lowerContent = trimmedContent.toLowerCase();
@@ -169,6 +245,9 @@ function AgentStepView({
                 const canTranslateSearch = isAction && (toolName === 'search' || looksLikeSearchCall) && hasUnicodeEscapes(rawContent);
                 const isTranslated = !!translatedSearchSteps[stepKey];
                 const displayContent = canTranslateSearch && isTranslated ? decodeUnicodeEscapes(rawContent) : rawContent;
+                const errorDetails = isError ? String(step.metadata?.traceback || '') : '';
+                const hasErrorDetails = Boolean(errorDetails);
+                const errorExpanded = !!expandedErrors[stepKey];
                 let observationText = '';
                 let observationPreview = '';
                 let observationHasMore = false;
@@ -216,8 +295,12 @@ function AgentStepView({
                                     )}
                                 </div>
                             ) : (
-                                <div className={`agent-step-content${isAction ? ' action-content' : ''}`}>
-                                    {renderRichContent(displayContent)}
+                                <div
+                                    className={`agent-step-content${isAction ? ' action-content' : ''}`}
+                                    ref={isThought ? (el) => { thoughtRefs.current[stepKey] = el; } : undefined}
+                                    onScroll={isThought ? handleThoughtScroll(stepKey) : undefined}
+                                >
+                                    {renderRichContent(displayContent, handleMarkdownClick)}
                                     {canTranslateSearch && (
                                         <button
                                             type="button"
@@ -228,6 +311,22 @@ function AgentStepView({
                                         >
                                             {isTranslated ? '原文' : '翻译'}
                                         </button>
+                                    )}
+                                    {hasErrorDetails && (
+                                        <>
+                                            <button
+                                                type="button"
+                                                className="error-toggle"
+                                                onClick={() =>
+                                                    setExpandedErrors((prev) => ({ ...prev, [stepKey]: !prev[stepKey] }))
+                                                }
+                                            >
+                                                {errorExpanded ? '隐藏错误详情' : '显示错误详情'}
+                                            </button>
+                                            {errorExpanded && (
+                                                <pre className="error-details">{errorDetails}</pre>
+                                            )}
+                                        </>
                                     )}
                                 </div>
                             )}

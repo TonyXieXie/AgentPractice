@@ -8,6 +8,7 @@ Implements a ReAct-style loop with tool calling.
 
 import json
 import re
+import traceback
 from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
 from .base import AgentStrategy, AgentStep
 from tools.base import Tool, tool_to_openai_function, tool_to_openai_responses_tool
@@ -124,9 +125,11 @@ class ReActAgent(AgentStrategy):
 
             if openai_format == "openai_responses":
                 content_buffer = ""
+                reasoning_buffer = ""
                 tool_calls = []
                 response_output_items: List[Dict[str, Any]] = []
                 thought_stream_key = f"assistant_content_{iteration}"
+                reasoning_stream_key = f"assistant_reasoning_{iteration}"
                 stream_mode = "answer"
                 stopped = False
 
@@ -141,6 +144,15 @@ class ReActAgent(AgentStrategy):
                                 step_type=step_type,
                                 content=delta,
                                 metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                            )
+                    elif event_type == "reasoning":
+                        delta = event.get("delta", "")
+                        if delta:
+                            reasoning_buffer += delta
+                            yield AgentStep(
+                                step_type="thought_delta",
+                                content=delta,
+                                metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
                             )
                     elif event_type == "tool_call_delta":
                         if stream_mode != "thought":
@@ -215,6 +227,12 @@ class ReActAgent(AgentStrategy):
                             "tool_calls": tool_calls,
                             "content": content_buffer
                         })
+                    if reasoning_buffer.strip():
+                        yield AgentStep(
+                            step_type="thought",
+                            content=reasoning_buffer,
+                            metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
+                        )
                     if content_buffer.strip():
                         yield AgentStep(
                             step_type="thought",
@@ -269,8 +287,10 @@ class ReActAgent(AgentStrategy):
                 return
 
             content_buffer = ""
+            reasoning_buffer = ""
             tool_calls = []
             thought_stream_key = f"assistant_content_{iteration}"
+            reasoning_stream_key = f"assistant_reasoning_{iteration}"
             stream_mode = "answer"
             stopped = False
 
@@ -285,6 +305,15 @@ class ReActAgent(AgentStrategy):
                             step_type=step_type,
                             content=delta,
                             metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                        )
+                elif event_type == "reasoning":
+                    delta = event.get("delta", "")
+                    if delta:
+                        reasoning_buffer += delta
+                        yield AgentStep(
+                            step_type="thought_delta",
+                            content=delta,
+                            metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
                         )
                 elif event_type == "tool_call_delta":
                     if stream_mode != "thought":
@@ -334,6 +363,13 @@ class ReActAgent(AgentStrategy):
                         "content": content_buffer
                     })
 
+                if reasoning_buffer.strip():
+                    yield AgentStep(
+                        step_type="thought",
+                        content=reasoning_buffer,
+                        metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
+                    )
+
                 if content_buffer.strip():
                     yield AgentStep(
                         step_type="thought",
@@ -378,6 +414,13 @@ class ReActAgent(AgentStrategy):
 
             if llm_call_id:
                 self._update_llm_processed(llm_call_id, {"final_answer": content_buffer})
+
+            if reasoning_buffer.strip():
+                yield AgentStep(
+                    step_type="thought",
+                    content=reasoning_buffer,
+                    metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
+                )
 
             if content_buffer.strip():
                 yield AgentStep(
@@ -436,7 +479,7 @@ class ReActAgent(AgentStrategy):
                 yield AgentStep(
                     step_type="error",
                     content=f"LLM call failed: {str(e)}",
-                    metadata={"iteration": iteration, "error": str(e)}
+                    metadata={"iteration": iteration, "error": str(e), "traceback": traceback.format_exc()}
                 )
                 return
 

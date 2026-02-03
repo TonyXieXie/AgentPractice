@@ -1,6 +1,6 @@
 ﻿import { useState, useEffect, useRef } from 'react';
 import './App.css';
-import { Message, LLMConfig, LLMCall, ToolPermissionRequest } from './types';
+import { Message, LLMConfig, LLMCall, ToolPermissionRequest, ReasoningEffort, AgentMode } from './types';
 import {
   sendMessageAgentStream,
   getDefaultConfig,
@@ -14,6 +14,7 @@ import {
   rollbackSession,
   getToolPermissions,
   updateToolPermission,
+  updateConfig,
   AgentStep,
   AgentStepWithMessage,
 } from './api';
@@ -21,6 +22,23 @@ import ConfigManager from './components/ConfigManager';
 import SessionList from './components/SessionList';
 import DebugPanel from './components/DebugPanel';
 import AgentStepView from './components/AgentStepView';
+
+const DRAFT_SESSION_KEY = '__draft__';
+
+const REASONING_OPTIONS: { value: ReasoningEffort; label: string }[] = [
+  { value: 'none', label: 'none' },
+  { value: 'minimal', label: 'minimal' },
+  { value: 'low', label: 'low' },
+  { value: 'medium', label: 'medium' },
+  { value: 'high', label: 'high' },
+  { value: 'xhigh', label: 'xhigh' },
+];
+
+const AGENT_MODE_OPTIONS: { value: AgentMode; label: string; description: string }[] = [
+  { value: 'default', label: '默认', description: '使用默认安全策略' },
+  { value: 'shell_safe', label: 'Shell安全', description: '允许部分操作（基于允许列表）' },
+  { value: 'super', label: '超级', description: '允许所有操作' },
+];
 
 function App() {
   const [inputMsg, setInputMsg] = useState('');
@@ -45,11 +63,22 @@ function App() {
   const stopRequestedRef = useRef(false);
   const [pendingPermission, setPendingPermission] = useState<ToolPermissionRequest | null>(null);
   const [permissionBusy, setPermissionBusy] = useState(false);
+  const [agentMode, setAgentMode] = useState<AgentMode>('default');
+  const [showReasoningSelector, setShowReasoningSelector] = useState(false);
+  const [showAgentModeSelector, setShowAgentModeSelector] = useState(false);
+  const [streamingSessionKey, setStreamingSessionKey] = useState<string | null>(null);
+  const messagesCacheRef = useRef<Record<string, Message[]>>({});
+  const currentSessionIdRef = useRef<string | null>(null);
+  const streamingSessionKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     loadDefaultConfig();
     loadAllConfigs();
   }, []);
+
+  useEffect(() => {
+    currentSessionIdRef.current = currentSessionId;
+  }, [currentSessionId]);
 
   useEffect(() => {
     if (autoScrollRef.current) {
@@ -58,21 +87,26 @@ function App() {
   }, [messages]);
 
   useEffect(() => {
+    if (!showConfigSelector && !showReasoningSelector && !showAgentModeSelector) return;
     const handleClickOutside = (event: MouseEvent) => {
       const target = event.target as HTMLElement;
-      if (showConfigSelector && !target.closest('.config-selector-wrapper')) {
+      if (showConfigSelector && !target.closest('.model-selector-inline')) {
         setShowConfigSelector(false);
+      }
+      if (showReasoningSelector && !target.closest('.reasoning-selector-inline')) {
+        setShowReasoningSelector(false);
+      }
+      if (showAgentModeSelector && !target.closest('.agent-mode-selector-inline')) {
+        setShowAgentModeSelector(false);
       }
     };
 
-    if (showConfigSelector) {
-      document.addEventListener('click', handleClickOutside);
-    }
+    document.addEventListener('click', handleClickOutside);
 
     return () => {
       document.removeEventListener('click', handleClickOutside);
     };
-  }, [showConfigSelector]);
+  }, [showConfigSelector, showReasoningSelector, showAgentModeSelector]);
 
   useEffect(() => {
     if (showDebugPanel && currentSessionId) {
@@ -133,6 +167,32 @@ function App() {
     }
   };
 
+  const getSessionKey = (sessionId: string | null) => sessionId ?? DRAFT_SESSION_KEY;
+
+  const getCurrentSessionKey = () => getSessionKey(currentSessionIdRef.current);
+
+  const setSessionMessages = (sessionKey: string, next: Message[]) => {
+    messagesCacheRef.current[sessionKey] = next;
+    if (sessionKey === getCurrentSessionKey()) {
+      setMessages(next);
+    }
+  };
+
+  const updateSessionMessages = (sessionKey: string, updater: (prev: Message[]) => Message[]) => {
+    const prev = messagesCacheRef.current[sessionKey] || [];
+    const next = updater(prev);
+    messagesCacheRef.current[sessionKey] = next;
+    if (sessionKey === getCurrentSessionKey()) {
+      setMessages(next);
+    }
+    return next;
+  };
+
+  const stashCurrentMessages = () => {
+    const key = getCurrentSessionKey();
+    messagesCacheRef.current[key] = messages;
+  };
+
   const refreshSessionDebug = async (sessionId: string) => {
     try {
       const calls = await getSessionLLMCalls(sessionId);
@@ -153,6 +213,19 @@ function App() {
     }
   };
 
+  const handleReasoningChange = async (value: ReasoningEffort) => {
+    if (!currentConfig) return;
+    try {
+      const updated = await updateConfig(currentConfig.id, { reasoning_effort: value });
+      setCurrentConfig(updated);
+      setAllConfigs((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+      setShowReasoningSelector(false);
+    } catch (error) {
+      console.error('Failed to update reasoning:', error);
+      alert('Failed to update reasoning.');
+    }
+  };
+
   const handleSend = async () => {
     if (!inputMsg.trim() || loading) return;
     if (!currentConfig) {
@@ -170,6 +243,11 @@ function App() {
     abortControllerRef.current = abortController;
 
     const targetSessionId = currentSessionId;
+    stashCurrentMessages();
+    const sessionKey = getSessionKey(targetSessionId);
+    let activeSessionKey = sessionKey;
+    streamingSessionKeyRef.current = sessionKey;
+    setStreamingSessionKey(sessionKey);
 
     const tempUserId = Date.now();
     const tempAssistantId = tempUserId + 1;
@@ -199,7 +277,7 @@ function App() {
       }
     };
 
-    setMessages((prev) => [...prev, tempUserMsg, tempAssistantMsg]);
+    updateSessionMessages(sessionKey, (prev) => [...prev, tempUserMsg, tempAssistantMsg]);
 
     try {
       const streamGenerator = sendMessageAgentStream(
@@ -207,6 +285,7 @@ function App() {
           message: userMessage,
           session_id: targetSessionId || undefined,
           config_id: currentConfig.id,
+          agent_mode: agentMode,
         },
         abortController.signal
       );
@@ -232,7 +311,7 @@ function App() {
             }
           }
           if (incomingUserId || incomingAssistantId) {
-            setMessages((prev) =>
+            updateSessionMessages(activeSessionKey, (prev) =>
               prev.map((msg) => {
                 if (typeof incomingUserId === 'number' && msg.id === tempUserId) {
                   return { ...msg, id: incomingUserId, session_id: newSessionId };
@@ -248,8 +327,21 @@ function App() {
             );
           }
           if (!targetSessionId) {
+            currentSessionIdRef.current = newSessionId;
             setCurrentSessionId(newSessionId);
             setSessionRefreshTrigger((prev) => prev + 1);
+          }
+          if (activeSessionKey === DRAFT_SESSION_KEY && newSessionId) {
+            const cached = messagesCacheRef.current[activeSessionKey] || [];
+            delete messagesCacheRef.current[activeSessionKey];
+            messagesCacheRef.current[newSessionId] = cached;
+            activeSessionKey = newSessionId;
+            streamingSessionKeyRef.current = newSessionId;
+            setStreamingSessionKey(newSessionId);
+          } else if (newSessionId) {
+            activeSessionKey = newSessionId;
+            streamingSessionKeyRef.current = newSessionId;
+            setStreamingSessionKey(newSessionId);
           }
           continue;
         }
@@ -260,7 +352,7 @@ function App() {
 
         const step = chunk as AgentStep;
 
-        setMessages((prev) =>
+        updateSessionMessages(activeSessionKey, (prev) =>
           prev.map((msg) => {
             if (msg.id !== currentAssistantId) return msg;
 
@@ -421,7 +513,7 @@ function App() {
         );
       }
 
-      setMessages((prev) =>
+      updateSessionMessages(activeSessionKey, (prev) =>
         prev.map((msg) =>
           msg.id === currentAssistantId
             ? { ...msg, metadata: { ...(msg.metadata || {}), agent_streaming: false, agent_answer_buffers: {} } }
@@ -445,11 +537,13 @@ function App() {
           content: `Chat error: ${error.message || 'Please check whether the backend is running.'}`,
           timestamp: new Date().toISOString(),
         };
-        setMessages((prev) => [...prev.filter((m) => m.id !== currentAssistantId), errorMsg]);
+        updateSessionMessages(activeSessionKey, (prev) => [...prev.filter((m) => m.id !== currentAssistantId), errorMsg]);
       }
     } finally {
       setLoading(false);
       abortControllerRef.current = null;
+      streamingSessionKeyRef.current = null;
+      setStreamingSessionKey(null);
     }
   };
 
@@ -502,7 +596,7 @@ function App() {
         console.error('Failed to stop stream:', error);
       }
     }
-    setMessages((prev) => {
+    updateSessionMessages(getCurrentSessionKey(), (prev) => {
       if (!assistantId) {
         const lastAssistant = [...prev].reverse().find((msg) => msg.role === 'assistant');
         assistantId = lastAssistant?.id ?? null;
@@ -511,6 +605,8 @@ function App() {
       return prev.map((msg) => (msg.id === assistantId ? applyStopNoteToMessage(msg) : msg));
     });
     setLoading(false);
+    streamingSessionKeyRef.current = null;
+    setStreamingSessionKey(null);
   };
 
   const handlePermissionDecision = async (status: 'approved' | 'denied') => {
@@ -529,32 +625,51 @@ function App() {
 
   const handleSelectSession = async (sessionId: string) => {
     try {
+      autoScrollRef.current = true;
+      stashCurrentMessages();
+      currentSessionIdRef.current = sessionId;
       setCurrentSessionId(sessionId);
-      const [msgs, session, calls, steps] = await Promise.all([
-        getSessionMessages(sessionId),
+      setShowConfigSelector(false);
+      setShowReasoningSelector(false);
+
+      const cached = messagesCacheRef.current[sessionId];
+      const isStreamingSession = streamingSessionKeyRef.current === sessionId;
+      const hasStreaming = Boolean(cached?.some((msg) => msg.metadata?.agent_streaming));
+      if (cached && (isStreamingSession || hasStreaming)) {
+        setSessionMessages(sessionId, cached);
+      }
+
+      const [session, calls] = await Promise.all([
         getSession(sessionId),
         getSessionLLMCalls(sessionId),
-        getSessionAgentSteps(sessionId),
       ]);
 
-      const stepMap = new Map<number, AgentStep[]>();
-      (steps as AgentStepWithMessage[]).forEach((step) => {
-        const list = stepMap.get(step.message_id) || [];
-        list.push({ step_type: step.step_type as AgentStep['step_type'], content: step.content, metadata: step.metadata });
-        stepMap.set(step.message_id, list);
-      });
-
-      const hydratedMessages = msgs.map((msg) => {
-        const agentSteps = stepMap.get(msg.id) || [];
-        if (!agentSteps.length) return msg;
-        return {
-          ...msg,
-          metadata: { ...(msg.metadata || {}), agent_steps: agentSteps, agent_streaming: false }
-        };
-      });
-
-      setMessages(hydratedMessages);
       setLlmCalls(calls);
+
+      if (!cached || (!isStreamingSession && !hasStreaming)) {
+        const [msgs, steps] = await Promise.all([
+          getSessionMessages(sessionId),
+          getSessionAgentSteps(sessionId),
+        ]);
+
+        const stepMap = new Map<number, AgentStep[]>();
+        (steps as AgentStepWithMessage[]).forEach((step) => {
+          const list = stepMap.get(step.message_id) || [];
+          list.push({ step_type: step.step_type as AgentStep['step_type'], content: step.content, metadata: step.metadata });
+          stepMap.set(step.message_id, list);
+        });
+
+        const hydratedMessages = msgs.map((msg) => {
+          const agentSteps = stepMap.get(msg.id) || [];
+          if (!agentSteps.length) return msg;
+          return {
+            ...msg,
+            metadata: { ...(msg.metadata || {}), agent_steps: agentSteps, agent_streaming: false }
+          };
+        });
+
+        setSessionMessages(sessionId, hydratedMessages);
+      }
 
       const config = await getConfig(session.config_id);
       setCurrentConfig(config);
@@ -565,9 +680,12 @@ function App() {
   };
 
   const handleNewChat = () => {
+    stashCurrentMessages();
+    currentSessionIdRef.current = null;
     setCurrentSessionId(null);
-    setMessages([]);
+    setSessionMessages(DRAFT_SESSION_KEY, []);
     setLlmCalls([]);
+    autoScrollRef.current = true;
   };
 
   const handleRollback = async (messageId: number) => {
@@ -608,6 +726,9 @@ function App() {
 
   const latestAssistantId =
     [...messages].reverse().find((msg) => msg.role === 'assistant')?.id ?? null;
+  const currentSessionKey = getSessionKey(currentSessionId);
+  const isStreamingCurrent = Boolean(loading && streamingSessionKey === currentSessionKey);
+  const currentReasoning = (currentConfig?.reasoning_effort || 'medium') as ReasoningEffort;
 
   return (
     <div className="app-container">
@@ -639,16 +760,50 @@ function App() {
                 className="header-btn"
                 onClick={() => setShowConfigManager(true)}
                 title="Manage configs"
+                aria-label="Manage configs"
               >
-                Config
+                <svg
+                  className="header-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <line x1="4" y1="6" x2="20" y2="6" />
+                  <line x1="4" y1="12" x2="20" y2="12" />
+                  <line x1="4" y1="18" x2="20" y2="18" />
+                  <circle cx="9" cy="6" r="2" />
+                  <circle cx="15" cy="12" r="2" />
+                  <circle cx="11" cy="18" r="2" />
+                </svg>
               </button>
 
               <button
                 className={`header-btn ${showDebugPanel ? 'active' : ''}`}
                 onClick={() => setShowDebugPanel(!showDebugPanel)}
                 title="Debug"
+                aria-label="Debug"
               >
-                Debug
+                <svg
+                  className="header-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <rect x="9" y="9" width="6" height="8" rx="2" />
+                  <path d="M8 9h8V6H8z" />
+                  <path d="M4 13h4" />
+                  <path d="M16 13h4" />
+                  <path d="M6 7L4 5" />
+                  <path d="M18 7l2-2" />
+                </svg>
               </button>
             </div>
           </div>
@@ -706,7 +861,7 @@ function App() {
                 );
               })
             )}
-            {loading && (
+            {isStreamingCurrent && (
               <div className="message assistant loading">
                 <div className="message-content">
                   <span className="typing-indicator">
@@ -733,59 +888,154 @@ function App() {
               ref={inputRef}
             />
 
-            {currentConfig && (
-              <div className="model-selector-inline">
-                <button
-                  className="model-selector-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setShowConfigSelector(!showConfigSelector);
-                  }}
-                >
-                  <span>Model</span>
-                  <span>{currentConfig.name}</span>
-                  <span>{showConfigSelector ? '^' : 'v'}</span>
-                </button>
+            <div className="input-footer">
+              {currentConfig && (
+                <div className="input-controls">
+                  <div className="model-selector-inline">
+                    <button
+                      className={`model-selector-btn ${showConfigSelector ? 'active' : ''}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowConfigSelector(!showConfigSelector);
+                      }}
+                      aria-label={`Select model: ${currentConfig.name}`}
+                      title={`Model: ${currentConfig.name}`}
+                    >
+                      <span className="selector-text">{currentConfig.name}</span>
+                      <span className="dropdown-arrow">▾</span>
+                    </button>
 
-                {showConfigSelector && (
-                  <div className="config-dropdown-inline">
-                    {allConfigs.map((config) => (
-                      <div
-                        key={config.id}
-                        className={`config-option ${config.id === currentConfig.id ? 'active' : ''}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleSwitchConfig(config.id);
-                          setShowConfigSelector(false);
-                        }}
-                      >
-                        <div className="config-name">{config.name}</div>
-                        <div className="config-meta">
-                          {config.api_format} / {config.api_profile} / {config.model}
-                        </div>
+                    {showConfigSelector && (
+                      <div className="config-dropdown-inline">
+                        {allConfigs.map((config) => (
+                          <div
+                            key={config.id}
+                            className={`config-option ${config.id === currentConfig.id ? 'active' : ''}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleSwitchConfig(config.id);
+                              setShowConfigSelector(false);
+                            }}
+                          >
+                            <div className="config-name">{config.name}</div>
+                            <div className="config-meta">
+                              {config.api_format} / {config.api_profile} / {config.model}
+                            </div>
+                          </div>
+                        ))}
                       </div>
-                    ))}
+                    )}
                   </div>
+
+                  <div className="agent-mode-selector-inline">
+                    <button
+                      type="button"
+                      className={`agent-mode-selector-btn ${showAgentModeSelector ? 'active' : ''}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowAgentModeSelector(!showAgentModeSelector);
+                      }}
+                      disabled={!currentConfig || loading}
+                      aria-label={`Agent mode: ${agentMode}`}
+                      title={`Agent模式: ${agentMode}`}
+                    >
+                      <span className="selector-text">
+                        {AGENT_MODE_OPTIONS.find((opt) => opt.value === agentMode)?.label || agentMode}
+                      </span>
+                      <span className="dropdown-arrow">▾</span>
+                    </button>
+
+                    {showAgentModeSelector && (
+                      <div className="agent-mode-dropdown-inline">
+                        {AGENT_MODE_OPTIONS.map((option) => (
+                          <div
+                            key={option.value}
+                            className={`agent-mode-option ${option.value === agentMode ? 'active' : ''}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setAgentMode(option.value);
+                              setShowAgentModeSelector(false);
+                            }}
+                            title={option.description}
+                          >
+                            <div className="agent-mode-label">{option.label}</div>
+                            <div className="agent-mode-desc">{option.description}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="reasoning-selector-inline">
+                    <button
+                      className={`reasoning-selector-btn ${showReasoningSelector ? 'active' : ''}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowReasoningSelector(!showReasoningSelector);
+                      }}
+                      disabled={!currentConfig || loading}
+                      aria-label={`Reasoning: ${currentReasoning}`}
+                      title={`Reasoning: ${currentReasoning}`}
+                    >
+                      <span className="selector-text">{currentReasoning}</span>
+                      <span className="dropdown-arrow">▾</span>
+                    </button>
+
+                    {showReasoningSelector && (
+                      <div className="reasoning-dropdown-inline">
+                        {REASONING_OPTIONS.map((option) => (
+                          <div
+                            key={option.value}
+                            className={`reasoning-option ${option.value === currentReasoning ? 'active' : ''}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleReasoningChange(option.value);
+                            }}
+                          >
+                            {option.label}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <div className="input-actions">
+                <button
+                  type="button"
+                  className="send-btn"
+                  onClick={handleSend}
+                  disabled={!currentConfig || loading || !inputMsg.trim()}
+                  aria-label="Send"
+                  title="Send"
+                >
+                  {loading ? (
+                    <span className="send-spinner" aria-hidden="true" />
+                  ) : (
+                    <svg className="send-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        d="M4 12l16-7-7 16-2.5-6L4 12z"
+                        fill="currentColor"
+                      />
+                    </svg>
+                  )}
+                </button>
+                {isStreamingCurrent && (
+                  <button
+                    type="button"
+                    className="stop-btn"
+                    onClick={handleStop}
+                    aria-label="Stop"
+                    title="Stop"
+                  >
+                    <svg className="stop-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
+                    </svg>
+                  </button>
                 )}
               </div>
-            )}
-
-            <button
-              type="button"
-              onClick={handleSend}
-              disabled={!currentConfig || loading || !inputMsg.trim()}
-            >
-              {loading ? 'Sending...' : 'Send'}
-            </button>
-            {loading && (
-              <button
-                type="button"
-                className="stop-btn"
-                onClick={handleStop}
-              >
-                Stop
-              </button>
-            )}
+            </div>
           </div>
         </div>
       </div>

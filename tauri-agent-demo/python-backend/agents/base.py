@@ -60,7 +60,7 @@ class AgentStrategy(ABC):
             tools: Available tools for the agent
             llm_client: LLM client for making API calls
             session_id: Optional session ID for context
-            request_overrides: Optional per-request overrides (e.g. response_format)
+            request_overrides: Optional per-request overrides
         
         Yields:
             AgentStep: Each step of agent execution (thought, action, observation, etc.)

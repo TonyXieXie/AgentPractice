@@ -7,6 +7,7 @@ import os
 import shlex
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+import traceback
 
 from models import (
     LLMConfig, LLMConfigCreate, LLMConfigUpdate,
@@ -198,34 +199,15 @@ async def _generate_title(
     ]
     client = create_llm_client(config)
     client.timeout = TITLE_REQUEST_TIMEOUT
-    response_format = {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "chat_title",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": TITLE_MAX_CHARS
-                    }
-                },
-                "required": ["title"],
-                "additionalProperties": False
-            }
-        }
-    }
-    request_overrides = {
-        "response_format": response_format
-    }
+    request_overrides = None
     if session_id:
-        request_overrides["_debug"] = {
-            "session_id": session_id,
-            "message_id": message_id,
-            "agent_type": "title",
-            "iteration": 0
+        request_overrides = {
+            "_debug": {
+                "session_id": session_id,
+                "message_id": message_id,
+                "agent_type": "title",
+                "iteration": 0
+            }
         }
     result = await client.chat(messages, request_overrides)
     raw_content = result.get("content", "") if isinstance(result, dict) else ""
@@ -440,13 +422,9 @@ async def chat(request: ChatRequest):
             "api_format": config.api_format,
             "api_profile": config.api_profile
         }
-        if request.response_format is not None:
-            raw_request_data["response_format"] = request.response_format
 
         llm_client = create_llm_client(config)
         llm_overrides = {}
-        if request.response_format is not None:
-            llm_overrides["response_format"] = request.response_format
         llm_overrides["_debug"] = {
             "session_id": session.id,
             "message_id": user_msg.id,
@@ -535,8 +513,6 @@ async def chat_stream(request: ChatRequest):
             "api_format": config.api_format,
             "api_profile": config.api_profile
         }
-        if request.response_format is not None:
-            raw_request_data["response_format"] = request.response_format
 
         user_msg = db.create_message(ChatMessageCreate(
             session_id=session.id,
@@ -551,8 +527,6 @@ async def chat_stream(request: ChatRequest):
             try:
                 llm_client = create_llm_client(config)
                 llm_overrides = {}
-                if request.response_format is not None:
-                    llm_overrides["response_format"] = request.response_format
                 llm_overrides["_debug"] = {
                     "session_id": session.id,
                     "message_id": user_msg.id,
@@ -777,8 +751,10 @@ async def chat_agent_stream(request: ChatRequest):
                     }
                 }
                 request_overrides["_stop_event"] = stop_event
-                if request.response_format is not None:
-                    request_overrides["response_format"] = request.response_format
+                if request.agent_mode is not None:
+                    request_overrides["agent_mode"] = request.agent_mode
+                if request.shell_unrestricted is not None:
+                    request_overrides["shell_unrestricted"] = request.shell_unrestricted
 
                 async for step in executor.run(
                     user_input=processed_message,
@@ -848,7 +824,7 @@ async def chat_agent_stream(request: ChatRequest):
                 error_step = AgentStep(
                     step_type="error",
                     content=f"Agent failed: {str(e)}",
-                    metadata={"error": str(e)}
+                    metadata={"error": str(e), "traceback": traceback.format_exc()}
                 )
                 yield f"data: {json.dumps(error_step.to_dict())}\n\n"
             finally:

@@ -9,10 +9,12 @@ Provides:
 """
 
 from typing import List, Dict, Optional, AsyncGenerator, Any
+import traceback
 from .base import AgentStep, AgentStrategy
 from .simple import SimpleAgent
 from .react import ReActAgent
 from tools.base import Tool, ToolRegistry
+from tools.context import set_tool_context, reset_tool_context
 
 
 class AgentExecutor:
@@ -58,14 +60,33 @@ class AgentExecutor:
             user_input: User's message
             history: Conversation history
             session_id: Optional session ID
-            request_overrides: Optional per-request overrides (e.g. response_format)
+            request_overrides: Optional per-request overrides
 
         Yields:
             AgentStep for each step of execution
         """
         history = history or []
 
+        token = None
         try:
+            agent_mode = None
+            if request_overrides and request_overrides.get("agent_mode") is not None:
+                agent_mode = str(request_overrides.get("agent_mode") or "default").lower()
+
+            shell_unrestricted = False
+            if agent_mode:
+                if agent_mode == "super":
+                    shell_unrestricted = True
+                else:
+                    shell_unrestricted = False
+            elif request_overrides and request_overrides.get("shell_unrestricted") is not None:
+                shell_unrestricted = bool(request_overrides.get("shell_unrestricted"))
+
+            token = set_tool_context({
+                "shell_unrestricted": shell_unrestricted,
+                "agent_mode": agent_mode or "default"
+            })
+
             async for step in self.strategy.execute(
                 user_input=user_input,
                 history=history,
@@ -78,11 +99,15 @@ class AgentExecutor:
 
         except Exception as e:
             # Catch any unhandled errors
+            tb = traceback.format_exc()
             yield AgentStep(
                 step_type="error",
                 content=f"Agent execution failed: {str(e)}",
-                metadata={"error": str(e), "error_type": type(e).__name__}
+                metadata={"error": str(e), "error_type": type(e).__name__, "traceback": tb}
             )
+        finally:
+            if token is not None:
+                reset_tool_context(token)
 
 
 def create_agent_executor(

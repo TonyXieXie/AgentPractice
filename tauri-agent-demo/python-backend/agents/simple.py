@@ -8,6 +8,7 @@ This agent maintains simple conversational behavior:
 """
 
 from typing import List, Dict, Any, AsyncGenerator, Optional
+import traceback
 from .base import AgentStrategy, AgentStep
 from message_processor import message_processor
 
@@ -70,7 +71,7 @@ class SimpleAgent(AgentStrategy):
             tools: Available tools (ignored for simple agent)
             llm_client: LLM client
             session_id: Optional session ID
-            request_overrides: Optional per-request overrides (e.g. response_format)
+            request_overrides: Optional per-request overrides
 
         Yields:
             AgentStep with type "answer" containing LLM response
@@ -114,7 +115,7 @@ class SimpleAgent(AgentStrategy):
             yield AgentStep(
                 step_type="error",
                 content=f"LLM call failed: {str(e)}",
-                metadata={"error": str(e)}
+                metadata={"error": str(e), "traceback": traceback.format_exc()}
             )
 
     def build_prompt(

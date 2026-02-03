@@ -131,6 +131,34 @@ class LLMClient:
                 return f"[Reasoning]\n{reasoning_content}\n\n[Answer]\n{content}"
         return content
 
+    def _coerce_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            for key in ("text", "content", "delta", "value", "reasoning", "thinking"):
+                if key in value:
+                    coerced = self._coerce_text(value.get(key))
+                    if coerced:
+                        return coerced
+            return str(value) if value else ""
+        if isinstance(value, list):
+            parts = [self._coerce_text(item) for item in value]
+            return "".join([part for part in parts if part])
+        return str(value)
+
+    def _extract_reasoning_delta(self, delta: Dict[str, Any]) -> str:
+        for key in ("reasoning", "reasoning_content", "thinking", "thinking_content", "analysis"):
+            if key in delta and delta.get(key) is not None:
+                return self._coerce_text(delta.get(key))
+        delta_type = str(delta.get("type", "") or "").lower()
+        if delta_type in ("thinking", "reasoning", "analysis"):
+            for key in ("content", "text", "delta", "value"):
+                if key in delta and delta.get(key) is not None:
+                    return self._coerce_text(delta.get(key))
+        return ""
+
     def _get_debug_context(self, request_overrides: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not request_overrides:
             return None
@@ -216,8 +244,6 @@ class LLMClient:
             "max_tokens": self.config.max_tokens
         }
         if request_overrides:
-            if request_overrides.get("response_format") is not None:
-                request_payload["response_format"] = request_overrides["response_format"]
             if request_overrides.get("tools") is not None:
                 request_payload["tools"] = request_overrides["tools"]
             if request_overrides.get("tool_choice") is not None:
@@ -279,8 +305,6 @@ class LLMClient:
             "stream": True
         }
         if request_overrides:
-            if request_overrides.get("response_format") is not None:
-                request_payload["response_format"] = request_overrides["response_format"]
             if request_overrides.get("tools") is not None:
                 request_payload["tools"] = request_overrides["tools"]
             if request_overrides.get("tool_choice") is not None:
@@ -316,10 +340,13 @@ class LLMClient:
                             choices = chunk.get("choices") or []
                             if not choices:
                                 continue
-                            delta = choices[0].get("delta", {})
+                            delta = choices[0].get("delta", {}) or {}
+                            delta_type = str(delta.get("type", "") or "").lower()
                             if "content" in delta:
-                                full_text += delta["content"]
-                                yield delta["content"]
+                                text_delta = self._coerce_text(delta.get("content"))
+                                if text_delta and delta_type not in ("thinking", "reasoning", "analysis"):
+                                    full_text += text_delta
+                                    yield text_delta
                         except (json.JSONDecodeError, KeyError):
                             continue
                 if stopped:
@@ -350,8 +377,6 @@ class LLMClient:
             "stream": True
         }
         if request_overrides:
-            if request_overrides.get("response_format") is not None:
-                request_payload["response_format"] = request_overrides["response_format"]
             if request_overrides.get("tools") is not None:
                 request_payload["tools"] = request_overrides["tools"]
             if request_overrides.get("tool_choice") is not None:
@@ -393,12 +418,17 @@ class LLMClient:
                     if not choices:
                         continue
                     delta = choices[0].get("delta", {}) or {}
+                    delta_type = str(delta.get("type", "") or "").lower()
 
                     if "content" in delta:
-                        text_delta = delta.get("content", "")
-                        if text_delta:
+                        text_delta = self._coerce_text(delta.get("content"))
+                        if text_delta and delta_type not in ("thinking", "reasoning", "analysis"):
                             full_text += text_delta
                             yield {"type": "content", "delta": text_delta}
+
+                    reasoning_delta = self._extract_reasoning_delta(delta)
+                    if reasoning_delta:
+                        yield {"type": "reasoning", "delta": reasoning_delta}
 
                     if "tool_calls" in delta:
                         for tool_delta in delta.get("tool_calls", []) or []:
@@ -472,8 +502,6 @@ class LLMClient:
                 request_payload["previous_response_id"] = request_overrides["previous_response_id"]
             if request_overrides.get("instructions") is not None:
                 request_payload["instructions"] = request_overrides["instructions"]
-            if request_overrides.get("response_format") is not None:
-                request_payload["response_format"] = request_overrides["response_format"]
             if request_overrides.get("tools") is not None:
                 request_payload["tools"] = request_overrides["tools"]
             if request_overrides.get("tool_choice") is not None:
@@ -534,8 +562,6 @@ class LLMClient:
                 request_payload["previous_response_id"] = request_overrides["previous_response_id"]
             if request_overrides.get("instructions") is not None:
                 request_payload["instructions"] = request_overrides["instructions"]
-            if request_overrides.get("response_format") is not None:
-                request_payload["response_format"] = request_overrides["response_format"]
             if request_overrides.get("tools") is not None:
                 request_payload["tools"] = request_overrides["tools"]
             if request_overrides.get("tool_choice") is not None:
@@ -614,8 +640,6 @@ class LLMClient:
                 request_payload["previous_response_id"] = request_overrides["previous_response_id"]
             if request_overrides.get("instructions") is not None:
                 request_payload["instructions"] = request_overrides["instructions"]
-            if request_overrides.get("response_format") is not None:
-                request_payload["response_format"] = request_overrides["response_format"]
             if request_overrides.get("tools") is not None:
                 request_payload["tools"] = request_overrides["tools"]
             if request_overrides.get("tool_choice") is not None:
@@ -662,6 +686,12 @@ class LLMClient:
                         if delta:
                             full_text += delta
                             yield {"type": "content", "delta": delta}
+                        continue
+
+                    if event_type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                        delta = event.get("delta", "")
+                        if delta:
+                            yield {"type": "reasoning", "delta": delta}
                         continue
 
                     if event_type == "response.function_call_arguments.delta":
