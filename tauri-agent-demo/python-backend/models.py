@@ -116,6 +116,7 @@ class ToolPermissionRequest(BaseModel):
     tool_name: str
     action: str
     path: str
+    session_id: Optional[str] = None
     reason: Optional[str] = None
     status: str
     created_at: Optional[str] = None

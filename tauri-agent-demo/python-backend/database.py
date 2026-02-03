@@ -181,6 +181,7 @@ class Database:
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS tool_permission_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
                 tool_name TEXT NOT NULL,
                 action TEXT NOT NULL,
                 path TEXT NOT NULL,
@@ -190,6 +191,11 @@ class Database:
                 updated_at TEXT NOT NULL
             )
         ''')
+
+        try:
+            cursor.execute('ALTER TABLE tool_permission_requests ADD COLUMN session_id TEXT')
+        except sqlite3.OperationalError:
+            pass
 
         try:
             cursor.execute('ALTER TABLE llm_calls ADD COLUMN api_profile TEXT')
@@ -644,14 +650,14 @@ class Database:
 
     # ==================== Tool Permission Requests ====================
 
-    def create_permission_request(self, tool_name: str, action: str, path: str, reason: str = None) -> int:
+    def create_permission_request(self, tool_name: str, action: str, path: str, reason: str = None, session_id: str = None) -> int:
         conn = self.get_connection()
         cursor = conn.cursor()
         timestamp = datetime.now().isoformat()
         cursor.execute('''
-            INSERT INTO tool_permission_requests (tool_name, action, path, reason, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (tool_name, action, path, reason, "pending", timestamp, timestamp))
+            INSERT INTO tool_permission_requests (tool_name, action, path, reason, status, created_at, updated_at, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (tool_name, action, path, reason, "pending", timestamp, timestamp, session_id))
         request_id = cursor.lastrowid
         conn.commit()
         conn.close()

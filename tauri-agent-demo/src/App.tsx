@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef } from 'react';
+﻿import { useState, useEffect, useRef, useMemo } from 'react';
 import './App.css';
 import { Message, LLMConfig, LLMCall, ToolPermissionRequest, ReasoningEffort, AgentMode } from './types';
 import {
@@ -40,36 +40,57 @@ const AGENT_MODE_OPTIONS: { value: AgentMode; label: string; description: string
   { value: 'super', label: '超级', description: '允许所有操作' },
 ];
 
+const MAX_CONCURRENT_STREAMS = 10;
+
+type QueueItem = {
+  id: string;
+  message: string;
+  sessionId: string | null;
+  sessionKey: string;
+  configId: string;
+  agentMode: AgentMode;
+  enqueuedAt: number;
+};
+
+type InFlightState = {
+  abortController: AbortController;
+  stopRequested: boolean;
+  activeAssistantId: number | null;
+  tempAssistantId: number;
+  sessionKey: string;
+};
+
 function App() {
   const [inputMsg, setInputMsg] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [currentConfig, setCurrentConfig] = useState<LLMConfig | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [showConfigManager, setShowConfigManager] = useState(false);
-  const [loading, setLoading] = useState(false);
   const [sessionRefreshTrigger, setSessionRefreshTrigger] = useState(0);
-  const [showSidebar, setShowSidebar] = useState(true);
+  const [showSidebar] = useState(true);
   const [allConfigs, setAllConfigs] = useState<LLMConfig[]>([]);
   const [showConfigSelector, setShowConfigSelector] = useState(false);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
   const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
+  const [agentMode, setAgentMode] = useState<AgentMode>('default');
+  const [showReasoningSelector, setShowReasoningSelector] = useState(false);
+  const [showAgentModeSelector, setShowAgentModeSelector] = useState(false);
+  const [queueTick, setQueueTick] = useState(0);
+  const [inFlightTick, setInFlightTick] = useState(0);
+  const [permissionTick, setPermissionTick] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const lastScrollTopRef = useRef(0);
   const inputRef = useRef<HTMLInputElement>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const activeAssistantIdRef = useRef<number | null>(null);
-  const stopRequestedRef = useRef(false);
-  const [pendingPermission, setPendingPermission] = useState<ToolPermissionRequest | null>(null);
-  const [permissionBusy, setPermissionBusy] = useState(false);
-  const [agentMode, setAgentMode] = useState<AgentMode>('default');
-  const [showReasoningSelector, setShowReasoningSelector] = useState(false);
-  const [showAgentModeSelector, setShowAgentModeSelector] = useState(false);
-  const [streamingSessionKey, setStreamingSessionKey] = useState<string | null>(null);
   const messagesCacheRef = useRef<Record<string, Message[]>>({});
   const currentSessionIdRef = useRef<string | null>(null);
-  const streamingSessionKeyRef = useRef<string | null>(null);
+  const queueBySessionRef = useRef<Record<string, QueueItem[]>>({});
+  const inFlightBySessionRef = useRef<Record<string, InFlightState>>({});
+  const pendingPermissionBySessionRef = useRef<Record<string, ToolPermissionRequest | null>>({});
+  const permissionBusyBySessionRef = useRef<Record<string, boolean>>({});
+  const processingQueueRef = useRef(false);
+  const pendingQueueRunRef = useRef(false);
 
   useEffect(() => {
     loadDefaultConfig();
@@ -115,8 +136,11 @@ function App() {
   }, [showDebugPanel, currentSessionId, sessionRefreshTrigger]);
 
   useEffect(() => {
-    if (!loading) {
-      setPendingPermission(null);
+    if (getInFlightCount() === 0) {
+      if (Object.keys(pendingPermissionBySessionRef.current).length > 0) {
+        pendingPermissionBySessionRef.current = {};
+        bumpPermissions();
+      }
       return;
     }
     let cancelled = false;
@@ -127,13 +151,27 @@ function App() {
       inFlight = true;
       try {
         const pending = await getToolPermissions('pending');
-        const shellRequest = pending.find((item) => item.tool_name === 'run_shell') || null;
+        const nextBySession: Record<string, ToolPermissionRequest | null> = {};
+        const inFlightKeys = Object.keys(inFlightBySessionRef.current);
+        const fallbackKey = inFlightKeys.length === 1 ? inFlightKeys[0] : null;
+
+        for (const item of pending) {
+          if (item.tool_name !== 'run_shell') continue;
+          const sessionKey = item.session_id ? getSessionKey(item.session_id) : fallbackKey;
+          if (!sessionKey) continue;
+          if (!nextBySession[sessionKey]) {
+            nextBySession[sessionKey] = item;
+          }
+        }
+
         if (!cancelled) {
-          setPendingPermission(shellRequest);
+          pendingPermissionBySessionRef.current = nextBySession;
+          bumpPermissions();
         }
       } catch (error) {
         if (!cancelled) {
-          setPendingPermission(null);
+          pendingPermissionBySessionRef.current = {};
+          bumpPermissions();
         }
       } finally {
         inFlight = false;
@@ -146,7 +184,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [loading]);
+  }, [inFlightTick]);
 
   const loadDefaultConfig = async () => {
     try {
@@ -171,6 +209,34 @@ function App() {
 
   const getCurrentSessionKey = () => getSessionKey(currentSessionIdRef.current);
 
+  const bumpQueue = () => setQueueTick((prev) => prev + 1);
+  const bumpInFlight = () => setInFlightTick((prev) => prev + 1);
+  const bumpPermissions = () => setPermissionTick((prev) => prev + 1);
+
+  const getInFlightCount = () => Object.keys(inFlightBySessionRef.current).length;
+
+  const getSessionQueue = (sessionKey: string) => queueBySessionRef.current[sessionKey] || [];
+
+  const setSessionQueue = (sessionKey: string, next: QueueItem[]) => {
+    if (next.length > 0) {
+      queueBySessionRef.current[sessionKey] = next;
+    } else {
+      delete queueBySessionRef.current[sessionKey];
+    }
+    bumpQueue();
+  };
+
+  const enqueueSessionQueue = (sessionKey: string, item: QueueItem) => {
+    const queue = getSessionQueue(sessionKey);
+    setSessionQueue(sessionKey, [...queue, item]);
+  };
+
+  const removeSessionQueueItem = (sessionKey: string, itemId: string) => {
+    const queue = getSessionQueue(sessionKey);
+    const next = queue.filter((item) => item.id !== itemId);
+    setSessionQueue(sessionKey, next);
+  };
+
   const setSessionMessages = (sessionKey: string, next: Message[]) => {
     messagesCacheRef.current[sessionKey] = next;
     if (sessionKey === getCurrentSessionKey()) {
@@ -193,65 +259,64 @@ function App() {
     messagesCacheRef.current[key] = messages;
   };
 
-  const refreshSessionDebug = async (sessionId: string) => {
-    try {
-      const calls = await getSessionLLMCalls(sessionId);
-      setLlmCalls(calls);
-    } catch (error) {
-      console.error('Failed to load LLM calls:', error);
+  const migrateSessionKey = (fromKey: string, toKey: string) => {
+    if (!fromKey || !toKey || fromKey === toKey) return;
+
+    const cached = messagesCacheRef.current[fromKey];
+    if (cached) {
+      if (!messagesCacheRef.current[toKey]) {
+        messagesCacheRef.current[toKey] = cached;
+      } else {
+        messagesCacheRef.current[toKey] = [...messagesCacheRef.current[toKey], ...cached];
+      }
+      delete messagesCacheRef.current[fromKey];
+    }
+
+    const queued = queueBySessionRef.current[fromKey];
+    if (queued && queued.length > 0) {
+      const updatedQueue = queued.map((item) => ({
+        ...item,
+        sessionId: toKey,
+        sessionKey: toKey,
+      }));
+      const existing = queueBySessionRef.current[toKey] || [];
+      queueBySessionRef.current[toKey] = [...existing, ...updatedQueue];
+      delete queueBySessionRef.current[fromKey];
+      bumpQueue();
+    }
+
+    const inflight = inFlightBySessionRef.current[fromKey];
+    if (inflight) {
+      inFlightBySessionRef.current[toKey] = { ...inflight, sessionKey: toKey };
+      delete inFlightBySessionRef.current[fromKey];
+      bumpInFlight();
+    }
+
+    const pending = pendingPermissionBySessionRef.current[fromKey];
+    if (pending) {
+      pendingPermissionBySessionRef.current[toKey] = pending;
+      delete pendingPermissionBySessionRef.current[fromKey];
+      bumpPermissions();
+    }
+
+    if (fromKey in permissionBusyBySessionRef.current) {
+      permissionBusyBySessionRef.current[toKey] = permissionBusyBySessionRef.current[fromKey];
+      delete permissionBusyBySessionRef.current[fromKey];
+      bumpPermissions();
     }
   };
 
-  const handleSwitchConfig = async (configId: string) => {
-    try {
-      const config = await getConfig(configId);
-      setCurrentConfig(config);
-      setShowConfigSelector(false);
-    } catch (error) {
-      console.error('Failed to switch config:', error);
-      alert('Failed to switch config.');
-    }
-  };
-
-  const handleReasoningChange = async (value: ReasoningEffort) => {
-    if (!currentConfig) return;
-    try {
-      const updated = await updateConfig(currentConfig.id, { reasoning_effort: value });
-      setCurrentConfig(updated);
-      setAllConfigs((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
-      setShowReasoningSelector(false);
-    } catch (error) {
-      console.error('Failed to update reasoning:', error);
-      alert('Failed to update reasoning.');
-    }
-  };
-
-  const handleSend = async () => {
-    if (!inputMsg.trim() || loading) return;
-    if (!currentConfig) {
-      alert('Please configure an LLM first.');
-      return;
-    }
-    autoScrollRef.current = true;
-
-    const userMessage = inputMsg.trim();
-    setInputMsg('');
-    setLoading(true);
-    stopRequestedRef.current = false;
-    activeAssistantIdRef.current = null;
-    const abortController = new AbortController();
-    abortControllerRef.current = abortController;
-
-    const targetSessionId = currentSessionId;
-    stashCurrentMessages();
-    const sessionKey = getSessionKey(targetSessionId);
-    let activeSessionKey = sessionKey;
-    streamingSessionKeyRef.current = sessionKey;
-    setStreamingSessionKey(sessionKey);
-
-    const tempUserId = Date.now();
-    const tempAssistantId = tempUserId + 1;
-    let currentUserId = tempUserId;
+  const runStreamForItem = async (
+    item: QueueItem,
+    startSessionKey: string,
+    tempUserId: number,
+    tempAssistantId: number,
+    abortController: AbortController
+  ) => {
+    const userMessage = item.message;
+    const targetSessionId = item.sessionId;
+    let activeSessionKey = startSessionKey;
+    let newSessionId = targetSessionId;
     let currentAssistantId = tempAssistantId;
 
     const tempUserMsg: Message = {
@@ -273,41 +338,41 @@ function App() {
         agent_streaming: true,
         agent_answer_buffers: {},
         agent_thought_buffers: {},
-        agent_action_buffers: {}
+        agent_action_buffers: {},
       }
     };
 
-    updateSessionMessages(sessionKey, (prev) => [...prev, tempUserMsg, tempAssistantMsg]);
+    updateSessionMessages(activeSessionKey, (prev) => [...prev, tempUserMsg, tempAssistantMsg]);
 
     try {
       const streamGenerator = sendMessageAgentStream(
         {
           message: userMessage,
           session_id: targetSessionId || undefined,
-          config_id: currentConfig.id,
-          agent_mode: agentMode,
+          config_id: item.configId,
+          agent_mode: item.agentMode,
         },
         abortController.signal
       );
 
-      let newSessionId = targetSessionId;
-
       for await (const chunk of streamGenerator) {
-        if (stopRequestedRef.current && !('session_id' in chunk)) {
+        const inflightState = inFlightBySessionRef.current[activeSessionKey];
+        if (inflightState?.stopRequested && !('session_id' in chunk)) {
           continue;
         }
+
         if ('session_id' in chunk && typeof chunk.session_id === 'string') {
           newSessionId = chunk.session_id;
           const incomingUserId = (chunk as any).user_message_id;
           const incomingAssistantId = (chunk as any).assistant_message_id;
-          if (typeof incomingUserId === 'number') {
-            currentUserId = incomingUserId;
-          }
           if (typeof incomingAssistantId === 'number') {
             currentAssistantId = incomingAssistantId;
-            activeAssistantIdRef.current = incomingAssistantId;
-            if (stopRequestedRef.current) {
-              stopAgentStream(incomingAssistantId).catch(() => undefined);
+            const currentState = inFlightBySessionRef.current[activeSessionKey];
+            if (currentState) {
+              currentState.activeAssistantId = incomingAssistantId;
+              if (currentState.stopRequested) {
+                stopAgentStream(incomingAssistantId).catch(() => undefined);
+              }
             }
           }
           if (incomingUserId || incomingAssistantId) {
@@ -326,22 +391,16 @@ function App() {
               })
             );
           }
-          if (!targetSessionId) {
+          if (!targetSessionId && newSessionId && currentSessionIdRef.current === null) {
             currentSessionIdRef.current = newSessionId;
             setCurrentSessionId(newSessionId);
             setSessionRefreshTrigger((prev) => prev + 1);
           }
           if (activeSessionKey === DRAFT_SESSION_KEY && newSessionId) {
-            const cached = messagesCacheRef.current[activeSessionKey] || [];
-            delete messagesCacheRef.current[activeSessionKey];
-            messagesCacheRef.current[newSessionId] = cached;
+            migrateSessionKey(activeSessionKey, newSessionId);
             activeSessionKey = newSessionId;
-            streamingSessionKeyRef.current = newSessionId;
-            setStreamingSessionKey(newSessionId);
           } else if (newSessionId) {
             activeSessionKey = newSessionId;
-            streamingSessionKeyRef.current = newSessionId;
-            setStreamingSessionKey(newSessionId);
           }
           continue;
         }
@@ -526,13 +585,14 @@ function App() {
         await refreshSessionDebug(newSessionId);
       }
     } catch (error: any) {
-      if (error?.name === 'AbortError' || stopRequestedRef.current) {
+      const stopped = inFlightBySessionRef.current[activeSessionKey]?.stopRequested;
+      if (error?.name === 'AbortError' || stopped) {
         // User stopped streaming
       } else {
         console.error('Failed to send message:', error);
         const errorMsg: Message = {
           id: Date.now() + 2,
-          session_id: targetSessionId || '',
+          session_id: newSessionId || targetSessionId || '',
           role: 'assistant',
           content: `Chat error: ${error.message || 'Please check whether the backend is running.'}`,
           timestamp: new Date().toISOString(),
@@ -540,11 +600,131 @@ function App() {
         updateSessionMessages(activeSessionKey, (prev) => [...prev.filter((m) => m.id !== currentAssistantId), errorMsg]);
       }
     } finally {
-      setLoading(false);
-      abortControllerRef.current = null;
-      streamingSessionKeyRef.current = null;
-      setStreamingSessionKey(null);
+      delete inFlightBySessionRef.current[activeSessionKey];
+      bumpInFlight();
+      processQueues();
     }
+  };
+
+  const startStreamForItem = (item: QueueItem, sessionKey: string) => {
+    if (inFlightBySessionRef.current[sessionKey]) return;
+    const tempBase = Date.now() + Math.floor(Math.random() * 1000);
+    const tempUserId = -tempBase;
+    const tempAssistantId = -(tempBase + 1);
+    const abortController = new AbortController();
+    inFlightBySessionRef.current[sessionKey] = {
+      abortController,
+      stopRequested: false,
+      activeAssistantId: null,
+      tempAssistantId,
+      sessionKey,
+    };
+    bumpInFlight();
+    void runStreamForItem(item, sessionKey, tempUserId, tempAssistantId, abortController);
+  };
+
+  const processQueues = () => {
+    if (processingQueueRef.current) {
+      pendingQueueRunRef.current = true;
+      return;
+    }
+    processingQueueRef.current = true;
+    try {
+      let available = MAX_CONCURRENT_STREAMS - getInFlightCount();
+      if (available <= 0) return;
+
+      const candidates = Object.entries(queueBySessionRef.current)
+        .filter(([sessionKey, queue]) => queue.length > 0 && !inFlightBySessionRef.current[sessionKey])
+        .map(([sessionKey, queue]) => ({ sessionKey, item: queue[0] }))
+        .sort((a, b) => a.item.enqueuedAt - b.item.enqueuedAt);
+
+      for (const candidate of candidates) {
+        if (available <= 0) break;
+        const queue = queueBySessionRef.current[candidate.sessionKey] || [];
+        if (!queue.length || queue[0].id !== candidate.item.id) continue;
+        const nextQueue = queue.slice(1);
+        if (nextQueue.length > 0) {
+          queueBySessionRef.current[candidate.sessionKey] = nextQueue;
+        } else {
+          delete queueBySessionRef.current[candidate.sessionKey];
+        }
+        bumpQueue();
+        startStreamForItem(candidate.item, candidate.sessionKey);
+        available -= 1;
+      }
+    } finally {
+      processingQueueRef.current = false;
+      if (pendingQueueRunRef.current) {
+        pendingQueueRunRef.current = false;
+        processQueues();
+      }
+    }
+  };
+
+  const refreshSessionDebug = async (sessionId: string) => {
+    try {
+      const calls = await getSessionLLMCalls(sessionId);
+      setLlmCalls(calls);
+    } catch (error) {
+      console.error('Failed to load LLM calls:', error);
+    }
+  };
+
+  const handleSwitchConfig = async (configId: string) => {
+    try {
+      const config = await getConfig(configId);
+      setCurrentConfig(config);
+      setShowConfigSelector(false);
+    } catch (error) {
+      console.error('Failed to switch config:', error);
+      alert('Failed to switch config.');
+    }
+  };
+
+  const handleReasoningChange = async (value: ReasoningEffort) => {
+    if (!currentConfig) return;
+    try {
+      const updated = await updateConfig(currentConfig.id, { reasoning_effort: value });
+      setCurrentConfig(updated);
+      setAllConfigs((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+      setShowReasoningSelector(false);
+    } catch (error) {
+      console.error('Failed to update reasoning:', error);
+      alert('Failed to update reasoning.');
+    }
+  };
+
+  const handleSend = () => {
+    if (!inputMsg.trim()) return;
+    if (!currentConfig) {
+      alert('Please configure an LLM first.');
+      return;
+    }
+    autoScrollRef.current = true;
+
+    const userMessage = inputMsg.trim();
+    setInputMsg('');
+
+    const targetSessionId = currentSessionIdRef.current;
+    const sessionKey = getSessionKey(targetSessionId);
+    const queueItem: QueueItem = {
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      message: userMessage,
+      sessionId: targetSessionId,
+      sessionKey,
+      configId: currentConfig.id,
+      agentMode,
+      enqueuedAt: Date.now(),
+    };
+
+    enqueueSessionQueue(sessionKey, queueItem);
+    processQueues();
+  };
+
+  const handleRemoveQueuedItem = (itemId: string) => {
+    const sessionKey = getCurrentSessionKey();
+    removeSessionQueueItem(sessionKey, itemId);
+    processQueues();
   };
 
   const applyStopNoteToMessage = (msg: Message) => {
@@ -586,17 +766,20 @@ function App() {
   };
 
   const handleStop = async () => {
-    if (!loading) return;
-    stopRequestedRef.current = true;
-    let assistantId = activeAssistantIdRef.current;
-    if (assistantId) {
+    const sessionKey = getCurrentSessionKey();
+    const inflight = inFlightBySessionRef.current[sessionKey];
+    if (!inflight) return;
+    inflight.stopRequested = true;
+    const activeAssistantId = inflight.activeAssistantId;
+    let assistantId = activeAssistantId ?? inflight.tempAssistantId;
+    if (activeAssistantId) {
       try {
-        await stopAgentStream(assistantId);
+        await stopAgentStream(activeAssistantId);
       } catch (error) {
         console.error('Failed to stop stream:', error);
       }
     }
-    updateSessionMessages(getCurrentSessionKey(), (prev) => {
+    updateSessionMessages(sessionKey, (prev) => {
       if (!assistantId) {
         const lastAssistant = [...prev].reverse().find((msg) => msg.role === 'assistant');
         assistantId = lastAssistant?.id ?? null;
@@ -604,22 +787,25 @@ function App() {
       if (!assistantId) return prev;
       return prev.map((msg) => (msg.id === assistantId ? applyStopNoteToMessage(msg) : msg));
     });
-    setLoading(false);
-    streamingSessionKeyRef.current = null;
-    setStreamingSessionKey(null);
   };
 
   const handlePermissionDecision = async (status: 'approved' | 'denied') => {
-    if (!pendingPermission || permissionBusy) return;
-    setPermissionBusy(true);
+    const sessionKey = getCurrentSessionKey();
+    const pending = pendingPermissionBySessionRef.current[sessionKey];
+    if (!pending || permissionBusyBySessionRef.current[sessionKey]) return;
+    permissionBusyBySessionRef.current[sessionKey] = true;
+    bumpPermissions();
     try {
-      await updateToolPermission(pendingPermission.id, status);
-      setPendingPermission(null);
+      await updateToolPermission(pending.id, status);
+      if (pendingPermissionBySessionRef.current[sessionKey]?.id === pending.id) {
+        delete pendingPermissionBySessionRef.current[sessionKey];
+      }
     } catch (error) {
       console.error('Failed to update permission:', error);
       alert('权限更新失败');
     } finally {
-      setPermissionBusy(false);
+      permissionBusyBySessionRef.current[sessionKey] = false;
+      bumpPermissions();
     }
   };
 
@@ -632,11 +818,12 @@ function App() {
       setShowConfigSelector(false);
       setShowReasoningSelector(false);
 
-      const cached = messagesCacheRef.current[sessionId];
-      const isStreamingSession = streamingSessionKeyRef.current === sessionId;
+      const sessionKey = getSessionKey(sessionId);
+      const cached = messagesCacheRef.current[sessionKey];
+      const isStreamingSession = Boolean(inFlightBySessionRef.current[sessionKey]);
       const hasStreaming = Boolean(cached?.some((msg) => msg.metadata?.agent_streaming));
       if (cached && (isStreamingSession || hasStreaming)) {
-        setSessionMessages(sessionId, cached);
+        setSessionMessages(sessionKey, cached);
       }
 
       const [session, calls] = await Promise.all([
@@ -668,7 +855,7 @@ function App() {
           };
         });
 
-        setSessionMessages(sessionId, hydratedMessages);
+        setSessionMessages(sessionKey, hydratedMessages);
       }
 
       const config = await getConfig(session.config_id);
@@ -690,7 +877,8 @@ function App() {
 
   const handleRollback = async (messageId: number) => {
     if (!currentSessionId) return;
-    if (loading) {
+    const currentKey = getCurrentSessionKey();
+    if (inFlightBySessionRef.current[currentKey]) {
       alert('请先停止当前输出再回撤。');
       return;
     }
@@ -727,7 +915,22 @@ function App() {
   const latestAssistantId =
     [...messages].reverse().find((msg) => msg.role === 'assistant')?.id ?? null;
   const currentSessionKey = getSessionKey(currentSessionId);
-  const isStreamingCurrent = Boolean(loading && streamingSessionKey === currentSessionKey);
+  const isStreamingCurrent = useMemo(
+    () => Boolean(inFlightBySessionRef.current[currentSessionKey]),
+    [currentSessionKey, inFlightTick]
+  );
+  const currentSessionQueue = useMemo(
+    () => getSessionQueue(currentSessionKey),
+    [currentSessionKey, queueTick]
+  );
+  const currentPendingPermission = useMemo(
+    () => pendingPermissionBySessionRef.current[currentSessionKey] || null,
+    [currentSessionKey, permissionTick]
+  );
+  const currentPermissionBusy = useMemo(
+    () => Boolean(permissionBusyBySessionRef.current[currentSessionKey]),
+    [currentSessionKey, permissionTick]
+  );
   const currentReasoning = (currentConfig?.reasoning_effort || 'medium') as ReasoningEffort;
 
   return (
@@ -737,77 +940,15 @@ function App() {
           currentSessionId={currentSessionId}
           onSelectSession={handleSelectSession}
           onNewChat={handleNewChat}
+          onOpenConfig={() => setShowConfigManager(true)}
+          onToggleDebug={() => setShowDebugPanel((prev) => !prev)}
+          debugActive={showDebugPanel}
           refreshTrigger={sessionRefreshTrigger}
         />
       )}
 
       <div className="main-content">
         <div className="chat-container">
-          <div className="chat-header">
-            <div className="header-left">
-              <button
-                className="sidebar-toggle"
-                onClick={() => setShowSidebar(!showSidebar)}
-                title={showSidebar ? 'Hide sidebar' : 'Show sidebar'}
-              >
-                {showSidebar ? '<' : '>'}
-              </button>
-              <h1>Agent Desktop Demo</h1>
-            </div>
-
-            <div className="header-right">
-              <button
-                className="header-btn"
-                onClick={() => setShowConfigManager(true)}
-                title="Manage configs"
-                aria-label="Manage configs"
-              >
-                <svg
-                  className="header-icon"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
-                >
-                  <line x1="4" y1="6" x2="20" y2="6" />
-                  <line x1="4" y1="12" x2="20" y2="12" />
-                  <line x1="4" y1="18" x2="20" y2="18" />
-                  <circle cx="9" cy="6" r="2" />
-                  <circle cx="15" cy="12" r="2" />
-                  <circle cx="11" cy="18" r="2" />
-                </svg>
-              </button>
-
-              <button
-                className={`header-btn ${showDebugPanel ? 'active' : ''}`}
-                onClick={() => setShowDebugPanel(!showDebugPanel)}
-                title="Debug"
-                aria-label="Debug"
-              >
-                <svg
-                  className="header-icon"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
-                >
-                  <rect x="9" y="9" width="6" height="8" rx="2" />
-                  <path d="M8 9h8V6H8z" />
-                  <path d="M4 13h4" />
-                  <path d="M16 13h4" />
-                  <path d="M6 7L4 5" />
-                  <path d="M18 7l2-2" />
-                </svg>
-              </button>
-            </div>
-          </div>
-
           <div className="messages" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
             {messages.length === 0 ? (
               <div className="welcome-message">
@@ -819,7 +960,7 @@ function App() {
               messages.map((msg) => {
                 const steps = (msg.metadata?.agent_steps || []) as AgentStep[];
                 const streaming = Boolean(msg.metadata?.agent_streaming);
-                const showPermission = Boolean(pendingPermission && msg.id === latestAssistantId);
+                const showPermission = Boolean(currentPendingPermission && msg.id === latestAssistantId);
                 return (
                   <div key={msg.id} className={`message ${msg.role}`}>
                     <div className="message-content">
@@ -827,9 +968,9 @@ function App() {
                         <AgentStepView
                           steps={steps}
                           streaming={streaming}
-                          pendingPermission={showPermission ? pendingPermission : null}
+                          pendingPermission={showPermission ? currentPendingPermission : null}
                           onPermissionDecision={handlePermissionDecision}
-                          permissionBusy={permissionBusy}
+                          permissionBusy={currentPermissionBusy}
                         />
                       ) : msg.role === 'user' ? (
                         <>
@@ -884,9 +1025,34 @@ function App() {
               onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
               value={inputMsg}
               placeholder={currentConfig ? 'Type a message...' : 'Please configure an LLM'}
-              disabled={!currentConfig || loading}
+              disabled={!currentConfig}
               ref={inputRef}
             />
+
+            {currentSessionQueue.length > 0 && (
+              <div className="queue-panel">
+                <div className="queue-header">
+                  <span>排队消息</span>
+                  <span className="queue-count">{currentSessionQueue.length}</span>
+                </div>
+                <div className="queue-list">
+                  {currentSessionQueue.map((item) => (
+                    <div key={item.id} className="queue-item">
+                      <span className="queue-text">{item.message}</span>
+                      <button
+                        type="button"
+                        className="queue-remove"
+                        onClick={() => handleRemoveQueuedItem(item.id)}
+                        aria-label="删除排队消息"
+                        title="删除排队消息"
+                      >
+                        删除
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div className="input-footer">
               {currentConfig && (
@@ -935,7 +1101,7 @@ function App() {
                         e.stopPropagation();
                         setShowAgentModeSelector(!showAgentModeSelector);
                       }}
-                      disabled={!currentConfig || loading}
+                      disabled={!currentConfig}
                       aria-label={`Agent mode: ${agentMode}`}
                       title={`Agent模式: ${agentMode}`}
                     >
@@ -973,7 +1139,7 @@ function App() {
                         e.stopPropagation();
                         setShowReasoningSelector(!showReasoningSelector);
                       }}
-                      disabled={!currentConfig || loading}
+                      disabled={!currentConfig}
                       aria-label={`Reasoning: ${currentReasoning}`}
                       title={`Reasoning: ${currentReasoning}`}
                     >
@@ -1006,11 +1172,11 @@ function App() {
                   type="button"
                   className="send-btn"
                   onClick={handleSend}
-                  disabled={!currentConfig || loading || !inputMsg.trim()}
+                  disabled={!currentConfig || !inputMsg.trim()}
                   aria-label="Send"
                   title="Send"
                 >
-                  {loading ? (
+                  {isStreamingCurrent ? (
                     <span className="send-spinner" aria-hidden="true" />
                   ) : (
                     <svg className="send-icon" viewBox="0 0 24 24" aria-hidden="true">

@@ -106,6 +106,7 @@ export interface ToolPermissionRequest {
     tool_name: string;
     action: string;
     path: string;
+    session_id?: string | null;
     reason?: string | null;
     status: string;
     created_at?: string | null;

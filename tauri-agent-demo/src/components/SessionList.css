@@ -13,29 +13,21 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 8px;
 }
 
-.session-list-header h3 {
-    margin: 0;
-    color: #fff;
-    font-size: 1.1rem;
+.session-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 
 .new-chat-btn {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    color: white;
-    border: none;
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-    cursor: pointer;
-    font-size: 1rem;
-    transition: all 0.2s;
+    flex-shrink: 0;
 }
 
 .new-chat-btn:hover {
-    transform: scale(1.1);
-    box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+    transform: translateY(-1px);
 }
 
 .sessions-container {

@@ -84,7 +84,8 @@ class AgentExecutor:
 
             token = set_tool_context({
                 "shell_unrestricted": shell_unrestricted,
-                "agent_mode": agent_mode or "default"
+                "agent_mode": agent_mode or "default",
+                "session_id": session_id
             })
 
             async for step in self.strategy.execute(

@@ -8,6 +8,9 @@ interface SessionListProps {
     currentSessionId: string | null;
     onSelectSession: (sessionId: string) => void;
     onNewChat: () => void;
+    onOpenConfig: () => void;
+    onToggleDebug: () => void;
+    debugActive: boolean;
     refreshTrigger?: number;
 }
 
@@ -15,6 +18,9 @@ export default function SessionList({
     currentSessionId,
     onSelectSession,
     onNewChat,
+    onOpenConfig,
+    onToggleDebug,
+    debugActive,
     refreshTrigger
 }: SessionListProps) {
     const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -91,10 +97,71 @@ export default function SessionList({
     return (
         <div className="session-list">
             <div className="session-list-header">
-                <h3>💬 对话历史</h3>
-                <button className="new-chat-btn" onClick={onNewChat} title="新建对话">
-                    ➕
+                <button className="header-btn new-chat-btn" onClick={onNewChat} title="新建对话" aria-label="新建对话">
+                    <svg
+                        className="header-icon"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                    >
+                        <path d="M12 5v14" />
+                        <path d="M5 12h14" />
+                    </svg>
                 </button>
+                <div className="session-header-actions">
+                    <button
+                        className="header-btn"
+                        onClick={onOpenConfig}
+                        title="Manage configs"
+                        aria-label="Manage configs"
+                    >
+                        <svg
+                            className="header-icon"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                        >
+                            <line x1="4" y1="6" x2="20" y2="6" />
+                            <line x1="4" y1="12" x2="20" y2="12" />
+                            <line x1="4" y1="18" x2="20" y2="18" />
+                            <circle cx="9" cy="6" r="2" />
+                            <circle cx="15" cy="12" r="2" />
+                            <circle cx="11" cy="18" r="2" />
+                        </svg>
+                    </button>
+                    <button
+                        className={`header-btn ${debugActive ? 'active' : ''}`}
+                        onClick={onToggleDebug}
+                        title="Debug"
+                        aria-label="Debug"
+                    >
+                        <svg
+                            className="header-icon"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                        >
+                            <rect x="9" y="9" width="6" height="8" rx="2" />
+                            <path d="M8 9h8V6H8z" />
+                            <path d="M4 13h4" />
+                            <path d="M16 13h4" />
+                            <path d="M6 7L4 5" />
+                            <path d="M18 7l2-2" />
+                        </svg>
+                    </button>
+                </div>
             </div>
 
             <div className="sessions-container">

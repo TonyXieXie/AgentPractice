@@ -108,26 +108,191 @@ class ReActAgent(AgentStrategy):
             openai_tools = [tool_to_openai_function(t) for t in tools] if tools else []
 
         response_input = self._build_responses_input(messages)
+        max_no_answer_attempts = 3
 
         for iteration in range(self.max_iterations):
-            llm_overrides = dict(request_overrides) if request_overrides else {}
-            if openai_tools:
-                llm_overrides.setdefault("tools", openai_tools)
-                if openai_format != "openai_responses":
-                    llm_overrides.setdefault("tool_choice", "auto")
+            no_answer_attempts = 0
+            while True:
+                llm_overrides = dict(request_overrides) if request_overrides else {}
+                if openai_tools:
+                    llm_overrides.setdefault("tools", openai_tools)
+                    if openai_format != "openai_responses":
+                        llm_overrides.setdefault("tool_choice", "auto")
 
-            debug_ctx = self._merge_debug_context(session_id, request_overrides, "react", iteration)
-            if debug_ctx:
-                llm_overrides["_debug"] = debug_ctx
+                debug_ctx = self._merge_debug_context(session_id, request_overrides, "react", iteration)
+                if debug_ctx:
+                    llm_overrides["_debug"] = debug_ctx
 
-            if openai_format == "openai_responses":
-                llm_overrides["input"] = response_input
+                if openai_format == "openai_responses":
+                    llm_overrides["input"] = response_input
 
-            if openai_format == "openai_responses":
+                    content_buffer = ""
+                    reasoning_buffer = ""
+                    tool_calls = []
+                    response_output_items: List[Dict[str, Any]] = []
+                    thought_stream_key = f"assistant_content_{iteration}"
+                    reasoning_stream_key = f"assistant_reasoning_{iteration}"
+                    stream_mode = "answer"
+                    stopped = False
+
+                    async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
+                        event_type = event.get("type")
+                        if event_type == "content":
+                            delta = event.get("delta", "")
+                            if delta:
+                                content_buffer += delta
+                                step_type = "answer_delta" if stream_mode == "answer" else "thought_delta"
+                                yield AgentStep(
+                                    step_type=step_type,
+                                    content=delta,
+                                    metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                                )
+                        elif event_type == "reasoning":
+                            delta = event.get("delta", "")
+                            if delta:
+                                reasoning_buffer += delta
+                                yield AgentStep(
+                                    step_type="thought_delta",
+                                    content=delta,
+                                    metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
+                                )
+                        elif event_type == "tool_call_delta":
+                            if stream_mode != "thought":
+                                stream_mode = "thought"
+                            call_index = event.get("index", 0)
+                            call_key = f"tool-{iteration}-{call_index}"
+                            tool_name = event.get("name") or ""
+                            args_delta = event.get("arguments_delta", "")
+                            if args_delta or tool_name:
+                                yield AgentStep(
+                                    step_type="action_delta",
+                                    content=args_delta,
+                                    metadata={
+                                        "iteration": iteration,
+                                        "stream_key": call_key,
+                                        "tool": tool_name,
+                                        "call_index": call_index
+                                    }
+                                )
+                        elif event_type == "done":
+                            content_buffer = event.get("content", "") or ""
+                            tool_calls = event.get("tool_calls", []) or []
+                            response_obj = event.get("response") or {}
+                            if isinstance(response_obj, dict):
+                                response_output_items = response_obj.get("output", []) or []
+                            stopped = bool(event.get("stopped"))
+
+                    llm_call_id = None
+                    if llm_overrides.get("_debug"):
+                        llm_call_id = llm_overrides.get("_debug", {}).get("llm_call_id")
+
+                    if stopped:
+                        stopped_text = self._append_stop_note(content_buffer)
+                        if llm_call_id:
+                            self._update_llm_processed(llm_call_id, {
+                                "stopped_by_user": True,
+                                "content": stopped_text
+                            })
+                        yield AgentStep(
+                            step_type="answer",
+                            content=stopped_text,
+                            metadata={"agent_type": "react", "iterations": iteration + 1, "stopped_by_user": True}
+                        )
+                        return
+
+                    output_items = response_output_items
+                    if not output_items:
+                        synthetic_items: List[Dict[str, Any]] = []
+                        if content_buffer.strip():
+                            synthetic_items.append({
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": content_buffer}]
+                            })
+                        for idx, call in enumerate(tool_calls):
+                            call_id = call.get("call_id") or call.get("id") or f"call_{iteration}_{idx}"
+                            call["call_id"] = call_id
+                            synthetic_items.append({
+                                "type": "function_call",
+                                "call_id": call_id,
+                                "name": call.get("name", ""),
+                                "arguments": call.get("arguments", "")
+                            })
+                        output_items = synthetic_items
+
+                    if tool_calls:
+                        if output_items:
+                            response_input += output_items
+                        if llm_call_id:
+                            self._update_llm_processed(llm_call_id, {
+                                "tool_calls": tool_calls,
+                                "content": content_buffer
+                            })
+                        if reasoning_buffer.strip():
+                            yield AgentStep(
+                                step_type="thought",
+                                content=reasoning_buffer,
+                                metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
+                            )
+                        if content_buffer.strip():
+                            yield AgentStep(
+                                step_type="thought",
+                                content=content_buffer,
+                                metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                            )
+
+                        for call_index, call in enumerate(tool_calls):
+                            call_index = call.get("index", call_index)
+                            tool_name = call.get("name")
+                            call_id = call.get("call_id") or call.get("id") or f"call_{iteration}_{call_index}"
+                            args_text = call.get("arguments", "")
+                            call_key = f"tool-{iteration}-{call_index}"
+
+                            tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
+                            yield AgentStep(
+                                step_type="action",
+                                content=f"{tool_name}[{tool_input}]",
+                                metadata={"tool": tool_name, "input": tool_input, "iteration": iteration, "stream_key": call_key}
+                            )
+                            tool_output = error_msg if error_msg else await self._execute_tool(tool, tool_input) if tool else f"Tool not found: '{tool_name}'"
+                            yield AgentStep(
+                                step_type="observation",
+                                content=tool_output,
+                                metadata={"tool": tool_name, "iteration": iteration}
+                            )
+
+                            response_input.append({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": tool_output
+                            })
+
+                        break
+
+                    if llm_call_id:
+                        self._update_llm_processed(llm_call_id, {"final_answer": content_buffer})
+
+                    if content_buffer.strip():
+                        yield AgentStep(
+                            step_type="answer",
+                            content=content_buffer,
+                            metadata={"agent_type": "react", "iterations": iteration + 1, "stream_key": thought_stream_key}
+                        )
+                        return
+
+                    no_answer_attempts += 1
+                    if no_answer_attempts >= max_no_answer_attempts:
+                        yield AgentStep(
+                            step_type="error",
+                            content="LLM returned no content.",
+                            metadata={"iteration": iteration}
+                        )
+                        return
+                    continue
+
                 content_buffer = ""
                 reasoning_buffer = ""
                 tool_calls = []
-                response_output_items: List[Dict[str, Any]] = []
                 thought_stream_key = f"assistant_content_{iteration}"
                 reasoning_stream_key = f"assistant_reasoning_{iteration}"
                 stream_mode = "answer"
@@ -175,9 +340,6 @@ class ReActAgent(AgentStrategy):
                     elif event_type == "done":
                         content_buffer = event.get("content", "") or ""
                         tool_calls = event.get("tool_calls", []) or []
-                        response_obj = event.get("response") or {}
-                        if isinstance(response_obj, dict):
-                            response_output_items = response_obj.get("output", []) or []
                         stopped = bool(event.get("stopped"))
 
                 llm_call_id = None
@@ -198,41 +360,20 @@ class ReActAgent(AgentStrategy):
                     )
                     return
 
-                output_items = response_output_items
-                if not output_items:
-                    synthetic_items: List[Dict[str, Any]] = []
-                    if content_buffer.strip():
-                        synthetic_items.append({
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": content_buffer}]
-                        })
-                    for idx, call in enumerate(tool_calls):
-                        call_id = call.get("call_id") or call.get("id") or f"call_{iteration}_{idx}"
-                        call["call_id"] = call_id
-                        synthetic_items.append({
-                            "type": "function_call",
-                            "call_id": call_id,
-                            "name": call.get("name", ""),
-                            "arguments": call.get("arguments", "")
-                        })
-                    output_items = synthetic_items
-
-                if output_items:
-                    response_input += output_items
-
                 if tool_calls:
                     if llm_call_id:
                         self._update_llm_processed(llm_call_id, {
                             "tool_calls": tool_calls,
                             "content": content_buffer
                         })
+
                     if reasoning_buffer.strip():
                         yield AgentStep(
                             step_type="thought",
                             content=reasoning_buffer,
                             metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
                         )
+
                     if content_buffer.strip():
                         yield AgentStep(
                             step_type="thought",
@@ -240,11 +381,18 @@ class ReActAgent(AgentStrategy):
                             metadata={"iteration": iteration, "stream_key": thought_stream_key}
                         )
 
-                    for call_index, call in enumerate(tool_calls):
-                        call_index = call.get("index", call_index)
-                        tool_name = call.get("name")
-                        call_id = call.get("call_id") or call.get("id") or f"call_{iteration}_{call_index}"
-                        args_text = call.get("arguments", "")
+                    messages.append({
+                        "role": "assistant",
+                        "content": content_buffer,
+                        "tool_calls": tool_calls
+                    })
+
+                    for call in tool_calls:
+                        function = call.get("function", {}) or {}
+                        tool_name = function.get("name")
+                        args_text = function.get("arguments", "")
+                        call_id = call.get("id")
+                        call_index = call.get("index", 0) if isinstance(call, dict) else 0
                         call_key = f"tool-{iteration}-{call_index}"
 
                         tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
@@ -260,108 +408,16 @@ class ReActAgent(AgentStrategy):
                             metadata={"tool": tool_name, "iteration": iteration}
                         )
 
-                        response_input.append({
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": tool_output
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": tool_output
                         })
 
-                    continue
+                    break
 
                 if llm_call_id:
                     self._update_llm_processed(llm_call_id, {"final_answer": content_buffer})
-
-                if content_buffer.strip():
-                    yield AgentStep(
-                        step_type="answer",
-                        content=content_buffer,
-                        metadata={"agent_type": "react", "iterations": iteration + 1, "stream_key": thought_stream_key}
-                    )
-                    return
-
-                yield AgentStep(
-                    step_type="error",
-                    content="LLM returned no content.",
-                    metadata={"iteration": iteration}
-                )
-                return
-
-            content_buffer = ""
-            reasoning_buffer = ""
-            tool_calls = []
-            thought_stream_key = f"assistant_content_{iteration}"
-            reasoning_stream_key = f"assistant_reasoning_{iteration}"
-            stream_mode = "answer"
-            stopped = False
-
-            async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
-                event_type = event.get("type")
-                if event_type == "content":
-                    delta = event.get("delta", "")
-                    if delta:
-                        content_buffer += delta
-                        step_type = "answer_delta" if stream_mode == "answer" else "thought_delta"
-                        yield AgentStep(
-                            step_type=step_type,
-                            content=delta,
-                            metadata={"iteration": iteration, "stream_key": thought_stream_key}
-                        )
-                elif event_type == "reasoning":
-                    delta = event.get("delta", "")
-                    if delta:
-                        reasoning_buffer += delta
-                        yield AgentStep(
-                            step_type="thought_delta",
-                            content=delta,
-                            metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
-                        )
-                elif event_type == "tool_call_delta":
-                    if stream_mode != "thought":
-                        stream_mode = "thought"
-                    call_index = event.get("index", 0)
-                    call_key = f"tool-{iteration}-{call_index}"
-                    tool_name = event.get("name") or ""
-                    args_delta = event.get("arguments_delta", "")
-                    if args_delta or tool_name:
-                        yield AgentStep(
-                            step_type="action_delta",
-                            content=args_delta,
-                            metadata={
-                                "iteration": iteration,
-                                "stream_key": call_key,
-                                "tool": tool_name,
-                                "call_index": call_index
-                            }
-                        )
-                elif event_type == "done":
-                    content_buffer = event.get("content", "") or ""
-                    tool_calls = event.get("tool_calls", []) or []
-                    stopped = bool(event.get("stopped"))
-
-            llm_call_id = None
-            if llm_overrides.get("_debug"):
-                llm_call_id = llm_overrides.get("_debug", {}).get("llm_call_id")
-
-            if stopped:
-                stopped_text = self._append_stop_note(content_buffer)
-                if llm_call_id:
-                    self._update_llm_processed(llm_call_id, {
-                        "stopped_by_user": True,
-                        "content": stopped_text
-                    })
-                yield AgentStep(
-                    step_type="answer",
-                    content=stopped_text,
-                    metadata={"agent_type": "react", "iterations": iteration + 1, "stopped_by_user": True}
-                )
-                return
-
-            if tool_calls:
-                if llm_call_id:
-                    self._update_llm_processed(llm_call_id, {
-                        "tool_calls": tool_calls,
-                        "content": content_buffer
-                    })
 
                 if reasoning_buffer.strip():
                     yield AgentStep(
@@ -372,70 +428,20 @@ class ReActAgent(AgentStrategy):
 
                 if content_buffer.strip():
                     yield AgentStep(
-                        step_type="thought",
+                        step_type="answer",
                         content=content_buffer,
-                        metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                        metadata={"agent_type": "react", "iterations": iteration + 1, "stream_key": thought_stream_key}
                     )
+                    return
 
-                messages.append({
-                    "role": "assistant",
-                    "content": content_buffer,
-                    "tool_calls": tool_calls
-                })
-
-                for call in tool_calls:
-                    function = call.get("function", {}) or {}
-                    tool_name = function.get("name")
-                    args_text = function.get("arguments", "")
-                    call_id = call.get("id")
-                    call_index = call.get("index", 0) if isinstance(call, dict) else 0
-                    call_key = f"tool-{iteration}-{call_index}"
-
-                    tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
+                no_answer_attempts += 1
+                if no_answer_attempts >= max_no_answer_attempts:
                     yield AgentStep(
-                        step_type="action",
-                        content=f"{tool_name}[{tool_input}]",
-                        metadata={"tool": tool_name, "input": tool_input, "iteration": iteration, "stream_key": call_key}
+                        step_type="error",
+                        content="LLM returned no content.",
+                        metadata={"iteration": iteration}
                     )
-                    tool_output = error_msg if error_msg else await self._execute_tool(tool, tool_input) if tool else f"Tool not found: '{tool_name}'"
-                    yield AgentStep(
-                        step_type="observation",
-                        content=tool_output,
-                        metadata={"tool": tool_name, "iteration": iteration}
-                    )
-
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": tool_output
-                    })
-
-                continue
-
-            if llm_call_id:
-                self._update_llm_processed(llm_call_id, {"final_answer": content_buffer})
-
-            if reasoning_buffer.strip():
-                yield AgentStep(
-                    step_type="thought",
-                    content=reasoning_buffer,
-                    metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
-                )
-
-            if content_buffer.strip():
-                yield AgentStep(
-                    step_type="answer",
-                    content=content_buffer,
-                    metadata={"agent_type": "react", "iterations": iteration + 1, "stream_key": thought_stream_key}
-                )
-                return
-
-            yield AgentStep(
-                step_type="error",
-                content="LLM returned no content.",
-                metadata={"iteration": iteration}
-            )
-            return
+                    return
 
         yield AgentStep(
             step_type="answer",

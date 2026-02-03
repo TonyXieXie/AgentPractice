@@ -30,11 +30,14 @@ def _is_within_root(path: Path, root: Path) -> bool:
 def _log_permission_request(tool_name: str, action: str, path: Path, reason: str) -> Optional[int]:
     try:
         from database import db
+        tool_ctx = get_tool_context()
+        session_id = tool_ctx.get("session_id")
         return db.create_permission_request(
             tool_name=tool_name,
             action=action,
             path=str(path),
-            reason=reason
+            reason=reason,
+            session_id=session_id
         )
     except Exception:
         return None
@@ -359,7 +362,8 @@ class RunShellTool(Tool):
                     tool_name=self.name,
                     action="execute",
                     path=str(command),
-                    reason=" ".join(reasons)
+                    reason=" ".join(reasons),
+                    session_id=tool_ctx.get("session_id")
                 )
             except Exception:
                 request_id = None

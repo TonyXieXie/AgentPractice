@@ -31,7 +31,8 @@
       "cmd",
       "powershell",
       "if",
-      "mkdir"
+      "mkdir",
+      "curl"
     ],
     "timeout_sec": 30,
     "max_output": 20000

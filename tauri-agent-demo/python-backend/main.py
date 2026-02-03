@@ -230,7 +230,11 @@ async def _maybe_update_session_title(
     if not is_first_turn:
         return
     current = db.get_session(session_id)
-    if not current or current.title != "New Chat":
+    if not current or not is_first_turn:
+        return
+    current_title = (current.title or "").strip()
+    provisional_title = _fallback_title(user_message)
+    if current_title not in ("New Chat", provisional_title):
         return
     title = ""
     try:
@@ -366,6 +370,7 @@ def rollback_session(session_id: str, request: RollbackRequest):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
+        new_session_created = False
         if request.session_id:
             session = db.get_session(request.session_id)
             if not session:
@@ -386,6 +391,7 @@ async def chat(request: ChatRequest):
                 title="New Chat",
                 config_id=config_id
             ))
+            new_session_created = True
         is_first_turn = (session.message_count or 0) == 0
 
         config = db.get_config(session.config_id)
@@ -393,6 +399,10 @@ async def chat(request: ChatRequest):
             raise HTTPException(status_code=404, detail="Config not found")
 
         processed_message = message_processor.preprocess_user_message(request.message)
+        if new_session_created:
+            provisional_title = _fallback_title(processed_message)
+            if provisional_title and provisional_title != session.title:
+                db.update_session(session.id, ChatSessionUpdate(title=provisional_title))
 
         user_msg = db.create_message(ChatMessageCreate(
             session_id=session.id,
@@ -472,6 +482,7 @@ async def chat(request: ChatRequest):
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
     try:
+        new_session_created = False
         if request.session_id:
             session = db.get_session(request.session_id)
             if not session:
@@ -482,6 +493,7 @@ async def chat_stream(request: ChatRequest):
                 title="New Chat",
                 config_id=config_id
             ))
+            new_session_created = True
         is_first_turn = (session.message_count or 0) == 0
 
         config = db.get_config(session.config_id)
@@ -489,6 +501,10 @@ async def chat_stream(request: ChatRequest):
             raise HTTPException(status_code=404, detail="Config not found")
 
         processed_message = message_processor.preprocess_user_message(request.message)
+        if new_session_created:
+            provisional_title = _fallback_title(processed_message)
+            if provisional_title and provisional_title != session.title:
+                db.update_session(session.id, ChatSessionUpdate(title=provisional_title))
 
         history = db.get_session_messages(session.id, limit=20)
         history_for_llm = [
@@ -678,6 +694,7 @@ def export_chat_history(request: ExportRequest):
 @app.post("/chat/agent/stream")
 async def chat_agent_stream(request: ChatRequest):
     try:
+        new_session_created = False
         if request.session_id:
             session = db.get_session(request.session_id)
             if not session:
@@ -688,6 +705,7 @@ async def chat_agent_stream(request: ChatRequest):
                 title="New Chat",
                 config_id=config_id
             ))
+            new_session_created = True
         is_first_turn = (session.message_count or 0) == 0
 
         config = db.get_config(session.config_id)
@@ -695,6 +713,10 @@ async def chat_agent_stream(request: ChatRequest):
             raise HTTPException(status_code=404, detail="Config not found")
 
         processed_message = message_processor.preprocess_user_message(request.message)
+        if new_session_created:
+            provisional_title = _fallback_title(processed_message)
+            if provisional_title and provisional_title != session.title:
+                db.update_session(session.id, ChatSessionUpdate(title=provisional_title))
 
         user_msg = db.create_message(ChatMessageCreate(
             session_id=session.id,
