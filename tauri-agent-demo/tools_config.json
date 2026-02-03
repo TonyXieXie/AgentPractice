@@ -20,7 +20,17 @@
       "python",
       "pip",
       "git",
-      "rg"
+      "rg",
+      "g++",
+      "pwd",
+      "cd",
+      "dir",
+      "echo",
+      "copy",
+      "ls",
+      "cmd",
+      "powershell",
+      "if"
     ],
     "timeout_sec": 30,
     "max_output": 20000
@@ -29,6 +39,6 @@
     "tavily_api_key": "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",
     "provider": "tavily",
     "max_results": 5,
-    "search_depth": "basic"
+    "search_depth": "advanced"
   }
 }

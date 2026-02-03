@@ -29,12 +29,14 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
             "rg"
         ],
         "timeout_sec": 30,
-        "max_output": 20000
+        "max_output": 20000,
+        "permission_timeout_sec": 300
     },
     "search": {
         "provider": "tavily",
         "max_results": 5,
-        "search_depth": "basic"
+        "search_depth": "basic",
+        "min_score": 0.4
     }
 }
 

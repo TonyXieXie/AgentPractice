@@ -607,6 +607,16 @@ class Database:
         conn.close()
         return request_id
 
+    def get_permission_request(self, request_id: int) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM tool_permission_requests WHERE id = ?
+        ''', (request_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
     def get_permission_requests(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         conn = self.get_connection()
         cursor = conn.cursor()

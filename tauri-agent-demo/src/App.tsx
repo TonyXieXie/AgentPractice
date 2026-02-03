@@ -1,6 +1,6 @@
 ﻿import { useState, useEffect, useRef } from 'react';
 import './App.css';
-import { Message, LLMConfig, LLMCall } from './types';
+import { Message, LLMConfig, LLMCall, ToolPermissionRequest } from './types';
 import {
   sendMessageAgentStream,
   getDefaultConfig,
@@ -12,6 +12,8 @@ import {
   getSessionAgentSteps,
   stopAgentStream,
   rollbackSession,
+  getToolPermissions,
+  updateToolPermission,
   AgentStep,
   AgentStepWithMessage,
 } from './api';
@@ -41,6 +43,8 @@ function App() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const activeAssistantIdRef = useRef<number | null>(null);
   const stopRequestedRef = useRef(false);
+  const [pendingPermission, setPendingPermission] = useState<ToolPermissionRequest | null>(null);
+  const [permissionBusy, setPermissionBusy] = useState(false);
 
   useEffect(() => {
     loadDefaultConfig();
@@ -75,6 +79,40 @@ function App() {
       refreshSessionDebug(currentSessionId);
     }
   }, [showDebugPanel, currentSessionId, sessionRefreshTrigger]);
+
+  useEffect(() => {
+    if (!loading) {
+      setPendingPermission(null);
+      return;
+    }
+    let cancelled = false;
+    let inFlight = false;
+
+    const pollPermissions = async () => {
+      if (inFlight || cancelled) return;
+      inFlight = true;
+      try {
+        const pending = await getToolPermissions('pending');
+        const shellRequest = pending.find((item) => item.tool_name === 'run_shell') || null;
+        if (!cancelled) {
+          setPendingPermission(shellRequest);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setPendingPermission(null);
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    pollPermissions();
+    const timer = window.setInterval(pollPermissions, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [loading]);
 
   const loadDefaultConfig = async () => {
     try {
@@ -475,6 +513,20 @@ function App() {
     setLoading(false);
   };
 
+  const handlePermissionDecision = async (status: 'approved' | 'denied') => {
+    if (!pendingPermission || permissionBusy) return;
+    setPermissionBusy(true);
+    try {
+      await updateToolPermission(pendingPermission.id, status);
+      setPendingPermission(null);
+    } catch (error) {
+      console.error('Failed to update permission:', error);
+      alert('权限更新失败');
+    } finally {
+      setPermissionBusy(false);
+    }
+  };
+
   const handleSelectSession = async (sessionId: string) => {
     try {
       setCurrentSessionId(sessionId);
@@ -554,6 +606,9 @@ function App() {
     lastScrollTopRef.current = currentScrollTop;
   };
 
+  const latestAssistantId =
+    [...messages].reverse().find((msg) => msg.role === 'assistant')?.id ?? null;
+
   return (
     <div className="app-container">
       {showSidebar && (
@@ -609,11 +664,18 @@ function App() {
               messages.map((msg) => {
                 const steps = (msg.metadata?.agent_steps || []) as AgentStep[];
                 const streaming = Boolean(msg.metadata?.agent_streaming);
+                const showPermission = Boolean(pendingPermission && msg.id === latestAssistantId);
                 return (
                   <div key={msg.id} className={`message ${msg.role}`}>
                     <div className="message-content">
-                      {msg.role === 'assistant' && steps.length > 0 ? (
-                        <AgentStepView steps={steps} streaming={streaming} />
+                      {msg.role === 'assistant' && (steps.length > 0 || showPermission) ? (
+                        <AgentStepView
+                          steps={steps}
+                          streaming={streaming}
+                          pendingPermission={showPermission ? pendingPermission : null}
+                          onPermissionDecision={handlePermissionDecision}
+                          permissionBusy={permissionBusy}
+                        />
                       ) : msg.role === 'user' ? (
                         <>
                           <div className="message-text">{msg.content}</div>
@@ -745,6 +807,7 @@ function App() {
           }}
         />
       )}
+
     </div>
   );
 }

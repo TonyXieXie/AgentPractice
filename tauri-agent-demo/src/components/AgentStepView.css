@@ -42,6 +42,13 @@
     background: rgba(71, 85, 105, 0.2);
 }
 
+.agent-step.permission {
+    border-left: 3px solid #f97316;
+    background: rgba(124, 45, 18, 0.3);
+    border: 1px dashed rgba(251, 146, 60, 0.45);
+    box-shadow: 0 10px 22px rgba(249, 115, 22, 0.12);
+}
+
 .agent-step-header {
     display: flex;
     align-items: center;
@@ -66,6 +73,116 @@
     font-size: 0.9rem;
     line-height: 1.6;
     white-space: pre-wrap;
+}
+
+.agent-step-content.action-content {
+    max-height: 160px;
+    overflow: auto;
+    padding-right: 6px;
+    scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+    scrollbar-width: thin;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.agent-step-content.action-content::-webkit-scrollbar {
+    width: 6px;
+}
+
+.agent-step-content.action-content::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.agent-step-content.action-content::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 3px;
+}
+
+.agent-step-content.action-content::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.3);
+}
+
+.action-translate-btn {
+    align-self: flex-end;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(52, 211, 153, 0.45);
+    background: rgba(16, 185, 129, 0.12);
+    color: #d1fae5;
+    font-size: 0.72rem;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.action-translate-btn:hover {
+    background: rgba(16, 185, 129, 0.2);
+    transform: translateY(-1px);
+}
+
+.permission-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.permission-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #f8fafc;
+}
+
+.permission-subtitle {
+    font-size: 0.8rem;
+    color: #cbd5f5;
+}
+
+.permission-command {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    padding: 8px 10px;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 0.82rem;
+    color: #fff;
+    word-break: break-all;
+}
+
+.permission-reason {
+    font-size: 0.78rem;
+    color: #a3a3c2;
+}
+
+.permission-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.permission-btn {
+    padding: 8px 14px;
+    border-radius: 10px;
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.permission-btn.deny {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #fff;
+}
+
+.permission-btn.allow {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border: none;
+    color: #fff;
+}
+
+.permission-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
 }
 
 .agent-step-content.observation {

@@ -229,13 +229,13 @@ class ReActAgent(AgentStrategy):
                         args_text = call.get("arguments", "")
                         call_key = f"tool-{iteration}-{call_index}"
 
-                        tool_input, tool_output = await self._execute_tool_call(tools, tool_name, args_text)
-
+                        tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
                         yield AgentStep(
                             step_type="action",
                             content=f"{tool_name}[{tool_input}]",
                             metadata={"tool": tool_name, "input": tool_input, "iteration": iteration, "stream_key": call_key}
                         )
+                        tool_output = error_msg if error_msg else await self._execute_tool(tool, tool_input) if tool else f"Tool not found: '{tool_name}'"
                         yield AgentStep(
                             step_type="observation",
                             content=tool_output,
@@ -355,13 +355,13 @@ class ReActAgent(AgentStrategy):
                     call_index = call.get("index", 0) if isinstance(call, dict) else 0
                     call_key = f"tool-{iteration}-{call_index}"
 
-                    tool_input, tool_output = await self._execute_tool_call(tools, tool_name, args_text)
-
+                    tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
                     yield AgentStep(
                         step_type="action",
                         content=f"{tool_name}[{tool_input}]",
                         metadata={"tool": tool_name, "input": tool_input, "iteration": iteration, "stream_key": call_key}
                     )
+                    tool_output = error_msg if error_msg else await self._execute_tool(tool, tool_input) if tool else f"Tool not found: '{tool_name}'"
                     yield AgentStep(
                         step_type="observation",
                         content=tool_output,
@@ -608,22 +608,33 @@ Final Answer: <your final answer>
             return str(value)
         return json.dumps(args)
 
-    async def _execute_tool_call(self, tools: List[Tool], tool_name: Optional[str], args_text: str) -> Tuple[str, str]:
+    def _prepare_tool_call(self, tools: List[Tool], tool_name: Optional[str], args_text: str) -> Tuple[Optional[Tool], str, Optional[str]]:
         tool = self._get_tool(tools, tool_name)
         args, parse_error = self._safe_json_loads(args_text)
 
         if tool is None:
-            return "", f"Tool not found: '{tool_name}'"
+            return None, "", f"Tool not found: '{tool_name}'"
 
         if parse_error:
-            return "", parse_error
+            return tool, "", parse_error
 
         tool_input = self._extract_tool_input(tool, args or {})
+        return tool, tool_input, None
+
+    async def _execute_tool(self, tool: Tool, tool_input: str) -> str:
         try:
-            output = await tool.execute(tool_input)
-            return tool_input, output
+            return await tool.execute(tool_input)
         except Exception as e:
-            return tool_input, f"Tool execution failed: {str(e)}"
+            return f"Tool execution failed: {str(e)}"
+
+    async def _execute_tool_call(self, tools: List[Tool], tool_name: Optional[str], args_text: str) -> Tuple[str, str]:
+        tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
+        if error_msg:
+            return tool_input, error_msg
+        if tool is None:
+            return tool_input, f"Tool not found: '{tool_name}'"
+        output = await self._execute_tool(tool, tool_input)
+        return tool_input, output
 
     def _build_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         input_items: List[Dict[str, Any]] = []

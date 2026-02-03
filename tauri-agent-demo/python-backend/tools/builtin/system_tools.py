@@ -3,13 +3,14 @@ import json
 import os
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional
 
 import httpx
 
 from ..base import Tool, ToolParameter
-from ..config import get_tool_config
+from ..config import get_tool_config, update_tool_config
 
 
 def _get_root_path() -> Path:
@@ -90,6 +91,45 @@ def _contains_shell_operators(command: str) -> bool:
         if token in command:
             return True
     return False
+
+
+def _ensure_shell_allowlist_entry(command_name: str) -> None:
+    if not command_name:
+        return
+    config = get_tool_config()
+    allowlist = list(config.get("shell", {}).get("allowlist", []) or [])
+    allowset = {str(item).lower() for item in allowlist}
+    if command_name.lower() in allowset:
+        return
+    allowlist.append(command_name)
+    try:
+        update_tool_config({"shell": {"allowlist": allowlist}})
+    except Exception:
+        pass
+
+
+async def _wait_for_permission(request_id: Optional[int], timeout_sec: float) -> str:
+    if not request_id:
+        return "denied"
+    start = time.monotonic()
+    while True:
+        try:
+            from database import db
+            record = db.get_permission_request(request_id)
+            if record and record.get("status") and record["status"] != "pending":
+                return record["status"]
+        except Exception:
+            pass
+
+        if timeout_sec is not None and (time.monotonic() - start) >= timeout_sec:
+            try:
+                from database import db
+                db.update_permission_request(request_id, "timeout")
+            except Exception:
+                pass
+            return "timeout"
+
+        await asyncio.sleep(0.5)
 
 
 class ReadFileTool(Tool):
@@ -239,14 +279,38 @@ class RunShellTool(Tool):
         command = data.get("command") or input_data
         if not command:
             raise ValueError("Missing command.")
-        if _contains_shell_operators(command):
-            raise ValueError("Shell operators are not allowed.")
-
         cmd_name = _extract_command_name(command)
         allowlist = get_tool_config().get("shell", {}).get("allowlist", [])
         allowset = {str(item).lower() for item in allowlist}
+        reasons = []
+        if _contains_shell_operators(command):
+            reasons.append("Shell operators detected.")
         if cmd_name not in allowset:
-            raise ValueError(f"Command '{cmd_name}' is not allowed.")
+            reasons.append("Command not in allowlist.")
+        if reasons:
+            request_id = None
+            try:
+                from database import db
+                request_id = db.create_permission_request(
+                    tool_name=self.name,
+                    action="execute",
+                    path=str(command),
+                    reason=" ".join(reasons)
+                )
+            except Exception:
+                request_id = None
+
+            timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
+            status = await _wait_for_permission(request_id, timeout_sec)
+            if status != "approved":
+                if status == "denied":
+                    return "Permission denied."
+                if status == "timeout":
+                    return "Permission request timed out."
+                return "Permission required."
+
+            if cmd_name not in allowset:
+                _ensure_shell_allowlist_entry(cmd_name)
 
         root = _get_root_path()
         cwd = data.get("cwd")
@@ -316,6 +380,11 @@ class TavilySearchTool(Tool):
         max_results = data.get("max_results")
         max_results = int(max_results) if max_results is not None else int(search_cfg.get("max_results", 5))
         search_depth = search_cfg.get("search_depth", "basic")
+        min_score = search_cfg.get("min_score", 0.4)
+        try:
+            min_score = float(min_score)
+        except (TypeError, ValueError):
+            min_score = 0.4
 
         payload = {
             "api_key": api_key,
@@ -332,11 +401,22 @@ class TavilySearchTool(Tool):
             data = response.json()
 
         results = data.get("results", []) if isinstance(data, dict) else []
-        if not results:
+        filtered_results = []
+        for item in results:
+            score = item.get("score") if isinstance(item, dict) else None
+            if score is not None:
+                try:
+                    score = float(score)
+                except (TypeError, ValueError):
+                    score = None
+            if score is not None and score < min_score:
+                continue
+            filtered_results.append(item)
+        if not filtered_results:
             return "No results."
 
         lines = ["Search results:"]
-        for idx, item in enumerate(results, start=1):
+        for idx, item in enumerate(filtered_results, start=1):
             title = item.get("title", "")
             url = item.get("url", "")
             snippet = item.get("content", "")

@@ -3,6 +3,8 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import json
+import os
+import shlex
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
@@ -120,6 +122,22 @@ def _parse_title_json(raw: str) -> str:
         except Exception:
             continue
     return ""
+
+
+def _extract_command_name(command: str) -> str:
+    if not command:
+        return ""
+    try:
+        parts = shlex.split(command, posix=False)
+    except Exception:
+        parts = command.strip().split()
+    if not parts:
+        return ""
+    first = parts[0].strip().strip('"').strip("'")
+    base = os.path.basename(first).lower()
+    if base.endswith(".exe") or base.endswith(".cmd") or base.endswith(".bat"):
+        base = os.path.splitext(base)[0]
+    return base
 
 
 def _looks_like_title(raw: str) -> bool:
@@ -887,6 +905,18 @@ def update_tool_permission(request_id: int, update: ToolPermissionRequestUpdate)
     updated = db.update_permission_request(request_id, update.status)
     if not updated:
         raise HTTPException(status_code=404, detail="Permission request not found")
+    if update.status == "approved" and updated.get("tool_name") == "run_shell":
+        cmd_name = _extract_command_name(updated.get("path") or "")
+        if cmd_name:
+            cfg = get_tool_config()
+            allowlist = list(cfg.get("shell", {}).get("allowlist", []) or [])
+            allowset = {str(item).lower() for item in allowlist}
+            if cmd_name.lower() not in allowset:
+                allowlist.append(cmd_name)
+                try:
+                    update_tool_config({"shell": {"allowlist": allowlist}})
+                except Exception:
+                    pass
     return updated
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@
     Message,
     ChatRequest,
     ChatResponse,
-    LLMCall
+    LLMCall,
+    ToolPermissionRequest
 } from './types';
 
 const API_BASE_URL = 'http://127.0.0.1:8000';
@@ -272,6 +273,27 @@ export async function rollbackSession(sessionId: string, messageId: number): Pro
         body: JSON.stringify({ message_id: messageId })
     });
     if (!response.ok) throw new Error('Failed to rollback session');
+    return response.json();
+}
+
+// ==================== Tool Permissions ====================
+
+export async function getToolPermissions(status?: string): Promise<ToolPermissionRequest[]> {
+    const url = status
+        ? `${API_BASE_URL}/tools/permissions?status=${encodeURIComponent(status)}`
+        : `${API_BASE_URL}/tools/permissions`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Failed to fetch tool permissions');
+    return response.json();
+}
+
+export async function updateToolPermission(requestId: number, status: string): Promise<ToolPermissionRequest> {
+    const response = await fetch(`${API_BASE_URL}/tools/permissions/${requestId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status })
+    });
+    if (!response.ok) throw new Error('Failed to update tool permission');
     return response.json();
 }
 

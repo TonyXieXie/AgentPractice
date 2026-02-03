@@ -92,6 +92,17 @@ export interface LLMCall {
     created_at: string;
 }
 
+export interface ToolPermissionRequest {
+    id: number;
+    tool_name: string;
+    action: string;
+    path: string;
+    reason?: string | null;
+    status: string;
+    created_at?: string | null;
+    updated_at?: string | null;
+}
+
 export interface ChatRequest {
     message: string;
     session_id?: string;
