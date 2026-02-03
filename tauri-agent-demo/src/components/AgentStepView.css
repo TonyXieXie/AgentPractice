@@ -60,6 +60,18 @@
     letter-spacing: 0.02em;
 }
 
+.agent-step-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.agent-step-header-actions .action-translate-btn,
+.agent-step-header-actions .observation-toggle {
+    align-self: center;
+    margin: 0;
+}
+
 .agent-step-category {
     font-weight: 600;
 }
@@ -441,6 +453,52 @@
 .content-markdown a {
     color: #7dd3fc;
     text-decoration: underline;
+}
+
+.content-link {
+    color: #7dd3fc;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.file-link {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    color: #7dd3fc;
+    text-decoration: underline;
+    cursor: pointer;
+    font: inherit;
+}
+
+.file-context-menu {
+    position: fixed;
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: rgba(15, 23, 42, 0.96);
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    border-radius: 8px;
+    padding: 6px;
+    box-shadow: 0 10px 20px rgba(15, 23, 42, 0.3);
+    min-width: 160px;
+}
+
+.file-context-item {
+    background: transparent;
+    border: none;
+    color: #e2e8f0;
+    text-align: left;
+    padding: 6px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.78rem;
+}
+
+.file-context-item:hover {
+    background: rgba(148, 163, 184, 0.15);
 }
 
 .content-markdown ul,

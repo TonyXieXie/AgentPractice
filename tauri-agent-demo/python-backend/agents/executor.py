@@ -72,6 +72,9 @@ class AgentExecutor:
             agent_mode = None
             if request_overrides and request_overrides.get("agent_mode") is not None:
                 agent_mode = str(request_overrides.get("agent_mode") or "default").lower()
+            work_path = None
+            if request_overrides and request_overrides.get("work_path"):
+                work_path = request_overrides.get("work_path")
 
             shell_unrestricted = False
             if agent_mode:
@@ -85,7 +88,8 @@ class AgentExecutor:
             token = set_tool_context({
                 "shell_unrestricted": shell_unrestricted,
                 "agent_mode": agent_mode or "default",
-                "session_id": session_id
+                "session_id": session_id,
+                "work_path": work_path
             })
 
             async for step in self.strategy.execute(

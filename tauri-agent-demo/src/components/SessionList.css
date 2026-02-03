@@ -91,6 +91,26 @@
 .session-meta {
     color: #888;
     font-size: 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+}
+
+.session-meta-sep {
+    opacity: 0.6;
+}
+
+.session-work-path {
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.session-work-path.empty {
+    opacity: 0.6;
+    font-style: italic;
 }
 
 .session-actions {

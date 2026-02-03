@@ -588,6 +588,41 @@ body {
   flex-wrap: wrap;
 }
 
+.work-path-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: #cbd5f5;
+  font-size: 0.78rem;
+  cursor: pointer;
+  text-align: left;
+  max-width: 100%;
+}
+
+.work-path-row:hover .work-path-value {
+  color: #fff;
+}
+
+.work-path-label {
+  color: #94a3b8;
+}
+
+.work-path-value {
+  color: #e2e8f0;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.work-path-value.empty {
+  color: #94a3b8;
+  font-style: italic;
+}
+
 .input-area .send-btn {
   width: 32px;
   height: 32px;

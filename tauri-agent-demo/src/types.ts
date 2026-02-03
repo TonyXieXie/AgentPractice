@@ -70,6 +70,7 @@ export interface ChatSession {
     id: string;
     title: string;
     config_id: string;
+    work_path?: string | null;
     created_at: string;
     updated_at: string;
     message_count?: number;
@@ -78,10 +79,12 @@ export interface ChatSession {
 export interface ChatSessionCreate {
     title?: string;
     config_id: string;
+    work_path?: string | null;
 }
 
 export interface ChatSessionUpdate {
     title?: string;
+    work_path?: string | null;
 }
 
 export interface LLMCall {
@@ -117,6 +120,7 @@ export interface ChatRequest {
     message: string;
     session_id?: string;
     config_id?: string;
+    work_path?: string | null;
     agent_mode?: AgentMode;
     shell_unrestricted?: boolean;
 }

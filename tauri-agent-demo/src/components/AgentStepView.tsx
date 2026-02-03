@@ -3,6 +3,7 @@ import MarkdownIt from 'markdown-it';
 import texmath from 'markdown-it-texmath';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
+import { open } from '@tauri-apps/plugin-opener';
 import { AgentStep } from '../api';
 import { ToolPermissionRequest } from '../types';
 import DiffView from './DiffView';
@@ -96,6 +97,66 @@ function decodeUnicodeEscapes(content: string) {
         .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
+type LinkToken =
+    | { type: 'text'; value: string }
+    | { type: 'url'; value: string }
+    | { type: 'file'; value: string };
+
+const LINK_PATTERN = /((?:https?|file):\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+|[a-zA-Z]:\\[^\s<>"'`]+|\\\\[^\s<>"'`]+|\/[^\s<>"'`]+)/g;
+const TRAILING_PUNCTUATION = /[),.;:!?]+$/;
+
+function splitTrailingPunctuation(value: string) {
+    const match = value.match(TRAILING_PUNCTUATION);
+    if (!match) {
+        return { value, trailing: '' };
+    }
+    return {
+        value: value.slice(0, -match[0].length),
+        trailing: match[0]
+    };
+}
+
+function tokenizeLinks(text: string): LinkToken[] {
+    if (!text) return [{ type: 'text', value: '' }];
+    const tokens: LinkToken[] = [];
+    let lastIndex = 0;
+    LINK_PATTERN.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = LINK_PATTERN.exec(text))) {
+        const start = match.index;
+        const raw = match[0];
+        if (start > lastIndex) {
+            tokens.push({ type: 'text', value: text.slice(lastIndex, start) });
+        }
+        const { value, trailing } = splitTrailingPunctuation(raw);
+        if (value) {
+            const isUrl = /^(?:https?:\/\/|file:\/\/|www\.)/i.test(value);
+            tokens.push({ type: isUrl ? 'url' : 'file', value });
+        }
+        if (trailing) {
+            tokens.push({ type: 'text', value: trailing });
+        }
+        lastIndex = start + raw.length;
+    }
+    if (lastIndex < text.length) {
+        tokens.push({ type: 'text', value: text.slice(lastIndex) });
+    }
+    return tokens;
+}
+
+function getParentPath(filePath: string) {
+    const trimmed = filePath.replace(/[\\/]+$/, '');
+    const idx = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'));
+    if (idx < 0) {
+        return trimmed;
+    }
+    const parent = trimmed.slice(0, idx);
+    if (/^[a-zA-Z]:$/.test(parent)) {
+        return `${parent}\\`;
+    }
+    return parent || trimmed;
+}
+
 function AgentStepView({
     steps,
     streaming,
@@ -108,6 +169,7 @@ function AgentStepView({
     const [expandedErrors, setExpandedErrors] = useState<Record<string, boolean>>({});
     const [thoughtAutoScroll, setThoughtAutoScroll] = useState<Record<string, boolean>>({});
     const thoughtRefs = useRef<Record<string, HTMLDivElement | null>>({});
+    const [fileMenu, setFileMenu] = useState<{ path: string; x: number; y: number } | null>(null);
 
     useEffect(() => {
         steps.forEach((step, index) => {
@@ -121,6 +183,91 @@ function AgentStepView({
             el.scrollTop = el.scrollHeight;
         });
     }, [steps, thoughtAutoScroll]);
+
+    useEffect(() => {
+        if (!fileMenu) return;
+        const dismiss = () => setFileMenu(null);
+        window.addEventListener('click', dismiss);
+        window.addEventListener('blur', dismiss);
+        return () => {
+            window.removeEventListener('click', dismiss);
+            window.removeEventListener('blur', dismiss);
+        };
+    }, [fileMenu]);
+
+    const handleOpenLink = async (href: string) => {
+        if (!href) return;
+        const normalized = href.startsWith('www.') ? `https://${href}` : href;
+        try {
+            await open(normalized);
+        } catch {
+            // ignore open errors
+        }
+    };
+
+    const handleOpenFile = async (filePath: string) => {
+        if (!filePath) return;
+        try {
+            await open(filePath);
+        } catch {
+            // ignore open errors
+        }
+    };
+
+    const handleOpenFileFolder = async (filePath: string) => {
+        if (!filePath) return;
+        const parent = getParentPath(filePath);
+        try {
+            await open(parent || filePath);
+        } catch {
+            // ignore open errors
+        }
+    };
+
+    const renderLinkedText = (text: string) => {
+        const tokens = tokenizeLinks(text);
+        return tokens.map((token, idx) => {
+            if (token.type === 'text') {
+                return token.value;
+            }
+            if (token.type === 'url') {
+                const href = token.value.startsWith('www.') ? `https://${token.value}` : token.value;
+                return (
+                    <a
+                        key={`${token.type}-${idx}`}
+                        href={href}
+                        className="content-link"
+                        onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            handleOpenLink(href);
+                        }}
+                    >
+                        {token.value}
+                    </a>
+                );
+            }
+            return (
+                <button
+                    key={`${token.type}-${idx}`}
+                    type="button"
+                    className="file-link"
+                    onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        handleOpenFile(token.value);
+                    }}
+                    onContextMenu={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setFileMenu({ path: token.value, x: event.clientX, y: event.clientY });
+                    }}
+                >
+                    {token.value}
+                </button>
+            );
+        });
+    };
 
     const handleThoughtScroll = (stepKey: string) => (event: React.UIEvent<HTMLDivElement>) => {
         const el = event.currentTarget;
@@ -159,6 +306,15 @@ function AgentStepView({
                 }, 1200);
             }
         );
+    };
+
+    const handleContentClick: MouseEventHandler<HTMLDivElement> = (event) => {
+        const target = event.target as HTMLElement;
+        const link = target.closest<HTMLAnchorElement>('a');
+        if (!link || !link.href) return;
+        event.preventDefault();
+        event.stopPropagation();
+        handleOpenLink(link.href);
     };
 
     if (!steps.length && !pendingPermission) {
@@ -265,20 +421,9 @@ function AgentStepView({
                         <div className={`agent-step ${category}${isAction ? ' action' : ''}`}>
                             <div className="agent-step-header">
                                 <span className="agent-step-category">{CATEGORY_LABELS[category]}</span>
-                                <span className="agent-step-type">{step.step_type}</span>
-                            </div>
-                            {isObservation ? (
-                                <div className="agent-step-content observation">
-                                    {expandedObservations[stepKey] ? (
-                                        observationIsDiff ? (
-                                            <DiffView content={observationText} />
-                                        ) : (
-                                            <pre className="observation-text expanded">{observationText}</pre>
-                                        )
-                                    ) : (
-                                        <pre className="observation-text">{observationPreview}</pre>
-                                    )}
-                                    {observationHasMore && (
+                                <div className="agent-step-header-actions">
+                                    <span className="agent-step-type">{step.step_type}</span>
+                                    {isObservation && observationHasMore && (
                                         <button
                                             type="button"
                                             className="observation-toggle"
@@ -293,14 +438,6 @@ function AgentStepView({
                                             </span>
                                         </button>
                                     )}
-                                </div>
-                            ) : (
-                                <div
-                                    className={`agent-step-content${isAction ? ' action-content' : ''}`}
-                                    ref={isThought ? (el) => { thoughtRefs.current[stepKey] = el; } : undefined}
-                                    onScroll={isThought ? handleThoughtScroll(stepKey) : undefined}
-                                >
-                                    {renderRichContent(displayContent, handleMarkdownClick)}
                                     {canTranslateSearch && (
                                         <button
                                             type="button"
@@ -312,6 +449,30 @@ function AgentStepView({
                                             {isTranslated ? '原文' : '翻译'}
                                         </button>
                                     )}
+                                </div>
+                            </div>
+                            {isObservation ? (
+                                <div className="agent-step-content observation">
+                                    {expandedObservations[stepKey] ? (
+                                        observationIsDiff ? (
+                                            <DiffView content={observationText} />
+                                        ) : (
+                                            <div className="observation-text expanded">{renderLinkedText(observationText)}</div>
+                                        )
+                                    ) : (
+                                        <div className="observation-text">{renderLinkedText(observationPreview)}</div>
+                                    )}
+                                </div>
+                            ) : (
+                                <div
+                                    className={`agent-step-content${isAction ? ' action-content' : ''}`}
+                                    ref={isThought ? (el) => { thoughtRefs.current[stepKey] = el; } : undefined}
+                                    onScroll={isThought ? handleThoughtScroll(stepKey) : undefined}
+                                >
+                                    {renderRichContent(displayContent, (event) => {
+                                        handleMarkdownClick(event);
+                                        handleContentClick(event);
+                                    })}
                                     {hasErrorDetails && (
                                         <>
                                             <button
@@ -348,6 +509,38 @@ function AgentStepView({
                 </div>
             )}
         </div>
+        {fileMenu && (
+            <div
+                className="file-context-menu"
+                style={{
+                    top: Math.min(fileMenu.y, window.innerHeight - 90),
+                    left: Math.min(fileMenu.x, window.innerWidth - 180)
+                }}
+                onClick={(event) => event.stopPropagation()}
+                onContextMenu={(event) => event.preventDefault()}
+            >
+                <button
+                    type="button"
+                    className="file-context-item"
+                    onClick={() => {
+                        handleOpenFile(fileMenu.path);
+                        setFileMenu(null);
+                    }}
+                >
+                    打开文件
+                </button>
+                <button
+                    type="button"
+                    className="file-context-item"
+                    onClick={() => {
+                        handleOpenFileFolder(fileMenu.path);
+                        setFileMenu(null);
+                    }}
+                >
+                    打开所在文件夹
+                </button>
+            </div>
+        )}
     );
 }
 

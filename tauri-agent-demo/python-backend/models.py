@@ -78,6 +78,7 @@ class ChatSession(BaseModel):
     id: Optional[str] = None
     title: str
     config_id: str
+    work_path: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     message_count: Optional[int] = 0
@@ -86,16 +87,19 @@ class ChatSession(BaseModel):
 class ChatSessionCreate(BaseModel):
     title: str = "New Chat"
     config_id: str
+    work_path: Optional[str] = None
 
 
 class ChatSessionUpdate(BaseModel):
     title: Optional[str] = None
+    work_path: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     config_id: Optional[str] = None
+    work_path: Optional[str] = None
     agent_mode: Optional[AgentMode] = None
     shell_unrestricted: Optional[bool] = None
 

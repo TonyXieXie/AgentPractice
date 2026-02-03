@@ -193,7 +193,16 @@ export default function SessionList({
                                     <div className="session-info">
                                         <div className="session-title">{session.title}</div>
                                         <div className="session-meta">
-                                            {formatDate(session.created_at)} · {session.message_count || 0} 条消息
+                                            <span>{formatDate(session.created_at)}</span>
+                                            <span className="session-meta-sep">{'\u00b7'}</span>
+                                            <span
+                                                className={`session-work-path${session.work_path ? '' : ' empty'}`}
+                                                title={session.work_path || '\u672a\u8bbe\u7f6e\u5de5\u4f5c\u8def\u5f84'}
+                                            >
+                                                {session.work_path || '\u672a\u8bbe\u7f6e\u5de5\u4f5c\u8def\u5f84'}
+                                            </span>
+                                            <span className="session-meta-sep">{'\u00b7'}</span>
+                                            <span>{session.message_count || 0} \u6761\u6d88\u606f</span>
                                         </div>
                                     </div>
                                     <div className="session-actions">

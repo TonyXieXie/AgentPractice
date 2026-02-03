@@ -15,8 +15,9 @@ from ..context import get_tool_context
 
 
 def _get_root_path() -> Path:
-    root = get_tool_config().get("project_root")
-    return Path(root).resolve()
+    tool_ctx = get_tool_context()
+    root = tool_ctx.get("work_path") or get_tool_config().get("project_root") or os.getcwd()
+    return Path(root).expanduser().resolve()
 
 
 def _is_within_root(path: Path, root: Path) -> bool:
@@ -56,16 +57,19 @@ def _resolve_path(raw_path: str, tool_name: str, action: str) -> Path:
         path = root / path
     path = path.resolve()
     if not _is_within_root(path, root):
-        if _get_agent_mode() == "super":
+        mode = _get_agent_mode()
+        if mode == "super":
+            return path
+        if mode == "shell_safe" and action == "read":
             return path
         request_id = _log_permission_request(
             tool_name=tool_name,
             action=action,
             path=path,
-            reason="Path outside project root."
+            reason="Path outside work path."
         )
         suffix = f" Request ID: {request_id}" if request_id else ""
-        raise PermissionError(f"Permission required for paths outside project root.{suffix}")
+        raise PermissionError(f"Permission required for paths outside work path.{suffix}")
     return path
 
 
@@ -196,12 +200,12 @@ class ReadFileTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "read_file"
-        self.description = "Read a file inside the project root."
+        self.description = "Read a file inside the work path."
         self.parameters = [
             ToolParameter(
                 name="path",
                 type="string",
-                description="Relative path under project root.",
+                description="Relative path under the work path.",
                 required=True
             ),
             ToolParameter(
@@ -256,12 +260,12 @@ class WriteFileTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "write_file"
-        self.description = "Write content to a file inside the project root."
+        self.description = "Write content to a file inside the work path."
         self.parameters = [
             ToolParameter(
                 name="path",
                 type="string",
-                description="Relative path under project root.",
+                description="Relative path under the work path.",
                 required=True
             ),
             ToolParameter(
@@ -306,7 +310,7 @@ class RunShellTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "run_shell"
-        self.description = "Run a shell command from the allowlist within the project root."
+        self.description = "Run a shell command within the work path."
         self.parameters = [
             ToolParameter(
                 name="command",
@@ -317,7 +321,7 @@ class RunShellTool(Tool):
             ToolParameter(
                 name="cwd",
                 type="string",
-                description="Working directory (relative to project root).",
+                description="Working directory (relative to the work path).",
                 required=False
             ),
             ToolParameter(
@@ -341,19 +345,30 @@ class RunShellTool(Tool):
             raise ValueError("Missing command.")
         cmd_name = _extract_command_name(command)
         root = _get_root_path()
-        allowlist = get_tool_config().get("shell", {}).get("allowlist", [])
-        allowset = {str(item).lower() for item in allowlist}
         tool_ctx = get_tool_context()
         agent_mode = str(tool_ctx.get("agent_mode") or "default").lower()
         shell_unrestricted = bool(tool_ctx.get("shell_unrestricted"))
+        allowlist = get_tool_config().get("shell", {}).get("allowlist", [])
+        allowset = {str(item).lower() for item in allowlist}
         reasons = []
         if agent_mode != "super":
-            if _contains_shell_operators(command):
-                reasons.append("Shell operators detected.")
-            if not shell_unrestricted and cmd_name not in allowset:
-                reasons.append("Command not in allowlist.")
-            if shell_unrestricted and _command_targets_outside_root(command, root):
-                reasons.append("Command may access paths outside project root.")
+            if agent_mode == "default":
+                if _contains_shell_operators(command):
+                    reasons.append("Shell operators detected.")
+                if not shell_unrestricted and cmd_name not in allowset:
+                    reasons.append("Command not in allowlist.")
+                if _command_targets_outside_root(command, root):
+                    reasons.append("Command may access paths outside work path.")
+            elif agent_mode == "shell_safe":
+                if _command_targets_outside_root(command, root):
+                    reasons.append("Command may access paths outside work path.")
+            else:
+                if _contains_shell_operators(command):
+                    reasons.append("Shell operators detected.")
+                if not shell_unrestricted and cmd_name not in allowset:
+                    reasons.append("Command not in allowlist.")
+                if _command_targets_outside_root(command, root):
+                    reasons.append("Command may access paths outside work path.")
         if reasons:
             request_id = None
             try:
@@ -377,7 +392,7 @@ class RunShellTool(Tool):
                     return "Permission request timed out."
                 return "Permission required."
 
-            if not shell_unrestricted and cmd_name not in allowset:
+            if agent_mode == "default" and not shell_unrestricted and cmd_name not in allowset:
                 _ensure_shell_allowlist_entry(cmd_name)
 
         cwd = data.get("cwd")

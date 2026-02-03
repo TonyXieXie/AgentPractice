@@ -108,14 +108,20 @@ class Database:
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 config_id TEXT NOT NULL,
+                work_path TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (config_id) REFERENCES llm_configs(id)
             )
         ''')
-        
+
         try:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN agent_type TEXT DEFAULT "simple"')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN work_path TEXT')
         except sqlite3.OperationalError:
             pass
         
@@ -401,14 +407,14 @@ class Database:
         """Create session"""
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         session_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
-        
+
         cursor.execute('''
-            INSERT INTO chat_sessions (id, title, config_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (session_id, session.title, session.config_id, now, now))
+            INSERT INTO chat_sessions (id, title, config_id, work_path, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (session_id, session.title, session.config_id, session.work_path, now, now))
         
         conn.commit()
         conn.close()
@@ -453,15 +459,25 @@ class Database:
         """Update session"""
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+        fields = []
+        values = []
+
         if update.title is not None:
-            cursor.execute('''
-                UPDATE chat_sessions 
-                SET title = ?, updated_at = ?
-                WHERE id = ?
-            ''', (update.title, datetime.now().isoformat(), session_id))
+            fields.append("title = ?")
+            values.append(update.title)
+
+        if update.work_path is not None:
+            fields.append("work_path = ?")
+            values.append(update.work_path)
+
+        if fields:
+            fields.append("updated_at = ?")
+            values.append(datetime.now().isoformat())
+            values.append(session_id)
+            sql = f"UPDATE chat_sessions SET {', '.join(fields)} WHERE id = ?"
+            cursor.execute(sql, values)
             conn.commit()
-        
+
         conn.close()
         return self.get_session(session_id)
     

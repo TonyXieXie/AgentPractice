@@ -1,4 +1,5 @@
 ﻿import { useState, useEffect, useRef, useMemo } from 'react';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import './App.css';
 import { Message, LLMConfig, LLMCall, ToolPermissionRequest, ReasoningEffort, AgentMode } from './types';
 import {
@@ -15,6 +16,7 @@ import {
   getToolPermissions,
   updateToolPermission,
   updateConfig,
+  updateSession,
   AgentStep,
   AgentStepWithMessage,
 } from './api';
@@ -49,6 +51,7 @@ type QueueItem = {
   sessionKey: string;
   configId: string;
   agentMode: AgentMode;
+  workPath?: string;
   enqueuedAt: number;
 };
 
@@ -65,6 +68,7 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [currentConfig, setCurrentConfig] = useState<LLMConfig | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [currentWorkPath, setCurrentWorkPath] = useState('');
   const [showConfigManager, setShowConfigManager] = useState(false);
   const [sessionRefreshTrigger, setSessionRefreshTrigger] = useState(0);
   const [showSidebar] = useState(true);
@@ -84,6 +88,7 @@ function App() {
   const lastScrollTopRef = useRef(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const messagesCacheRef = useRef<Record<string, Message[]>>({});
+  const workPathBySessionRef = useRef<Record<string, string>>({});
   const currentSessionIdRef = useRef<string | null>(null);
   const queueBySessionRef = useRef<Record<string, QueueItem[]>>({});
   const inFlightBySessionRef = useRef<Record<string, InFlightState>>({});
@@ -209,6 +214,43 @@ function App() {
 
   const getCurrentSessionKey = () => getSessionKey(currentSessionIdRef.current);
 
+  const getSessionWorkPath = (sessionKey: string) => workPathBySessionRef.current[sessionKey] || '';
+
+  const setSessionWorkPath = (sessionKey: string, nextPath: string) => {
+    workPathBySessionRef.current[sessionKey] = nextPath;
+    if (sessionKey === getCurrentSessionKey()) {
+      setCurrentWorkPath(nextPath);
+    }
+  };
+
+  const pickWorkPath = async () => {
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: '\u9009\u62e9\u5de5\u4f5c\u8def\u5f84'
+      });
+      if (!selected) return '';
+      return Array.isArray(selected) ? (selected[0] || '') : selected;
+    } catch (error) {
+      console.error('Failed to pick work path:', error);
+      return '';
+    }
+  };
+
+  const applyWorkPath = async (sessionKey: string, sessionId: string | null, nextPath: string) => {
+    if (!nextPath) return;
+    setSessionWorkPath(sessionKey, nextPath);
+    if (sessionId) {
+      try {
+        await updateSession(sessionId, { work_path: nextPath });
+        setSessionRefreshTrigger((prev) => prev + 1);
+      } catch (error) {
+        console.error('Failed to update work path:', error);
+      }
+    }
+  };
+
   const bumpQueue = () => setQueueTick((prev) => prev + 1);
   const bumpInFlight = () => setInFlightTick((prev) => prev + 1);
   const bumpPermissions = () => setPermissionTick((prev) => prev + 1);
@@ -304,6 +346,14 @@ function App() {
       delete permissionBusyBySessionRef.current[fromKey];
       bumpPermissions();
     }
+
+    if (fromKey in workPathBySessionRef.current) {
+      workPathBySessionRef.current[toKey] = workPathBySessionRef.current[fromKey];
+      delete workPathBySessionRef.current[fromKey];
+      if (toKey === getCurrentSessionKey()) {
+        setCurrentWorkPath(workPathBySessionRef.current[toKey] || '');
+      }
+    }
   };
 
   const runStreamForItem = async (
@@ -351,6 +401,7 @@ function App() {
           session_id: targetSessionId || undefined,
           config_id: item.configId,
           agent_mode: item.agentMode,
+          work_path: item.workPath || undefined,
         },
         abortController.signal
       );
@@ -694,7 +745,14 @@ function App() {
     }
   };
 
-  const handleSend = () => {
+  const handleWorkPathPick = async () => {
+    const selected = await pickWorkPath();
+    if (!selected) return;
+    const sessionKey = getCurrentSessionKey();
+    await applyWorkPath(sessionKey, currentSessionIdRef.current, selected);
+  };
+
+  const handleSend = async () => {
     if (!inputMsg.trim()) return;
     if (!currentConfig) {
       alert('Please configure an LLM first.');
@@ -707,6 +765,15 @@ function App() {
 
     const targetSessionId = currentSessionIdRef.current;
     const sessionKey = getSessionKey(targetSessionId);
+    let workPath = getSessionWorkPath(sessionKey);
+    if (!targetSessionId && !workPath) {
+      const selected = await pickWorkPath();
+      if (selected) {
+        await applyWorkPath(sessionKey, null, selected);
+        workPath = selected;
+      }
+    }
+
     const queueItem: QueueItem = {
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       message: userMessage,
@@ -714,6 +781,7 @@ function App() {
       sessionKey,
       configId: currentConfig.id,
       agentMode,
+      workPath,
       enqueuedAt: Date.now(),
     };
 
@@ -832,6 +900,9 @@ function App() {
       ]);
 
       setLlmCalls(calls);
+      const sessionWorkPath = session.work_path || '';
+      workPathBySessionRef.current[session.id] = sessionWorkPath;
+      setCurrentWorkPath(sessionWorkPath);
 
       if (!cached || (!isStreamingSession && !hasStreaming)) {
         const [msgs, steps] = await Promise.all([
@@ -866,13 +937,27 @@ function App() {
     }
   };
 
-  const handleNewChat = () => {
+  const handleNewChat = async () => {
+    const sourceKey = getCurrentSessionKey();
+    const sourcePath = getSessionWorkPath(sourceKey);
+
     stashCurrentMessages();
     currentSessionIdRef.current = null;
     setCurrentSessionId(null);
     setSessionMessages(DRAFT_SESSION_KEY, []);
     setLlmCalls([]);
     autoScrollRef.current = true;
+
+    if (sourcePath) {
+      setSessionWorkPath(DRAFT_SESSION_KEY, sourcePath);
+      return;
+    }
+
+    setSessionWorkPath(DRAFT_SESSION_KEY, '');
+    const selected = await pickWorkPath();
+    if (selected) {
+      await applyWorkPath(DRAFT_SESSION_KEY, null, selected);
+    }
   };
 
   const handleRollback = async (messageId: number) => {
@@ -978,8 +1063,8 @@ function App() {
                           <button
                             className="message-action-btn icon inline"
                             onClick={() => handleRollback(msg.id)}
-                            title="回撤到此消息"
-                            aria-label="回撤到此消息"
+                            title={'\u56de\u64a4\u5230\u6b64\u6d88\u606f'}
+                            aria-label={'\u56de\u64a4\u5230\u6b64\u6d88\u606f'}
                           >
                             <svg className="icon-undo" viewBox="0 0 24 24" aria-hidden="true">
                               <path
@@ -1032,7 +1117,7 @@ function App() {
             {currentSessionQueue.length > 0 && (
               <div className="queue-panel">
                 <div className="queue-header">
-                  <span>排队消息</span>
+                  <span>{'\u6392\u961f\u6d88\u606f'}</span>
                   <span className="queue-count">{currentSessionQueue.length}</span>
                 </div>
                 <div className="queue-list">
@@ -1043,10 +1128,10 @@ function App() {
                         type="button"
                         className="queue-remove"
                         onClick={() => handleRemoveQueuedItem(item.id)}
-                        aria-label="删除排队消息"
-                        title="删除排队消息"
+                        aria-label={'\u5220\u9664\u6392\u961f\u6d88\u606f'}
+                        title={'\u5220\u9664\u6392\u961f\u6d88\u606f'}
                       >
-                        删除
+                        {'\u5220\u9664'}
                       </button>
                     </div>
                   ))}
@@ -1068,7 +1153,7 @@ function App() {
                       title={`Model: ${currentConfig.name}`}
                     >
                       <span className="selector-text">{currentConfig.name}</span>
-                      <span className="dropdown-arrow">▾</span>
+                      <span className="dropdown-arrow">{'\u25be'}</span>
                     </button>
 
                     {showConfigSelector && (
@@ -1103,12 +1188,12 @@ function App() {
                       }}
                       disabled={!currentConfig}
                       aria-label={`Agent mode: ${agentMode}`}
-                      title={`Agent模式: ${agentMode}`}
+                      title={`Agent\u6a21\u5f0f: ${agentMode}`}
                     >
                       <span className="selector-text">
                         {AGENT_MODE_OPTIONS.find((opt) => opt.value === agentMode)?.label || agentMode}
                       </span>
-                      <span className="dropdown-arrow">▾</span>
+                      <span className="dropdown-arrow">{'\u25be'}</span>
                     </button>
 
                     {showAgentModeSelector && (
@@ -1144,7 +1229,7 @@ function App() {
                       title={`Reasoning: ${currentReasoning}`}
                     >
                       <span className="selector-text">{currentReasoning}</span>
-                      <span className="dropdown-arrow">▾</span>
+                      <span className="dropdown-arrow">{'\u25be'}</span>
                     </button>
 
                     {showReasoningSelector && (
@@ -1202,6 +1287,18 @@ function App() {
                 )}
               </div>
             </div>
+            <button
+              type="button"
+              className="work-path-row"
+              onClick={handleWorkPathPick}
+              title={currentWorkPath || '\u70b9\u51fb\u9009\u62e9\u5de5\u4f5c\u8def\u5f84'}
+            >
+              <span className="work-path-label">{'\u5de5\u4f5c\u8def\u5f84'}</span>
+              <span className={`work-path-value${currentWorkPath ? '' : ' empty'}`}>
+                {currentWorkPath || '\u70b9\u51fb\u9009\u62e9\u5de5\u4f5c\u8def\u5f84'}
+              </span>
+            </button>
+
           </div>
         </div>
       </div>

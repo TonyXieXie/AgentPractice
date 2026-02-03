@@ -389,7 +389,8 @@ async def chat(request: ChatRequest):
 
             session = db.create_session(ChatSessionCreate(
                 title="New Chat",
-                config_id=config_id
+                config_id=config_id,
+                work_path=request.work_path
             ))
             new_session_created = True
         is_first_turn = (session.message_count or 0) == 0
@@ -491,7 +492,8 @@ async def chat_stream(request: ChatRequest):
             config_id = request.config_id if request.config_id else db.get_all_configs()[0].id
             session = db.create_session(ChatSessionCreate(
                 title="New Chat",
-                config_id=config_id
+                config_id=config_id,
+                work_path=request.work_path
             ))
             new_session_created = True
         is_first_turn = (session.message_count or 0) == 0
@@ -703,7 +705,8 @@ async def chat_agent_stream(request: ChatRequest):
             config_id = request.config_id or db.get_default_config().id
             session = db.create_session(ChatSessionCreate(
                 title="New Chat",
-                config_id=config_id
+                config_id=config_id,
+                work_path=request.work_path
             ))
             new_session_created = True
         is_first_turn = (session.message_count or 0) == 0
@@ -770,7 +773,8 @@ async def chat_agent_stream(request: ChatRequest):
                     "_debug": {
                         "session_id": session.id,
                         "message_id": assistant_msg_id
-                    }
+                    },
+                    "work_path": request.work_path or getattr(session, 'work_path', None)
                 }
                 request_overrides["_stop_event"] = stop_event
                 if request.agent_mode is not None:
