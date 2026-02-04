@@ -85,10 +85,14 @@ export default function SessionList({
     const formatDate = (dateStr: string) => {
         const date = new Date(dateStr);
         const now = new Date();
+        if (Number.isNaN(date.getTime())) return dateStr;
         const diff = now.getTime() - date.getTime();
+        if (diff < 60 * 1000) return '刚刚';
+        const minutes = Math.floor(diff / (1000 * 60));
+        if (minutes < 60) return `${minutes}分钟前`;
+        const hours = Math.floor(diff / (1000 * 60 * 60));
+        if (hours < 24) return `${hours}小时前`;
         const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-
-        if (days === 0) return '今天';
         if (days === 1) return '昨天';
         if (days < 7) return `${days}天前`;
         return date.toLocaleDateString('zh-CN');
@@ -193,7 +197,7 @@ export default function SessionList({
                                     <div className="session-info">
                                         <div className="session-title">{session.title}</div>
                                         <div className="session-meta">
-                                            <span>{formatDate(session.created_at)}</span>
+                                            <span>{formatDate(session.updated_at || session.created_at)}</span>
                                             <span className="session-meta-sep">{'\u00b7'}</span>
                                             <span
                                                 className={`session-work-path${session.work_path ? '' : ' empty'}`}
@@ -201,8 +205,6 @@ export default function SessionList({
                                             >
                                                 {session.work_path || '\u672a\u8bbe\u7f6e\u5de5\u4f5c\u8def\u5f84'}
                                             </span>
-                                            <span className="session-meta-sep">{'\u00b7'}</span>
-                                            <span>{session.message_count || 0} \u6761\u6d88\u606f</span>
                                         </div>
                                     </div>
                                     <div className="session-actions">
@@ -211,14 +213,39 @@ export default function SessionList({
                                             onClick={(e) => handleRename(session.id, e)}
                                             title="重命名"
                                         >
-                                            ✏️
+                                            <svg
+                                                className="session-action-icon"
+                                                viewBox="0 0 24 24"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                strokeWidth="1.8"
+                                                strokeLinecap="round"
+                                                strokeLinejoin="round"
+                                                aria-hidden="true"
+                                            >
+                                                <path d="M12 20h9" />
+                                                <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z" />
+                                            </svg>
                                         </button>
                                         <button
                                             className="session-action-btn delete"
                                             onClick={(e) => handleDelete(session, e)}
                                             title="删除"
                                         >
-                                            🗑️
+                                            <svg
+                                                className="session-action-icon"
+                                                viewBox="0 0 24 24"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                strokeWidth="1.8"
+                                                strokeLinecap="round"
+                                                strokeLinejoin="round"
+                                                aria-hidden="true"
+                                            >
+                                                <path d="M3 6h18" />
+                                                <path d="M8 6V4h8v2" />
+                                                <path d="M6 6l1 14h10l1-14" />
+                                            </svg>
                                         </button>
                                     </div>
                                 </>

@@ -16,10 +16,10 @@
 
 .confirm-dialog {
     width: min(420px, 90vw);
-    background: linear-gradient(135deg, #1c1c2b 0%, #26263a 100%);
-    border-radius: 14px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+    background: #1b1d20;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
     overflow: hidden;
     animation: confirmPop 0.2s ease-out;
 }
@@ -42,13 +42,13 @@
 
 .confirm-header h3 {
     margin: 0;
-    color: #fff;
+    color: #e5e7eb;
     font-size: 1.1rem;
 }
 
 .confirm-body {
     padding: 18px;
-    color: #cbd5f5;
+    color: #cbd5e1;
     font-size: 0.95rem;
     line-height: 1.6;
 }
@@ -61,40 +61,46 @@
 }
 
 .confirm-btn {
-    border: none;
+    border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 8px;
     padding: 8px 14px;
     font-size: 0.9rem;
     cursor: pointer;
-    transition: all 0.2s;
+    transition: background 0.2s, border-color 0.2s, color 0.2s;
     min-width: 88px;
+    background: #23272e;
+    color: #e5e7eb;
 }
 
 .confirm-btn.ghost {
-    background: rgba(255, 255, 255, 0.08);
-    color: #e2e8f0;
+    background: transparent;
+    color: #cbd5e1;
 }
 
 .confirm-btn.ghost:hover {
-    background: rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.2);
 }
 
 .confirm-btn.primary {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    color: #fff;
+    background: #30363d;
+    border-color: rgba(255, 255, 255, 0.18);
+    color: #f8fafc;
 }
 
 .confirm-btn.primary:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 6px 14px rgba(102, 126, 234, 0.35);
+    background: #3a4048;
+    border-color: rgba(255, 255, 255, 0.24);
 }
 
 .confirm-btn.danger {
-    background: linear-gradient(135deg, #f87171 0%, #ef4444 100%);
-    color: #fff;
+    background: #3a2323;
+    border-color: rgba(248, 113, 113, 0.35);
+    color: #fecaca;
 }
 
 .confirm-btn.danger:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 6px 14px rgba(239, 68, 68, 0.35);
+    background: #432828;
+    border-color: rgba(248, 113, 113, 0.5);
+    color: #fee2e2;
 }

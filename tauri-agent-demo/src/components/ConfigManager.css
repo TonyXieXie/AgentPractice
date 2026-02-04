@@ -4,7 +4,7 @@
   left: 0;
   right: 0;
   bottom: 0;
-  background-color: rgba(0, 0, 0, 0.7);
+  background-color: rgba(0, 0, 0, 0.65);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -18,13 +18,14 @@
 }
 
 .modal-content {
-  background: linear-gradient(135deg, #1e1e2e 0%, #2a2a3e 100%);
-  border-radius: 16px;
+  background: #1b1d20;
+  border-radius: 12px;
   max-width: 700px;
   width: 90%;
   max-height: 90vh;
   overflow: hidden;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
   animation: slideUp 0.3s ease-out;
 }
 
@@ -43,56 +44,86 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 20px 24px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 18px 20px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .modal-header h2 {
   margin: 0;
-  font-size: 1.5rem;
-  color: #fff;
+  font-size: 1.2rem;
+  color: #f3f4f6;
 }
 
 .close-btn {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.06);
   border: none;
-  color: #fff;
-  font-size: 1.5rem;
-  width: 36px;
-  height: 36px;
-  border-radius: 8px;
+  color: #cbd5e1;
+  font-size: 1.1rem;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
   cursor: pointer;
   transition: all 0.2s;
 }
 
 .close-btn:hover {
-  background: rgba(255, 255, 255, 0.2);
-  transform: scale(1.1);
+  background: rgba(255, 255, 255, 0.12);
 }
 
 .modal-body {
-  padding: 24px;
+  padding: 20px;
   overflow-y: auto;
   max-height: calc(90vh - 80px);
+}
+
+.config-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  margin-bottom: 14px;
+}
+
+.config-tab {
+  flex: 1;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: #cbd5e1;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.config-tab:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.config-tab.active {
+  background: rgba(255, 255, 255, 0.12);
+  color: #f8fafc;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16);
 }
 
 /* 配置列表 */
 .add-btn {
   width: 100%;
-  padding: 12px;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
+  padding: 10px;
+  background: #2a2d31;
+  color: #e2e8f0;
   border: none;
-  border-radius: 8px;
-  font-size: 1rem;
+  border-radius: 6px;
+  font-size: 0.95rem;
   cursor: pointer;
   margin-bottom: 20px;
   transition: all 0.3s;
 }
 
 .add-btn:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+  background: #33373d;
 }
 
 .configs-list {
@@ -109,10 +140,10 @@
 }
 
 .config-item {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 12px;
-  padding: 16px;
+  background: #22252a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 14px;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -120,36 +151,35 @@
 }
 
 .config-item:hover {
-  background: rgba(255, 255, 255, 0.08);
-  transform: translateX(4px);
+  background: #262a30;
 }
 
 .config-info h3 {
   margin: 0 0 8px 0;
-  color: #fff;
-  font-size: 1.1rem;
+  color: #f1f5f9;
+  font-size: 1rem;
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
 .badge {
-  background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-  color: white;
-  padding: 2px 8px;
+  background: rgba(255, 255, 255, 0.16);
+  color: #e2e8f0;
+  padding: 2px 6px;
   border-radius: 4px;
-  font-size: 0.75rem;
+  font-size: 0.7rem;
   font-weight: normal;
 }
 
 .config-detail {
   margin: 4px 0;
-  color: #aaa;
-  font-size: 0.9rem;
+  color: #a3aab4;
+  font-size: 0.85rem;
 }
 
 .config-detail strong {
-  color: #ccc;
+  color: #cbd5e1;
   margin-right: 4px;
 }
 
@@ -159,22 +189,23 @@
 }
 
 .config-actions button {
-  padding: 8px 16px;
-  border: none;
+  padding: 7px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 6px;
   cursor: pointer;
-  font-size: 0.9rem;
+  font-size: 0.85rem;
   transition: all 0.2s;
-  background: rgba(102, 126, 234, 0.8);
-  color: white;
+  background: #2b3036;
+  color: #e2e8f0;
 }
 
 .config-actions button:hover {
-  transform: scale(1.05);
+  background: #343a42;
 }
 
 .config-actions .delete-btn {
-  background: rgba(255, 70, 70, 0.8);
+  border-color: rgba(255, 255, 255, 0.16);
+  color: #f1f5f9;
 }
 
 /* 表单样式 */
@@ -186,8 +217,8 @@
 
 .config-form h3 {
   margin: 0 0 8px 0;
-  color: #fff;
-  font-size: 1.2rem;
+  color: #f3f4f6;
+  font-size: 1.05rem;
 }
 
 .form-group {
@@ -197,32 +228,32 @@
 }
 
 .form-group label {
-  color: #ddd;
-  font-size: 0.9rem;
+  color: #cbd5e1;
+  font-size: 0.85rem;
   font-weight: 500;
 }
 
 .form-group input,
 .form-group select {
-  padding: 10px 12px;
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 8px;
-  color: #fff;
-  font-size: 1rem;
+  padding: 9px 10px;
+  background: #1f2328;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  color: #f1f5f9;
+  font-size: 0.95rem;
   transition: all 0.2s;
 }
 
 .form-group input:focus,
 .form-group select:focus {
   outline: none;
-  border-color: #667eea;
-  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.35);
+  background: #22272d;
 }
 
 .form-group small {
-  color: #999;
-  font-size: 0.8rem;
+  color: #8b949e;
+  font-size: 0.75rem;
 }
 
 .form-row {
@@ -252,29 +283,36 @@
 
 .form-actions button {
   flex: 1;
-  padding: 12px;
-  border: none;
-  border-radius: 8px;
-  font-size: 1rem;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  font-size: 0.9rem;
   cursor: pointer;
   transition: all 0.2s;
 }
 
 .form-actions button[type="button"] {
-  background: rgba(255, 255, 255, 0.1);
-  color: #fff;
+  background: #2b3036;
+  color: #e2e8f0;
 }
 
 .form-actions button[type="submit"] {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
+  background: #30363d;
+  color: #f8fafc;
 }
 
 .form-actions button:hover:not(:disabled) {
-  transform: translateY(-2px);
+  background: #3a4048;
 }
 
 .form-actions button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.save-hint {
+  margin-top: 8px;
+  color: #86efac;
+  font-size: 0.8rem;
+  text-align: right;
 }

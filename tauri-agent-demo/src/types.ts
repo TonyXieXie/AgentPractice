@@ -4,6 +4,18 @@ export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | '
 export type ReasoningSummary = 'auto' | 'concise' | 'detailed';
 export type AgentMode = 'default' | 'shell_safe' | 'super';
 
+export interface AppConfig {
+    llm?: {
+        timeout_sec?: number;
+    };
+}
+
+export interface AppConfigUpdate {
+    llm?: {
+        timeout_sec?: number;
+    };
+}
+
 export interface LLMConfig {
     id: string;
     name: string;
@@ -114,6 +126,27 @@ export interface ToolPermissionRequest {
     status: string;
     created_at?: string | null;
     updated_at?: string | null;
+}
+
+export interface ApplyPatchSummary {
+    path: string;
+    added: number;
+    removed: number;
+}
+
+export interface ApplyPatchResult {
+    ok: boolean;
+    summary?: ApplyPatchSummary[];
+    diff?: string;
+    revert_patch?: string;
+    error?: string;
+}
+
+export interface PatchRevertResponse {
+    ok: boolean;
+    result?: ApplyPatchResult;
+    user_message_id?: number;
+    assistant_message_id?: number;
 }
 
 export interface ChatRequest {

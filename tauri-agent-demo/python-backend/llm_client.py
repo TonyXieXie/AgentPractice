@@ -1,6 +1,7 @@
 ﻿from typing import Optional, List, Dict, Any
 import httpx
 from models import LLMConfig
+from app_config import get_app_config
 
 
 class LLMClient:
@@ -8,7 +9,16 @@ class LLMClient:
 
     def __init__(self, config: LLMConfig):
         self.config = config
-        self.timeout = 60.0
+        self.timeout = self._resolve_timeout()
+
+    def _resolve_timeout(self) -> float:
+        app_config = get_app_config()
+        timeout = app_config.get("llm", {}).get("timeout_sec", 180.0)
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            return 180.0
+        return max(1.0, timeout)
 
     async def chat(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
@@ -233,6 +243,32 @@ class LLMClient:
         if profile == "deepseek" and "reasoner" in model_lower:
             request_payload.pop("temperature", None)
 
+    async def _log_http_error(self, exc: httpx.HTTPStatusError):
+        response = exc.response
+        status = response.status_code if response is not None else "unknown"
+        detail_text = ""
+        detail_json = None
+        if response is not None:
+            try:
+                raw = await response.aread()
+                detail_text = raw.decode("utf-8", errors="replace")
+            except Exception as read_error:
+                try:
+                    detail_text = response.text
+                except Exception:
+                    detail_text = f"<failed to read response body: {read_error}>"
+        if detail_text:
+            try:
+                import json
+                detail_json = json.loads(detail_text)
+            except Exception:
+                detail_json = None
+        log_text = detail_text
+        if len(log_text) > 4000:
+            log_text = log_text[:4000] + "...<truncated>"
+        print(f"[LLM HTTP Error] {exc} | status={status} | body={log_text}")
+        return detail_text, detail_json, status
+
     async def _chat_openai(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """OpenAI-compatible Chat Completions API."""
         base_url = self._get_base_url()
@@ -261,7 +297,24 @@ class LLMClient:
                 },
                 json=request_payload
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                detail_text, detail_json, status = await self._log_http_error(exc)
+                if debug_ctx:
+                    error_payload = {"status": status, "message": str(exc)}
+                    if detail_json is not None:
+                        error_payload["body"] = detail_json
+                    elif detail_text:
+                        error_payload["body"] = detail_text
+                    self._save_llm_call(
+                        debug_ctx,
+                        stream=False,
+                        request_payload=request_payload,
+                        response_json={"error": error_payload},
+                        response_text=detail_text or str(exc)
+                    )
+                raise
             data = response.json()
 
             usage = data.get("usage", {})
@@ -325,7 +378,24 @@ class LLMClient:
                 },
                 json=request_payload
             ) as response:
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    detail_text, detail_json, status = await self._log_http_error(exc)
+                    if debug_ctx:
+                        error_payload = {"status": status, "message": str(exc)}
+                        if detail_json is not None:
+                            error_payload["body"] = detail_json
+                        elif detail_text:
+                            error_payload["body"] = detail_text
+                        self._save_llm_call(
+                            debug_ctx,
+                            stream=True,
+                            request_payload=request_payload,
+                            response_json={"error": error_payload},
+                            response_text=detail_text or str(exc)
+                        )
+                    raise
                 async for line in response.aiter_lines():
                     if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                         stopped = True
@@ -398,7 +468,24 @@ class LLMClient:
                 },
                 json=request_payload
             ) as response:
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    detail_text, detail_json, status = await self._log_http_error(exc)
+                    if debug_ctx:
+                        error_payload = {"status": status, "message": str(exc)}
+                        if detail_json is not None:
+                            error_payload["body"] = detail_json
+                        elif detail_text:
+                            error_payload["body"] = detail_text
+                        self._save_llm_call(
+                            debug_ctx,
+                            stream=True,
+                            request_payload=request_payload,
+                            response_json={"error": error_payload},
+                            response_text=detail_text or str(exc)
+                        )
+                    raise
                 async for line in response.aiter_lines():
                     if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                         stopped = True
@@ -519,7 +606,24 @@ class LLMClient:
                 },
                 json=request_payload
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                detail_text, detail_json, status = await self._log_http_error(exc)
+                if debug_ctx:
+                    error_payload = {"status": status, "message": str(exc)}
+                    if detail_json is not None:
+                        error_payload["body"] = detail_json
+                    elif detail_text:
+                        error_payload["body"] = detail_text
+                    self._save_llm_call(
+                        debug_ctx,
+                        stream=False,
+                        request_payload=request_payload,
+                        response_json={"error": error_payload},
+                        response_text=detail_text or str(exc)
+                    )
+                raise
             data = response.json()
             response_text = self._extract_openai_responses_text(data)
             llm_call_id = None
@@ -582,7 +686,24 @@ class LLMClient:
                 },
                 json=request_payload
             ) as response:
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    detail_text, detail_json, status = await self._log_http_error(exc)
+                    if debug_ctx:
+                        error_payload = {"status": status, "message": str(exc)}
+                        if detail_json is not None:
+                            error_payload["body"] = detail_json
+                        elif detail_text:
+                            error_payload["body"] = detail_text
+                        self._save_llm_call(
+                            debug_ctx,
+                            stream=True,
+                            request_payload=request_payload,
+                            response_json={"error": error_payload},
+                            response_text=detail_text or str(exc)
+                        )
+                    raise
                 async for line in response.aiter_lines():
                     if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                         stopped = True
@@ -663,7 +784,24 @@ class LLMClient:
                 },
                 json=request_payload
             ) as response:
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    detail_text, detail_json, status = await self._log_http_error(exc)
+                    if debug_ctx:
+                        error_payload = {"status": status, "message": str(exc)}
+                        if detail_json is not None:
+                            error_payload["body"] = detail_json
+                        elif detail_text:
+                            error_payload["body"] = detail_text
+                        self._save_llm_call(
+                            debug_ctx,
+                            stream=True,
+                            request_payload=request_payload,
+                            response_json={"error": error_payload},
+                            response_text=detail_text or str(exc)
+                        )
+                    raise
                 async for line in response.aiter_lines():
                     if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                         stopped = True

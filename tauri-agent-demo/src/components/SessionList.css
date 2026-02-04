@@ -1,15 +1,16 @@
 .session-list {
     width: 280px;
-    background: linear-gradient(180deg, #1a1a2e 0%, #16213e 100%);
-    border-right: 1px solid rgba(255, 255, 255, 0.1);
+    background: #0f1115;
+    border-right: 1px solid rgba(255, 255, 255, 0.08);
     display: flex;
     flex-direction: column;
     height: 100%;
 }
 
 .session-list-header {
-    padding: 20px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    background: #15181d;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -35,7 +36,7 @@
     overflow-y: auto;
     overflow-x: hidden;
     /* 防止水平滚动 */
-    padding: 8px;
+    padding: 6px;
     min-height: 0;
     /* 关键：允许flex子项缩小 */
     scroll-behavior: smooth;
@@ -44,43 +45,48 @@
 
 .empty-sessions {
     text-align: center;
-    color: #666;
+    color: #8b949e;
     padding: 40px 20px;
     font-size: 0.9rem;
 }
 
 .session-item {
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    border-radius: 10px;
-    padding: 12px;
-    margin-bottom: 8px;
+    background: #151a21;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 10px;
+    padding-right: 30px;
+    margin-bottom: 4px;
     cursor: pointer;
-    transition: all 0.2s;
+    transition: background 0.2s, border-color 0.2s;
     display: flex;
-    justify-content: space-between;
+    justify-content: flex-start;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
+    position: relative;
 }
 
 .session-item:hover {
-    background: rgba(255, 255, 255, 0.08);
-    transform: translateX(4px);
+    background: #1b212a;
+    border-color: rgba(255, 255, 255, 0.12);
 }
 
 .session-item.active {
-    background: linear-gradient(135deg, rgba(102, 126, 234, 0.2) 0%, rgba(118, 75, 162, 0.2) 100%);
-    border-color: rgba(102, 126, 234, 0.5);
+    background: #1b212a;
+    border-color: rgba(255, 255, 255, 0.2);
 }
 
 .session-info {
     flex: 1;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
 }
 
 .session-title {
-    color: #fff;
-    font-size: 0.95rem;
+    color: #e5e7eb;
+    font-size: 0.9rem;
     font-weight: 500;
     margin-bottom: 4px;
     overflow: hidden;
@@ -89,8 +95,8 @@
 }
 
 .session-meta {
-    color: #888;
-    font-size: 0.75rem;
+    color: #8b949e;
+    font-size: 0.72rem;
     display: flex;
     align-items: center;
     gap: 4px;
@@ -102,7 +108,7 @@
 }
 
 .session-work-path {
-    max-width: 140px;
+    max-width: 160px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -115,9 +121,14 @@
 
 .session-actions {
     display: flex;
-    gap: 4px;
+    flex-direction: column;
+    gap: 2px;
     opacity: 0;
     transition: opacity 0.2s;
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
 }
 
 .session-item:hover .session-actions {
@@ -125,34 +136,43 @@
 }
 
 .session-action-btn {
-    background: rgba(255, 255, 255, 0.1);
-    border: none;
-    width: 28px;
-    height: 28px;
+    background: transparent;
+    border: 1px solid transparent;
+    width: 24px;
+    height: 24px;
     border-radius: 6px;
     cursor: pointer;
     font-size: 0.85rem;
-    transition: all 0.2s;
+    transition: background 0.2s, border-color 0.2s, color 0.2s;
     display: flex;
     align-items: center;
     justify-content: center;
+    color: #e2e8f0;
+}
+
+.session-action-icon {
+    width: 13px;
+    height: 13px;
 }
 
 .session-action-btn:hover {
-    background: rgba(255, 255, 255, 0.2);
-    transform: scale(1.1);
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.12);
+    color: #fff;
 }
 
 .session-action-btn.delete:hover {
-    background: rgba(255, 70, 70, 0.3);
+    background: rgba(248, 113, 113, 0.12);
+    border-color: rgba(248, 113, 113, 0.35);
+    color: #fecaca;
 }
 
 .session-rename-input {
     flex: 1;
-    background: rgba(255, 255, 255, 0.12);
-    border: 1px solid rgba(102, 126, 234, 0.6);
+    background: #1f2328;
+    border: 1px solid rgba(255, 255, 255, 0.2);
     border-radius: 6px;
-    color: #fff;
+    color: #f8fafc;
     padding: 6px 8px;
     font-size: 0.9rem;
     outline: none;

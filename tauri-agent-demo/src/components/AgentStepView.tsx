@@ -3,7 +3,7 @@ import MarkdownIt from 'markdown-it';
 import texmath from 'markdown-it-texmath';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
-import { open } from '@tauri-apps/plugin-opener';
+import { openPath, openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { AgentStep } from '../api';
 import { ToolPermissionRequest } from '../types';
 import DiffView from './DiffView';
@@ -17,6 +17,10 @@ interface AgentStepViewProps {
     pendingPermission?: ToolPermissionRequest | null;
     onPermissionDecision?: (status: 'approved' | 'denied') => void;
     permissionBusy?: boolean;
+    onRetryMessage?: () => void;
+    onRollbackMessage?: () => void;
+    onRevertPatch?: (patch: string) => void;
+    patchRevertBusy?: boolean;
 }
 
 const CATEGORY_LABELS: Record<Category, string> = {
@@ -50,7 +54,7 @@ markdown.use(texmath, {
     katexOptions: { throwOnError: false, errorColor: '#f87171' }
 });
 
-markdown.renderer.rules.fence = (tokens, idx, options, env, self) => {
+markdown.renderer.rules.fence = (tokens, idx, _options, _env, _self) => {
     const token = tokens[idx];
     const info = (token.info || '').trim();
     const lang = info ? info.split(/\s+/g)[0] : '';
@@ -84,6 +88,27 @@ function renderRichContent(content: string, onClick?: MouseEventHandler<HTMLDivE
 
 function looksLikeDiff(content: string) {
     return /^diff --git /m.test(content) || /^@@\s+-\d+/m.test(content);
+}
+
+type ApplyPatchResult = {
+    ok: boolean;
+    summary?: { path: string; added: number; removed: number }[];
+    diff?: string;
+    revert_patch?: string;
+    error?: string;
+};
+
+function parseApplyPatchResult(content: string): ApplyPatchResult | null {
+    if (!content) return null;
+    try {
+        const parsed = JSON.parse(content);
+        if (parsed && typeof parsed === 'object' && typeof parsed.ok === 'boolean') {
+            return parsed as ApplyPatchResult;
+        }
+    } catch {
+        // ignore
+    }
+    return null;
 }
 
 function hasUnicodeEscapes(content: string) {
@@ -162,12 +187,18 @@ function AgentStepView({
     streaming,
     pendingPermission,
     onPermissionDecision,
-    permissionBusy
+    permissionBusy,
+    onRetryMessage,
+    onRollbackMessage,
+    onRevertPatch,
+    patchRevertBusy
 }: AgentStepViewProps) {
     const [expandedObservations, setExpandedObservations] = useState<Record<string, boolean>>({});
     const [translatedSearchSteps, setTranslatedSearchSteps] = useState<Record<string, boolean>>({});
     const [expandedErrors, setExpandedErrors] = useState<Record<string, boolean>>({});
+    const [errorCopyState, setErrorCopyState] = useState<Record<string, 'idle' | 'copied' | 'failed'>>({});
     const [thoughtAutoScroll, setThoughtAutoScroll] = useState<Record<string, boolean>>({});
+    const [expandedPatches, setExpandedPatches] = useState<Record<string, boolean>>({});
     const thoughtRefs = useRef<Record<string, HTMLDivElement | null>>({});
     const [fileMenu, setFileMenu] = useState<{ path: string; x: number; y: number } | null>(null);
 
@@ -199,7 +230,7 @@ function AgentStepView({
         if (!href) return;
         const normalized = href.startsWith('www.') ? `https://${href}` : href;
         try {
-            await open(normalized);
+            await openUrl(normalized);
         } catch {
             // ignore open errors
         }
@@ -208,7 +239,7 @@ function AgentStepView({
     const handleOpenFile = async (filePath: string) => {
         if (!filePath) return;
         try {
-            await open(filePath);
+            await openPath(filePath);
         } catch {
             // ignore open errors
         }
@@ -216,11 +247,15 @@ function AgentStepView({
 
     const handleOpenFileFolder = async (filePath: string) => {
         if (!filePath) return;
-        const parent = getParentPath(filePath);
         try {
-            await open(parent || filePath);
+            await revealItemInDir(filePath);
         } catch {
-            // ignore open errors
+            try {
+                const parent = getParentPath(filePath);
+                await openPath(parent || filePath);
+            } catch {
+                // ignore open errors
+            }
         }
     };
 
@@ -317,6 +352,24 @@ function AgentStepView({
         handleOpenLink(link.href);
     };
 
+    const handleCopyError = (stepKey: string, text: string) => {
+        if (!text) return;
+        navigator.clipboard.writeText(text).then(
+            () => {
+                setErrorCopyState((prev) => ({ ...prev, [stepKey]: 'copied' }));
+                window.setTimeout(() => {
+                    setErrorCopyState((prev) => ({ ...prev, [stepKey]: 'idle' }));
+                }, 1200);
+            },
+            () => {
+                setErrorCopyState((prev) => ({ ...prev, [stepKey]: 'failed' }));
+                window.setTimeout(() => {
+                    setErrorCopyState((prev) => ({ ...prev, [stepKey]: 'idle' }));
+                }, 1200);
+            }
+        );
+    };
+
     if (!steps.length && !pendingPermission) {
         return (
             <div className="agent-steps empty">
@@ -383,14 +436,30 @@ function AgentStepView({
         </div>
     ) : null;
 
+    const lastPatchIndex = (() => {
+        let idx = -1;
+        steps.forEach((step, index) => {
+            if (step.step_type !== 'observation') return;
+            const toolName = String(step.metadata?.tool || '').toLowerCase();
+            if (toolName === 'apply_patch') {
+                idx = index;
+            }
+        });
+        return idx;
+    })();
+
     return (
-        <div className="agent-steps">
+        <>
+            <div className="agent-steps">
             {steps.map((step, index) => {
                 const category = STEP_CATEGORY[step.step_type] || 'other';
                 const stepKey = `${step.step_type}-${index}`;
                 const isObservation = step.step_type === 'observation';
                 const isAction = step.step_type === 'action' || step.step_type === 'action_delta';
                 const isError = step.step_type === 'error';
+                const errorType = String(step.metadata?.error_type || '').toLowerCase();
+                const isTimeoutError =
+                    isError && (errorType.includes('timeout') || /timeout/i.test(String(step.content || '')));
                 const isThought = category === 'thought';
                 const rawContent = String(step.content || '');
                 const trimmedContent = rawContent.trimStart();
@@ -408,27 +477,34 @@ function AgentStepView({
                 let observationPreview = '';
                 let observationHasMore = false;
                 let observationIsDiff = false;
+                let applyPatchResult: ApplyPatchResult | null = null;
+                let isApplyPatch = false;
                 if (isObservation) {
                     observationText = rawContent.replace(/\r\n/g, '\n');
                     const lines = observationText.split('\n');
                     observationHasMore = lines.length > 1;
                     observationPreview = observationHasMore ? `${lines[0]} ...` : lines[0] || '';
                     observationIsDiff = looksLikeDiff(observationText);
+                    isApplyPatch = toolName === 'apply_patch';
+                    if (isApplyPatch) {
+                        applyPatchResult = parseApplyPatchResult(observationText);
+                    }
                 }
+                const showObservationToggle = isObservation && observationHasMore && !isApplyPatch;
 
                 return (
                     <Fragment key={`${step.step_type}-${index}`}>
                         <div className={`agent-step ${category}${isAction ? ' action' : ''}`}>
                             <div className="agent-step-header">
-                                <span className="agent-step-category">{CATEGORY_LABELS[category]}</span>
-                                <div className="agent-step-header-actions">
-                                    <span className="agent-step-type">{step.step_type}</span>
-                                    {isObservation && observationHasMore && (
-                                        <button
-                                            type="button"
-                                            className="observation-toggle"
-                                            aria-label={expandedObservations[stepKey] ? 'Collapse observation' : 'Expand observation'}
-                                            title={expandedObservations[stepKey] ? 'Collapse' : 'Expand'}
+                                    <span className="agent-step-category">{CATEGORY_LABELS[category]}</span>
+                                    <div className="agent-step-header-actions">
+                                        <span className="agent-step-type">{step.step_type}</span>
+                                        {showObservationToggle && (
+                                            <button
+                                                type="button"
+                                                className="observation-toggle"
+                                                aria-label={expandedObservations[stepKey] ? 'Collapse observation' : 'Expand observation'}
+                                                title={expandedObservations[stepKey] ? 'Collapse' : 'Expand'}
                                             onClick={() =>
                                                 setExpandedObservations((prev) => ({ ...prev, [stepKey]: !prev[stepKey] }))
                                             }
@@ -453,7 +529,60 @@ function AgentStepView({
                             </div>
                             {isObservation ? (
                                 <div className="agent-step-content observation">
-                                    {expandedObservations[stepKey] ? (
+                                    {isApplyPatch && applyPatchResult ? (
+                                        applyPatchResult.ok ? (
+                                            <div className="patch-result">
+                                                <div className="patch-summary-header">
+                                                    <span className="patch-summary-title">修改</span>
+                                                    <div className="patch-summary-actions">
+                                                        <button
+                                                            type="button"
+                                                            className="patch-summary-btn"
+                                                            onClick={() =>
+                                                                setExpandedPatches((prev) => ({
+                                                                    ...prev,
+                                                                    [stepKey]: !prev[stepKey]
+                                                                }))
+                                                            }
+                                                        >
+                                                            {expandedPatches[stepKey] ? '收起' : '展开'}
+                                                        </button>
+                                                        {index === lastPatchIndex && onRevertPatch && applyPatchResult.revert_patch && (
+                                                            <button
+                                                                type="button"
+                                                                className="patch-summary-btn danger"
+                                                                onClick={() => onRevertPatch(applyPatchResult!.revert_patch || '')}
+                                                                disabled={patchRevertBusy}
+                                                            >
+                                                                {patchRevertBusy ? '处理中...' : '撤销'}
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                <div className="patch-summary-list">
+                                                    {(applyPatchResult.summary || []).length === 0 && (
+                                                        <div className="patch-summary-item">
+                                                            <span className="patch-summary-path">无变更</span>
+                                                            <span className="patch-summary-counts">+0 -0</span>
+                                                        </div>
+                                                    )}
+                                                    {(applyPatchResult.summary || []).map((item, idx) => (
+                                                        <div key={`${item.path}-${idx}`} className="patch-summary-item">
+                                                            <span className="patch-summary-path">{item.path}</span>
+                                                            <span className="patch-summary-counts">
+                                                                +{item.added} -{item.removed}
+                                                            </span>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                                {expandedPatches[stepKey] && applyPatchResult.diff && (
+                                                    <DiffView content={applyPatchResult.diff} />
+                                                )}
+                                            </div>
+                                        ) : (
+                                            <div className="observation-text">{applyPatchResult.error || 'Apply patch failed.'}</div>
+                                        )
+                                    ) : expandedObservations[stepKey] ? (
                                         observationIsDiff ? (
                                             <DiffView content={observationText} />
                                         ) : (
@@ -475,19 +604,49 @@ function AgentStepView({
                                     })}
                                     {hasErrorDetails && (
                                         <>
-                                            <button
-                                                type="button"
-                                                className="error-toggle"
-                                                onClick={() =>
-                                                    setExpandedErrors((prev) => ({ ...prev, [stepKey]: !prev[stepKey] }))
-                                                }
-                                            >
-                                                {errorExpanded ? '隐藏错误详情' : '显示错误详情'}
-                                            </button>
+                                            <div className="error-actions">
+                                                <button
+                                                    type="button"
+                                                    className="error-toggle"
+                                                    onClick={() =>
+                                                        setExpandedErrors((prev) => ({ ...prev, [stepKey]: !prev[stepKey] }))
+                                                    }
+                                                >
+                                                    {errorExpanded ? '隐藏错误详情' : '显示错误详情'}
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    className={`error-copy-btn ${errorCopyState[stepKey] || 'idle'}`}
+                                                    onClick={() => handleCopyError(stepKey, errorDetails)}
+                                                >
+                                                    {errorCopyState[stepKey] === 'copied'
+                                                        ? '已复制'
+                                                        : errorCopyState[stepKey] === 'failed'
+                                                            ? '复制失败'
+                                                            : '复制错误'}
+                                                </button>
+                                            </div>
                                             {errorExpanded && (
                                                 <pre className="error-details">{errorDetails}</pre>
                                             )}
                                         </>
+                                    )}
+                                    {isTimeoutError && (onRetryMessage || onRollbackMessage) && (
+                                        <div className="timeout-banner">
+                                            <span>请求超时</span>
+                                            <div className="timeout-actions">
+                                                {onRollbackMessage && (
+                                                    <button type="button" onClick={onRollbackMessage}>
+                                                        撤销本次
+                                                    </button>
+                                                )}
+                                                {onRetryMessage && (
+                                                    <button type="button" onClick={onRetryMessage}>
+                                                        重新发送
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
                                     )}
                                 </div>
                             )}
@@ -508,8 +667,8 @@ function AgentStepView({
                     </div>
                 </div>
             )}
-        </div>
-        {fileMenu && (
+            </div>
+            {fileMenu && (
             <div
                 className="file-context-menu"
                 style={{
@@ -540,7 +699,8 @@ function AgentStepView({
                     打开所在文件夹
                 </button>
             </div>
-        )}
+            )}
+        </>
     );
 }
 

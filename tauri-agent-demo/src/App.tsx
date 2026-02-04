@@ -13,6 +13,7 @@ import {
   getSessionAgentSteps,
   stopAgentStream,
   rollbackSession,
+  revertPatch,
   getToolPermissions,
   updateToolPermission,
   updateConfig,
@@ -43,6 +44,14 @@ const AGENT_MODE_OPTIONS: { value: AgentMode; label: string; description: string
 ];
 
 const MAX_CONCURRENT_STREAMS = 10;
+const WORK_PATH_MAX_LENGTH = 200;
+
+const formatWorkPath = (path: string) => {
+  if (!path) return '点击选择工作路径';
+  if (path.length <= WORK_PATH_MAX_LENGTH) return path;
+  const tailLength = Math.max(1, WORK_PATH_MAX_LENGTH - 3);
+  return `...${path.slice(-tailLength)}`;
+};
 
 type QueueItem = {
   id: string;
@@ -82,6 +91,7 @@ function App() {
   const [queueTick, setQueueTick] = useState(0);
   const [inFlightTick, setInFlightTick] = useState(0);
   const [permissionTick, setPermissionTick] = useState(0);
+  const [patchRevertBusy, setPatchRevertBusy] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
@@ -366,7 +376,7 @@ function App() {
     const userMessage = item.message;
     const targetSessionId = item.sessionId;
     let activeSessionKey = startSessionKey;
-    let newSessionId = targetSessionId;
+    let newSessionId: string | null = targetSessionId;
     let currentAssistantId = tempAssistantId;
 
     const tempUserMsg: Message = {
@@ -427,16 +437,17 @@ function App() {
             }
           }
           if (incomingUserId || incomingAssistantId) {
+            const resolvedSessionId = newSessionId || '';
             updateSessionMessages(activeSessionKey, (prev) =>
               prev.map((msg) => {
                 if (typeof incomingUserId === 'number' && msg.id === tempUserId) {
-                  return { ...msg, id: incomingUserId, session_id: newSessionId };
+                  return { ...msg, id: incomingUserId, session_id: resolvedSessionId };
                 }
                 if (typeof incomingAssistantId === 'number' && msg.id === tempAssistantId) {
-                  return { ...msg, id: incomingAssistantId, session_id: newSessionId };
+                  return { ...msg, id: incomingAssistantId, session_id: resolvedSessionId };
                 }
                 if (!msg.session_id && newSessionId) {
-                  return { ...msg, session_id: newSessionId };
+                  return { ...msg, session_id: resolvedSessionId };
                 }
                 return msg;
               })
@@ -617,7 +628,7 @@ function App() {
               nextSteps.push(step);
             }
             nextMetadata.agent_steps = nextSteps;
-            nextMetadata.agent_streaming = step.step_type !== 'answer' && step.step_type !== 'error';
+            nextMetadata.agent_streaming = true;
             return { ...msg, metadata: nextMetadata };
           })
         );
@@ -752,21 +763,17 @@ function App() {
     await applyWorkPath(sessionKey, currentSessionIdRef.current, selected);
   };
 
-  const handleSend = async () => {
-    if (!inputMsg.trim()) return;
+  const enqueueMessage = async (message: string, sessionId: string | null) => {
+    if (!message.trim()) return;
     if (!currentConfig) {
       alert('Please configure an LLM first.');
       return;
     }
     autoScrollRef.current = true;
 
-    const userMessage = inputMsg.trim();
-    setInputMsg('');
-
-    const targetSessionId = currentSessionIdRef.current;
-    const sessionKey = getSessionKey(targetSessionId);
+    const sessionKey = getSessionKey(sessionId);
     let workPath = getSessionWorkPath(sessionKey);
-    if (!targetSessionId && !workPath) {
+    if (!sessionId && !workPath) {
       const selected = await pickWorkPath();
       if (selected) {
         await applyWorkPath(sessionKey, null, selected);
@@ -776,8 +783,8 @@ function App() {
 
     const queueItem: QueueItem = {
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      message: userMessage,
-      sessionId: targetSessionId,
+      message,
+      sessionId,
       sessionKey,
       configId: currentConfig.id,
       agentMode,
@@ -787,6 +794,27 @@ function App() {
 
     enqueueSessionQueue(sessionKey, queueItem);
     processQueues();
+  };
+
+  const handleSend = async () => {
+    const userMessage = inputMsg.trim();
+    if (!userMessage) return;
+    setInputMsg('');
+    await enqueueMessage(userMessage, currentSessionIdRef.current);
+  };
+
+  const handleRetryMessage = async (messageId: number | null, message: string) => {
+    if (!message) return;
+    if (isStreamingCurrent) {
+      alert('请先停止当前输出再重试。');
+      return;
+    }
+    let rollbackOk = true;
+    if (messageId && currentSessionIdRef.current) {
+      rollbackOk = await rollbackToMessage(messageId, { silent: true, keepInput: false });
+    }
+    if (!rollbackOk) return;
+    await enqueueMessage(message, currentSessionIdRef.current);
   };
 
   const handleRemoveQueuedItem = (itemId: string) => {
@@ -839,7 +867,7 @@ function App() {
     if (!inflight) return;
     inflight.stopRequested = true;
     const activeAssistantId = inflight.activeAssistantId;
-    let assistantId = activeAssistantId ?? inflight.tempAssistantId;
+    let assistantId: number | null = activeAssistantId ?? inflight.tempAssistantId;
     if (activeAssistantId) {
       try {
         await stopAgentStream(activeAssistantId);
@@ -961,24 +989,62 @@ function App() {
   };
 
   const handleRollback = async (messageId: number) => {
-    if (!currentSessionId) return;
+    await rollbackToMessage(messageId, { silent: false, keepInput: true });
+  };
+
+  const rollbackToMessage = async (
+    messageId: number,
+    options?: { silent?: boolean; keepInput?: boolean }
+  ) => {
+    if (!currentSessionId) return false;
     const currentKey = getCurrentSessionKey();
     if (inFlightBySessionRef.current[currentKey]) {
       alert('请先停止当前输出再回撤。');
-      return;
+      return false;
     }
-    if (!confirm('确定回撤到这条消息吗？')) return;
+    if (!options?.silent && !confirm('确定回撤到这条消息吗？')) return false;
 
     try {
       const result = await rollbackSession(currentSessionId, messageId);
       await handleSelectSession(currentSessionId);
-      setInputMsg(result.input_message || '');
-      inputRef.current?.focus();
+      if (options?.keepInput) {
+        setInputMsg(result.input_message || '');
+        inputRef.current?.focus();
+      } else {
+        setInputMsg('');
+      }
       setSessionRefreshTrigger((prev) => prev + 1);
       await refreshSessionDebug(currentSessionId);
+      return true;
     } catch (error) {
       console.error('Failed to rollback session:', error);
       alert('回撤失败');
+      return false;
+    }
+  };
+
+  const handleRevertPatch = async (revertPatchContent: string) => {
+    if (!currentSessionId) {
+      alert('请先选择会话。');
+      return;
+    }
+    if (patchRevertBusy) return;
+    const currentKey = getCurrentSessionKey();
+    if (inFlightBySessionRef.current[currentKey]) {
+      alert('请先停止当前输出再撤销。');
+      return;
+    }
+    setPatchRevertBusy(true);
+    try {
+      await revertPatch(currentSessionId, revertPatchContent);
+      await handleSelectSession(currentSessionId);
+      setSessionRefreshTrigger((prev) => prev + 1);
+      await refreshSessionDebug(currentSessionId);
+    } catch (error) {
+      console.error('Failed to revert patch:', error);
+      alert('撤销失败');
+    } finally {
+      setPatchRevertBusy(false);
     }
   };
 
@@ -1017,6 +1083,7 @@ function App() {
     [currentSessionKey, permissionTick]
   );
   const currentReasoning = (currentConfig?.reasoning_effort || 'medium') as ReasoningEffort;
+  const workPathDisplay = useMemo(() => formatWorkPath(currentWorkPath), [currentWorkPath]);
 
   return (
     <div className="app-container">
@@ -1042,10 +1109,17 @@ function App() {
                 {!currentConfig && <p className="warning">Please configure an LLM.</p>}
               </div>
             ) : (
-              messages.map((msg) => {
+              messages.map((msg, index) => {
                 const steps = (msg.metadata?.agent_steps || []) as AgentStep[];
                 const streaming = Boolean(msg.metadata?.agent_streaming);
                 const showPermission = Boolean(currentPendingPermission && msg.id === latestAssistantId);
+                const previousUser = (() => {
+                  for (let i = index - 1; i >= 0; i -= 1) {
+                    if (messages[i].role === 'user') return messages[i];
+                  }
+                  return null;
+                })();
+
                 return (
                   <div key={msg.id} className={`message ${msg.role}`}>
                     <div className="message-content">
@@ -1056,6 +1130,16 @@ function App() {
                           pendingPermission={showPermission ? currentPendingPermission : null}
                           onPermissionDecision={handlePermissionDecision}
                           permissionBusy={currentPermissionBusy}
+                          onRollbackMessage={
+                            previousUser?.id ? () => handleRollback(previousUser.id) : undefined
+                          }
+                          onRetryMessage={
+                            previousUser?.content
+                              ? () => handleRetryMessage(previousUser.id, previousUser.content)
+                              : undefined
+                          }
+                          onRevertPatch={handleRevertPatch}
+                          patchRevertBusy={patchRevertBusy}
                         />
                       ) : msg.role === 'user' ? (
                         <>
@@ -1249,6 +1333,18 @@ function App() {
                       </div>
                     )}
                   </div>
+
+                  <button
+                    type="button"
+                    className="work-path-row"
+                    onClick={handleWorkPathPick}
+                    title={currentWorkPath || '\u70b9\u51fb\u9009\u62e9\u5de5\u4f5c\u8def\u5f84'}
+                    aria-label={'\u9009\u62e9\u5de5\u4f5c\u8def\u5f84'}
+                  >
+                    <span className={`work-path-value${currentWorkPath ? '' : ' empty'}`}>
+                      {workPathDisplay}
+                    </span>
+                  </button>
                 </div>
               )}
 
@@ -1287,18 +1383,6 @@ function App() {
                 )}
               </div>
             </div>
-            <button
-              type="button"
-              className="work-path-row"
-              onClick={handleWorkPathPick}
-              title={currentWorkPath || '\u70b9\u51fb\u9009\u62e9\u5de5\u4f5c\u8def\u5f84'}
-            >
-              <span className="work-path-label">{'\u5de5\u4f5c\u8def\u5f84'}</span>
-              <span className={`work-path-value${currentWorkPath ? '' : ' empty'}`}>
-                {currentWorkPath || '\u70b9\u51fb\u9009\u62e9\u5de5\u4f5c\u8def\u5f84'}
-              </span>
-            </button>
-
           </div>
         </div>
       </div>

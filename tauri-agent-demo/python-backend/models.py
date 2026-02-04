@@ -137,3 +137,8 @@ class ChatStopRequest(BaseModel):
 
 class RollbackRequest(BaseModel):
     message_id: int
+
+
+class PatchRevertRequest(BaseModel):
+    session_id: str
+    revert_patch: str

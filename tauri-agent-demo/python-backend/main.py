@@ -15,7 +15,7 @@ from models import (
     ChatSession, ChatSessionCreate, ChatSessionUpdate,
     ChatRequest, ChatResponse, ExportRequest,
     ToolPermissionRequest, ToolPermissionRequestUpdate,
-    ChatStopRequest, RollbackRequest
+    ChatStopRequest, RollbackRequest, PatchRevertRequest
 )
 from database import db
 from llm_client import create_llm_client
@@ -25,8 +25,11 @@ from agents.executor import create_agent_executor
 from agents.base import AgentStep
 from tools.builtin import register_builtin_tools
 from tools.base import ToolRegistry
-from tools.config import get_tool_config, update_tool_config
+from tools.config import get_tool_config, update_tool_config, get_tool_config_path
+from tools.context import set_tool_context, reset_tool_context
+from tools.builtin.system_tools import ApplyPatchTool
 from stream_control import stream_stop_registry
+from app_config import get_app_config, update_app_config, get_app_config_path
 
 app = FastAPI(title="Tauri Agent Chat Backend")
 
@@ -256,7 +259,20 @@ async def _maybe_update_session_title(
 
 @app.get("/")
 def read_root():
-    return {"status": "FastAPI is running!", "version": "2.0"}
+    return {"status": "FastAPI is running!", "version": "2.2", "app_config": True}
+
+@app.get("/__debug/info")
+def debug_info():
+    tool_config = get_tool_config()
+    return {
+        "file": __file__,
+        "cwd": os.getcwd(),
+        "routes": [route.path for route in app.routes],
+        "tool_config_path": get_tool_config_path(),
+        "app_config_path": get_app_config_path(),
+        "tools_enabled": tool_config.get("enabled", {}),
+        "tool_names": [tool.name for tool in ToolRegistry.get_all()]
+    }
 
 # ==================== LLM Configs ====================
 
@@ -871,6 +887,83 @@ async def chat_agent_stream(request: ChatRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+
+# ==================== App Config ====================
+
+@app.get("/app/config")
+def get_app_config_route():
+    return get_app_config()
+
+@app.put("/app/config")
+def set_app_config(payload: Dict[str, Any]):
+    try:
+        updated = update_app_config(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return updated
+
+# ==================== Patch Revert ====================
+
+@app.post("/patch/revert")
+async def revert_patch(request: PatchRevertRequest):
+    session = db.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    token = set_tool_context({
+        "shell_unrestricted": False,
+        "agent_mode": "default",
+        "session_id": session.id,
+        "work_path": session.work_path
+    })
+    try:
+        tool = ApplyPatchTool()
+        result_text = await tool.execute(json.dumps({"patch": request.revert_patch}))
+    finally:
+        reset_tool_context(token)
+
+    try:
+        result = json.loads(result_text)
+    except Exception:
+        result = {"ok": False, "error": result_text}
+
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Patch revert failed"))
+
+    user_msg = db.create_message(ChatMessageCreate(
+        session_id=session.id,
+        role="user",
+        content="撤销最近一次 apply_patch 修改",
+        metadata={"action": "revert_patch"}
+    ))
+
+    assistant_msg = db.create_message(ChatMessageCreate(
+        session_id=session.id,
+        role="assistant",
+        content="已撤销最近一次修改。"
+    ))
+
+    db.save_agent_step(
+        message_id=assistant_msg.id,
+        step_type="observation",
+        content=result_text,
+        sequence=0,
+        metadata={"tool": "apply_patch", "patch_event": "revert"}
+    )
+    db.save_agent_step(
+        message_id=assistant_msg.id,
+        step_type="answer",
+        content="已撤销最近一次修改。",
+        sequence=1,
+        metadata={"patch_event": "revert"}
+    )
+
+    return {
+        "ok": True,
+        "result": result,
+        "user_message_id": user_msg.id,
+        "assistant_message_id": assistant_msg.id
+    }
 
 # ==================== Tools ====================
 

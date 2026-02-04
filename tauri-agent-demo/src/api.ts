@@ -2,6 +2,8 @@
     LLMConfig,
     LLMConfigCreate,
     LLMConfigUpdate,
+    AppConfig,
+    AppConfigUpdate,
     ChatSession,
     ChatSessionCreate,
     ChatSessionUpdate,
@@ -9,10 +11,28 @@
     ChatRequest,
     ChatResponse,
     LLMCall,
-    ToolPermissionRequest
+    ToolPermissionRequest,
+    PatchRevertResponse
 } from './types';
 
 const API_BASE_URL = 'http://127.0.0.1:8000';
+
+async function buildApiError(response: Response, baseMessage: string): Promise<Error> {
+    const text = await response.text();
+    let detail = text;
+    if (text) {
+        try {
+            const data = JSON.parse(text);
+            if (data?.detail) {
+                detail = String(data.detail);
+            }
+        } catch {
+            // keep raw text
+        }
+    }
+    const suffix = detail ? `: ${detail}` : '';
+    return new Error(`${baseMessage} (${response.status})${suffix}`);
+}
 
 // ==================== Config API ====================
 
@@ -59,6 +79,44 @@ export async function deleteConfig(configId: string): Promise<void> {
         method: 'DELETE',
     });
     if (!response.ok) throw new Error('Failed to delete config');
+}
+
+export async function revertPatch(sessionId: string, revertPatch: string): Promise<PatchRevertResponse> {
+    const response = await fetch(`${API_BASE_URL}/patch/revert`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId, revert_patch: revertPatch }),
+    });
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to revert patch');
+    }
+    return response.json();
+}
+
+export async function getAppConfig(): Promise<AppConfig> {
+    const response = await fetch(`${API_BASE_URL}/app/config`);
+    if (!response.ok) {
+        if (response.status === 404) {
+            throw new Error('App config endpoint not found. Please restart the backend.');
+        }
+        throw await buildApiError(response, 'Failed to fetch app config');
+    }
+    return response.json();
+}
+
+export async function updateAppConfig(update: AppConfigUpdate): Promise<AppConfig> {
+    const response = await fetch(`${API_BASE_URL}/app/config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(update),
+    });
+    if (!response.ok) {
+        if (response.status === 404) {
+            throw new Error('App config endpoint not found. Please restart the backend.');
+        }
+        throw await buildApiError(response, 'Failed to update app config');
+    }
+    return response.json();
 }
 
 // ==================== Session API ====================

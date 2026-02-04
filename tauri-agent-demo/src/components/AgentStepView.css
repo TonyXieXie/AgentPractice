@@ -11,42 +11,43 @@
 }
 
 .agent-step {
-    background: rgba(15, 23, 42, 0.6);
-    border: 1px solid rgba(148, 163, 184, 0.12);
-    box-shadow: 0 8px 18px rgba(15, 23, 42, 0.2);
-    border-radius: 10px;
+    background: #161b22;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: none;
+    border-radius: 8px;
     padding: 8px 10px;
+    border-left: 2px solid rgba(255, 255, 255, 0.12);
 }
 
 .agent-step.thought {
-    border-left: 3px solid #60a5fa;
+    border-left-color: rgba(255, 255, 255, 0.12);
 }
 
 .agent-step.tool {
-    border-left: 3px solid #34d399;
-    background: rgba(6, 78, 59, 0.2);
+    border-left-color: rgba(255, 255, 255, 0.12);
+    background: #161b22;
 }
 
 .agent-step.final {
-    border-left: 3px solid #f59e0b;
-    background: rgba(120, 53, 15, 0.2);
+    border-left-color: rgba(255, 255, 255, 0.12);
+    background: #161b22;
 }
 
 .agent-step.error {
-    border-left: 3px solid #f87171;
-    background: rgba(127, 29, 29, 0.25);
+    border-left-color: rgba(248, 113, 113, 0.6);
+    background: #1a1416;
 }
 
 .agent-step.status {
-    border-left: 3px solid #94a3b8;
-    background: rgba(71, 85, 105, 0.2);
+    border-left-color: rgba(255, 255, 255, 0.12);
+    background: #161b22;
 }
 
 .agent-step.permission {
-    border-left: 3px solid #f97316;
-    background: rgba(124, 45, 18, 0.3);
-    border: 1px dashed rgba(251, 146, 60, 0.45);
-    box-shadow: 0 10px 22px rgba(249, 115, 22, 0.12);
+    border-left-color: rgba(245, 158, 11, 0.6);
+    background: #1b1a14;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: none;
 }
 
 .agent-step-header {
@@ -54,7 +55,7 @@
     align-items: center;
     justify-content: space-between;
     text-transform: uppercase;
-    color: #94a3b8;
+    color: #8b949e;
     margin-bottom: 6px;
     font-size: 0.7rem;
     letter-spacing: 0.02em;
@@ -81,7 +82,7 @@
 }
 
 .agent-step-content {
-    color: #e2e8f0;
+    color: #e5e7eb;
     white-space: pre-wrap;
     font-size: 0.85rem;
     line-height: 1.45;
@@ -143,9 +144,9 @@
 .action-translate-btn {
     align-self: flex-end;
     border-radius: 999px;
-    border: 1px solid rgba(52, 211, 153, 0.45);
-    background: rgba(16, 185, 129, 0.12);
-    color: #d1fae5;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: rgba(255, 255, 255, 0.06);
+    color: #cbd5e1;
     cursor: pointer;
     transition: all 0.2s ease;
     padding: 2px 8px;
@@ -153,16 +154,16 @@
 }
 
 .action-translate-btn:hover {
-    background: rgba(16, 185, 129, 0.2);
+    background: rgba(255, 255, 255, 0.12);
     transform: translateY(-1px);
 }
 
 .error-toggle {
     align-self: flex-end;
     border-radius: 999px;
-    border: 1px solid rgba(248, 113, 113, 0.45);
-    background: rgba(248, 113, 113, 0.12);
-    color: #fee2e2;
+    border: 1px solid rgba(248, 113, 113, 0.4);
+    background: rgba(248, 113, 113, 0.08);
+    color: #fca5a5;
     cursor: pointer;
     transition: all 0.2s ease;
     padding: 2px 8px;
@@ -170,15 +171,51 @@
 }
 
 .error-toggle:hover {
-    background: rgba(248, 113, 113, 0.2);
+    background: rgba(248, 113, 113, 0.16);
     transform: translateY(-1px);
+}
+
+.error-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.error-copy-btn {
+    align-self: flex-end;
+    border-radius: 999px;
+    border: 1px solid rgba(248, 113, 113, 0.3);
+    background: rgba(248, 113, 113, 0.06);
+    color: #fca5a5;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    padding: 2px 8px;
+    font-size: 0.68rem;
+}
+
+.error-copy-btn:hover {
+    background: rgba(248, 113, 113, 0.14);
+    transform: translateY(-1px);
+}
+
+.error-copy-btn.copied {
+    border-color: rgba(34, 197, 94, 0.35);
+    background: rgba(34, 197, 94, 0.12);
+    color: #86efac;
+}
+
+.error-copy-btn.failed {
+    border-color: rgba(248, 113, 113, 0.6);
+    background: rgba(248, 113, 113, 0.22);
+    color: #fee2e2;
 }
 
 .error-details {
     margin: 6px 0 0;
     overflow: auto;
-    background: rgba(15, 23, 42, 0.8);
-    border: 1px solid rgba(248, 113, 113, 0.25);
+    background: #11151b;
+    border: 1px solid rgba(248, 113, 113, 0.2);
     font-family: 'Courier New', monospace;
     color: #fca5a5;
     white-space: pre-wrap;
@@ -208,6 +245,42 @@
     background: rgba(255, 255, 255, 0.3);
 }
 
+.timeout-banner {
+    margin-top: 8px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    border: 1px solid rgba(248, 113, 113, 0.25);
+    background: rgba(248, 113, 113, 0.06);
+    color: #fca5a5;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 0.74rem;
+}
+
+.timeout-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.timeout-actions button {
+    border-radius: 999px;
+    border: 1px solid rgba(248, 113, 113, 0.3);
+    background: rgba(248, 113, 113, 0.06);
+    color: #fecaca;
+    cursor: pointer;
+    padding: 2px 8px;
+    font-size: 0.68rem;
+    transition: all 0.2s ease;
+}
+
+.timeout-actions button:hover {
+    background: rgba(248, 113, 113, 0.14);
+    transform: translateY(-1px);
+}
+
 .permission-card {
     display: flex;
     flex-direction: column;
@@ -216,20 +289,20 @@
 
 .permission-title {
     font-weight: 600;
-    color: #f8fafc;
+    color: #e5e7eb;
     font-size: 0.9rem;
 }
 
 .permission-subtitle {
-    color: #cbd5f5;
+    color: #9ca3af;
     font-size: 0.75rem;
 }
 
 .permission-command {
-    background: rgba(255, 255, 255, 0.08);
+    background: #12161c;
     border: 1px solid rgba(255, 255, 255, 0.1);
     font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-    color: #fff;
+    color: #e5e7eb;
     word-break: break-all;
     border-radius: 8px;
     padding: 6px 8px;
@@ -237,7 +310,7 @@
 }
 
 .permission-reason {
-    color: #a3a3c2;
+    color: #8b949e;
     font-size: 0.74rem;
 }
 
@@ -257,15 +330,15 @@
 }
 
 .permission-btn.deny {
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    color: #fff;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: #e5e7eb;
 }
 
 .permission-btn.allow {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    border: none;
-    color: #fff;
+    background: #2b313b;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    color: #e5e7eb;
 }
 
 .permission-btn:disabled {
@@ -277,6 +350,91 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+}
+
+.patch-result {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.patch-summary-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.patch-summary-title {
+    color: #cbd5e1;
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+
+.patch-summary-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.patch-summary-btn {
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: rgba(255, 255, 255, 0.06);
+    color: #cbd5e1;
+    cursor: pointer;
+    padding: 2px 10px;
+    font-size: 0.68rem;
+    transition: all 0.2s ease;
+}
+
+.patch-summary-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.patch-summary-btn.danger {
+    border-color: rgba(248, 113, 113, 0.35);
+    color: #fca5a5;
+}
+
+.patch-summary-btn.danger:hover:not(:disabled) {
+    background: rgba(248, 113, 113, 0.14);
+}
+
+.patch-summary-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.patch-summary-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.patch-summary-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    background: #11151b;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    font-size: 0.74rem;
+}
+
+.patch-summary-path {
+    color: #e5e7eb;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+}
+
+.patch-summary-counts {
+    color: #9ca3af;
+    font-variant-numeric: tabular-nums;
 }
 
 .observation-text {
@@ -338,8 +496,8 @@
 }
 
 .code-block {
-    background: rgba(15, 23, 42, 0.9);
-    border: 1px solid rgba(56, 189, 248, 0.2);
+    background: #11151b;
+    border: 1px solid rgba(255, 255, 255, 0.08);
     overflow: hidden;
     border-radius: 8px;
 }
@@ -354,17 +512,17 @@
 }
 
 .code-lang {
-    background: rgba(15, 23, 42, 0.85);
-    color: #7dd3fc;
-    border-bottom: 1px solid rgba(56, 189, 248, 0.2);
+    background: #0f1318;
+    color: #cbd5e1;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
     padding: 4px 10px;
     font-size: 0.65rem;
 }
 
 .latex-block {
-    border: 1px dashed rgba(248, 250, 252, 0.4);
-    background: rgba(30, 41, 59, 0.6);
-    color: #f8fafc;
+    border: 1px dashed rgba(255, 255, 255, 0.2);
+    background: #151a21;
+    color: #e5e7eb;
     padding: 8px 10px;
     border-radius: 6px;
 }
@@ -372,7 +530,7 @@
 .latex-inline {
     padding: 0 4px;
     border-radius: 4px;
-    background: rgba(148, 163, 184, 0.2);
+    background: rgba(255, 255, 255, 0.12);
     display: inline-flex;
 }
 

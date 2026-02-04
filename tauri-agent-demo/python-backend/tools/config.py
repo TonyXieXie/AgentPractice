@@ -6,12 +6,14 @@ from typing import Any, Dict
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": {
-        "calculator": True,
-        "weather": True,
+        "rg": True,
+        "apply_patch": True,
         "search": True,
         "read_file": True,
         "write_file": True,
-        "run_shell": True
+        "run_shell": True,
+        "calculator": False,
+        "weather": False
     },
     "files": {
         "max_bytes": 20000
@@ -70,6 +72,10 @@ def _get_config_file_path() -> Path:
         return backend_path
 
     return default_path
+
+
+def get_tool_config_path() -> str:
+    return str(_get_config_file_path())
 
 
 def _load_config_file() -> Dict[str, Any]:

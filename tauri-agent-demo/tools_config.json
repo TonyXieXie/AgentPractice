@@ -1,11 +1,13 @@
 {
   "enabled": {
-    "calculator": true,
-    "weather": true,
+    "rg": true,
+    "apply_patch": true,
     "search": true,
     "read_file": true,
     "write_file": true,
-    "run_shell": true
+    "run_shell": true,
+    "calculator": false,
+    "weather": false
   },
   "files": {
     "max_bytes": 20000
@@ -32,7 +34,9 @@
       "powershell",
       "if",
       "mkdir",
-      "curl"
+      "curl",
+      "{\"run_shell<arg_key>command\":",
+      "tree"
     ],
     "timeout_sec": 30,
     "max_output": 20000

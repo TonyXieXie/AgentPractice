@@ -10,6 +10,8 @@ import json
 import re
 import traceback
 from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
+
+import httpx
 from .base import AgentStrategy, AgentStep
 from tools.base import Tool, tool_to_openai_function, tool_to_openai_responses_tool
 
@@ -126,6 +128,9 @@ class ReActAgent(AgentStrategy):
                 if openai_format == "openai_responses":
                     llm_overrides["input"] = response_input
 
+                    max_connect_retries = 3
+                    connect_attempt = 0
+                    connect_ok = False
                     content_buffer = ""
                     reasoning_buffer = ""
                     tool_calls = []
@@ -135,52 +140,92 @@ class ReActAgent(AgentStrategy):
                     stream_mode = "answer"
                     stopped = False
 
-                    async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
-                        event_type = event.get("type")
-                        if event_type == "content":
-                            delta = event.get("delta", "")
-                            if delta:
-                                content_buffer += delta
-                                step_type = "answer_delta" if stream_mode == "answer" else "thought_delta"
+                    while connect_attempt < max_connect_retries:
+                        connect_attempt += 1
+                        content_buffer = ""
+                        reasoning_buffer = ""
+                        tool_calls = []
+                        response_output_items = []
+                        stream_mode = "answer"
+                        stopped = False
+                        received_any = False
+
+                        if connect_attempt > 1:
+                            yield AgentStep(
+                                step_type="thought",
+                                content=f"网络连接中（第{connect_attempt}/{max_connect_retries}次）...",
+                                metadata={"iteration": iteration, "stream_key": thought_stream_key, "network_retry": connect_attempt}
+                            )
+
+                        try:
+                            async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
+                                received_any = True
+                                event_type = event.get("type")
+                                if event_type == "content":
+                                    delta = event.get("delta", "")
+                                    if delta:
+                                        content_buffer += delta
+                                        step_type = "answer_delta" if stream_mode == "answer" else "thought_delta"
+                                        yield AgentStep(
+                                            step_type=step_type,
+                                            content=delta,
+                                            metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                                        )
+                                elif event_type == "reasoning":
+                                    delta = event.get("delta", "")
+                                    if delta:
+                                        reasoning_buffer += delta
+                                        yield AgentStep(
+                                            step_type="thought_delta",
+                                            content=delta,
+                                            metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
+                                        )
+                                elif event_type == "tool_call_delta":
+                                    if stream_mode != "thought":
+                                        stream_mode = "thought"
+                                    call_index = event.get("index", 0)
+                                    call_key = f"tool-{iteration}-{call_index}"
+                                    tool_name = event.get("name") or ""
+                                    args_delta = event.get("arguments_delta", "")
+                                    if args_delta or tool_name:
+                                        yield AgentStep(
+                                            step_type="action_delta",
+                                            content=args_delta,
+                                            metadata={
+                                                "iteration": iteration,
+                                                "stream_key": call_key,
+                                                "tool": tool_name,
+                                                "call_index": call_index
+                                            }
+                                        )
+                                elif event_type == "done":
+                                    content_buffer = event.get("content", "") or ""
+                                    tool_calls = event.get("tool_calls", []) or []
+                                    response_obj = event.get("response") or {}
+                                    if isinstance(response_obj, dict):
+                                        response_output_items = response_obj.get("output", []) or []
+                                    stopped = bool(event.get("stopped"))
+                            connect_ok = True
+                            break
+                        except httpx.ConnectError as e:
+                            if received_any:
                                 yield AgentStep(
-                                    step_type=step_type,
-                                    content=delta,
-                                    metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                                    step_type="error",
+                                    content="网络错误：连接中断，请重试。",
+                                    metadata={"error": str(e), "error_type": "ConnectError"}
                                 )
-                        elif event_type == "reasoning":
-                            delta = event.get("delta", "")
-                            if delta:
-                                reasoning_buffer += delta
+                                return
+                            if connect_attempt >= max_connect_retries:
                                 yield AgentStep(
-                                    step_type="thought_delta",
-                                    content=delta,
-                                    metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
+                                    step_type="error",
+                                    content=f"网络错误：连接失败（已重试{max_connect_retries}次）",
+                                    metadata={"error": str(e), "error_type": "ConnectError"}
                                 )
-                        elif event_type == "tool_call_delta":
-                            if stream_mode != "thought":
-                                stream_mode = "thought"
-                            call_index = event.get("index", 0)
-                            call_key = f"tool-{iteration}-{call_index}"
-                            tool_name = event.get("name") or ""
-                            args_delta = event.get("arguments_delta", "")
-                            if args_delta or tool_name:
-                                yield AgentStep(
-                                    step_type="action_delta",
-                                    content=args_delta,
-                                    metadata={
-                                        "iteration": iteration,
-                                        "stream_key": call_key,
-                                        "tool": tool_name,
-                                        "call_index": call_index
-                                    }
-                                )
-                        elif event_type == "done":
-                            content_buffer = event.get("content", "") or ""
-                            tool_calls = event.get("tool_calls", []) or []
-                            response_obj = event.get("response") or {}
-                            if isinstance(response_obj, dict):
-                                response_output_items = response_obj.get("output", []) or []
-                            stopped = bool(event.get("stopped"))
+                                return
+                            continue
+
+                    if not connect_ok:
+                        return
 
                     llm_call_id = None
                     if llm_overrides.get("_debug"):
@@ -199,6 +244,31 @@ class ReActAgent(AgentStrategy):
                             metadata={"agent_type": "react", "iterations": iteration + 1, "stopped_by_user": True}
                         )
                         return
+
+                    prepared_calls: List[Dict[str, Any]] = []
+                    if tool_calls:
+                        sanitized_tool_calls: List[Dict[str, Any]] = []
+                        for call_index, call in enumerate(tool_calls):
+                            call_index = call.get("index", call_index)
+                            tool_name = call.get("name")
+                            call_id = call.get("call_id") or call.get("id") or f"call_{iteration}_{call_index}"
+                            args_text = call.get("arguments", "")
+                            _, parse_error = self._safe_json_loads(args_text)
+                            sanitized_args = "{}" if parse_error else args_text
+                            sanitized_call = dict(call)
+                            sanitized_call["arguments"] = sanitized_args
+                            sanitized_tool_calls.append(sanitized_call)
+                            tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
+                            prepared_calls.append({
+                                "call_index": call_index,
+                                "tool_name": tool_name,
+                                "call_id": call_id,
+                                "call_key": f"tool-{iteration}-{call_index}",
+                                "tool": tool,
+                                "tool_input": tool_input,
+                                "error_msg": error_msg
+                            })
+                        tool_calls = sanitized_tool_calls
 
                     output_items = response_output_items
                     if not output_items:
@@ -241,14 +311,14 @@ class ReActAgent(AgentStrategy):
                                 metadata={"iteration": iteration, "stream_key": thought_stream_key}
                             )
 
-                        for call_index, call in enumerate(tool_calls):
-                            call_index = call.get("index", call_index)
-                            tool_name = call.get("name")
-                            call_id = call.get("call_id") or call.get("id") or f"call_{iteration}_{call_index}"
-                            args_text = call.get("arguments", "")
-                            call_key = f"tool-{iteration}-{call_index}"
-
-                            tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
+                        for prepared in prepared_calls:
+                            call_index = prepared["call_index"]
+                            tool_name = prepared["tool_name"]
+                            call_id = prepared["call_id"]
+                            call_key = prepared["call_key"]
+                            tool = prepared["tool"]
+                            tool_input = prepared["tool_input"]
+                            error_msg = prepared["error_msg"]
                             yield AgentStep(
                                 step_type="action",
                                 content=f"{tool_name}[{tool_input}]",
@@ -290,57 +360,94 @@ class ReActAgent(AgentStrategy):
                         return
                     continue
 
-                content_buffer = ""
-                reasoning_buffer = ""
-                tool_calls = []
+                max_connect_retries = 3
+                connect_attempt = 0
+                connect_ok = False
                 thought_stream_key = f"assistant_content_{iteration}"
                 reasoning_stream_key = f"assistant_reasoning_{iteration}"
-                stream_mode = "answer"
-                stopped = False
 
-                async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
-                    event_type = event.get("type")
-                    if event_type == "content":
-                        delta = event.get("delta", "")
-                        if delta:
-                            content_buffer += delta
-                            step_type = "answer_delta" if stream_mode == "answer" else "thought_delta"
+                while connect_attempt < max_connect_retries:
+                    connect_attempt += 1
+                    content_buffer = ""
+                    reasoning_buffer = ""
+                    tool_calls = []
+                    stream_mode = "answer"
+                    stopped = False
+                    received_any = False
+
+                    if connect_attempt > 1:
+                        yield AgentStep(
+                            step_type="thought",
+                            content=f"网络连接中（第{connect_attempt}/{max_connect_retries}次）...",
+                            metadata={"iteration": iteration, "stream_key": thought_stream_key, "network_retry": connect_attempt}
+                        )
+
+                    try:
+                        async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
+                            received_any = True
+                            event_type = event.get("type")
+                            if event_type == "content":
+                                delta = event.get("delta", "")
+                                if delta:
+                                    content_buffer += delta
+                                    step_type = "answer_delta" if stream_mode == "answer" else "thought_delta"
+                                    yield AgentStep(
+                                        step_type=step_type,
+                                        content=delta,
+                                        metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                                    )
+                            elif event_type == "reasoning":
+                                delta = event.get("delta", "")
+                                if delta:
+                                    reasoning_buffer += delta
+                                    yield AgentStep(
+                                        step_type="thought_delta",
+                                        content=delta,
+                                        metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
+                                    )
+                            elif event_type == "tool_call_delta":
+                                if stream_mode != "thought":
+                                    stream_mode = "thought"
+                                call_index = event.get("index", 0)
+                                call_key = f"tool-{iteration}-{call_index}"
+                                tool_name = event.get("name") or ""
+                                args_delta = event.get("arguments_delta", "")
+                                if args_delta or tool_name:
+                                    yield AgentStep(
+                                        step_type="action_delta",
+                                        content=args_delta,
+                                        metadata={
+                                            "iteration": iteration,
+                                            "stream_key": call_key,
+                                            "tool": tool_name,
+                                            "call_index": call_index
+                                        }
+                                    )
+                            elif event_type == "done":
+                                content_buffer = event.get("content", "") or ""
+                                tool_calls = event.get("tool_calls", []) or []
+                                stopped = bool(event.get("stopped"))
+                        connect_ok = True
+                        break
+                    except httpx.ConnectError as e:
+                        if received_any:
                             yield AgentStep(
-                                step_type=step_type,
-                                content=delta,
-                                metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                                step_type="error",
+                                content="网络错误：连接中断，请重试。",
+                                metadata={"error": str(e), "error_type": "ConnectError"}
                             )
-                    elif event_type == "reasoning":
-                        delta = event.get("delta", "")
-                        if delta:
-                            reasoning_buffer += delta
+                            return
+                        if connect_attempt >= max_connect_retries:
                             yield AgentStep(
-                                step_type="thought_delta",
-                                content=delta,
-                                metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
+                                step_type="error",
+                                content=f"网络错误：连接失败（已重试{max_connect_retries}次）",
+                                metadata={"error": str(e), "error_type": "ConnectError"}
                             )
-                    elif event_type == "tool_call_delta":
-                        if stream_mode != "thought":
-                            stream_mode = "thought"
-                        call_index = event.get("index", 0)
-                        call_key = f"tool-{iteration}-{call_index}"
-                        tool_name = event.get("name") or ""
-                        args_delta = event.get("arguments_delta", "")
-                        if args_delta or tool_name:
-                            yield AgentStep(
-                                step_type="action_delta",
-                                content=args_delta,
-                                metadata={
-                                    "iteration": iteration,
-                                    "stream_key": call_key,
-                                    "tool": tool_name,
-                                    "call_index": call_index
-                                }
-                            )
-                    elif event_type == "done":
-                        content_buffer = event.get("content", "") or ""
-                        tool_calls = event.get("tool_calls", []) or []
-                        stopped = bool(event.get("stopped"))
+                            return
+                        continue
+
+                if not connect_ok:
+                    return
 
                 llm_call_id = None
                 if llm_overrides.get("_debug"):
@@ -361,11 +468,6 @@ class ReActAgent(AgentStrategy):
                     return
 
                 if tool_calls:
-                    if llm_call_id:
-                        self._update_llm_processed(llm_call_id, {
-                            "tool_calls": tool_calls,
-                            "content": content_buffer
-                        })
 
                     if reasoning_buffer.strip():
                         yield AgentStep(
@@ -381,21 +483,52 @@ class ReActAgent(AgentStrategy):
                             metadata={"iteration": iteration, "stream_key": thought_stream_key}
                         )
 
-                    messages.append({
-                        "role": "assistant",
-                        "content": content_buffer,
-                        "tool_calls": tool_calls
-                    })
-
-                    for call in tool_calls:
+                    prepared_calls: List[Dict[str, Any]] = []
+                    sanitized_tool_calls: List[Dict[str, Any]] = []
+                    for call_index, call in enumerate(tool_calls):
+                        call_index = call.get("index", call_index) if isinstance(call, dict) else call_index
                         function = call.get("function", {}) or {}
                         tool_name = function.get("name")
                         args_text = function.get("arguments", "")
                         call_id = call.get("id")
-                        call_index = call.get("index", 0) if isinstance(call, dict) else 0
-                        call_key = f"tool-{iteration}-{call_index}"
-
+                        _, parse_error = self._safe_json_loads(args_text)
+                        sanitized_args = "{}" if parse_error else args_text
+                        sanitized_call = dict(call)
+                        sanitized_func = dict(function)
+                        sanitized_func["arguments"] = sanitized_args
+                        sanitized_call["function"] = sanitized_func
+                        sanitized_tool_calls.append(sanitized_call)
                         tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
+                        prepared_calls.append({
+                            "call_index": call_index,
+                            "tool_name": tool_name,
+                            "call_id": call_id,
+                            "call_key": f"tool-{iteration}-{call_index}",
+                            "tool": tool,
+                            "tool_input": tool_input,
+                            "error_msg": error_msg
+                        })
+
+                    if llm_call_id:
+                        self._update_llm_processed(llm_call_id, {
+                            "tool_calls": sanitized_tool_calls,
+                            "content": content_buffer
+                        })
+
+                    messages.append({
+                        "role": "assistant",
+                        "content": content_buffer,
+                        "tool_calls": sanitized_tool_calls
+                    })
+
+                    for prepared in prepared_calls:
+                        call_index = prepared["call_index"]
+                        tool_name = prepared["tool_name"]
+                        call_id = prepared["call_id"]
+                        call_key = prepared["call_key"]
+                        tool = prepared["tool"]
+                        tool_input = prepared["tool_input"]
+                        error_msg = prepared["error_msg"]
                         yield AgentStep(
                             step_type="action",
                             content=f"{tool_name}[{tool_input}]",
@@ -581,6 +714,19 @@ class ReActAgent(AgentStrategy):
                 "Tool definitions are provided separately via the API tools field.\n\n"
                 "Guidelines:\n"
                 "- If a tool is needed, call it with JSON arguments that match its schema.\n"
+                "- Prefer rg for searching file contents.\n"
+                "- Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.\n"
+                "- apply_patch format (strict):\n"
+                "  *** Begin Patch\n"
+                "  *** Update File: path\n"
+                "  @@\n"
+                "  - old line\n"
+                "  + new line\n"
+                "  *** End Patch\n"
+                "- Each change line must start with + or -, and context lines must be included under @@ hunks.\n"
+                "- Do NOT wrap apply_patch content in code fences; send raw patch text only.\n"
+                "- apply_patch matches by context; if the match is not unique, request more surrounding context.\n"
+                "- If apply_patch fails due to context, ask for more context and retry.\n"
                 "- If no tool is needed, answer directly.\n"
             )
 
@@ -592,6 +738,19 @@ class ReActAgent(AgentStrategy):
 ## Tools
 Available tool names: {tool_names}
 Tool definitions are provided separately via the API tools field.
+Guidelines:
+- Prefer rg for searching file contents.
+- Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.
+- apply_patch format (strict):
+  *** Begin Patch
+  *** Update File: path
+  @@
+  - old line
+  + new line
+  *** End Patch
+- Do NOT wrap apply_patch content in code fences; send raw patch text only.
+- If apply_patch context is not unique, request more surrounding context.
+- If apply_patch fails due to context, request more context and retry.
 
 ## Output Format (strict)
 Thought: <your reasoning>

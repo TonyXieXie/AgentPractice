@@ -2,8 +2,8 @@
 Built-in Tools
 
 This module provides basic tools that are included by default:
-- CalculatorTool: Mathematical calculations
-- WeatherTool: Weather information (mock)
+- RgTool: File content search via ripgrep
+- ApplyPatchTool: Patch-based file edits
 - TavilySearchTool: Web search (Tavily)
 - ReadFileTool / WriteFileTool: Project file access
 - RunShellTool: Shell execution with allowlist
@@ -11,7 +11,7 @@ This module provides basic tools that are included by default:
 
 from ..base import Tool, ToolParameter
 from ..config import is_tool_enabled
-from .system_tools import ReadFileTool, WriteFileTool, RunShellTool, TavilySearchTool
+from .system_tools import ReadFileTool, WriteFileTool, RunShellTool, TavilySearchTool, RgTool, ApplyPatchTool
 
 
 class CalculatorTool(Tool):
@@ -107,10 +107,10 @@ from ..base import ToolRegistry
 
 def register_builtin_tools():
     """Register all built-in tools in the registry"""
-    if is_tool_enabled("calculator"):
-        ToolRegistry.register(CalculatorTool())
-    if is_tool_enabled("weather"):
-        ToolRegistry.register(WeatherTool())
+    if is_tool_enabled("rg"):
+        ToolRegistry.register(RgTool())
+    if is_tool_enabled("apply_patch"):
+        ToolRegistry.register(ApplyPatchTool())
     if is_tool_enabled("search"):
         ToolRegistry.register(TavilySearchTool())
     if is_tool_enabled("read_file"):
