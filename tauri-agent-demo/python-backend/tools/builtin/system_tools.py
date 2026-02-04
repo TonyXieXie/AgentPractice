@@ -21,6 +21,28 @@ def _get_root_path() -> Path:
     return Path(root).expanduser().resolve()
 
 
+def _resolve_rg_executable(root: Path) -> str:
+    override = os.environ.get("RG_EXE") or os.environ.get("RIPGREP_EXE")
+    if override:
+        return override
+    rel_path = Path("tools") / "rg" / ("rg.exe" if os.name == "nt" else "rg")
+    candidates = [root / rel_path]
+    project_root = get_tool_config().get("project_root")
+    if project_root:
+        try:
+            candidates.append(Path(project_root).expanduser().resolve() / rel_path)
+        except Exception:
+            pass
+    try:
+        candidates.append(Path(__file__).resolve().parents[3] / rel_path)
+    except Exception:
+        pass
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return "rg"
+
+
 def _is_within_root(path: Path, root: Path) -> bool:
     root_str = str(root).lower()
     path_str = str(path).lower()
@@ -743,14 +765,16 @@ class RgTool(Tool):
         max_results = data.get("max_results")
         max_results = int(max_results) if max_results is not None else 200
 
-        args = ["rg", "--line-number", "--column", "--no-heading", "--color", "never"]
+        rg_exe = _resolve_rg_executable(root)
+        args = [rg_exe, "--line-number", "--column", "--no-heading", "--color", "never"]
         if not case_sensitive:
             args.append("-i")
         if glob:
             args.extend(["--glob", str(glob)])
         if max_results > 0:
             args.extend(["--max-count", str(max_results)])
-        args.extend([str(pattern), str(search_path)])
+        # Use "--" to prevent patterns starting with "-" from being parsed as flags.
+        args.extend(["--", str(pattern), str(search_path)])
 
         def _run() -> Tuple[int, str]:
             completed = subprocess.run(

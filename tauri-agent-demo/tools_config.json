@@ -36,7 +36,8 @@
       "mkdir",
       "curl",
       "{\"run_shell<arg_key>command\":",
-      "tree"
+      "tree",
+      "ren"
     ],
     "timeout_sec": 30,
     "max_output": 20000

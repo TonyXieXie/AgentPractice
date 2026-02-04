@@ -7,9 +7,12 @@ echo ========================================
 echo.
 
 set "PIDS="
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr /R /C:":8000"') do (
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr /R /C:":8000 .*LISTENING"') do (
   if "%%a" neq "" (
-    set "PIDS=!PIDS! %%a"
+    echo !PIDS! | findstr /C:" %%a " >nul
+    if errorlevel 1 (
+      set "PIDS=!PIDS! %%a "
+    )
   )
 )
 
@@ -27,5 +30,11 @@ for %%p in (!PIDS!) do (
 )
 
 echo.
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr /R /C:":8000 .*LISTENING"') do (
+  if "%%a" neq "" (
+    echo Still listening on port 8000 (PID %%a).
+  )
+)
+
 echo Done.
 pause

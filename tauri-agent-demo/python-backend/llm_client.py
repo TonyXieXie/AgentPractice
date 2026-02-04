@@ -1,4 +1,4 @@
-﻿from typing import Optional, List, Dict, Any
+﻿from typing import Optional, List, Dict, Any, Tuple
 import httpx
 from models import LLMConfig
 from app_config import get_app_config
@@ -10,6 +10,7 @@ class LLMClient:
     def __init__(self, config: LLMConfig):
         self.config = config
         self.timeout = self._resolve_timeout()
+        self.max_retries, self.retry_base_delay, self.retry_max_delay = self._resolve_retry_policy()
 
     def _resolve_timeout(self) -> float:
         app_config = get_app_config()
@@ -19,6 +20,49 @@ class LLMClient:
         except (TypeError, ValueError):
             return 180.0
         return max(1.0, timeout)
+
+    def _resolve_retry_policy(self) -> Tuple[int, float, float]:
+        app_config = get_app_config()
+        retry_cfg = app_config.get("llm", {}).get("retry", {})
+        max_retries = retry_cfg.get("max_retries", 5)
+        base_delay = retry_cfg.get("base_delay_sec", 1.0)
+        max_delay = retry_cfg.get("max_delay_sec", 8.0)
+        try:
+            max_retries = int(max_retries)
+        except (TypeError, ValueError):
+            max_retries = 5
+        try:
+            base_delay = float(base_delay)
+        except (TypeError, ValueError):
+            base_delay = 1.0
+        try:
+            max_delay = float(max_delay)
+        except (TypeError, ValueError):
+            max_delay = 8.0
+        if max_retries < 0:
+            max_retries = 0
+        if base_delay < 0:
+            base_delay = 0.0
+        if max_delay < base_delay:
+            max_delay = base_delay
+        return max_retries, base_delay, max_delay
+
+    def _should_retry_status(self, status_code: Optional[int]) -> bool:
+        if status_code is None:
+            return False
+        try:
+            code = int(status_code)
+        except (TypeError, ValueError):
+            return False
+        return 500 <= code <= 599
+
+    def _get_retry_delay(self, attempt: int) -> float:
+        if attempt < 0:
+            attempt = 0
+        delay = self.retry_base_delay * (2 ** attempt)
+        if self.retry_max_delay > 0:
+            delay = min(self.retry_max_delay, delay)
+        return max(0.0, delay)
 
     async def chat(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
@@ -289,58 +333,63 @@ class LLMClient:
         self._apply_reasoning_params(request_payload)
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.config.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json=request_payload
-            )
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                detail_text, detail_json, status = await self._log_http_error(exc)
+            for attempt in range(self.max_retries + 1):
+                response = await client.post(
+                    f"{base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.config.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json=request_payload
+                )
+                if self._should_retry_status(response.status_code) and attempt < self.max_retries:
+                    await response.aread()
+                    await asyncio.sleep(self._get_retry_delay(attempt))
+                    continue
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    detail_text, detail_json, status = await self._log_http_error(exc)
+                    if debug_ctx:
+                        error_payload = {"status": status, "message": str(exc)}
+                        if detail_json is not None:
+                            error_payload["body"] = detail_json
+                        elif detail_text:
+                            error_payload["body"] = detail_text
+                        self._save_llm_call(
+                            debug_ctx,
+                            stream=False,
+                            request_payload=request_payload,
+                            response_json={"error": error_payload},
+                            response_text=detail_text or str(exc)
+                        )
+                    raise
+                data = response.json()
+
+                usage = data.get("usage", {})
+                reasoning_tokens = usage.get("reasoning_tokens", 0)
+                if reasoning_tokens > 0:
+                    print(f"[Reasoning Tokens] {reasoning_tokens} tokens used for reasoning")
+
+                response_text = self._extract_chat_response_text(data)
+                llm_call_id = None
                 if debug_ctx:
-                    error_payload = {"status": status, "message": str(exc)}
-                    if detail_json is not None:
-                        error_payload["body"] = detail_json
-                    elif detail_text:
-                        error_payload["body"] = detail_text
-                    self._save_llm_call(
+                    llm_call_id = self._save_llm_call(
                         debug_ctx,
                         stream=False,
                         request_payload=request_payload,
-                        response_json={"error": error_payload},
-                        response_text=detail_text or str(exc)
+                        response_json=data,
+                        response_text=response_text
                     )
-                raise
-            data = response.json()
 
-            usage = data.get("usage", {})
-            reasoning_tokens = usage.get("reasoning_tokens", 0)
-            if reasoning_tokens > 0:
-                print(f"[Reasoning Tokens] {reasoning_tokens} tokens used for reasoning")
-
-            response_text = self._extract_chat_response_text(data)
-            llm_call_id = None
-            if debug_ctx:
-                llm_call_id = self._save_llm_call(
-                    debug_ctx,
-                    stream=False,
-                    request_payload=request_payload,
-                    response_json=data,
-                    response_text=response_text
-                )
-
-            result = {
-                "content": response_text,
-                "raw_response": data,
-                "reasoning_tokens": reasoning_tokens
-            }
-            if llm_call_id is not None:
-                result["llm_call_id"] = llm_call_id
-            return result
+                result = {
+                    "content": response_text,
+                    "raw_response": data,
+                    "reasoning_tokens": reasoning_tokens
+                }
+                if llm_call_id is not None:
+                    result["llm_call_id"] = llm_call_id
+                return result
 
     async def _chat_openai_stream(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None):
         """OpenAI-compatible Chat Completions streaming API."""
@@ -368,61 +417,75 @@ class LLMClient:
 
         self._apply_reasoning_params(request_payload)
 
+        completed = False
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            async with client.stream(
-                "POST",
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.config.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json=request_payload
-            ) as response:
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    detail_text, detail_json, status = await self._log_http_error(exc)
-                    if debug_ctx:
-                        error_payload = {"status": status, "message": str(exc)}
-                        if detail_json is not None:
-                            error_payload["body"] = detail_json
-                        elif detail_text:
-                            error_payload["body"] = detail_text
-                        self._save_llm_call(
-                            debug_ctx,
-                            stream=True,
-                            request_payload=request_payload,
-                            response_json={"error": error_payload},
-                            response_text=detail_text or str(exc)
-                        )
-                    raise
-                async for line in response.aiter_lines():
-                    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                        stopped = True
-                        break
-                    if line.startswith("data: "):
-                        data = line[6:]
-                        if data == "[DONE]":
-                            break
+            for attempt in range(self.max_retries + 1):
+                should_retry = False
+                async with client.stream(
+                    "POST",
+                    f"{base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.config.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json=request_payload
+                ) as response:
+                    if self._should_retry_status(response.status_code) and attempt < self.max_retries:
+                        await response.aread()
+                        should_retry = True
+                    else:
                         try:
-                            chunk = json.loads(data)
-                            events.append(chunk)
-                            choices = chunk.get("choices") or []
-                            if not choices:
-                                continue
-                            delta = choices[0].get("delta", {}) or {}
-                            delta_type = str(delta.get("type", "") or "").lower()
-                            if "content" in delta:
-                                text_delta = self._coerce_text(delta.get("content"))
-                                if text_delta and delta_type not in ("thinking", "reasoning", "analysis"):
-                                    full_text += text_delta
-                                    yield text_delta
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-                if stopped:
-                    return
+                            response.raise_for_status()
+                        except httpx.HTTPStatusError as exc:
+                            detail_text, detail_json, status = await self._log_http_error(exc)
+                            if debug_ctx:
+                                error_payload = {"status": status, "message": str(exc)}
+                                if detail_json is not None:
+                                    error_payload["body"] = detail_json
+                                elif detail_text:
+                                    error_payload["body"] = detail_text
+                                self._save_llm_call(
+                                    debug_ctx,
+                                    stream=True,
+                                    request_payload=request_payload,
+                                    response_json={"error": error_payload},
+                                    response_text=detail_text or str(exc)
+                                )
+                            raise
+                        async for line in response.aiter_lines():
+                            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                                stopped = True
+                                break
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(data)
+                                    events.append(chunk)
+                                    choices = chunk.get("choices") or []
+                                    if not choices:
+                                        continue
+                                    delta = choices[0].get("delta", {}) or {}
+                                    delta_type = str(delta.get("type", "") or "").lower()
+                                    if "content" in delta:
+                                        text_delta = self._coerce_text(delta.get("content"))
+                                        if text_delta and delta_type not in ("thinking", "reasoning", "analysis"):
+                                            full_text += text_delta
+                                            yield text_delta
+                                except (json.JSONDecodeError, KeyError):
+                                    continue
+                        if stopped:
+                            return
+                if should_retry:
+                    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                        return
+                    await asyncio.sleep(self._get_retry_delay(attempt))
+                    continue
+                completed = True
+                break
 
-        if debug_ctx:
+        if completed and debug_ctx:
             self._save_llm_call(
                 debug_ctx,
                 stream=True,
@@ -458,110 +521,124 @@ class LLMClient:
 
         self._apply_reasoning_params(request_payload)
 
+        completed = False
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            async with client.stream(
-                "POST",
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.config.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json=request_payload
-            ) as response:
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    detail_text, detail_json, status = await self._log_http_error(exc)
-                    if debug_ctx:
-                        error_payload = {"status": status, "message": str(exc)}
-                        if detail_json is not None:
-                            error_payload["body"] = detail_json
-                        elif detail_text:
-                            error_payload["body"] = detail_text
-                        self._save_llm_call(
-                            debug_ctx,
-                            stream=True,
-                            request_payload=request_payload,
-                            response_json={"error": error_payload},
-                            response_text=detail_text or str(exc)
-                        )
-                    raise
-                async for line in response.aiter_lines():
+            for attempt in range(self.max_retries + 1):
+                should_retry = False
+                async with client.stream(
+                    "POST",
+                    f"{base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.config.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json=request_payload
+                ) as response:
+                    if self._should_retry_status(response.status_code) and attempt < self.max_retries:
+                        await response.aread()
+                        should_retry = True
+                    else:
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPStatusError as exc:
+                            detail_text, detail_json, status = await self._log_http_error(exc)
+                            if debug_ctx:
+                                error_payload = {"status": status, "message": str(exc)}
+                                if detail_json is not None:
+                                    error_payload["body"] = detail_json
+                                elif detail_text:
+                                    error_payload["body"] = detail_text
+                                self._save_llm_call(
+                                    debug_ctx,
+                                    stream=True,
+                                    request_payload=request_payload,
+                                    response_json={"error": error_payload},
+                                    response_text=detail_text or str(exc)
+                                )
+                            raise
+                        async for line in response.aiter_lines():
+                            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                                stopped = True
+                                break
+                            if not line.startswith("data: "):
+                                continue
+                            data = line[6:]
+                            if data == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data)
+                            except json.JSONDecodeError:
+                                continue
+
+                            events.append(chunk)
+                            choices = chunk.get("choices") or []
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta", {}) or {}
+                            delta_type = str(delta.get("type", "") or "").lower()
+
+                            if "content" in delta:
+                                text_delta = self._coerce_text(delta.get("content"))
+                                if text_delta and delta_type not in ("thinking", "reasoning", "analysis"):
+                                    full_text += text_delta
+                                    yield {"type": "content", "delta": text_delta}
+
+                            reasoning_delta = self._extract_reasoning_delta(delta)
+                            if reasoning_delta:
+                                yield {"type": "reasoning", "delta": reasoning_delta}
+
+                            if "tool_calls" in delta:
+                                for tool_delta in delta.get("tool_calls", []) or []:
+                                    index = tool_delta.get("index", 0)
+                                    call = tool_calls.get(index)
+                                    if not call:
+                                        call = {
+                                            "index": index,
+                                            "id": tool_delta.get("id"),
+                                            "type": tool_delta.get("type", "function"),
+                                            "function": {"name": "", "arguments": ""}
+                                        }
+                                        tool_calls[index] = call
+
+                                    if tool_delta.get("id"):
+                                        call["id"] = tool_delta.get("id")
+                                    func = tool_delta.get("function", {}) or {}
+                                    name_updated = False
+                                    if "name" in func and func["name"]:
+                                        call["function"]["name"] = func["name"]
+                                        name_updated = True
+                                    if "arguments" in func and func["arguments"] is not None:
+                                        call["function"]["arguments"] += func["arguments"]
+                                        yield {
+                                            "type": "tool_call_delta",
+                                            "index": index,
+                                            "id": call.get("id"),
+                                            "name": call["function"].get("name", ""),
+                                            "arguments_delta": func.get("arguments", ""),
+                                            "arguments": call["function"].get("arguments", "")
+                                        }
+                                    elif name_updated:
+                                        yield {
+                                            "type": "tool_call_delta",
+                                            "index": index,
+                                            "id": call.get("id"),
+                                            "name": call["function"].get("name", ""),
+                                            "arguments_delta": "",
+                                            "arguments": call["function"].get("arguments", "")
+                                        }
+                        if stopped:
+                            pass
+                if should_retry:
                     if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                        stopped = True
-                        break
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-
-                    events.append(chunk)
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta", {}) or {}
-                    delta_type = str(delta.get("type", "") or "").lower()
-
-                    if "content" in delta:
-                        text_delta = self._coerce_text(delta.get("content"))
-                        if text_delta and delta_type not in ("thinking", "reasoning", "analysis"):
-                            full_text += text_delta
-                            yield {"type": "content", "delta": text_delta}
-
-                    reasoning_delta = self._extract_reasoning_delta(delta)
-                    if reasoning_delta:
-                        yield {"type": "reasoning", "delta": reasoning_delta}
-
-                    if "tool_calls" in delta:
-                        for tool_delta in delta.get("tool_calls", []) or []:
-                            index = tool_delta.get("index", 0)
-                            call = tool_calls.get(index)
-                            if not call:
-                                call = {
-                                    "index": index,
-                                    "id": tool_delta.get("id"),
-                                    "type": tool_delta.get("type", "function"),
-                                    "function": {"name": "", "arguments": ""}
-                                }
-                                tool_calls[index] = call
-
-                            if tool_delta.get("id"):
-                                call["id"] = tool_delta.get("id")
-                            func = tool_delta.get("function", {}) or {}
-                            name_updated = False
-                            if "name" in func and func["name"]:
-                                call["function"]["name"] = func["name"]
-                                name_updated = True
-                            if "arguments" in func and func["arguments"] is not None:
-                                call["function"]["arguments"] += func["arguments"]
-                                yield {
-                                    "type": "tool_call_delta",
-                                    "index": index,
-                                    "id": call.get("id"),
-                                    "name": call["function"].get("name", ""),
-                                    "arguments_delta": func.get("arguments", ""),
-                                    "arguments": call["function"].get("arguments", "")
-                                }
-                            elif name_updated:
-                                yield {
-                                    "type": "tool_call_delta",
-                                    "index": index,
-                                    "id": call.get("id"),
-                                    "name": call["function"].get("name", ""),
-                                    "arguments_delta": "",
-                                    "arguments": call["function"].get("arguments", "")
-                                }
-                if stopped:
-                    pass
+                        return
+                    await asyncio.sleep(self._get_retry_delay(attempt))
+                    continue
+                completed = True
+                break
 
         tool_calls_list = [tool_calls[idx] for idx in sorted(tool_calls.keys())]
 
-        if debug_ctx:
+        if completed and debug_ctx:
             self._save_llm_call(
                 debug_ctx,
                 stream=True,
@@ -598,51 +675,56 @@ class LLMClient:
         self._apply_reasoning_params(request_payload)
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{base_url}/responses",
-                headers={
-                    "Authorization": f"Bearer {self.config.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json=request_payload
-            )
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                detail_text, detail_json, status = await self._log_http_error(exc)
+            for attempt in range(self.max_retries + 1):
+                response = await client.post(
+                    f"{base_url}/responses",
+                    headers={
+                        "Authorization": f"Bearer {self.config.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json=request_payload
+                )
+                if self._should_retry_status(response.status_code) and attempt < self.max_retries:
+                    await response.aread()
+                    await asyncio.sleep(self._get_retry_delay(attempt))
+                    continue
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    detail_text, detail_json, status = await self._log_http_error(exc)
+                    if debug_ctx:
+                        error_payload = {"status": status, "message": str(exc)}
+                        if detail_json is not None:
+                            error_payload["body"] = detail_json
+                        elif detail_text:
+                            error_payload["body"] = detail_text
+                        self._save_llm_call(
+                            debug_ctx,
+                            stream=False,
+                            request_payload=request_payload,
+                            response_json={"error": error_payload},
+                            response_text=detail_text or str(exc)
+                        )
+                    raise
+                data = response.json()
+                response_text = self._extract_openai_responses_text(data)
+                llm_call_id = None
                 if debug_ctx:
-                    error_payload = {"status": status, "message": str(exc)}
-                    if detail_json is not None:
-                        error_payload["body"] = detail_json
-                    elif detail_text:
-                        error_payload["body"] = detail_text
-                    self._save_llm_call(
+                    llm_call_id = self._save_llm_call(
                         debug_ctx,
                         stream=False,
                         request_payload=request_payload,
-                        response_json={"error": error_payload},
-                        response_text=detail_text or str(exc)
+                        response_json=data,
+                        response_text=response_text
                     )
-                raise
-            data = response.json()
-            response_text = self._extract_openai_responses_text(data)
-            llm_call_id = None
-            if debug_ctx:
-                llm_call_id = self._save_llm_call(
-                    debug_ctx,
-                    stream=False,
-                    request_payload=request_payload,
-                    response_json=data,
-                    response_text=response_text
-                )
 
-            result = {
-                "content": response_text,
-                "raw_response": data
-            }
-            if llm_call_id is not None:
-                result["llm_call_id"] = llm_call_id
-            return result
+                result = {
+                    "content": response_text,
+                    "raw_response": data
+                }
+                if llm_call_id is not None:
+                    result["llm_call_id"] = llm_call_id
+                return result
 
     async def _chat_openai_responses_stream(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None):
         """OpenAI Responses streaming API."""
@@ -676,61 +758,75 @@ class LLMClient:
 
         self._apply_reasoning_params(request_payload)
 
+        completed = False
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            async with client.stream(
-                "POST",
-                f"{base_url}/responses",
-                headers={
-                    "Authorization": f"Bearer {self.config.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json=request_payload
-            ) as response:
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    detail_text, detail_json, status = await self._log_http_error(exc)
-                    if debug_ctx:
-                        error_payload = {"status": status, "message": str(exc)}
-                        if detail_json is not None:
-                            error_payload["body"] = detail_json
-                        elif detail_text:
-                            error_payload["body"] = detail_text
-                        self._save_llm_call(
-                            debug_ctx,
-                            stream=True,
-                            request_payload=request_payload,
-                            response_json={"error": error_payload},
-                            response_text=detail_text or str(exc)
-                        )
-                    raise
-                async for line in response.aiter_lines():
+            for attempt in range(self.max_retries + 1):
+                should_retry = False
+                async with client.stream(
+                    "POST",
+                    f"{base_url}/responses",
+                    headers={
+                        "Authorization": f"Bearer {self.config.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json=request_payload
+                ) as response:
+                    if self._should_retry_status(response.status_code) and attempt < self.max_retries:
+                        await response.aread()
+                        should_retry = True
+                    else:
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPStatusError as exc:
+                            detail_text, detail_json, status = await self._log_http_error(exc)
+                            if debug_ctx:
+                                error_payload = {"status": status, "message": str(exc)}
+                                if detail_json is not None:
+                                    error_payload["body"] = detail_json
+                                elif detail_text:
+                                    error_payload["body"] = detail_text
+                                self._save_llm_call(
+                                    debug_ctx,
+                                    stream=True,
+                                    request_payload=request_payload,
+                                    response_json={"error": error_payload},
+                                    response_text=detail_text or str(exc)
+                                )
+                            raise
+                        async for line in response.aiter_lines():
+                            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                                stopped = True
+                                break
+                            if not line.startswith("data: "):
+                                continue
+                            data = line[6:]
+                            if data == "[DONE]":
+                                break
+                            try:
+                                event = json.loads(data)
+                                events.append(event)
+                            except json.JSONDecodeError:
+                                continue
+
+                            event_type = event.get("type", "")
+                            if event_type == "response.output_text.delta":
+                                delta = event.get("delta", "")
+                                if delta:
+                                    full_text += delta
+                                    yield delta
+                            elif event_type in ("response.completed", "response.failed", "response.cancelled"):
+                                break
+                        if stopped:
+                            return
+                if should_retry:
                     if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                        stopped = True
-                        break
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(data)
-                        events.append(event)
-                    except json.JSONDecodeError:
-                        continue
+                        return
+                    await asyncio.sleep(self._get_retry_delay(attempt))
+                    continue
+                completed = True
+                break
 
-                    event_type = event.get("type", "")
-                    if event_type == "response.output_text.delta":
-                        delta = event.get("delta", "")
-                        if delta:
-                            full_text += delta
-                            yield delta
-                    elif event_type in ("response.completed", "response.failed", "response.cancelled"):
-                        break
-                if stopped:
-                    return
-
-        if debug_ctx:
+        if completed and debug_ctx:
             self._save_llm_call(
                 debug_ctx,
                 stream=True,
@@ -774,132 +870,146 @@ class LLMClient:
 
         self._apply_reasoning_params(request_payload)
 
+        completed = False
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            async with client.stream(
-                "POST",
-                f"{base_url}/responses",
-                headers={
-                    "Authorization": f"Bearer {self.config.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json=request_payload
-            ) as response:
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    detail_text, detail_json, status = await self._log_http_error(exc)
-                    if debug_ctx:
-                        error_payload = {"status": status, "message": str(exc)}
-                        if detail_json is not None:
-                            error_payload["body"] = detail_json
-                        elif detail_text:
-                            error_payload["body"] = detail_text
-                        self._save_llm_call(
-                            debug_ctx,
-                            stream=True,
-                            request_payload=request_payload,
-                            response_json={"error": error_payload},
-                            response_text=detail_text or str(exc)
-                        )
-                    raise
-                async for line in response.aiter_lines():
+            for attempt in range(self.max_retries + 1):
+                should_retry = False
+                async with client.stream(
+                    "POST",
+                    f"{base_url}/responses",
+                    headers={
+                        "Authorization": f"Bearer {self.config.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json=request_payload
+                ) as response:
+                    if self._should_retry_status(response.status_code) and attempt < self.max_retries:
+                        await response.aread()
+                        should_retry = True
+                    else:
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPStatusError as exc:
+                            detail_text, detail_json, status = await self._log_http_error(exc)
+                            if debug_ctx:
+                                error_payload = {"status": status, "message": str(exc)}
+                                if detail_json is not None:
+                                    error_payload["body"] = detail_json
+                                elif detail_text:
+                                    error_payload["body"] = detail_text
+                                self._save_llm_call(
+                                    debug_ctx,
+                                    stream=True,
+                                    request_payload=request_payload,
+                                    response_json={"error": error_payload},
+                                    response_text=detail_text or str(exc)
+                                )
+                            raise
+                        async for line in response.aiter_lines():
+                            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                                stopped = True
+                                break
+                            if not line.startswith("data: "):
+                                continue
+                            data = line[6:]
+                            if data == "[DONE]":
+                                break
+                            try:
+                                event = json.loads(data)
+                            except json.JSONDecodeError:
+                                continue
+
+                            events.append(event)
+                            event_type = event.get("type", "")
+
+                            if event_type == "response.output_text.delta":
+                                delta = event.get("delta", "")
+                                if delta:
+                                    full_text += delta
+                                    yield {"type": "content", "delta": delta}
+                                continue
+
+                            if event_type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                                delta = event.get("delta", "")
+                                if delta:
+                                    yield {"type": "reasoning", "delta": delta}
+                                continue
+
+                            if event_type == "response.function_call_arguments.delta":
+                                output_index = event.get("output_index", 0)
+                                call = tool_calls_by_index.get(output_index)
+                                if not call:
+                                    call = {
+                                        "index": output_index,
+                                        "call_id": event.get("call_id"),
+                                        "name": "",
+                                        "arguments": ""
+                                    }
+                                    tool_calls_by_index[output_index] = call
+                                if event.get("call_id"):
+                                    call["call_id"] = event.get("call_id")
+                                delta = event.get("delta", "")
+                                call["arguments"] = (call.get("arguments", "") or "") + delta
+                                yield {
+                                    "type": "tool_call_delta",
+                                    "index": output_index,
+                                    "id": call.get("call_id"),
+                                    "name": call.get("name", ""),
+                                    "arguments_delta": delta,
+                                    "arguments": call.get("arguments", "")
+                                }
+                                continue
+
+                            if event_type == "response.function_call_arguments.done":
+                                output_index = event.get("output_index", 0)
+                                call = tool_calls_by_index.get(output_index)
+                                if not call:
+                                    call = {"index": output_index, "call_id": event.get("call_id"), "name": "", "arguments": ""}
+                                    tool_calls_by_index[output_index] = call
+                                if event.get("call_id"):
+                                    call["call_id"] = event.get("call_id")
+                                if event.get("name"):
+                                    call["name"] = event.get("name")
+                                if event.get("arguments") is not None:
+                                    call["arguments"] = event.get("arguments")
+                                yield {
+                                    "type": "tool_call_delta",
+                                    "index": output_index,
+                                    "id": call.get("call_id"),
+                                    "name": call.get("name", ""),
+                                    "arguments_delta": "",
+                                    "arguments": call.get("arguments", "")
+                                }
+                                continue
+
+                            if event_type in ("response.output_item.added", "response.output_item.done"):
+                                item = event.get("item") or event.get("output_item") or {}
+                                if isinstance(item, dict) and item.get("type") == "function_call":
+                                    output_index = item.get("output_index", event.get("output_index", 0))
+                                    call = tool_calls_by_index.get(output_index)
+                                    if not call:
+                                        call = {"index": output_index, "call_id": None, "name": "", "arguments": ""}
+                                        tool_calls_by_index[output_index] = call
+                                    if item.get("call_id"):
+                                        call["call_id"] = item.get("call_id")
+                                    if item.get("name"):
+                                        call["name"] = item.get("name")
+                                    if item.get("arguments") is not None:
+                                        call["arguments"] = item.get("arguments")
+                                continue
+
+                            if event_type in ("response.completed", "response.done"):
+                                last_response = event.get("response")
+                                continue
+                        if stopped:
+                            pass
+                if should_retry:
                     if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                        stopped = True
-                        break
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-
-                    events.append(event)
-                    event_type = event.get("type", "")
-
-                    if event_type == "response.output_text.delta":
-                        delta = event.get("delta", "")
-                        if delta:
-                            full_text += delta
-                            yield {"type": "content", "delta": delta}
-                        continue
-
-                    if event_type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
-                        delta = event.get("delta", "")
-                        if delta:
-                            yield {"type": "reasoning", "delta": delta}
-                        continue
-
-                    if event_type == "response.function_call_arguments.delta":
-                        output_index = event.get("output_index", 0)
-                        call = tool_calls_by_index.get(output_index)
-                        if not call:
-                            call = {
-                                "index": output_index,
-                                "call_id": event.get("call_id"),
-                                "name": "",
-                                "arguments": ""
-                            }
-                            tool_calls_by_index[output_index] = call
-                        if event.get("call_id"):
-                            call["call_id"] = event.get("call_id")
-                        delta = event.get("delta", "")
-                        call["arguments"] = (call.get("arguments", "") or "") + delta
-                        yield {
-                            "type": "tool_call_delta",
-                            "index": output_index,
-                            "id": call.get("call_id"),
-                            "name": call.get("name", ""),
-                            "arguments_delta": delta,
-                            "arguments": call.get("arguments", "")
-                        }
-                        continue
-
-                    if event_type == "response.function_call_arguments.done":
-                        output_index = event.get("output_index", 0)
-                        call = tool_calls_by_index.get(output_index)
-                        if not call:
-                            call = {"index": output_index, "call_id": event.get("call_id"), "name": "", "arguments": ""}
-                            tool_calls_by_index[output_index] = call
-                        if event.get("call_id"):
-                            call["call_id"] = event.get("call_id")
-                        if event.get("name"):
-                            call["name"] = event.get("name")
-                        if event.get("arguments") is not None:
-                            call["arguments"] = event.get("arguments")
-                        yield {
-                            "type": "tool_call_delta",
-                            "index": output_index,
-                            "id": call.get("call_id"),
-                            "name": call.get("name", ""),
-                            "arguments_delta": "",
-                            "arguments": call.get("arguments", "")
-                        }
-                        continue
-
-                    if event_type in ("response.output_item.added", "response.output_item.done"):
-                        item = event.get("item") or event.get("output_item") or {}
-                        if isinstance(item, dict) and item.get("type") == "function_call":
-                            output_index = item.get("output_index", event.get("output_index", 0))
-                            call = tool_calls_by_index.get(output_index)
-                            if not call:
-                                call = {"index": output_index, "call_id": None, "name": "", "arguments": ""}
-                                tool_calls_by_index[output_index] = call
-                            if item.get("call_id"):
-                                call["call_id"] = item.get("call_id")
-                            if item.get("name"):
-                                call["name"] = item.get("name")
-                            if item.get("arguments") is not None:
-                                call["arguments"] = item.get("arguments")
-                        continue
-
-                    if event_type in ("response.completed", "response.done"):
-                        last_response = event.get("response")
-                        continue
-                if stopped:
-                    pass
+                        return
+                    await asyncio.sleep(self._get_retry_delay(attempt))
+                    continue
+                completed = True
+                break
 
         tool_calls_list = [tool_calls_by_index[idx] for idx in sorted(tool_calls_by_index.keys())]
 
@@ -917,7 +1027,7 @@ class LLMClient:
             if response_tool_calls:
                 tool_calls_list = response_tool_calls
 
-        if debug_ctx:
+        if completed and debug_ctx:
             self._save_llm_call(
                 debug_ctx,
                 stream=True,

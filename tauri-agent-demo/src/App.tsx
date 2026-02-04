@@ -25,6 +25,7 @@ import ConfigManager from './components/ConfigManager';
 import SessionList from './components/SessionList';
 import DebugPanel from './components/DebugPanel';
 import AgentStepView from './components/AgentStepView';
+import ConfirmDialog from './components/ConfirmDialog';
 
 const DRAFT_SESSION_KEY = '__draft__';
 
@@ -92,6 +93,7 @@ function App() {
   const [inFlightTick, setInFlightTick] = useState(0);
   const [permissionTick, setPermissionTick] = useState(0);
   const [patchRevertBusy, setPatchRevertBusy] = useState(false);
+  const [rollbackTarget, setRollbackTarget] = useState<{ messageId: number; keepInput?: boolean } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
@@ -117,9 +119,18 @@ function App() {
   }, [currentSessionId]);
 
   useEffect(() => {
-    if (autoScrollRef.current) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }
+    if (!autoScrollRef.current) return;
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const behavior: ScrollBehavior = container.scrollHeight > container.clientHeight ? 'smooth' : 'auto';
+    const scrollToBottom = () => {
+      if ('scrollTo' in container) {
+        container.scrollTo({ top: container.scrollHeight, behavior });
+      } else {
+        container.scrollTop = container.scrollHeight;
+      }
+    };
+    requestAnimationFrame(scrollToBottom);
   }, [messages]);
 
   useEffect(() => {
@@ -811,7 +822,7 @@ function App() {
     }
     let rollbackOk = true;
     if (messageId && currentSessionIdRef.current) {
-      rollbackOk = await rollbackToMessage(messageId, { silent: true, keepInput: false });
+      rollbackOk = await rollbackToMessage(messageId, { keepInput: false });
     }
     if (!rollbackOk) return;
     await enqueueMessage(message, currentSessionIdRef.current);
@@ -988,13 +999,13 @@ function App() {
     }
   };
 
-  const handleRollback = async (messageId: number) => {
-    await rollbackToMessage(messageId, { silent: false, keepInput: true });
+  const handleRollback = (messageId: number) => {
+    setRollbackTarget({ messageId, keepInput: true });
   };
 
   const rollbackToMessage = async (
     messageId: number,
-    options?: { silent?: boolean; keepInput?: boolean }
+    options?: { keepInput?: boolean }
   ) => {
     if (!currentSessionId) return false;
     const currentKey = getCurrentSessionKey();
@@ -1002,7 +1013,6 @@ function App() {
       alert('请先停止当前输出再回撤。');
       return false;
     }
-    if (!options?.silent && !confirm('确定回撤到这条消息吗？')) return false;
 
     try {
       const result = await rollbackSession(currentSessionId, messageId);
@@ -1021,6 +1031,13 @@ function App() {
       alert('回撤失败');
       return false;
     }
+  };
+
+  const handleConfirmRollback = async () => {
+    if (!rollbackTarget) return;
+    const { messageId, keepInput } = rollbackTarget;
+    setRollbackTarget(null);
+    await rollbackToMessage(messageId, { keepInput });
   };
 
   const handleRevertPatch = async (revertPatchContent: string) => {
@@ -1404,6 +1421,17 @@ function App() {
           }}
         />
       )}
+
+      <ConfirmDialog
+        open={Boolean(rollbackTarget)}
+        title="回撤消息"
+        message="确定回撤到这条消息吗？"
+        confirmLabel="回撤"
+        cancelLabel="取消"
+        danger
+        onCancel={() => setRollbackTarget(null)}
+        onConfirm={handleConfirmRollback}
+      />
 
     </div>
   );

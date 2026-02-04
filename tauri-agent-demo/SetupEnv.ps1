@@ -273,6 +273,15 @@ if ($rustOk) {
     }
 }
 
+$rgHome = Join-Path $script:Root "tools\rg"
+$rgExe = Join-Path $rgHome "rg.exe"
+if (Test-Path $rgExe) {
+    Add-SessionPath $rgHome
+    Write-Host "ripgrep found: $rgExe"
+} else {
+    Write-Host "ripgrep not found at $rgExe (optional)."
+}
+
 # ==================== Project dependencies ====================
 
 Write-Section "Project dependencies"
