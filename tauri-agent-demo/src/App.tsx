@@ -1,5 +1,6 @@
 ﻿import { useState, useEffect, useRef, useMemo } from 'react';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import './App.css';
 import { Message, LLMConfig, LLMCall, ToolPermissionRequest, ReasoningEffort, AgentMode } from './types';
 import {
@@ -94,6 +95,7 @@ function App() {
   const [permissionTick, setPermissionTick] = useState(0);
   const [patchRevertBusy, setPatchRevertBusy] = useState(false);
   const [rollbackTarget, setRollbackTarget] = useState<{ messageId: number; keepInput?: boolean } | null>(null);
+  const [isMaximized, setIsMaximized] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
@@ -108,6 +110,7 @@ function App() {
   const permissionBusyBySessionRef = useRef<Record<string, boolean>>({});
   const processingQueueRef = useRef(false);
   const pendingQueueRunRef = useRef(false);
+  const appWindow = useMemo(() => getCurrentWindow(), []);
 
   useEffect(() => {
     loadDefaultConfig();
@@ -117,6 +120,70 @@ function App() {
   useEffect(() => {
     currentSessionIdRef.current = currentSessionId;
   }, [currentSessionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const syncMaximize = async () => {
+      try {
+        const next = await appWindow.isMaximized();
+        if (!cancelled) {
+          setIsMaximized(next);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    syncMaximize();
+    let unlisten: (() => void) | null = null;
+    appWindow.onResized(() => {
+      syncMaximize();
+    }).then((stop) => {
+      unlisten = stop;
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [appWindow]);
+
+  const handleTitlebarMinimize = async () => {
+    try {
+      await appWindow.minimize();
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleTitlebarMaximize = async () => {
+    try {
+      await appWindow.toggleMaximize();
+      const next = await appWindow.isMaximized();
+      setIsMaximized(next);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleTitlebarClose = async () => {
+    try {
+      await appWindow.close();
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleTitlebarMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startDragging = (appWindow as unknown as { startDragging?: () => Promise<void> }).startDragging;
+    if (typeof startDragging === 'function') {
+      startDragging().catch(() => undefined);
+    }
+  };
+
+  const handleTitlebarDoubleClick = () => {
+    handleTitlebarMaximize();
+  };
 
   useEffect(() => {
     if (!autoScrollRef.current) return;
@@ -1103,7 +1170,76 @@ function App() {
   const workPathDisplay = useMemo(() => formatWorkPath(currentWorkPath), [currentWorkPath]);
 
   return (
-    <div className="app-container">
+    <div className="app-shell">
+      <div className="app-titlebar">
+        <div
+          className="titlebar-left"
+          data-tauri-drag-region
+          onMouseDown={handleTitlebarMouseDown}
+          onDoubleClick={handleTitlebarDoubleClick}
+        >
+          <div className="titlebar-appname">GYY</div>
+          <div className="titlebar-divider" />
+          <div className="titlebar-subtitle">Agent Chat</div>
+        </div>
+        <div className="titlebar-actions" data-tauri-drag-region="false">
+          <button
+            type="button"
+            className="titlebar-btn"
+            onClick={handleTitlebarMinimize}
+            aria-label="Minimize"
+            title="Minimize"
+            data-tauri-drag-region="false"
+          >
+            <svg viewBox="0 0 12 12" aria-hidden="true" data-tauri-drag-region="false">
+              <rect x="2" y="6" width="8" height="1.2" rx="0.6" fill="currentColor" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            className="titlebar-btn"
+            onClick={handleTitlebarMaximize}
+            aria-label={isMaximized ? 'Restore' : 'Maximize'}
+            title={isMaximized ? 'Restore' : 'Maximize'}
+            data-tauri-drag-region="false"
+          >
+            {isMaximized ? (
+              <svg viewBox="0 0 12 12" aria-hidden="true" data-tauri-drag-region="false">
+                <path
+                  d="M4 3h5a1 1 0 0 1 1 1v5M3 4a1 1 0 0 1 1-1h4v1H4v4H3z"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1"
+                />
+                <rect x="3" y="4" width="5" height="5" fill="none" stroke="currentColor" strokeWidth="1" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 12 12" aria-hidden="true" data-tauri-drag-region="false">
+                <rect x="3" y="3" width="6" height="6" fill="none" stroke="currentColor" strokeWidth="1" />
+              </svg>
+            )}
+          </button>
+          <button
+            type="button"
+            className="titlebar-btn close"
+            onClick={handleTitlebarClose}
+            aria-label="Close"
+            title="Close"
+            data-tauri-drag-region="false"
+          >
+            <svg viewBox="0 0 12 12" aria-hidden="true" data-tauri-drag-region="false">
+              <path
+                d="M3.2 3.2l5.6 5.6M8.8 3.2l-5.6 5.6"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.4"
+                strokeLinecap="round"
+              />
+            </svg>
+          </button>
+        </div>
+      </div>
+      <div className="app-container">
       {showSidebar && (
         <SessionList
           currentSessionId={currentSessionId}
@@ -1433,6 +1569,7 @@ function App() {
         onConfirm={handleConfirmRollback}
       />
 
+    </div>
     </div>
   );
 }

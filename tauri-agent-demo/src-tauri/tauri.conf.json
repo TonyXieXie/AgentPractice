@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "tauri-agent-demo",
+  "productName": "GYY",
   "version": "0.1.0",
   "identifier": "com.xiejihao.tauri-agent-demo",
   "build": {
@@ -12,9 +12,10 @@
   "app": {
     "windows": [
       {
-        "title": "tauri-agent-demo",
+        "title": "GYY",
         "width": 800,
-        "height": 600
+        "height": 600,
+        "decorations": false
       }
     ],
     "security": {
