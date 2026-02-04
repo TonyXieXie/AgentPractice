@@ -43,6 +43,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         model: '',
         temperature: 0.7,
         max_tokens: 2000,
+        max_context_tokens: 200000,
         is_default: false,
     });
 
@@ -151,6 +152,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             model: config.model,
             temperature: config.temperature,
             max_tokens: config.max_tokens,
+            max_context_tokens: config.max_context_tokens ?? 200000,
             is_default: config.is_default,
         });
         setShowForm(true);
@@ -184,6 +186,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             model: '',
             temperature: 0.7,
             max_tokens: 2000,
+            max_context_tokens: 200000,
             is_default: false,
         });
         setEditingConfig(null);
@@ -290,7 +293,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                                     </p>
                                                     <p className="config-detail">
                                                         <strong>Temp:</strong> {config.temperature} |
-                                                        <strong> Max Tokens:</strong> {config.max_tokens}
+                                                        <strong> Max Tokens:</strong> {config.max_tokens} |
+                                                        <strong> Max Context:</strong> {config.max_context_tokens ?? 200000}
                                                     </p>
                                                 </div>
                                                 <div className="config-actions">
@@ -402,6 +406,20 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                             onChange={(e) => setFormData({ ...formData, max_tokens: parseInt(e.target.value) })}
                                         />
                                     </div>
+                                </div>
+
+                                <div className="form-group">
+                                    <label>Max Context Tokens</label>
+                                    <input
+                                        type="number"
+                                        min="1000"
+                                        max="1000000"
+                                        value={formData.max_context_tokens ?? 200000}
+                                        onChange={(e) =>
+                                            setFormData({ ...formData, max_context_tokens: parseInt(e.target.value) })
+                                        }
+                                    />
+                                    <small>默认 200000。用于 context 使用率估算。</small>
                                 </div>
 
                                 <div className="form-group checkbox-group">

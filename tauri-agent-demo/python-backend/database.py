@@ -35,6 +35,7 @@ class Database:
                 model TEXT NOT NULL,
                 temperature REAL DEFAULT 0.7,
                 max_tokens INTEGER DEFAULT 2000,
+                max_context_tokens INTEGER DEFAULT 200000,
                 is_default INTEGER DEFAULT 0,
                 reasoning_effort TEXT DEFAULT "medium",
                 reasoning_summary TEXT DEFAULT "detailed",
@@ -63,6 +64,11 @@ class Database:
             pass
 
         try:
+            cursor.execute('ALTER TABLE llm_configs ADD COLUMN max_context_tokens INTEGER')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
             cursor.execute('''
                 UPDATE llm_configs
                 SET api_format = ?
@@ -86,6 +92,15 @@ class Database:
                 SET reasoning_summary = ?
                 WHERE reasoning_summary IS NULL
             ''', ("detailed",))
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('''
+                UPDATE llm_configs
+                SET max_context_tokens = ?
+                WHERE max_context_tokens IS NULL
+            ''', (200000,))
         except sqlite3.OperationalError:
             pass
 
@@ -246,10 +261,10 @@ class Database:
             cursor.execute('UPDATE llm_configs SET is_default = 0')
         
         cursor.execute('''
-            INSERT INTO llm_configs (id, name, api_type, api_format, api_profile, api_key, base_url, model, temperature, max_tokens, is_default, reasoning_effort, reasoning_summary, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO llm_configs (id, name, api_type, api_format, api_profile, api_key, base_url, model, temperature, max_tokens, max_context_tokens, is_default, reasoning_effort, reasoning_summary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (config_id, config.name, api_profile, api_format, api_profile, config.api_key, config.base_url,
-              config.model, config.temperature, config.max_tokens, int(config.is_default), reasoning_effort, reasoning_summary, created_at))
+              config.model, config.temperature, config.max_tokens, config.max_context_tokens, int(config.is_default), reasoning_effort, reasoning_summary, created_at))
         
         conn.commit()
         conn.close()
@@ -286,6 +301,7 @@ class Database:
                 model=row['model'],
                 temperature=row['temperature'],
                 max_tokens=row['max_tokens'],
+                max_context_tokens=row['max_context_tokens'] if 'max_context_tokens' in row.keys() else 200000,
                 is_default=bool(row['is_default']),
                 reasoning_effort=reasoning_effort,
                 reasoning_summary=reasoning_summary,
@@ -308,6 +324,7 @@ class Database:
             data["api_format"] = data.get("api_format") or "openai_chat_completions"
             data["reasoning_effort"] = data.get("reasoning_effort") or "medium"
             data["reasoning_summary"] = data.get("reasoning_summary") or "detailed"
+            data["max_context_tokens"] = data.get("max_context_tokens") or 200000
             configs.append(LLMConfig(**data))
         return configs
     
@@ -325,6 +342,7 @@ class Database:
             data["api_format"] = data.get("api_format") or "openai_chat_completions"
             data["reasoning_effort"] = data.get("reasoning_effort") or "medium"
             data["reasoning_summary"] = data.get("reasoning_summary") or "detailed"
+            data["max_context_tokens"] = data.get("max_context_tokens") or 200000
             return LLMConfig(**data)
         return None
     
@@ -367,6 +385,9 @@ class Database:
         if update.max_tokens is not None:
             update_fields.append('max_tokens = ?')
             values.append(update.max_tokens)
+        if update.max_context_tokens is not None:
+            update_fields.append('max_context_tokens = ?')
+            values.append(update.max_context_tokens)
         if update.reasoning_effort is not None:
             update_fields.append('reasoning_effort = ?')
             values.append(update.reasoning_effort)

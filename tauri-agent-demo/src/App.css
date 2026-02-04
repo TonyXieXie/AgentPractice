@@ -713,6 +713,40 @@ body {
   font-style: italic;
 }
 
+.work-path-menu {
+  position: fixed;
+  z-index: 1200;
+  background: #1b222b;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 6px;
+  min-width: 200px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+}
+
+.work-path-menu-item {
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  color: #e5e7eb;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.work-path-menu-item:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.work-path-menu-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+
 .input-area .send-btn {
   width: 32px;
   height: 32px;
@@ -836,6 +870,47 @@ body {
   align-items: center;
   gap: 6px;
   margin-left: auto;
+}
+
+.context-usage {
+  position: relative;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #cbd5e1;
+}
+
+.context-usage svg {
+  width: 24px;
+  height: 24px;
+  transform: rotate(-90deg);
+}
+
+.context-ring-bg {
+  stroke: rgba(148, 163, 184, 0.2);
+}
+
+.context-ring-value {
+  stroke: #38bdf8;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.2s ease, stroke 0.2s ease;
+}
+
+.context-usage.mid .context-ring-value {
+  stroke: #facc15;
+}
+
+.context-usage.warn .context-ring-value {
+  stroke: #f97316;
+}
+
+.context-usage-text {
+  position: absolute;
+  font-size: 0.6rem;
+  color: #e2e8f0;
+  letter-spacing: 0.01em;
 }
 
 .model-selector-inline {

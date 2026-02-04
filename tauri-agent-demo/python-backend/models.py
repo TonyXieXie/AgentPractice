@@ -15,6 +15,7 @@ class LLMConfig(BaseModel):
     model: str
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=2000, ge=1, le=32000)
+    max_context_tokens: int = Field(default=200000, ge=1000, le=1000000)
     is_default: bool = False
     created_at: Optional[str] = None
     # Reasoning params (OpenAI o1/GPT-5 models)
@@ -33,6 +34,7 @@ class LLMConfigCreate(BaseModel):
     model: str
     temperature: float = 0.7
     max_tokens: int = 2000
+    max_context_tokens: int = 200000
     is_default: bool = False
     reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = "medium"
     reasoning_summary: Optional[Literal["auto", "concise", "detailed"]] = "detailed"
@@ -49,6 +51,7 @@ class LLMConfigUpdate(BaseModel):
     api_type: Optional[LLMProfile] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    max_context_tokens: Optional[int] = None
     is_default: Optional[bool] = None
     reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = None
     reasoning_summary: Optional[Literal["auto", "concise", "detailed"]] = None

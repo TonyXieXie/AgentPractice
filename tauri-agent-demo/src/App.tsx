@@ -1,6 +1,8 @@
 ﻿import { useState, useEffect, useRef, useMemo } from 'react';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { openPath } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import './App.css';
 import { Message, LLMConfig, LLMCall, ToolPermissionRequest, ReasoningEffort, AgentMode } from './types';
 import {
@@ -47,12 +49,154 @@ const AGENT_MODE_OPTIONS: { value: AgentMode; label: string; description: string
 
 const MAX_CONCURRENT_STREAMS = 10;
 const WORK_PATH_MAX_LENGTH = 200;
+const WORKDIR_BOUNDS_KEY = 'workdirWindowBounds';
+const WORKDIR_DEFAULT_WIDTH = 1200;
+const WORKDIR_DEFAULT_HEIGHT = 800;
+const DEFAULT_MAX_CONTEXT_TOKENS = 200000;
+const CONTEXT_RING_RADIUS = 10;
+
+type WorkdirBounds = {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+};
+
+const getWorkdirWindowBounds = (): WorkdirBounds | null => {
+  try {
+    const raw = localStorage.getItem(WORKDIR_BOUNDS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<WorkdirBounds> | null;
+    if (!parsed || typeof parsed !== 'object') return null;
+    const next: WorkdirBounds = {};
+    if (Number.isFinite(parsed.width)) next.width = Math.max(640, Math.round(parsed.width as number));
+    if (Number.isFinite(parsed.height)) next.height = Math.max(480, Math.round(parsed.height as number));
+    if (Number.isFinite(parsed.x)) next.x = Math.round(parsed.x as number);
+    if (Number.isFinite(parsed.y)) next.y = Math.round(parsed.y as number);
+    return next;
+  } catch {
+    return null;
+  }
+};
+
+const hashPath = (value: string) => {
+  let hash = 5381;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = (hash << 5) + hash + value.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(16);
+};
+
+const makeWorkdirLabel = (path: string) => {
+  const normalized = path.toLowerCase();
+  const base = normalized
+    .replace(/[^a-zA-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 12);
+  const safeBase = base || 'path';
+  return `workdir-${safeBase}-${hashPath(normalized)}`;
+};
 
 const formatWorkPath = (path: string) => {
   if (!path) return '点击选择工作路径';
   if (path.length <= WORK_PATH_MAX_LENGTH) return path;
   const tailLength = Math.max(1, WORK_PATH_MAX_LENGTH - 3);
   return `...${path.slice(-tailLength)}`;
+};
+
+const estimateTokensForText = (text: string) => {
+  if (!text) return 0;
+  let ascii = 0;
+  let nonAscii = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code <= 0x7f) {
+      ascii += 1;
+    } else {
+      nonAscii += 1;
+    }
+  }
+  return Math.ceil(ascii / 4) + nonAscii;
+};
+
+const collectTextFromContent = (content: any, bucket: string[]) => {
+  if (!content) return;
+  if (typeof content === 'string') {
+    if (content.trim()) bucket.push(content);
+    return;
+  }
+  if (Array.isArray(content)) {
+    content.forEach((item) => collectTextFromContent(item, bucket));
+    return;
+  }
+  if (typeof content === 'object') {
+    if (typeof content.text === 'string') {
+      if (content.text.trim()) bucket.push(content.text);
+    }
+    if (typeof content.content === 'string') {
+      if (content.content.trim()) bucket.push(content.content);
+    }
+    if (Array.isArray(content.content)) {
+      content.content.forEach((item: any) => collectTextFromContent(item, bucket));
+    }
+  }
+};
+
+const estimateTokensFromRequest = (request: Record<string, any> | null) => {
+  if (!request) return 0;
+  let total = 0;
+  const texts: string[] = [];
+
+  if (Array.isArray(request.messages)) {
+    request.messages.forEach((msg: any) => {
+      if (!msg) return;
+      collectTextFromContent(msg.content, texts);
+      total += 4;
+    });
+  }
+
+  if (request.input) {
+    if (typeof request.input === 'string') {
+      texts.push(request.input);
+    } else if (Array.isArray(request.input)) {
+      request.input.forEach((item: any) => {
+        if (item && Array.isArray(item.content)) {
+          item.content.forEach((contentItem: any) => collectTextFromContent(contentItem, texts));
+        } else {
+          collectTextFromContent(item, texts);
+        }
+        total += 4;
+      });
+    } else {
+      collectTextFromContent(request.input, texts);
+    }
+  }
+
+  if (typeof request.instructions === 'string') {
+    texts.push(request.instructions);
+  }
+
+  if (typeof request.prompt === 'string') {
+    texts.push(request.prompt);
+  }
+
+  texts.forEach((text) => {
+    total += estimateTokensForText(text);
+  });
+
+  return total;
+};
+
+const getLatestRequestPayload = (calls: LLMCall[], history: Message[]) => {
+  for (let i = calls.length - 1; i >= 0; i -= 1) {
+    const payload = calls[i]?.request_json;
+    if (payload) return payload as Record<string, any>;
+  }
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const payload = history[i]?.raw_request;
+    if (payload) return payload as Record<string, any>;
+  }
+  return null;
 };
 
 type QueueItem = {
@@ -95,6 +239,7 @@ function App() {
   const [permissionTick, setPermissionTick] = useState(0);
   const [patchRevertBusy, setPatchRevertBusy] = useState(false);
   const [rollbackTarget, setRollbackTarget] = useState<{ messageId: number; keepInput?: boolean } | null>(null);
+  const [workPathMenu, setWorkPathMenu] = useState<{ x: number; y: number } | null>(null);
   const [isMaximized, setIsMaximized] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -221,6 +366,17 @@ function App() {
       document.removeEventListener('click', handleClickOutside);
     };
   }, [showConfigSelector, showReasoningSelector, showAgentModeSelector]);
+
+  useEffect(() => {
+    if (!workPathMenu) return;
+    const dismiss = () => setWorkPathMenu(null);
+    window.addEventListener('click', dismiss);
+    window.addEventListener('blur', dismiss);
+    return () => {
+      window.removeEventListener('click', dismiss);
+      window.removeEventListener('blur', dismiss);
+    };
+  }, [workPathMenu]);
 
   useEffect(() => {
     if (showDebugPanel && currentSessionId) {
@@ -841,6 +997,55 @@ function App() {
     await applyWorkPath(sessionKey, currentSessionIdRef.current, selected);
   };
 
+  const openWorkDirWindow = async (path: string) => {
+    const label = makeWorkdirLabel(path);
+    const existing = await WebviewWindow.getByLabel(label);
+    if (existing) {
+      try {
+        await existing.show();
+        await existing.setFocus();
+      } catch {
+        // ignore focus errors
+      }
+      void existing.emit('workdir:ping', { target: label });
+      void existing.emit('workdir:set', { path, target: label });
+      return;
+    }
+
+    const bounds = getWorkdirWindowBounds();
+    const url = `/?window=workdir&path=${encodeURIComponent(path)}`;
+    const win = new WebviewWindow(label, {
+      title: '工作目录',
+      url,
+      width: bounds?.width ?? WORKDIR_DEFAULT_WIDTH,
+      height: bounds?.height ?? WORKDIR_DEFAULT_HEIGHT,
+      x: bounds?.x,
+      y: bounds?.y,
+    });
+
+    win.once('tauri://created', () => {
+      void win.emit('workdir:set', { path, target: label });
+    });
+
+    win.once('tauri://error', (event) => {
+      console.error('Failed to create workdir window:', event);
+    });
+  };
+
+  const handleWorkPathClick = async () => {
+    if (!currentWorkPath) {
+      await handleWorkPathPick();
+      return;
+    }
+    await openWorkDirWindow(currentWorkPath);
+  };
+
+  const handleWorkPathContextMenu = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setWorkPathMenu({ x: event.clientX, y: event.clientY });
+  };
+
   const enqueueMessage = async (message: string, sessionId: string | null) => {
     if (!message.trim()) return;
     if (!currentConfig) {
@@ -1168,6 +1373,18 @@ function App() {
   );
   const currentReasoning = (currentConfig?.reasoning_effort || 'medium') as ReasoningEffort;
   const workPathDisplay = useMemo(() => formatWorkPath(currentWorkPath), [currentWorkPath]);
+  const contextUsage = useMemo(() => {
+    const maxTokens = currentConfig?.max_context_tokens || DEFAULT_MAX_CONTEXT_TOKENS;
+    const lastRequest = getLatestRequestPayload(llmCalls, messages);
+    const usedTokens = estimateTokensFromRequest(lastRequest);
+    const ratio = maxTokens > 0 ? Math.min(1, usedTokens / maxTokens) : 0;
+    return { usedTokens, maxTokens, ratio };
+  }, [currentConfig?.max_context_tokens, llmCalls, messages]);
+  const contextRing = useMemo(() => {
+    const circumference = 2 * Math.PI * CONTEXT_RING_RADIUS;
+    const dashOffset = circumference * (1 - contextUsage.ratio);
+    return { circumference, dashOffset };
+  }, [contextUsage.ratio]);
 
   return (
     <div className="app-shell">
@@ -1487,21 +1704,88 @@ function App() {
                     )}
                   </div>
 
-                  <button
-                    type="button"
-                    className="work-path-row"
-                    onClick={handleWorkPathPick}
-                    title={currentWorkPath || '\u70b9\u51fb\u9009\u62e9\u5de5\u4f5c\u8def\u5f84'}
-                    aria-label={'\u9009\u62e9\u5de5\u4f5c\u8def\u5f84'}
-                  >
+                    <button
+                      type="button"
+                      className="work-path-row"
+                      onClick={handleWorkPathClick}
+                      onContextMenu={handleWorkPathContextMenu}
+                      title={currentWorkPath || '\u70b9\u51fb\u9009\u62e9\u5de5\u4f5c\u8def\u5f84'}
+                      aria-label={'\u9009\u62e9\u5de5\u4f5c\u8def\u5f84'}
+                    >
                     <span className={`work-path-value${currentWorkPath ? '' : ' empty'}`}>
                       {workPathDisplay}
                     </span>
                   </button>
+                  {workPathMenu && (
+                    <div
+                      className="work-path-menu"
+                      style={{
+                        top: Math.min(workPathMenu.y, window.innerHeight - 90),
+                        left: Math.min(workPathMenu.x, window.innerWidth - 220)
+                      }}
+                      onClick={(event) => event.stopPropagation()}
+                      onContextMenu={(event) => event.preventDefault()}
+                    >
+                      <button
+                        type="button"
+                        className="work-path-menu-item"
+                        onClick={async () => {
+                          setWorkPathMenu(null);
+                          await handleWorkPathPick();
+                        }}
+                      >
+                        重新选择工作路径
+                      </button>
+                      <button
+                        type="button"
+                        className="work-path-menu-item"
+                        disabled={!currentWorkPath}
+                        onClick={async () => {
+                          if (!currentWorkPath) return;
+                          setWorkPathMenu(null);
+                          try {
+                            await openPath(currentWorkPath);
+                          } catch {
+                            // ignore open errors
+                          }
+                        }}
+                      >
+                        在资源管理器打开
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
 
               <div className="input-actions">
+                {currentConfig && (
+                  <div
+                    className={`context-usage${contextUsage.ratio >= 0.8 ? ' warn' : contextUsage.ratio >= 0.6 ? ' mid' : ''}`}
+                    title={`Context ${contextUsage.usedTokens} / ${contextUsage.maxTokens} tokens`}
+                    aria-label={`Context usage ${contextUsage.usedTokens} of ${contextUsage.maxTokens} tokens`}
+                  >
+                    <svg viewBox="0 0 36 36" aria-hidden="true">
+                      <circle
+                        className="context-ring-bg"
+                        cx="18"
+                        cy="18"
+                        r={CONTEXT_RING_RADIUS}
+                        fill="none"
+                        strokeWidth="4"
+                      />
+                      <circle
+                        className="context-ring-value"
+                        cx="18"
+                        cy="18"
+                        r={CONTEXT_RING_RADIUS}
+                        fill="none"
+                        strokeWidth="4"
+                        strokeDasharray={contextRing.circumference}
+                        strokeDashoffset={contextRing.dashOffset}
+                      />
+                    </svg>
+                  </div>
+                )}
                 <button
                   type="button"
                   className="send-btn"

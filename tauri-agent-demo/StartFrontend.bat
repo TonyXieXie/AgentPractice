@@ -35,5 +35,6 @@ set "CARGO_BIN=%USERPROFILE%\.cargo\bin"
 if exist "%CARGO_BIN%\cargo.exe" (
   set "PATH=%CARGO_BIN%;%PATH%"
 )
+set "ESBUILD_BINARY_PATH=%~dp0node_modules\@esbuild\win32-x64\esbuild.exe"
 npm run tauri dev
 pause

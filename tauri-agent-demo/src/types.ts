@@ -26,6 +26,7 @@ export interface LLMConfig {
     model: string;
     temperature: number;
     max_tokens: number;
+    max_context_tokens: number;
     is_default: boolean;
     created_at: string;
     reasoning_effort?: ReasoningEffort;
@@ -41,6 +42,7 @@ export interface LLMConfigCreate {
     model: string;
     temperature?: number;
     max_tokens?: number;
+    max_context_tokens?: number;
     is_default?: boolean;
     reasoning_effort?: ReasoningEffort;
     reasoning_summary?: ReasoningSummary;
@@ -55,6 +57,7 @@ export interface LLMConfigUpdate {
     api_profile?: LLMProfile;
     temperature?: number;
     max_tokens?: number;
+    max_context_tokens?: number;
     is_default?: boolean;
     reasoning_effort?: ReasoningEffort;
     reasoning_summary?: ReasoningSummary;
