@@ -20,6 +20,7 @@ const getInitialPath = () => {
 function WorkDirWindow() {
   const [rootPath, setRootPath] = useState(getInitialPath);
   const [ping, setPing] = useState(false);
+  const [isMaximized, setIsMaximized] = useState(false);
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
   useEffect(() => {
@@ -77,9 +78,144 @@ function WorkDirWindow() {
     };
   }, [appWindow]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const syncMaximize = async () => {
+      try {
+        const next = await appWindow.isMaximized();
+        if (!cancelled) {
+          setIsMaximized(next);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    syncMaximize();
+    let unlisten: (() => void) | null = null;
+    appWindow.onResized(() => {
+      syncMaximize();
+    }).then((stop) => {
+      unlisten = stop;
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [appWindow]);
+
+  const handleTitlebarMinimize = async () => {
+    try {
+      await appWindow.minimize();
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleTitlebarMaximize = async () => {
+    try {
+      await appWindow.toggleMaximize();
+      const next = await appWindow.isMaximized();
+      setIsMaximized(next);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleTitlebarClose = async () => {
+    try {
+      await appWindow.close();
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleTitlebarDoubleClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement;
+    if (target.closest('.workdir-titlebar-actions') || target.closest('.workdir-titlebar-btn')) {
+      return;
+    }
+    handleTitlebarMaximize();
+  };
+
+  const titlePath = rootPath || '未设置';
+
   return (
-    <div className={`workdir-standalone${ping ? ' ping' : ''}`}>
-      <WorkDirBrowser open rootPath={rootPath} mode="window" showActions={false} showClose={false} />
+    <div className={`workdir-shell${ping ? ' ping' : ''}`}>
+      <div className="workdir-titlebar" data-tauri-drag-region onDoubleClick={handleTitlebarDoubleClick}>
+        <div className="workdir-titlebar-left">
+          <div className="workdir-titlebar-appname">GYY</div>
+          <div className="workdir-titlebar-divider" />
+          <div className="workdir-titlebar-path" title={titlePath}>
+            {titlePath}
+          </div>
+        </div>
+        <div className="workdir-titlebar-actions" data-tauri-drag-region="false">
+          <button
+            type="button"
+            className="workdir-titlebar-btn"
+            data-tauri-drag-region="false"
+            onClick={handleTitlebarMinimize}
+            aria-label="Minimize"
+            title="Minimize"
+          >
+            <svg viewBox="0 0 12 12" aria-hidden="true">
+              <rect x="2" y="6" width="8" height="1.2" rx="0.6" fill="currentColor" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            className="workdir-titlebar-btn"
+            data-tauri-drag-region="false"
+            onClick={handleTitlebarMaximize}
+            aria-label={isMaximized ? 'Restore' : 'Maximize'}
+            title={isMaximized ? 'Restore' : 'Maximize'}
+          >
+            {isMaximized ? (
+              <svg viewBox="0 0 12 12" aria-hidden="true">
+                <path
+                  d="M4 3h5a1 1 0 0 1 1 1v5M3 4a1 1 0 0 1 1-1h4v1H4v4H3z"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1"
+                />
+                <rect x="3" y="4" width="5" height="5" fill="none" stroke="currentColor" strokeWidth="1" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 12 12" aria-hidden="true">
+                <rect x="3" y="3" width="6" height="6" fill="none" stroke="currentColor" strokeWidth="1" />
+              </svg>
+            )}
+          </button>
+          <button
+            type="button"
+            className="workdir-titlebar-btn close"
+            data-tauri-drag-region="false"
+            onClick={handleTitlebarClose}
+            aria-label="Close"
+            title="Close"
+          >
+            <svg viewBox="0 0 12 12" aria-hidden="true">
+              <path
+                d="M3.2 3.2l5.6 5.6M8.8 3.2l-5.6 5.6"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.4"
+                strokeLinecap="round"
+              />
+            </svg>
+          </button>
+        </div>
+      </div>
+      <div className="workdir-content">
+        <WorkDirBrowser
+          open
+          rootPath={rootPath}
+          mode="window"
+          showActions={false}
+          showClose={false}
+          showHeader={false}
+        />
+      </div>
     </div>
   );
 }

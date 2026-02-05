@@ -317,16 +317,11 @@ function App() {
     }
   };
 
-  const handleTitlebarMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    const startDragging = (appWindow as unknown as { startDragging?: () => Promise<void> }).startDragging;
-    if (typeof startDragging === 'function') {
-      startDragging().catch(() => undefined);
+  const handleTitlebarDoubleClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement;
+    if (target.closest('.titlebar-actions') || target.closest('.titlebar-btn')) {
+      return;
     }
-  };
-
-  const handleTitlebarDoubleClick = () => {
     handleTitlebarMaximize();
   };
 
@@ -1015,12 +1010,13 @@ function App() {
     const bounds = getWorkdirWindowBounds();
     const url = `/?window=workdir&path=${encodeURIComponent(path)}`;
     const win = new WebviewWindow(label, {
-      title: '工作目录',
+      title: 'GYY',
       url,
       width: bounds?.width ?? WORKDIR_DEFAULT_WIDTH,
       height: bounds?.height ?? WORKDIR_DEFAULT_HEIGHT,
       x: bounds?.x,
       y: bounds?.y,
+      decorations: false,
     });
 
     win.once('tauri://created', () => {
@@ -1388,12 +1384,13 @@ function App() {
 
   return (
     <div className="app-shell">
-      <div className="app-titlebar">
+      <div
+        className="app-titlebar"
+        data-tauri-drag-region
+        onDoubleClick={handleTitlebarDoubleClick}
+      >
         <div
           className="titlebar-left"
-          data-tauri-drag-region
-          onMouseDown={handleTitlebarMouseDown}
-          onDoubleClick={handleTitlebarDoubleClick}
         >
           <div className="titlebar-appname">GYY</div>
           <div className="titlebar-divider" />
@@ -1403,25 +1400,25 @@ function App() {
           <button
             type="button"
             className="titlebar-btn"
+            data-tauri-drag-region="false"
             onClick={handleTitlebarMinimize}
             aria-label="Minimize"
             title="Minimize"
-            data-tauri-drag-region="false"
           >
-            <svg viewBox="0 0 12 12" aria-hidden="true" data-tauri-drag-region="false">
+            <svg viewBox="0 0 12 12" aria-hidden="true">
               <rect x="2" y="6" width="8" height="1.2" rx="0.6" fill="currentColor" />
             </svg>
           </button>
           <button
             type="button"
             className="titlebar-btn"
+            data-tauri-drag-region="false"
             onClick={handleTitlebarMaximize}
             aria-label={isMaximized ? 'Restore' : 'Maximize'}
             title={isMaximized ? 'Restore' : 'Maximize'}
-            data-tauri-drag-region="false"
           >
             {isMaximized ? (
-              <svg viewBox="0 0 12 12" aria-hidden="true" data-tauri-drag-region="false">
+              <svg viewBox="0 0 12 12" aria-hidden="true">
                 <path
                   d="M4 3h5a1 1 0 0 1 1 1v5M3 4a1 1 0 0 1 1-1h4v1H4v4H3z"
                   fill="none"
@@ -1431,7 +1428,7 @@ function App() {
                 <rect x="3" y="4" width="5" height="5" fill="none" stroke="currentColor" strokeWidth="1" />
               </svg>
             ) : (
-              <svg viewBox="0 0 12 12" aria-hidden="true" data-tauri-drag-region="false">
+              <svg viewBox="0 0 12 12" aria-hidden="true">
                 <rect x="3" y="3" width="6" height="6" fill="none" stroke="currentColor" strokeWidth="1" />
               </svg>
             )}
@@ -1439,12 +1436,12 @@ function App() {
           <button
             type="button"
             className="titlebar-btn close"
+            data-tauri-drag-region="false"
             onClick={handleTitlebarClose}
             aria-label="Close"
             title="Close"
-            data-tauri-drag-region="false"
           >
-            <svg viewBox="0 0 12 12" aria-hidden="true" data-tauri-drag-region="false">
+            <svg viewBox="0 0 12 12" aria-hidden="true">
               <path
                 d="M3.2 3.2l5.6 5.6M8.8 3.2l-5.6 5.6"
                 fill="none"

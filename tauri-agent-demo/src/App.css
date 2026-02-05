@@ -31,7 +31,6 @@ body {
   user-select: none;
   cursor: default;
   -webkit-app-region: drag;
-  app-region: drag;
 }
 
 .titlebar-left {
@@ -41,8 +40,6 @@ body {
   font-size: 0.85rem;
   letter-spacing: 0.02em;
   cursor: grab;
-  -webkit-app-region: drag;
-  app-region: drag;
 }
 
 .titlebar-appname {
@@ -66,7 +63,6 @@ body {
   align-items: center;
   gap: 6px;
   -webkit-app-region: no-drag;
-  app-region: no-drag;
 }
 
 .titlebar-btn {
@@ -82,6 +78,7 @@ body {
   justify-content: center;
   transition: background 0.2s, border-color 0.2s, color 0.2s;
   padding: 0;
+  -webkit-app-region: no-drag;
 }
 
 .titlebar-btn svg {

@@ -37,8 +37,9 @@
 }
 
 .workdir-embedded {
-  width: 100vw;
-  height: 100vh;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
 }
 
 @keyframes workdirSlideUp {
@@ -170,6 +171,8 @@
   flex: 1;
   overflow-y: auto;
   padding: 6px 4px 10px;
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+  scrollbar-width: thin;
 }
 
 .workdir-tree-row {
@@ -180,7 +183,7 @@
   border-radius: 4px;
   color: #d4d4d4;
   cursor: pointer;
-  font-size: 0.82rem;
+  font-size: 0.76rem;
   user-select: none;
 }
 
@@ -230,23 +233,93 @@
 .workdir-editor {
   flex: 1;
   display: flex;
-  flex-direction: column;
   min-width: 0;
+}
+
+.workdir-split-container {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workdir-split-container.resizing {
+  cursor: col-resize;
+}
+
+.workdir-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid #2d2d2d;
+  min-height: 0;
+  background: #1e1e1e;
+}
+
+.workdir-pane:first-child {
+  border-left: none;
+}
+
+.workdir-pane.active {
+  box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.18);
+}
+
+.workdir-splitter {
+  width: 6px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  flex: 0 0 6px;
+}
+
+.workdir-splitter::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 1px;
+  background: #2d2d2d;
+}
+
+.workdir-splitter:hover::before {
+  background: rgba(59, 130, 246, 0.6);
 }
 
 .workdir-tabs {
   display: flex;
   align-items: center;
-  gap: 2px;
+  justify-content: space-between;
+  gap: 8px;
   padding: 4px 6px;
   background: #1f1f1f;
   border-bottom: 1px solid #2d2d2d;
+  min-height: 34px;
+}
+
+.workdir-tabs-list {
+  display: flex;
+  align-items: center;
+  gap: 2px;
   overflow-x: auto;
+  flex: 1;
+  min-width: 0;
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+  scrollbar-width: thin;
+}
+
+.workdir-tabs-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
 }
 
 .workdir-tabs-empty {
   color: #808080;
   font-size: 0.78rem;
+  padding-left: 6px;
 }
 
 .workdir-tab {
@@ -261,6 +334,11 @@
   border-bottom: none;
   cursor: pointer;
   max-width: 200px;
+  user-select: none;
+}
+
+.workdir-tab[draggable="true"] {
+  cursor: grab;
 }
 
 .workdir-tab.active {
@@ -274,6 +352,31 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.workdir-split-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.workdir-split-btn:hover {
+  color: #e2e8f0;
+}
+
+.workdir-split-btn svg {
+  width: 14px;
+  height: 14px;
+  display: block;
 }
 
 .workdir-tab-close {
@@ -295,6 +398,162 @@
   color: #d4d4d4;
   overflow: auto;
   padding: 16px 18px;
+  scrollbar-color: rgba(148, 163, 184, 0.35) rgba(148, 163, 184, 0.08);
+  scrollbar-width: thin;
+}
+
+.workdir-context-menu {
+  position: fixed;
+  z-index: 1400;
+  background: #1a1f26;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 6px;
+  min-width: 160px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.workdir-context-item {
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  color: #e5e7eb;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.workdir-context-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.workdir-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 17, 21, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1500;
+}
+
+.workdir-dialog {
+  width: min(420px, 86vw);
+  background: #151a21;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 14px;
+  padding: 18px 18px 16px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+  color: #e5e7eb;
+}
+
+.workdir-dialog-title {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.workdir-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.workdir-dialog-input {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: #0f1216;
+  color: #e5e7eb;
+  font-size: 0.9rem;
+}
+
+.workdir-dialog-input:focus {
+  outline: none;
+  border-color: rgba(255, 255, 255, 0.28);
+  background: #141820;
+}
+
+.workdir-dialog-error {
+  font-size: 0.78rem;
+  color: #fca5a5;
+}
+
+.workdir-dialog-actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.workdir-dialog-btn {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 6px 14px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.workdir-dialog-btn.ghost {
+  background: transparent;
+  color: #cbd5e1;
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+.workdir-dialog-btn.ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: #e2e8f0;
+}
+
+.workdir-dialog-btn.primary {
+  background: rgba(59, 130, 246, 0.85);
+  color: #0b1120;
+}
+
+.workdir-dialog-btn.primary:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 1);
+}
+
+.workdir-dialog-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.workdir-tree::-webkit-scrollbar,
+.workdir-viewer::-webkit-scrollbar,
+.workdir-tabs-list::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.workdir-tree::-webkit-scrollbar-track,
+.workdir-viewer::-webkit-scrollbar-track,
+.workdir-tabs-list::-webkit-scrollbar-track {
+  background: rgba(148, 163, 184, 0.08);
+  border-radius: 999px;
+}
+
+.workdir-tree::-webkit-scrollbar-thumb,
+.workdir-viewer::-webkit-scrollbar-thumb,
+.workdir-tabs-list::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.workdir-tree::-webkit-scrollbar-thumb:hover,
+.workdir-viewer::-webkit-scrollbar-thumb:hover,
+.workdir-tabs-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.55);
+  background-clip: padding-box;
 }
 
 .workdir-placeholder {
@@ -312,11 +571,35 @@
 }
 
 .workdir-text-viewer {
-  white-space: pre;
   font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
   font-size: 0.85rem;
   line-height: 1.55;
   margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.workdir-text-line {
+  display: flex;
+  align-items: flex-start;
+  white-space: pre;
+}
+
+.workdir-text-gutter {
+  flex: 0 0 auto;
+  text-align: right;
+  padding-right: 12px;
+  color: #6b7280;
+  user-select: none;
+  border-right: 1px solid rgba(148, 163, 184, 0.18);
+  margin-right: 12px;
+  min-width: 2ch;
+}
+
+.workdir-text-content {
+  white-space: pre;
+  flex: 1;
 }
 
 .workdir-image-viewer {
