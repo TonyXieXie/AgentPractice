@@ -37,7 +37,9 @@
       "curl",
       "{\"run_shell<arg_key>command\":",
       "tree",
-      "ren"
+      "ren",
+      "rm",
+      "del"
     ],
     "timeout_sec": 30,
     "max_output": 20000

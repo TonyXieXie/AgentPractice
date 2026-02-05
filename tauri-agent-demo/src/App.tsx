@@ -1,6 +1,6 @@
 ﻿import { useState, useEffect, useRef, useMemo } from 'react';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import { openPath } from '@tauri-apps/plugin-opener';
+import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import './App.css';
@@ -102,6 +102,31 @@ const formatWorkPath = (path: string) => {
   if (path.length <= WORK_PATH_MAX_LENGTH) return path;
   const tailLength = Math.max(1, WORK_PATH_MAX_LENGTH - 3);
   return `...${path.slice(-tailLength)}`;
+};
+
+const getParentPath = (filePath: string) => {
+  const trimmed = filePath.replace(/[\\/]+$/, '');
+  const idx = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'));
+  if (idx < 0) {
+    return trimmed;
+  }
+  const parent = trimmed.slice(0, idx);
+  if (/^[a-zA-Z]:$/.test(parent)) {
+    return `${parent}\\`;
+  }
+  return parent || trimmed;
+};
+
+const isAbsolutePath = (value: string) =>
+  /^(?:[a-zA-Z]:[\\/]|\\\\|\/)/.test(value);
+
+const joinPath = (base: string, child: string) => {
+  if (!base) return child;
+  const separator = base.includes('\\') ? '\\' : '/';
+  if (base.endsWith('\\') || base.endsWith('/')) {
+    return `${base}${child}`;
+  }
+  return `${base}${separator}${child}`;
 };
 
 const estimateTokensForText = (text: string) => {
@@ -992,7 +1017,7 @@ function App() {
     await applyWorkPath(sessionKey, currentSessionIdRef.current, selected);
   };
 
-  const openWorkDirWindow = async (path: string) => {
+  const openWorkDirWindow = async (path: string, openFilePath?: string) => {
     const label = makeWorkdirLabel(path);
     const existing = await WebviewWindow.getByLabel(label);
     if (existing) {
@@ -1004,11 +1029,16 @@ function App() {
       }
       void existing.emit('workdir:ping', { target: label });
       void existing.emit('workdir:set', { path, target: label });
+      if (openFilePath) {
+        void existing.emit('workdir:open-file', { path: openFilePath, target: label });
+      }
       return;
     }
 
     const bounds = getWorkdirWindowBounds();
-    const url = `/?window=workdir&path=${encodeURIComponent(path)}`;
+    const url = openFilePath
+      ? `/?window=workdir&path=${encodeURIComponent(path)}&open=${encodeURIComponent(openFilePath)}`
+      : `/?window=workdir&path=${encodeURIComponent(path)}`;
     const win = new WebviewWindow(label, {
       title: 'GYY',
       url,
@@ -1021,11 +1051,40 @@ function App() {
 
     win.once('tauri://created', () => {
       void win.emit('workdir:set', { path, target: label });
+      if (openFilePath) {
+        void win.emit('workdir:open-file', { path: openFilePath, target: label });
+      }
     });
 
     win.once('tauri://error', (event) => {
       console.error('Failed to create workdir window:', event);
     });
+  };
+
+  const openWorkdirForFile = async (filePath: string) => {
+    if (!filePath) return;
+    const resolvedPath =
+      !isAbsolutePath(filePath) && currentWorkPath ? joinPath(currentWorkPath, filePath) : filePath;
+    const root = currentWorkPath || getParentPath(resolvedPath);
+    if (!root) return;
+    await openWorkDirWindow(root, resolvedPath);
+  };
+
+  const openWorkPathInExplorer = async (path: string) => {
+    const trimmed = path.trim();
+    if (!trimmed) return;
+    try {
+      await revealItemInDir(trimmed);
+      return;
+    } catch (error) {
+      try {
+        await openPath(trimmed);
+        return;
+      } catch (inner) {
+        console.error('Failed to open work path in explorer:', inner ?? error);
+        alert('无法打开资源管理器，请确认路径存在。');
+      }
+    }
   };
 
   const handleWorkPathClick = async () => {
@@ -1507,6 +1566,7 @@ function App() {
                           }
                           onRevertPatch={handleRevertPatch}
                           patchRevertBusy={patchRevertBusy}
+                          onOpenWorkFile={openWorkdirForFile}
                         />
                       ) : msg.role === 'user' ? (
                         <>
@@ -1553,18 +1613,6 @@ function App() {
           </div>
 
           <div className="input-area">
-            <input
-              onChange={(e) => {
-                setInputMsg(e.currentTarget.value);
-                autoScrollRef.current = true;
-              }}
-              onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
-              value={inputMsg}
-              placeholder={currentConfig ? 'Type a message...' : 'Please configure an LLM'}
-              disabled={!currentConfig}
-              ref={inputRef}
-            />
-
             {currentSessionQueue.length > 0 && (
               <div className="queue-panel">
                 <div className="queue-header">
@@ -1589,6 +1637,18 @@ function App() {
                 </div>
               </div>
             )}
+
+            <input
+              onChange={(e) => {
+                setInputMsg(e.currentTarget.value);
+                autoScrollRef.current = true;
+              }}
+              onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
+              value={inputMsg}
+              placeholder={currentConfig ? 'Type a message...' : 'Please configure an LLM'}
+              disabled={!currentConfig}
+              ref={inputRef}
+            />
 
             <div className="input-footer">
               {currentConfig && (
@@ -1740,11 +1800,7 @@ function App() {
                         onClick={async () => {
                           if (!currentWorkPath) return;
                           setWorkPathMenu(null);
-                          try {
-                            await openPath(currentWorkPath);
-                          } catch {
-                            // ignore open errors
-                          }
+                          await openWorkPathInExplorer(currentWorkPath);
                         }}
                       >
                         在资源管理器打开

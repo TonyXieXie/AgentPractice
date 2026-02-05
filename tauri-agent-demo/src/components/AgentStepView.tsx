@@ -21,6 +21,7 @@ interface AgentStepViewProps {
     onRollbackMessage?: () => void;
     onRevertPatch?: (patch: string) => void;
     patchRevertBusy?: boolean;
+    onOpenWorkFile?: (filePath: string) => void;
 }
 
 const CATEGORY_LABELS: Record<Category, string> = {
@@ -182,6 +183,34 @@ function getParentPath(filePath: string) {
     return parent || trimmed;
 }
 
+const hasScheme = (value: string) => /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value);
+
+const isFileHref = (value: string) => {
+    if (!value) return false;
+    if (value.startsWith('#')) return false;
+    if (/^file:\/\//i.test(value)) return true;
+    if (/^[a-zA-Z]:[\\/]/.test(value)) return true;
+    if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return true;
+    return !hasScheme(value);
+};
+
+const normalizeFileHref = (value: string) => {
+    if (!value) return '';
+    if (value.startsWith('file://')) {
+        try {
+            const url = new URL(value);
+            let pathname = decodeURIComponent(url.pathname || '');
+            if (/^\/[A-Za-z]:\//.test(pathname)) {
+                pathname = pathname.slice(1);
+            }
+            return pathname;
+        } catch {
+            return value;
+        }
+    }
+    return value;
+};
+
 function AgentStepView({
     steps,
     streaming,
@@ -191,7 +220,8 @@ function AgentStepView({
     onRetryMessage,
     onRollbackMessage,
     onRevertPatch,
-    patchRevertBusy
+    patchRevertBusy,
+    onOpenWorkFile
 }: AgentStepViewProps) {
     const [expandedObservations, setExpandedObservations] = useState<Record<string, boolean>>({});
     const [translatedSearchSteps, setTranslatedSearchSteps] = useState<Record<string, boolean>>({});
@@ -238,6 +268,14 @@ function AgentStepView({
 
     const handleOpenFile = async (filePath: string) => {
         if (!filePath) return;
+        if (onOpenWorkFile) {
+            try {
+                await onOpenWorkFile(filePath);
+                return;
+            } catch (error) {
+                console.error('Failed to open work window for file:', error);
+            }
+        }
         try {
             await openPath(filePath);
         } catch {
@@ -347,9 +385,22 @@ function AgentStepView({
         const target = event.target as HTMLElement;
         const link = target.closest<HTMLAnchorElement>('a');
         if (!link || !link.href) return;
+        const rawHref = link.getAttribute('href') || '';
+        const href = rawHref || link.href;
+        if (isFileHref(rawHref || href)) {
+            event.preventDefault();
+            event.stopPropagation();
+            const filePath = normalizeFileHref(rawHref || href);
+            if (onOpenWorkFile) {
+                void onOpenWorkFile(filePath);
+                return;
+            }
+            void handleOpenFile(filePath);
+            return;
+        }
         event.preventDefault();
         event.stopPropagation();
-        handleOpenLink(link.href);
+        handleOpenLink(href);
     };
 
     const handleCopyError = (stepKey: string, text: string) => {
