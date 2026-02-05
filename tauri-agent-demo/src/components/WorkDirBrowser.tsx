@@ -3,8 +3,8 @@ import MarkdownIt from 'markdown-it';
 import texmath from 'markdown-it-texmath';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
-import { mkdir, readDir, readFile, readTextFile, watch, writeTextFile, type DirEntry, type UnwatchFn } from '@tauri-apps/plugin-fs';
-import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
+import { mkdir, readDir, readFile, readTextFile, watchImmediate, writeTextFile, type DirEntry, type UnwatchFn } from '@tauri-apps/plugin-fs';
+import { openPath, openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import './WorkDirBrowser.css';
 
 type FileKind = 'text' | 'markdown' | 'image' | 'unknown';
@@ -139,10 +139,13 @@ const joinPath = (base: string, child: string) => {
   return `${base}${separator}${child}`;
 };
 
+const isWindowsPath = (path: string) => /^[a-zA-Z]:\//.test(path) || path.startsWith('//');
+
 const normalizePath = (path: string) => {
   const normalized = path.replace(/[\\/]+/g, '/');
-  if (normalized === '/' || /^[A-Za-z]:\/$/.test(normalized)) return normalized;
-  return normalized.endsWith('/') ? normalized.slice(0, -1) : normalized;
+  const normalizedCase = isWindowsPath(normalized) ? normalized.toLowerCase() : normalized;
+  if (normalizedCase === '/' || /^[A-Za-z]:\/$/.test(normalizedCase)) return normalizedCase;
+  return normalizedCase.endsWith('/') ? normalizedCase.slice(0, -1) : normalizedCase;
 };
 
 const isPathWithin = (child: string, parent: string) => {
@@ -230,6 +233,8 @@ function WorkDirBrowser({
   const [newFileName, setNewFileName] = useState('');
   const [newFileError, setNewFileError] = useState<string | null>(null);
   const [creatingFile, setCreatingFile] = useState(false);
+  const [watchError, setWatchError] = useState<string | null>(null);
+  const [watchStatus, setWatchStatus] = useState<string | null>(null);
   const previousRootRef = useRef<string>('');
   const panesRef = useRef<Pane[]>([]);
   const createFolderInputRef = useRef<HTMLInputElement>(null);
@@ -479,19 +484,30 @@ function WorkDirBrowser({
     }, 120);
   };
 
+  const describeWatchPaths = (paths?: string[]) => {
+    if (!paths || paths.length === 0) return '未知路径';
+    const normalized = paths.map((value) => normalizeWatchPath(value));
+    const names = normalized.map((value) => getBaseName(value)).filter(Boolean);
+    const display = (names.length > 0 ? names : normalized).join(', ');
+    return display.length > 120 ? `${display.slice(0, 117)}...` : display;
+  };
+
   useEffect(() => {
     if (!open || !rootPath) return;
     let active = true;
 
     const startWatch = async () => {
       try {
-        const unwatch = await watch(
+        setWatchError(null);
+        setWatchStatus('监听已启动');
+        const unwatch = await watchImmediate(
           rootPath,
           (event) => {
             if (!active) return;
+            setWatchStatus(`监听事件：${describeWatchPaths(event?.paths)}`);
             scheduleRefreshDirs(event?.paths);
           },
-          { recursive: true, delayMs: 200 }
+          { recursive: true }
         );
         if (!active) {
           unwatch();
@@ -502,7 +518,8 @@ function WorkDirBrowser({
         }
         unwatchRef.current = unwatch;
       } catch (error) {
-        // Ignore watch errors; the tree can still be refreshed manually by re-expanding.
+        setWatchError(`监听失败：${formatError(error)}`);
+        setWatchStatus(null);
       }
     };
 
@@ -883,6 +900,24 @@ function WorkDirBrowser({
     setIsResizing(true);
   };
 
+  const handleMarkdownLinkClick = (event: MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement;
+    const link = target.closest<HTMLAnchorElement>('a');
+    if (!link) return;
+    const rawHref = link.getAttribute('href') || '';
+    if (rawHref.startsWith('#')) return;
+    const href = rawHref || link.href || '';
+    if (!href) return;
+    const normalized =
+      href.startsWith('www.') || rawHref.startsWith('www.') ? `https://${rawHref || href}` : href;
+    if (!/^(https?:\/\/|mailto:|tel:)/i.test(normalized)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openUrl(normalized).catch(() => {
+      // ignore open errors
+    });
+  };
+
   const renderEntries = (parentPath: string, depth: number) => {
     const entries = dirCache[parentPath];
     if (!entries) return null;
@@ -1049,6 +1084,16 @@ function WorkDirBrowser({
                   加载中...
                 </div>
               )}
+              {watchError && (
+                <div className="workdir-tree-error" style={{ paddingLeft: 20 }}>
+                  {watchError}
+                </div>
+              )}
+              {!watchError && watchStatus && (
+                <div className="workdir-tree-status" style={{ paddingLeft: 20 }}>
+                  {watchStatus}
+                </div>
+              )}
               {expandedDirs[rootPath] && renderEntries(rootPath, 1)}
             </div>
           </div>
@@ -1172,6 +1217,7 @@ function WorkDirBrowser({
                           paneActiveFile.kind === 'markdown' && (
                             <div
                               className="workdir-markdown"
+                              onClick={handleMarkdownLinkClick}
                               dangerouslySetInnerHTML={{ __html: markdown.render(paneActiveFile.content || '') }}
                             />
                           )}

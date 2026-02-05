@@ -220,7 +220,8 @@
 
 .workdir-tree-loading,
 .workdir-tree-error,
-.workdir-tree-empty {
+.workdir-tree-empty,
+.workdir-tree-status {
   font-size: 0.74rem;
   color: #8a8a8a;
   padding: 4px 0;

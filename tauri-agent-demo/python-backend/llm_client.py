@@ -64,7 +64,7 @@ class LLMClient:
             delay = min(self.retry_max_delay, delay)
         return max(0.0, delay)
 
-    async def chat(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def chat(self, messages: List[Dict[str, Any]], request_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Send a non-streaming chat request.
 
@@ -85,7 +85,7 @@ class LLMClient:
 
         return await self._chat_openai(messages, request_overrides)
 
-    async def chat_stream(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None):
+    async def chat_stream(self, messages: List[Dict[str, Any]], request_overrides: Optional[Dict[str, Any]] = None):
         """Send a streaming chat request and yield text chunks."""
         fmt = self._get_format()
         profile = self._get_profile()
@@ -100,7 +100,7 @@ class LLMClient:
         async for chunk in self._chat_openai_stream(messages, request_overrides):
             yield chunk
 
-    async def chat_stream_events(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None):
+    async def chat_stream_events(self, messages: List[Dict[str, Any]], request_overrides: Optional[Dict[str, Any]] = None):
         """Send a streaming chat request and yield structured events."""
         fmt = self._get_format()
         profile = self._get_profile()
@@ -144,20 +144,59 @@ class LLMClient:
         }
         return defaults.get(profile, "https://api.openai.com/v1")
 
-    def _build_openai_responses_input(self, messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    def _build_openai_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         input_items: List[Dict[str, Any]] = []
+
+        def add_text(items: List[Dict[str, Any]], role: str, text: Any):
+            if text is None:
+                return
+            text_value = str(text)
+            if not text_value:
+                return
+            item_type = "output_text" if role == "assistant" else "input_text"
+            items.append({"type": item_type, "text": text_value})
+
+        def add_image(items: List[Dict[str, Any]], role: str, image_url: Any):
+            if role == "assistant":
+                return
+            url = ""
+            if isinstance(image_url, dict):
+                url = image_url.get("url") or image_url.get("source") or ""
+            elif isinstance(image_url, str):
+                url = image_url
+            if not url:
+                return
+            items.append({"type": "input_image", "image_url": {"url": url}})
+
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            if role == "assistant":
-                content_items = [{"type": "output_text", "text": content}]
+            content_items: List[Dict[str, Any]] = []
+
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        part_type = str(part.get("type", "") or "").lower()
+                        if part_type in ("text", "input_text", "output_text"):
+                            add_text(content_items, role, part.get("text") or part.get("content"))
+                        elif part_type in ("image_url", "input_image"):
+                            add_image(content_items, role, part.get("image_url"))
+                        elif "text" in part:
+                            add_text(content_items, role, part.get("text"))
+                    else:
+                        add_text(content_items, role, part)
             else:
-                content_items = [{"type": "input_text", "text": content}]
+                add_text(content_items, role, content)
+
+            if not content_items:
+                add_text(content_items, role, "")
+
             input_items.append({
                 "type": "message",
                 "role": role,
                 "content": content_items
             })
+
         return input_items
 
     def _extract_openai_responses_text(self, data: Dict[str, Any]) -> str:
@@ -313,7 +352,7 @@ class LLMClient:
         print(f"[LLM HTTP Error] {exc} | status={status} | body={log_text}")
         return detail_text, detail_json, status
 
-    async def _chat_openai(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def _chat_openai(self, messages: List[Dict[str, Any]], request_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """OpenAI-compatible Chat Completions API."""
         base_url = self._get_base_url()
 
@@ -391,7 +430,7 @@ class LLMClient:
                     result["llm_call_id"] = llm_call_id
                 return result
 
-    async def _chat_openai_stream(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None):
+    async def _chat_openai_stream(self, messages: List[Dict[str, Any]], request_overrides: Optional[Dict[str, Any]] = None):
         """OpenAI-compatible Chat Completions streaming API."""
         import json
 
@@ -494,7 +533,7 @@ class LLMClient:
                 response_text=full_text
             )
 
-    async def _chat_openai_stream_events(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None):
+    async def _chat_openai_stream_events(self, messages: List[Dict[str, Any]], request_overrides: Optional[Dict[str, Any]] = None):
         """OpenAI-compatible Chat Completions streaming API (structured events)."""
         import json
 
@@ -649,7 +688,7 @@ class LLMClient:
 
         yield {"type": "done", "content": full_text, "tool_calls": tool_calls_list, "raw_events": events, "stopped": stopped}
 
-    async def _chat_openai_responses(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def _chat_openai_responses(self, messages: List[Dict[str, Any]], request_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """OpenAI Responses API."""
         base_url = self._get_base_url()
 
@@ -726,7 +765,7 @@ class LLMClient:
                     result["llm_call_id"] = llm_call_id
                 return result
 
-    async def _chat_openai_responses_stream(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None):
+    async def _chat_openai_responses_stream(self, messages: List[Dict[str, Any]], request_overrides: Optional[Dict[str, Any]] = None):
         """OpenAI Responses streaming API."""
         import json
 
@@ -835,7 +874,7 @@ class LLMClient:
                 response_text=full_text
             )
 
-    async def _chat_openai_responses_stream_events(self, messages: List[Dict[str, str]], request_overrides: Optional[Dict[str, Any]] = None):
+    async def _chat_openai_responses_stream_events(self, messages: List[Dict[str, Any]], request_overrides: Optional[Dict[str, Any]] = None):
         """OpenAI Responses streaming API (structured events)."""
         import json
 

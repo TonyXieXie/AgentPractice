@@ -79,8 +79,11 @@ class SimpleAgent(AgentStrategy):
         profile = getattr(llm_client.config, "api_profile", None) or getattr(llm_client.config, "api_type", None)
         profile = (profile or "openai").lower()
         system_role = "developer" if profile == "openai" else "system"
+        user_content = None
+        if request_overrides and request_overrides.get("user_content") is not None:
+            user_content = request_overrides.get("user_content")
         messages = message_processor.build_messages_for_llm(
-            user_message=user_input,
+            user_message=user_content if user_content is not None else user_input,
             history=history,
             system_prompt=self.system_prompt,
             max_history=self.max_history,

@@ -1,5 +1,5 @@
 ﻿from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, Literal
+from typing import Optional, Dict, Any, Literal, List
 
 # LLM API format and profile
 LLMApiFormat = Literal["openai_chat_completions", "openai_responses"]
@@ -57,6 +57,17 @@ class LLMConfigUpdate(BaseModel):
     reasoning_summary: Optional[Literal["auto", "concise", "detailed"]] = None
 
 
+class MessageAttachment(BaseModel):
+    id: Optional[int] = None
+    message_id: int
+    name: Optional[str] = None
+    mime: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    size: Optional[int] = None
+    created_at: Optional[str] = None
+
+
 class ChatMessage(BaseModel):
     id: Optional[int] = None
     session_id: str
@@ -66,6 +77,7 @@ class ChatMessage(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     raw_request: Optional[Dict[str, Any]] = None
     raw_response: Optional[Dict[str, Any]] = None
+    attachments: Optional[List[MessageAttachment]] = None
 
 
 class ChatMessageCreate(BaseModel):
@@ -98,6 +110,15 @@ class ChatSessionUpdate(BaseModel):
     work_path: Optional[str] = None
 
 
+class AttachmentInput(BaseModel):
+    name: Optional[str] = None
+    mime: Optional[str] = None
+    data_base64: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+    size: Optional[int] = None
+
+
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
@@ -105,6 +126,7 @@ class ChatRequest(BaseModel):
     work_path: Optional[str] = None
     agent_mode: Optional[AgentMode] = None
     shell_unrestricted: Optional[bool] = None
+    attachments: Optional[List[AttachmentInput]] = None
 
 
 class ChatResponse(BaseModel):

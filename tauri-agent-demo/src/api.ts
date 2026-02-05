@@ -15,7 +15,7 @@
     PatchRevertResponse
 } from './types';
 
-const API_BASE_URL = 'http://127.0.0.1:8000';
+export const API_BASE_URL = 'http://127.0.0.1:8000';
 
 async function buildApiError(response: Response, baseMessage: string): Promise<Error> {
     const text = await response.text();
@@ -353,5 +353,17 @@ export async function updateToolPermission(requestId: number, status: string): P
     });
     if (!response.ok) throw new Error('Failed to update tool permission');
     return response.json();
+}
+
+export function getAttachmentUrl(attachmentId: number, options?: { thumbnail?: boolean; maxSize?: number }): string {
+    const params = new URLSearchParams();
+    if (options?.thumbnail) {
+        params.set('thumbnail', 'true');
+    }
+    if (options?.maxSize) {
+        params.set('max_size', String(options.maxSize));
+    }
+    const query = params.toString();
+    return query ? `${API_BASE_URL}/attachments/${attachmentId}?${query}` : `${API_BASE_URL}/attachments/${attachmentId}`;
 }
 

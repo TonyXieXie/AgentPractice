@@ -98,7 +98,10 @@ class ReActAgent(AgentStrategy):
         messages: List[Dict[str, Any]] = [{"role": prompt_role, "content": prompt}]
         if history:
             messages.extend(history)
-        messages.append({"role": "user", "content": user_input})
+        user_content = None
+        if request_overrides and request_overrides.get("user_content") is not None:
+            user_content = request_overrides.get("user_content")
+        messages.append({"role": "user", "content": user_content if user_content is not None else user_input})
 
         openai_format = "openai_chat_completions"
         if hasattr(llm_client, "_get_format"):
@@ -592,6 +595,9 @@ class ReActAgent(AgentStrategy):
         request_overrides: Optional[Dict[str, Any]]
     ) -> AsyncGenerator[AgentStep, None]:
         scratchpad: List[str] = []
+        user_content = None
+        if request_overrides and request_overrides.get("user_content") is not None:
+            user_content = request_overrides.get("user_content")
 
         for iteration in range(self.max_iterations):
             prompt = self.build_prompt(user_input, history, tools, {
@@ -603,7 +609,7 @@ class ReActAgent(AgentStrategy):
             try:
                 messages = [
                     {"role": "system", "content": prompt},
-                    {"role": "user", "content": user_input}
+                    {"role": "user", "content": user_content if user_content is not None else user_input}
                 ]
 
                 llm_overrides = dict(request_overrides) if request_overrides else {}
@@ -846,18 +852,57 @@ Final Answer: <your final answer>
 
     def _build_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         input_items: List[Dict[str, Any]] = []
+
+        def add_text(items: List[Dict[str, Any]], role: str, text: Any):
+            if text is None:
+                return
+            text_value = str(text)
+            if not text_value:
+                return
+            item_type = "output_text" if role == "assistant" else "input_text"
+            items.append({"type": item_type, "text": text_value})
+
+        def add_image(items: List[Dict[str, Any]], role: str, image_url: Any):
+            if role == "assistant":
+                return
+            url = ""
+            if isinstance(image_url, dict):
+                url = image_url.get("url") or image_url.get("source") or ""
+            elif isinstance(image_url, str):
+                url = image_url
+            if not url:
+                return
+            items.append({"type": "input_image", "image_url": {"url": url}})
+
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            if role == "assistant":
-                content_items = [{"type": "output_text", "text": content}]
+            content_items: List[Dict[str, Any]] = []
+
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        part_type = str(part.get("type", "") or "").lower()
+                        if part_type in ("text", "input_text", "output_text"):
+                            add_text(content_items, role, part.get("text") or part.get("content"))
+                        elif part_type in ("image_url", "input_image"):
+                            add_image(content_items, role, part.get("image_url"))
+                        elif "text" in part:
+                            add_text(content_items, role, part.get("text"))
+                    else:
+                        add_text(content_items, role, part)
             else:
-                content_items = [{"type": "input_text", "text": content}]
+                add_text(content_items, role, content)
+
+            if not content_items:
+                add_text(content_items, role, "")
+
             input_items.append({
                 "type": "message",
                 "role": role,
                 "content": content_items
             })
+
         return input_items
 
     def _update_llm_processed(self, llm_call_id: int, payload: Dict[str, Any]) -> None:

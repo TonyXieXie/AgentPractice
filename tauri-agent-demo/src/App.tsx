@@ -1,10 +1,11 @@
 ﻿import { useState, useEffect, useRef, useMemo } from 'react';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { readDir } from '@tauri-apps/plugin-fs';
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import './App.css';
-import { Message, LLMConfig, LLMCall, ToolPermissionRequest, ReasoningEffort, AgentMode } from './types';
+import { Message, MessageAttachment, LLMConfig, LLMCall, ToolPermissionRequest, ReasoningEffort, AgentMode } from './types';
 import {
   sendMessageAgentStream,
   getDefaultConfig,
@@ -23,6 +24,7 @@ import {
   updateSession,
   AgentStep,
   AgentStepWithMessage,
+  getAttachmentUrl,
 } from './api';
 import ConfigManager from './components/ConfigManager';
 import SessionList from './components/SessionList';
@@ -120,6 +122,9 @@ const getParentPath = (filePath: string) => {
 const isAbsolutePath = (value: string) =>
   /^(?:[a-zA-Z]:[\\/]|\\\\|\/)/.test(value);
 
+const isBareFilename = (value: string) =>
+  Boolean(value) && !/[\\/]/.test(value) && !value.startsWith('./') && !value.startsWith('../');
+
 const joinPath = (base: string, child: string) => {
   if (!base) return child;
   const separator = base.includes('\\') ? '\\' : '/';
@@ -127,6 +132,47 @@ const joinPath = (base: string, child: string) => {
     return `${base}${child}`;
   }
   return `${base}${separator}${child}`;
+};
+
+const findWorkFileByName = async (root: string, fileName: string) => {
+  const target = fileName.trim().toLowerCase();
+  if (!root || !target) return '';
+
+  const queue: Array<{ path: string; depth: number }> = [{ path: root, depth: 0 }];
+  const maxDepth = 8;
+  const maxNodes = 5000;
+  let visited = 0;
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current) break;
+    let entries;
+    try {
+      entries = await readDir(current.path);
+    } catch {
+      continue;
+    }
+
+    const sorted = [...entries].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    for (const entry of sorted) {
+      visited += 1;
+      if (visited > maxNodes) {
+        return '';
+      }
+      const entryPath = joinPath(current.path, entry.name);
+      if (!entry.isDirectory) {
+        if (entry.name.toLowerCase() === target) {
+          return entryPath;
+        }
+        continue;
+      }
+      if (current.depth < maxDepth) {
+        queue.push({ path: entryPath, depth: current.depth + 1 });
+      }
+    }
+  }
+
+  return '';
 };
 
 const estimateTokensForText = (text: string) => {
@@ -224,6 +270,17 @@ const getLatestRequestPayload = (calls: LLMCall[], history: Message[]) => {
   return null;
 };
 
+type PendingAttachment = {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  width?: number;
+  height?: number;
+  previewUrl: string;
+  dataBase64: string;
+};
+
 type QueueItem = {
   id: string;
   message: string;
@@ -233,6 +290,7 @@ type QueueItem = {
   agentMode: AgentMode;
   workPath?: string;
   enqueuedAt: number;
+  attachments?: PendingAttachment[];
 };
 
 type InFlightState = {
@@ -245,6 +303,9 @@ type InFlightState = {
 
 function App() {
   const [inputMsg, setInputMsg] = useState('');
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const [dragActive, setDragActive] = useState(false);
+  const [imagePreview, setImagePreview] = useState<{ src: string; name?: string } | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [currentConfig, setCurrentConfig] = useState<LLMConfig | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
@@ -290,6 +351,111 @@ function App() {
   useEffect(() => {
     currentSessionIdRef.current = currentSessionId;
   }, [currentSessionId]);
+
+  const isImageFile = (file: File) => {
+    if (file.type && file.type.startsWith('image/')) return true;
+    const lower = file.name.toLowerCase();
+    return /\.(png|jpe?g|gif|bmp|webp|svg|tiff?|heic|heif|avif|ico)$/.test(lower);
+  };
+
+  const readFileAsDataUrl = (file: File) => new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('Failed to read file'));
+    reader.readAsDataURL(file);
+  });
+
+  const getImageDimensions = (url: string) => new Promise<{ width: number; height: number }>((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+    img.onerror = () => resolve({ width: 0, height: 0 });
+    img.src = url;
+  });
+
+  const buildPendingAttachment = async (file: File): Promise<PendingAttachment | null> => {
+    if (!isImageFile(file)) return null;
+    const previewUrl = URL.createObjectURL(file);
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      const commaIndex = dataUrl.indexOf(',');
+      const base64 = commaIndex >= 0 ? dataUrl.slice(commaIndex + 1) : '';
+      if (!base64) {
+        URL.revokeObjectURL(previewUrl);
+        return null;
+      }
+      const match = /^data:(.*?);base64,/i.exec(dataUrl);
+      const mime = file.type || (match ? match[1] : 'application/octet-stream');
+      const dims = await getImageDimensions(previewUrl);
+      const width = dims.width || undefined;
+      const height = dims.height || undefined;
+      return {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        name: file.name || 'image',
+        mime,
+        size: file.size,
+        width,
+        height,
+        previewUrl,
+        dataBase64: base64,
+      };
+    } catch (error) {
+      URL.revokeObjectURL(previewUrl);
+      return null;
+    }
+  };
+
+  const addPendingAttachments = async (files: File[]) => {
+    const candidates = files.filter((file) => isImageFile(file));
+    if (!candidates.length) return;
+    const built = await Promise.all(candidates.map((file) => buildPendingAttachment(file)));
+    const next = built.filter((item): item is PendingAttachment => Boolean(item));
+    if (next.length > 0) {
+      setPendingAttachments((prev) => [...prev, ...next]);
+    }
+  };
+
+  const removePendingAttachment = (attachmentId: string) => {
+    setPendingAttachments((prev) => {
+      const target = prev.find((item) => item.id === attachmentId);
+      if (target) {
+        URL.revokeObjectURL(target.previewUrl);
+      }
+      return prev.filter((item) => item.id !== attachmentId);
+    });
+  };
+
+  const mapPendingToMessageAttachments = (items: PendingAttachment[]): MessageAttachment[] =>
+    items.map((item) => ({
+      name: item.name,
+      mime: item.mime,
+      width: item.width,
+      height: item.height,
+      size: item.size,
+      preview_url: item.previewUrl,
+      local_id: item.id,
+    }));
+
+  const mapPendingToPayload = (items: PendingAttachment[]) =>
+    items.map((item) => ({
+      name: item.name,
+      mime: item.mime,
+      data_base64: item.dataBase64,
+      width: item.width,
+      height: item.height,
+      size: item.size,
+    }));
+
+  const getAttachmentPreviewSrc = (attachment: MessageAttachment) => {
+    if (attachment.preview_url) return attachment.preview_url;
+    if (attachment.id) return getAttachmentUrl(attachment.id, { thumbnail: true, maxSize: 320 });
+    return '';
+  };
+
+  const getAttachmentFullSrc = (attachment: MessageAttachment) => {
+    if (attachment.preview_url) return attachment.preview_url;
+    if (attachment.id) return getAttachmentUrl(attachment.id);
+    return '';
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -628,6 +794,8 @@ function App() {
     abortController: AbortController
   ) => {
     const userMessage = item.message;
+    const pendingItems = item.attachments || [];
+    const tempAttachments = pendingItems.length ? mapPendingToMessageAttachments(pendingItems) : undefined;
     const targetSessionId = item.sessionId;
     let activeSessionKey = startSessionKey;
     let newSessionId: string | null = targetSessionId;
@@ -639,6 +807,7 @@ function App() {
       role: 'user',
       content: userMessage,
       timestamp: new Date().toISOString(),
+      attachments: tempAttachments,
     };
 
     const tempAssistantMsg: Message = {
@@ -659,6 +828,7 @@ function App() {
     updateSessionMessages(activeSessionKey, (prev) => [...prev, tempUserMsg, tempAssistantMsg]);
 
     try {
+      const attachmentPayload = pendingItems.length ? mapPendingToPayload(pendingItems) : undefined;
       const streamGenerator = sendMessageAgentStream(
         {
           message: userMessage,
@@ -666,6 +836,7 @@ function App() {
           config_id: item.configId,
           agent_mode: item.agentMode,
           work_path: item.workPath || undefined,
+          attachments: attachmentPayload,
         },
         abortController.signal
       );
@@ -692,10 +863,19 @@ function App() {
           }
           if (incomingUserId || incomingAssistantId) {
             const resolvedSessionId = newSessionId || '';
+            const incomingAttachments = Array.isArray((chunk as any).user_attachments)
+              ? (chunk as any).user_attachments
+              : null;
+            const hasIncomingAttachments = Boolean(incomingAttachments && incomingAttachments.length > 0);
             updateSessionMessages(activeSessionKey, (prev) =>
               prev.map((msg) => {
                 if (typeof incomingUserId === 'number' && msg.id === tempUserId) {
-                  return { ...msg, id: incomingUserId, session_id: resolvedSessionId };
+                  return {
+                    ...msg,
+                    id: incomingUserId,
+                    session_id: resolvedSessionId,
+                    attachments: hasIncomingAttachments ? incomingAttachments : msg.attachments,
+                  };
                 }
                 if (typeof incomingAssistantId === 'number' && msg.id === tempAssistantId) {
                   return { ...msg, id: incomingAssistantId, session_id: resolvedSessionId };
@@ -706,6 +886,11 @@ function App() {
                 return msg;
               })
             );
+            if (hasIncomingAttachments && pendingItems.length) {
+              pendingItems.forEach((attachment) => {
+                URL.revokeObjectURL(attachment.previewUrl);
+              });
+            }
           }
           if (!targetSessionId && newSessionId && currentSessionIdRef.current === null) {
             currentSessionIdRef.current = newSessionId;
@@ -1062,11 +1247,24 @@ function App() {
   };
 
   const openWorkdirForFile = async (filePath: string) => {
-    if (!filePath) return;
-    const resolvedPath =
-      !isAbsolutePath(filePath) && currentWorkPath ? joinPath(currentWorkPath, filePath) : filePath;
-    const root = currentWorkPath || getParentPath(resolvedPath);
-    if (!root) return;
+    const trimmed = filePath.trim();
+    if (!trimmed) return;
+
+    let resolvedPath = trimmed;
+    if (!isAbsolutePath(trimmed) && currentWorkPath) {
+      if (isBareFilename(trimmed)) {
+        const matched = await findWorkFileByName(currentWorkPath, trimmed);
+        resolvedPath = matched || joinPath(currentWorkPath, trimmed);
+      } else {
+        resolvedPath = joinPath(currentWorkPath, trimmed);
+      }
+    }
+
+    const root = currentWorkPath || (isAbsolutePath(resolvedPath) ? getParentPath(resolvedPath) : '');
+    if (!root) {
+      alert('请先选择工作路径。');
+      return;
+    }
     await openWorkDirWindow(root, resolvedPath);
   };
 
@@ -1101,8 +1299,54 @@ function App() {
     setWorkPathMenu({ x: event.clientX, y: event.clientY });
   };
 
-  const enqueueMessage = async (message: string, sessionId: string | null) => {
-    if (!message.trim()) return;
+  const handlePaste = async (event: React.ClipboardEvent<HTMLInputElement>) => {
+    const items = event.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    Array.from(items).forEach((item) => {
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file && isImageFile(file)) {
+          files.push(file);
+        }
+      }
+    });
+    if (files.length > 0) {
+      event.preventDefault();
+      await addPendingAttachments(files);
+    }
+  };
+
+  const handleDragOver = (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    if (!dragActive) {
+      setDragActive(true);
+    }
+  };
+
+  const handleDragLeave = (event: React.DragEvent<HTMLDivElement>) => {
+    const nextTarget = event.relatedTarget as Node | null;
+    if (nextTarget && event.currentTarget.contains(nextTarget)) return;
+    setDragActive(false);
+  };
+
+  const handleDrop = async (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDragActive(false);
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (files.length > 0) {
+      await addPendingAttachments(files);
+    }
+  };
+
+  const handleAttachmentPreview = (attachment: MessageAttachment) => {
+    const src = getAttachmentFullSrc(attachment);
+    if (!src) return;
+    setImagePreview({ src, name: attachment.name });
+  };
+
+  const enqueueMessage = async (message: string, sessionId: string | null, attachments: PendingAttachment[] = []) => {
+    if (!message.trim() && attachments.length === 0) return;
     if (!currentConfig) {
       alert('Please configure an LLM first.');
       return;
@@ -1128,6 +1372,7 @@ function App() {
       agentMode,
       workPath,
       enqueuedAt: Date.now(),
+      attachments: attachments.length ? [...attachments] : undefined,
     };
 
     enqueueSessionQueue(sessionKey, queueItem);
@@ -1136,9 +1381,12 @@ function App() {
 
   const handleSend = async () => {
     const userMessage = inputMsg.trim();
-    if (!userMessage) return;
+    const hasAttachments = pendingAttachments.length > 0;
+    if (!userMessage && !hasAttachments) return;
+    const attachments = hasAttachments ? [...pendingAttachments] : [];
     setInputMsg('');
-    await enqueueMessage(userMessage, currentSessionIdRef.current);
+    setPendingAttachments([]);
+    await enqueueMessage(userMessage, currentSessionIdRef.current, attachments);
   };
 
   const handleRetryMessage = async (messageId: number | null, message: string) => {
@@ -1570,7 +1818,27 @@ function App() {
                         />
                       ) : msg.role === 'user' ? (
                         <>
-                          <div className="message-text">{msg.content}</div>
+                          {msg.content && <div className="message-text">{msg.content}</div>}
+                          {msg.attachments && msg.attachments.length > 0 && (
+                            <div className="message-attachments">
+                              {msg.attachments.map((attachment, idx) => {
+                                const src = getAttachmentPreviewSrc(attachment);
+                                if (!src) return null;
+                                return (
+                                  <button
+                                    key={`${attachment.id || attachment.local_id || 'att'}-${idx}`}
+                                    type="button"
+                                    className="attachment-thumb"
+                                    onClick={() => handleAttachmentPreview(attachment)}
+                                    title={attachment.name || 'image'}
+                                    aria-label={attachment.name || 'image'}
+                                  >
+                                    <img src={src} alt={attachment.name || 'attachment'} loading="lazy" />
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
                           <button
                             className="message-action-btn icon inline"
                             onClick={() => handleRollback(msg.id)}
@@ -1612,7 +1880,12 @@ function App() {
             <div ref={messagesEndRef} />
           </div>
 
-          <div className="input-area">
+          <div
+            className={`input-area${dragActive ? ' drag-active' : ''}`}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+          >
             {currentSessionQueue.length > 0 && (
               <div className="queue-panel">
                 <div className="queue-header">
@@ -1643,12 +1916,40 @@ function App() {
                 setInputMsg(e.currentTarget.value);
                 autoScrollRef.current = true;
               }}
+              onPaste={handlePaste}
               onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
               value={inputMsg}
               placeholder={currentConfig ? 'Type a message...' : 'Please configure an LLM'}
               disabled={!currentConfig}
               ref={inputRef}
             />
+
+            {pendingAttachments.length > 0 && (
+              <div className="input-attachments">
+                {pendingAttachments.map((attachment) => (
+                  <div key={attachment.id} className="input-attachment">
+                    <button
+                      type="button"
+                      className="attachment-remove"
+                      onClick={() => removePendingAttachment(attachment.id)}
+                      aria-label="Remove image"
+                      title="Remove"
+                    >
+                      ×
+                    </button>
+                    <button
+                      type="button"
+                      className="attachment-thumb"
+                      onClick={() => setImagePreview({ src: attachment.previewUrl, name: attachment.name })}
+                      aria-label={attachment.name || 'image'}
+                      title={attachment.name || 'image'}
+                    >
+                      <img src={attachment.previewUrl} alt={attachment.name || 'attachment'} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
 
             <div className="input-footer">
               {currentConfig && (
@@ -1843,7 +2144,7 @@ function App() {
                   type="button"
                   className="send-btn"
                   onClick={handleSend}
-                  disabled={!currentConfig || !inputMsg.trim()}
+                  disabled={!currentConfig || (!inputMsg.trim() && pendingAttachments.length === 0)}
                   aria-label="Send"
                   title="Send"
                 >
@@ -1905,6 +2206,23 @@ function App() {
         onCancel={() => setRollbackTarget(null)}
         onConfirm={handleConfirmRollback}
       />
+
+      {imagePreview && (
+        <div className="image-preview-overlay" onClick={() => setImagePreview(null)}>
+          <div className="image-preview-modal" onClick={(event) => event.stopPropagation()}>
+            <button
+              type="button"
+              className="image-preview-close"
+              onClick={() => setImagePreview(null)}
+              aria-label="Close preview"
+            >
+              ×
+            </button>
+            <img src={imagePreview.src} alt={imagePreview.name || 'image'} />
+            {imagePreview.name && <div className="image-preview-name">{imagePreview.name}</div>}
+          </div>
+        </div>
+      )}
 
     </div>
     </div>
