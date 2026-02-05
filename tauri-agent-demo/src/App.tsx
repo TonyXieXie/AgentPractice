@@ -1756,11 +1756,11 @@ function App() {
 
               <div className="input-actions">
                 {currentConfig && (
-                  <div
-                    className={`context-usage${contextUsage.ratio >= 0.8 ? ' warn' : contextUsage.ratio >= 0.6 ? ' mid' : ''}`}
-                    title={`Context ${contextUsage.usedTokens} / ${contextUsage.maxTokens} tokens`}
-                    aria-label={`Context usage ${contextUsage.usedTokens} of ${contextUsage.maxTokens} tokens`}
-                  >
+                <div
+                  className={`context-usage${contextUsage.ratio >= 0.8 ? ' warn' : contextUsage.ratio >= 0.6 ? ' mid' : ''}`}
+                  title={`Context ${Math.round(contextUsage.ratio * 100)}%`}
+                  aria-label={`Context usage ${Math.round(contextUsage.ratio * 100)}%`}
+                >
                     <svg viewBox="0 0 36 36" aria-hidden="true">
                       <circle
                         className="context-ring-bg"
