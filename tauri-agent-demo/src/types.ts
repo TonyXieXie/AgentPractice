@@ -72,6 +72,7 @@ export interface Message {
     metadata?: Record<string, any>;
     raw_request?: Record<string, any>;
     raw_response?: Record<string, any>;
+    attachments?: MessageAttachment[];
 }
 
 export interface MessageCreate {
@@ -159,6 +160,29 @@ export interface ChatRequest {
     work_path?: string | null;
     agent_mode?: AgentMode;
     shell_unrestricted?: boolean;
+    attachments?: ChatAttachmentInput[];
+}
+
+export interface MessageAttachment {
+    id?: number;
+    message_id?: number;
+    name?: string;
+    mime?: string;
+    width?: number;
+    height?: number;
+    size?: number;
+    created_at?: string;
+    preview_url?: string;
+    local_id?: string;
+}
+
+export interface ChatAttachmentInput {
+    name?: string;
+    mime?: string;
+    data_base64: string;
+    width?: number;
+    height?: number;
+    size?: number;
 }
 
 export interface ChatResponse {

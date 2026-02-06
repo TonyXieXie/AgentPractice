@@ -153,6 +153,21 @@ class Database:
                 FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
             )
         ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS message_attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                name TEXT,
+                mime TEXT,
+                width INTEGER,
+                height INTEGER,
+                size INTEGER,
+                data BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
+            )
+        ''')
         
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS agent_steps (
@@ -234,6 +249,7 @@ class Database:
             pass
         
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_attachments_message ON message_attachments(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_config ON chat_sessions(config_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_steps_message ON agent_steps(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id)')
@@ -506,6 +522,12 @@ class Database:
         """Delete session and its messages"""
         conn = self.get_connection()
         cursor = conn.cursor()
+        cursor.execute('''
+            DELETE FROM message_attachments
+            WHERE message_id IN (
+                SELECT id FROM chat_messages WHERE session_id = ?
+            )
+        ''', (session_id,))
         cursor.execute('DELETE FROM chat_messages WHERE session_id = ?', (session_id,))
         cursor.execute('DELETE FROM chat_sessions WHERE id = ?', (session_id,))
         deleted = cursor.rowcount > 0
@@ -570,13 +592,34 @@ class Database:
             ''', (session_id,))
         
         rows = cursor.fetchall()
+        message_ids = [row['id'] for row in rows]
+        attachments_by_message: Dict[int, List[Dict[str, Any]]] = {}
+        if message_ids:
+            placeholders = ",".join(["?"] * len(message_ids))
+            cursor.execute(
+                f'''
+                SELECT id, message_id, name, mime, width, height, size, created_at
+                FROM message_attachments
+                WHERE message_id IN ({placeholders})
+                ORDER BY created_at ASC
+                ''',
+                message_ids
+            )
+            for attach_row in cursor.fetchall():
+                data = dict(attach_row)
+                msg_id = data.get("message_id")
+                if msg_id is None:
+                    continue
+                attachments_by_message.setdefault(msg_id, []).append(data)
+
         conn.close()
-        
+
         messages = []
         for row in rows:
             metadata = json.loads(row['metadata']) if row['metadata'] else None
             raw_request = json.loads(row['raw_request']) if row['raw_request'] else None
             raw_response = json.loads(row['raw_response']) if row['raw_response'] else None
+            attachments = attachments_by_message.get(row['id'])
             messages.append(ChatMessage(
                 id=row['id'],
                 session_id=row['session_id'],
@@ -585,13 +628,86 @@ class Database:
                 timestamp=row['timestamp'],
                 metadata=metadata,
                 raw_request=raw_request,
-                raw_response=raw_response
+                raw_response=raw_response,
+                attachments=attachments
             ))
         
         if limit:
             messages.reverse()
-        
+
         return messages
+
+    def save_message_attachment(
+        self,
+        message_id: int,
+        name: Optional[str],
+        mime: Optional[str],
+        data: bytes,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        size: Optional[int] = None
+    ) -> Dict[str, Any]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        created_at = datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO message_attachments (message_id, name, mime, width, height, size, data, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (message_id, name, mime, width, height, size, data, created_at))
+        attachment_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return {
+            "id": attachment_id,
+            "message_id": message_id,
+            "name": name,
+            "mime": mime,
+            "width": width,
+            "height": height,
+            "size": size,
+            "created_at": created_at
+        }
+
+    def save_message_attachments(self, message_id: int, attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        saved: List[Dict[str, Any]] = []
+        for item in attachments:
+            saved.append(
+                self.save_message_attachment(
+                    message_id=message_id,
+                    name=item.get("name"),
+                    mime=item.get("mime"),
+                    data=item.get("data") or b"",
+                    width=item.get("width"),
+                    height=item.get("height"),
+                    size=item.get("size")
+                )
+            )
+        return saved
+
+    def get_message_attachments(self, message_id: int) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, message_id, name, mime, width, height, size, created_at
+            FROM message_attachments
+            WHERE message_id = ?
+            ORDER BY created_at ASC
+        ''', (message_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def get_attachment(self, attachment_id: int) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT *
+            FROM message_attachments
+            WHERE id = ?
+        ''', (attachment_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
     
     # ==================== Agent Steps + Tool Calls ====================
     
@@ -887,6 +1003,14 @@ class Database:
         cursor.execute('''
             DELETE FROM llm_calls
             WHERE session_id = ? AND (message_id IS NULL OR message_id >= ?)
+        ''', (session_id, message_id))
+
+        cursor.execute('''
+            DELETE FROM message_attachments
+            WHERE message_id IN (
+                SELECT id FROM chat_messages
+                WHERE session_id = ? AND id >= ?
+            )
         ''', (session_id, message_id))
 
         cursor.execute('''

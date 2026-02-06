@@ -1,7 +1,10 @@
 ﻿import { Fragment, useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent } from 'react';
 import MarkdownIt from 'markdown-it';
-import { mkdir, readDir, readFile, readTextFile, writeTextFile, type DirEntry } from '@tauri-apps/plugin-fs';
-import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
+import texmath from 'markdown-it-texmath';
+import katex from 'katex';
+import 'katex/dist/katex.min.css';
+import { mkdir, readDir, readFile, readTextFile, watchImmediate, writeTextFile, type DirEntry, type UnwatchFn } from '@tauri-apps/plugin-fs';
+import { openPath, openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import './WorkDirBrowser.css';
 
 type FileKind = 'text' | 'markdown' | 'image' | 'unknown';
@@ -26,6 +29,7 @@ type Pane = {
 type WorkDirBrowserProps = {
   open: boolean;
   rootPath: string;
+  openFileRequest?: { path: string; nonce: number } | null;
   onClose?: () => void;
   onPickWorkPath?: () => void;
   onOpenInExplorer?: () => void;
@@ -39,6 +43,12 @@ const markdown = new MarkdownIt({
   html: false,
   linkify: true,
   breaks: true,
+});
+
+markdown.use(texmath, {
+  engine: katex,
+  delimiters: ['brackets', 'dollars', 'beg_end'],
+  katexOptions: { throwOnError: false, errorColor: '#f87171' },
 });
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico']);
@@ -129,6 +139,38 @@ const joinPath = (base: string, child: string) => {
   return `${base}${separator}${child}`;
 };
 
+const isWindowsPath = (path: string) => /^[a-zA-Z]:\//.test(path) || path.startsWith('//');
+
+const normalizePath = (path: string) => {
+  const normalized = path.replace(/[\\/]+/g, '/');
+  const normalizedCase = isWindowsPath(normalized) ? normalized.toLowerCase() : normalized;
+  if (normalizedCase === '/' || /^[A-Za-z]:\/$/.test(normalizedCase)) return normalizedCase;
+  return normalizedCase.endsWith('/') ? normalizedCase.slice(0, -1) : normalizedCase;
+};
+
+const isPathWithin = (child: string, parent: string) => {
+  const normalizedChild = normalizePath(child);
+  const normalizedParent = normalizePath(parent);
+  return normalizedChild === normalizedParent || normalizedChild.startsWith(`${normalizedParent}/`);
+};
+
+const normalizeWatchPath = (path: string) => {
+  if (!path) return '';
+  if (path.startsWith('file://')) {
+    try {
+      const url = new URL(path);
+      let pathname = decodeURIComponent(url.pathname || '');
+      if (/^\/[A-Za-z]:\//.test(pathname)) {
+        pathname = pathname.slice(1);
+      }
+      return pathname;
+    } catch {
+      return path;
+    }
+  }
+  return path;
+};
+
 const getBaseName = (path: string) => {
   const trimmed = path.replace(/[\\/]+$/, '');
   const idx = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'));
@@ -145,6 +187,7 @@ const formatError = (error: unknown) => {
 function WorkDirBrowser({
   open,
   rootPath,
+  openFileRequest,
   onClose,
   onPickWorkPath,
   onOpenInExplorer,
@@ -190,11 +233,18 @@ function WorkDirBrowser({
   const [newFileName, setNewFileName] = useState('');
   const [newFileError, setNewFileError] = useState<string | null>(null);
   const [creatingFile, setCreatingFile] = useState(false);
+  const [watchError, setWatchError] = useState<string | null>(null);
+  const [watchStatus, setWatchStatus] = useState<string | null>(null);
   const previousRootRef = useRef<string>('');
   const panesRef = useRef<Pane[]>([]);
   const createFolderInputRef = useRef<HTMLInputElement>(null);
   const createFileInputRef = useRef<HTMLInputElement>(null);
   const splitContainerRef = useRef<HTMLDivElement>(null);
+  const dirLoadingRef = useRef<Record<string, boolean>>({});
+  const expandedDirsRef = useRef<Record<string, boolean>>({});
+  const refreshTimerRef = useRef<number | null>(null);
+  const pendingDirRefreshRef = useRef<Record<string, boolean>>({});
+  const unwatchRef = useRef<UnwatchFn | null>(null);
 
   const rootName = useMemo(() => (rootPath ? getBaseName(rootPath) : ''), [rootPath]);
 
@@ -244,6 +294,14 @@ function WorkDirBrowser({
   useEffect(() => {
     paneSizesRef.current = paneSizes;
   }, [paneSizes]);
+
+  useEffect(() => {
+    dirLoadingRef.current = dirLoading;
+  }, [dirLoading]);
+
+  useEffect(() => {
+    expandedDirsRef.current = expandedDirs;
+  }, [expandedDirs]);
 
   useEffect(() => {
     if (panes.length === 0) {
@@ -343,6 +401,11 @@ function WorkDirBrowser({
   }, [newFileTarget]);
 
   const loadDir = async (path: string) => {
+    if (dirLoadingRef.current[path]) {
+      pendingDirRefreshRef.current[path] = true;
+      return;
+    }
+    dirLoadingRef.current[path] = true;
     setDirLoading((prev) => ({ ...prev, [path]: true }));
     try {
       const entries = await readDir(path);
@@ -364,15 +427,155 @@ function WorkDirBrowser({
         delete next[path];
         return next;
       });
+      delete dirLoadingRef.current[path];
+      if (pendingDirRefreshRef.current[path]) {
+        delete pendingDirRefreshRef.current[path];
+        void loadDir(path);
+      }
     }
   };
 
   const toggleDir = (path: string) => {
-    setExpandedDirs((prev) => ({ ...prev, [path]: !prev[path] }));
-    if (!dirCache[path] && !dirLoading[path]) {
+    const nextExpanded = !expandedDirs[path];
+    setExpandedDirs((prev) => ({ ...prev, [path]: nextExpanded }));
+    if (nextExpanded) {
       void loadDir(path);
     }
   };
+
+  const refreshDirsForPaths = (paths?: string[]) => {
+    const expanded = expandedDirsRef.current;
+    const expandedList = Object.keys(expanded).filter((entryPath) => expanded[entryPath]);
+    if (expandedList.length === 0) return;
+
+    if (!paths || paths.length === 0) {
+      expandedList.forEach((entryPath) => {
+        void loadDir(entryPath);
+      });
+      return;
+    }
+
+    const refreshTargets = expandedList.filter((entryPath) =>
+      paths.some((changedPath) => isPathWithin(changedPath, entryPath))
+    );
+
+    if (refreshTargets.length === 0) {
+      expandedList.forEach((entryPath) => {
+        void loadDir(entryPath);
+      });
+      return;
+    }
+
+    refreshTargets.forEach((entryPath) => {
+      void loadDir(entryPath);
+    });
+  };
+
+  const scheduleRefreshDirs = (paths?: string[]) => {
+    if (refreshTimerRef.current != null) {
+      window.clearTimeout(refreshTimerRef.current);
+    }
+    const snapshot = paths
+      ? paths.map((value) => normalizeWatchPath(value)).filter((value) => value.length > 0)
+      : undefined;
+    refreshTimerRef.current = window.setTimeout(() => {
+      refreshTimerRef.current = null;
+      refreshDirsForPaths(snapshot);
+    }, 120);
+  };
+
+  const describeWatchPaths = (paths?: string[]) => {
+    if (!paths || paths.length === 0) return '未知路径';
+    const normalized = paths.map((value) => normalizeWatchPath(value));
+    const names = normalized.map((value) => getBaseName(value)).filter(Boolean);
+    const display = (names.length > 0 ? names : normalized).join(', ');
+    return display.length > 120 ? `${display.slice(0, 117)}...` : display;
+  };
+
+  useEffect(() => {
+    if (!open || !rootPath) return;
+    let active = true;
+
+    const startWatch = async () => {
+      try {
+        setWatchError(null);
+        setWatchStatus('监听已启动');
+        const unwatch = await watchImmediate(
+          rootPath,
+          (event) => {
+            if (!active) return;
+            setWatchStatus(`监听事件：${describeWatchPaths(event?.paths)}`);
+            scheduleRefreshDirs(event?.paths);
+          },
+          { recursive: true }
+        );
+        if (!active) {
+          unwatch();
+          return;
+        }
+        if (unwatchRef.current) {
+          unwatchRef.current();
+        }
+        unwatchRef.current = unwatch;
+      } catch (error) {
+        setWatchError(`监听失败：${formatError(error)}`);
+        setWatchStatus(null);
+      }
+    };
+
+    void startWatch();
+
+    return () => {
+      active = false;
+      if (unwatchRef.current) {
+        unwatchRef.current();
+        unwatchRef.current = null;
+      }
+      if (refreshTimerRef.current != null) {
+        window.clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, rootPath]);
+
+  const openFileFromExternal = async (rawPath: string) => {
+    const path = normalizeWatchPath(rawPath);
+    if (!path) return;
+    const name = getBaseName(path);
+    if (!name) return;
+
+    if (rootPath) {
+      const normalizedRoot = normalizePath(rootPath);
+      const normalizedFile = normalizePath(path);
+      if (isPathWithin(normalizedFile, normalizedRoot)) {
+        const relative = normalizedFile.slice(normalizedRoot.length).replace(/^\/+/, '');
+        const parts = relative ? relative.split('/') : [];
+        const dirParts = parts.slice(0, -1);
+        const expandedUpdates: Record<string, boolean> = { [rootPath]: true };
+        let current = rootPath;
+        for (const part of dirParts) {
+          current = joinPath(current, part);
+          expandedUpdates[current] = true;
+        }
+        setExpandedDirs((prev) => ({ ...prev, ...expandedUpdates }));
+        void loadDir(rootPath);
+        Object.keys(expandedUpdates).forEach((dir) => {
+          if (dir !== rootPath) {
+            void loadDir(dir);
+          }
+        });
+      }
+    }
+
+    void openFile(path, name);
+  };
+
+  useEffect(() => {
+    if (!open || !openFileRequest?.path) return;
+    void openFileFromExternal(openFileRequest.path);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, openFileRequest?.nonce]);
 
   const findFileLocation = (path: string, list = panesRef.current) => {
     for (const pane of list) {
@@ -697,6 +900,24 @@ function WorkDirBrowser({
     setIsResizing(true);
   };
 
+  const handleMarkdownLinkClick = (event: MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement;
+    const link = target.closest<HTMLAnchorElement>('a');
+    if (!link) return;
+    const rawHref = link.getAttribute('href') || '';
+    if (rawHref.startsWith('#')) return;
+    const href = rawHref || link.href || '';
+    if (!href) return;
+    const normalized =
+      href.startsWith('www.') || rawHref.startsWith('www.') ? `https://${rawHref || href}` : href;
+    if (!/^(https?:\/\/|mailto:|tel:)/i.test(normalized)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openUrl(normalized).catch(() => {
+      // ignore open errors
+    });
+  };
+
   const renderEntries = (parentPath: string, depth: number) => {
     const entries = dirCache[parentPath];
     if (!entries) return null;
@@ -863,6 +1084,16 @@ function WorkDirBrowser({
                   加载中...
                 </div>
               )}
+              {watchError && (
+                <div className="workdir-tree-error" style={{ paddingLeft: 20 }}>
+                  {watchError}
+                </div>
+              )}
+              {!watchError && watchStatus && (
+                <div className="workdir-tree-status" style={{ paddingLeft: 20 }}>
+                  {watchStatus}
+                </div>
+              )}
               {expandedDirs[rootPath] && renderEntries(rootPath, 1)}
             </div>
           </div>
@@ -986,6 +1217,7 @@ function WorkDirBrowser({
                           paneActiveFile.kind === 'markdown' && (
                             <div
                               className="workdir-markdown"
+                              onClick={handleMarkdownLinkClick}
                               dangerouslySetInnerHTML={{ __html: markdown.render(paneActiveFile.content || '') }}
                             />
                           )}

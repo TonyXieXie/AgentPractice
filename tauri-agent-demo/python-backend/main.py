@@ -5,9 +5,13 @@ import uvicorn
 import json
 import os
 import shlex
-from typing import List, Optional, Dict, Any
+import base64
+from io import BytesIO
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 import traceback
+
+from PIL import Image
 
 from models import (
     LLMConfig, LLMConfigCreate, LLMConfigUpdate,
@@ -170,6 +174,145 @@ def _looks_like_title(raw: str) -> bool:
         if marker in text:
             return False
     return True
+
+
+def _split_data_url(value: str) -> Tuple[Optional[str], str]:
+    if not value:
+        return None, ""
+    if value.startswith("data:") and "," in value:
+        header, payload = value.split(",", 1)
+        mime = header[5:].split(";")[0].strip() if ";" in header else header[5:].strip()
+        return mime or None, payload
+    return None, value
+
+
+def _prepare_attachment_input(item: Any) -> Optional[Dict[str, Any]]:
+    if not item:
+        return None
+    raw_data = getattr(item, "data_base64", None) or ""
+    inferred_mime, payload = _split_data_url(raw_data)
+    mime = (getattr(item, "mime", None) or inferred_mime or "application/octet-stream").strip()
+    payload = payload.strip()
+    if not payload:
+        return None
+    try:
+        decoded = base64.b64decode(payload)
+    except Exception:
+        return None
+
+    width = getattr(item, "width", None)
+    height = getattr(item, "height", None)
+    if (width is None or height is None) and mime.startswith("image/"):
+        try:
+            with Image.open(BytesIO(decoded)) as img:
+                width, height = img.size
+        except Exception:
+            pass
+
+    size = getattr(item, "size", None)
+    if size is None:
+        size = len(decoded)
+
+    return {
+        "name": getattr(item, "name", None),
+        "mime": mime,
+        "data": decoded,
+        "width": width,
+        "height": height,
+        "size": size
+    }
+
+
+def _convert_image_for_llm(data: bytes, mime: str) -> Optional[Tuple[str, bytes]]:
+    try:
+        with Image.open(BytesIO(data)) as img:
+            img.load()
+            has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+            output = BytesIO()
+            if has_alpha:
+                if img.mode not in ("RGBA", "LA"):
+                    img = img.convert("RGBA")
+                img.save(output, format="PNG")
+                return "image/png", output.getvalue()
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(output, format="JPEG", quality=92)
+            return "image/jpeg", output.getvalue()
+    except Exception:
+        return None
+
+
+def _build_llm_user_content(text: str, image_urls: List[str]) -> Any:
+    if not image_urls:
+        return text
+    items: List[Dict[str, Any]] = []
+    if text:
+        items.append({"type": "text", "text": text})
+    for url in image_urls:
+        items.append({"type": "image_url", "image_url": {"url": url}})
+    return items
+
+
+def _collect_prepared_attachments(attachments: Optional[List[Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    prepared_items: List[Dict[str, Any]] = []
+    llm_image_urls: List[str] = []
+    if not attachments:
+        return prepared_items, llm_image_urls
+
+    for item in attachments:
+        prepared = _prepare_attachment_input(item)
+        if not prepared:
+            continue
+        prepared_items.append(prepared)
+
+        converted = _convert_image_for_llm(prepared.get("data") or b"", prepared.get("mime") or "")
+        if not converted:
+            raw_mime = (prepared.get("mime") or "").lower()
+            if raw_mime in ("image/png", "image/jpeg", "image/jpg"):
+                mime = "image/jpeg" if raw_mime == "image/jpg" else raw_mime
+                converted = (mime, prepared.get("data") or b"")
+        if converted:
+            mime, out_data = converted
+            data_url = f"data:{mime};base64,{base64.b64encode(out_data).decode('ascii')}"
+            llm_image_urls.append(data_url)
+
+    return prepared_items, llm_image_urls
+
+
+def _save_prepared_attachments(message_id: int, prepared_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    saved_meta: List[Dict[str, Any]] = []
+    for prepared in prepared_items:
+        saved = db.save_message_attachment(
+            message_id=message_id,
+            name=prepared.get("name"),
+            mime=prepared.get("mime"),
+            data=prepared.get("data") or b"",
+            width=prepared.get("width"),
+            height=prepared.get("height"),
+            size=prepared.get("size")
+        )
+        saved_meta.append(saved)
+    return saved_meta
+
+
+def _build_thumbnail(data: bytes, max_size: int = 360) -> Optional[Tuple[str, bytes]]:
+    try:
+        with Image.open(BytesIO(data)) as img:
+            img.load()
+            img.thumbnail((max_size, max_size))
+            has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+            output = BytesIO()
+            if has_alpha:
+                if img.mode not in ("RGBA", "LA"):
+                    img = img.convert("RGBA")
+                img.save(output, format="PNG")
+                return "image/png", output.getvalue()
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(output, format="JPEG", quality=85)
+            return "image/jpeg", output.getvalue()
+    except Exception:
+        return None
 
 
 async def _generate_title(
@@ -381,6 +524,24 @@ def rollback_session(session_id: str, request: RollbackRequest):
         raise HTTPException(status_code=400, detail=result["error"])
     return result
 
+# ==================== Attachments ====================
+
+@app.get("/attachments/{attachment_id}")
+def get_attachment(attachment_id: int, thumbnail: bool = False, max_size: int = 360):
+    attachment = db.get_attachment(attachment_id)
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    data = attachment.get("data") or b""
+    if isinstance(data, memoryview):
+        data = data.tobytes()
+    mime = attachment.get("mime") or "application/octet-stream"
+    if thumbnail:
+        thumb = _build_thumbnail(data, max_size=max_size)
+        if thumb:
+            mime, data = thumb
+    return Response(content=data, media_type=mime)
+
 # ==================== Chat ====================
 
 @app.post("/chat", response_model=ChatResponse)
@@ -421,11 +582,15 @@ async def chat(request: ChatRequest):
             if provisional_title and provisional_title != session.title:
                 db.update_session(session.id, ChatSessionUpdate(title=provisional_title))
 
+        prepared_attachments, llm_image_urls = _collect_prepared_attachments(request.attachments)
+        user_content = _build_llm_user_content(processed_message, llm_image_urls)
+
         user_msg = db.create_message(ChatMessageCreate(
             session_id=session.id,
             role="user",
             content=processed_message
         ))
+        _save_prepared_attachments(user_msg.id, prepared_attachments)
 
         history = db.get_session_messages(session.id, limit=20)
         history_for_llm = [
@@ -440,6 +605,8 @@ async def chat(request: ChatRequest):
             system_prompt="You are a helpful AI assistant.",
             system_role=system_role
         )
+        if llm_image_urls:
+            llm_messages[-1]["content"] = user_content
 
         raw_request_data = {
             "model": config.model,
@@ -524,6 +691,9 @@ async def chat_stream(request: ChatRequest):
             if provisional_title and provisional_title != session.title:
                 db.update_session(session.id, ChatSessionUpdate(title=provisional_title))
 
+        prepared_attachments, llm_image_urls = _collect_prepared_attachments(request.attachments)
+        user_content = _build_llm_user_content(processed_message, llm_image_urls)
+
         history = db.get_session_messages(session.id, limit=20)
         history_for_llm = [
             {"role": msg.role, "content": msg.content}
@@ -537,6 +707,8 @@ async def chat_stream(request: ChatRequest):
             system_prompt="You are a helpful AI assistant.",
             system_role=system_role
         )
+        if llm_image_urls:
+            llm_messages[-1]["content"] = user_content
 
         raw_request_data = {
             "model": config.model,
@@ -554,9 +726,10 @@ async def chat_stream(request: ChatRequest):
             content=processed_message,
             raw_request=raw_request_data
         ))
+        saved_attachments = _save_prepared_attachments(user_msg.id, prepared_attachments)
 
         async def generate():
-            yield f"data: {json.dumps({'session_id': session.id, 'user_message_id': user_msg.id})}\n\n"
+            yield f"data: {json.dumps({'session_id': session.id, 'user_message_id': user_msg.id, 'user_attachments': saved_attachments})}\n\n"
             full_response = ""
             try:
                 llm_client = create_llm_client(config)
@@ -737,11 +910,15 @@ async def chat_agent_stream(request: ChatRequest):
             if provisional_title and provisional_title != session.title:
                 db.update_session(session.id, ChatSessionUpdate(title=provisional_title))
 
+        prepared_attachments, llm_image_urls = _collect_prepared_attachments(request.attachments)
+        user_content = _build_llm_user_content(processed_message, llm_image_urls)
+
         user_msg = db.create_message(ChatMessageCreate(
             session_id=session.id,
             role="user",
             content=processed_message
         ))
+        saved_attachments = _save_prepared_attachments(user_msg.id, prepared_attachments)
 
         history = db.get_session_messages(session.id, limit=20)
         history_for_llm = [
@@ -784,7 +961,7 @@ async def chat_agent_stream(request: ChatRequest):
                 ))
                 assistant_msg_id = temp_assistant_msg.id
                 stop_event = stream_stop_registry.create(assistant_msg_id)
-                yield f"data: {json.dumps({'session_id': session.id, 'user_message_id': user_msg.id, 'assistant_message_id': assistant_msg_id})}\n\n"
+                yield f"data: {json.dumps({'session_id': session.id, 'user_message_id': user_msg.id, 'assistant_message_id': assistant_msg_id, 'user_attachments': saved_attachments})}\n\n"
                 request_overrides = {
                     "_debug": {
                         "session_id": session.id,
@@ -793,6 +970,8 @@ async def chat_agent_stream(request: ChatRequest):
                     "work_path": request.work_path or getattr(session, 'work_path', None)
                 }
                 request_overrides["_stop_event"] = stop_event
+                if llm_image_urls:
+                    request_overrides["user_content"] = user_content
                 if request.agent_mode is not None:
                     request_overrides["agent_mode"] = request.agent_mode
                 if request.shell_unrestricted is not None:

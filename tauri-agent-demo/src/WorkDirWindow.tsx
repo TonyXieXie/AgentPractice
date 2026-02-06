@@ -17,8 +17,23 @@ const getInitialPath = () => {
   }
 };
 
+const getInitialOpenFile = () => {
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get('open');
+  if (!raw) return '';
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+};
+
 function WorkDirWindow() {
   const [rootPath, setRootPath] = useState(getInitialPath);
+  const [openFileRequest, setOpenFileRequest] = useState(() => {
+    const initial = getInitialOpenFile();
+    return initial ? { path: initial, nonce: Date.now() } : null;
+  });
   const [ping, setPing] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
   const appWindow = useMemo(() => getCurrentWindow(), []);
@@ -44,6 +59,22 @@ function WorkDirWindow() {
       if (label && event.payload?.target && event.payload.target !== label) return;
       setPing(true);
       window.setTimeout(() => setPing(false), 800);
+    }).then((stop) => {
+      unlisten = stop;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [appWindow]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    const label = (appWindow as { label?: string }).label;
+    listen<{ path: string; target?: string }>('workdir:open-file', (event) => {
+      if (label && event.payload?.target && event.payload.target !== label) return;
+      const path = event.payload?.path;
+      if (!path) return;
+      setOpenFileRequest({ path, nonce: Date.now() });
     }).then((stop) => {
       unlisten = stop;
     });
@@ -210,6 +241,7 @@ function WorkDirWindow() {
         <WorkDirBrowser
           open
           rootPath={rootPath}
+          openFileRequest={openFileRequest}
           mode="window"
           showActions={false}
           showClose={false}
