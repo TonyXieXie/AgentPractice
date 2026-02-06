@@ -57,10 +57,22 @@ def _get_project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _normalize_config_path(path: Path) -> Path:
+    if path.exists() and path.is_file():
+        return path
+    if path.suffix:
+        return path
+    return path / "tools_config.json"
+
+
 def _get_config_file_path() -> Path:
     env_path = os.getenv("TOOLS_CONFIG_PATH")
     if env_path:
-        return Path(env_path)
+        return _normalize_config_path(Path(env_path))
+
+    tauri_data_dir = os.getenv("TAURI_AGENT_DATA_DIR")
+    if tauri_data_dir:
+        return _normalize_config_path(Path(tauri_data_dir))
 
     root = _get_project_root()
     default_path = root / "tools_config.json"

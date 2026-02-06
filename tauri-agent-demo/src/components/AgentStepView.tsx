@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, Fragment, type MouseEventHandler } from 'react';
+import { useState, useEffect, useRef, Fragment, type MouseEventHandler, type ReactElement } from 'react';
 import MarkdownIt from 'markdown-it';
 import texmath from 'markdown-it-texmath';
 import katex from 'katex';
@@ -13,15 +13,18 @@ type Category = 'thought' | 'tool' | 'final' | 'error' | 'other';
 
 interface AgentStepViewProps {
     steps: AgentStep[];
+    messageId?: number;
     streaming?: boolean;
     pendingPermission?: ToolPermissionRequest | null;
     onPermissionDecision?: (status: 'approved' | 'denied') => void;
     permissionBusy?: boolean;
     onRetryMessage?: () => void;
     onRollbackMessage?: () => void;
-    onRevertPatch?: (patch: string) => void;
+    onRevertPatch?: (patch: string, messageId?: number) => void;
     patchRevertBusy?: boolean;
-    onOpenWorkFile?: (filePath: string) => void;
+    onOpenWorkFile?: (filePath: string, line?: number, column?: number) => void;
+    debugActive?: boolean;
+    onOpenDebugCall?: (iteration: number) => void;
 }
 
 const CATEGORY_LABELS: Record<Category, string> = {
@@ -123,13 +126,98 @@ function decodeUnicodeEscapes(content: string) {
         .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
+type StepItem = {
+    iteration: number | null;
+    element: ReactElement;
+};
+
+type GroupOptions = {
+    debugActive?: boolean;
+    onOpenDebugCall?: (iteration: number) => void;
+};
+
+const getIterationValue = (step: AgentStep): number | null => {
+    const raw = (step.metadata as any)?.iteration;
+    if (typeof raw === 'number') {
+        return Number.isFinite(raw) ? raw : null;
+    }
+    if (typeof raw === 'string') {
+        const parsed = Number(raw);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+};
+
+const groupStepElements = (items: StepItem[], options?: GroupOptions) => {
+    const groups: ReactElement[] = [];
+    let currentIteration: number | null = null;
+    let currentElements: ReactElement[] = [];
+    const showDebug = Boolean(options?.debugActive && options?.onOpenDebugCall);
+
+    const flush = () => {
+        if (currentIteration === null || currentElements.length === 0) {
+            currentElements = [];
+            currentIteration = null;
+            return;
+        }
+        const iterationValue = currentIteration;
+        const iterationLabel = `Round ${iterationValue + 1}`;
+        groups.push(
+            <div key={`group-${iterationValue}-${groups.length}`} className="agent-step-group">
+                <div className="agent-step-group-header">
+                    <span className="agent-step-group-label">{iterationLabel}</span>
+                    {showDebug && (
+                        <button
+                            type="button"
+                            className="agent-step-group-debug"
+                            onClick={() => options?.onOpenDebugCall?.(iterationValue)}
+                            aria-label={`Open debug for ${iterationLabel}`}
+                            title="Open debug"
+                        >
+                            Debug
+                        </button>
+                    )}
+                </div>
+                <div className="agent-step-group-body">{currentElements}</div>
+            </div>
+        );
+        currentElements = [];
+        currentIteration = null;
+    };
+
+    items.forEach((item, idx) => {
+        if (item.iteration === null) {
+            flush();
+            groups.push(
+                <div key={`group-solo-${idx}`} className="agent-step-group solo">
+                    {item.element}
+                </div>
+            );
+            return;
+        }
+
+        if (currentIteration === null || currentIteration !== item.iteration) {
+            flush();
+            currentIteration = item.iteration;
+        }
+        currentElements.push(item.element);
+    });
+
+    flush();
+    return groups;
+};
+
 type LinkToken =
     | { type: 'text'; value: string }
     | { type: 'url'; value: string }
     | { type: 'file'; value: string };
 
-const LINK_PATTERN = /((?:https?|file):\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+|[a-zA-Z]:\\[^\s<>"'`]+|\\\\[^\s<>"'`]+|\/[^\s<>"'`]+)/g;
+const LINK_PATTERN = /((?:https?|file):\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+|[a-zA-Z]:\\[^\s<>"'`]+|\\\\[^\s<>"'`]+|\/[^\s<>"'`]+|[^\s<>"'`]+\.[A-Za-z0-9]{1,10}:\d+(?::\d+)?)/g;
 const TRAILING_PUNCTUATION = /[),.;:!?]+$/;
+const FILE_EXT_PATTERN = /\.[A-Za-z0-9]{1,10}$/;
+const ESCAPE_SEGMENTS = new Set(['n', 'r', 't', 'b', 'f', 'v', '0']);
+const FILE_HASH_PATTERN = /^(.*)#L(\d+)(?:C(\d+))?$/i;
+const FILE_LINE_PATTERN = /^(.*?)(?::(\d+))(?:[:#](\d+))?$/;
 
 function splitTrailingPunctuation(value: string) {
     const match = value.match(TRAILING_PUNCTUATION);
@@ -140,6 +228,55 @@ function splitTrailingPunctuation(value: string) {
         value: value.slice(0, -match[0].length),
         trailing: match[0]
     };
+}
+
+function looksLikeFilePath(value: string) {
+    if (!value) return false;
+    if (/^file:\/\//i.test(value)) return true;
+    if (/^[a-zA-Z]:[\\/]/.test(value)) {
+        const rest = value.slice(3);
+        const firstSegment = rest.split(/[\\/]/)[0];
+        if (firstSegment.length === 1 && ESCAPE_SEGMENTS.has(firstSegment.toLowerCase())) {
+            return false;
+        }
+        return true;
+    }
+    if (value.startsWith('\\\\')) return true;
+    if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return true;
+    return FILE_EXT_PATTERN.test(value);
+}
+
+function parseFileReference(rawValue: string) {
+    const trimmed = rawValue.trim();
+    if (!trimmed) return null;
+    const { value } = splitTrailingPunctuation(trimmed);
+    if (!value) return null;
+    const hashMatch = value.match(FILE_HASH_PATTERN);
+    if (hashMatch) {
+        const path = hashMatch[1];
+        if (looksLikeFilePath(path) && (!hasScheme(path) || /^[a-zA-Z]:[\\/]/.test(path) || /^file:\/\//i.test(path))) {
+            return {
+                path,
+                line: Number(hashMatch[2]),
+                column: hashMatch[3] ? Number(hashMatch[3]) : undefined
+            };
+        }
+    }
+    const lineMatch = value.match(FILE_LINE_PATTERN);
+    if (lineMatch) {
+        const path = lineMatch[1];
+        if (looksLikeFilePath(path) && (!hasScheme(path) || /^[a-zA-Z]:[\\/]/.test(path) || /^file:\/\//i.test(path))) {
+            return {
+                path,
+                line: Number(lineMatch[2]),
+                column: lineMatch[3] ? Number(lineMatch[3]) : undefined
+            };
+        }
+    }
+    if (looksLikeFilePath(value)) {
+        return { path: value };
+    }
+    return null;
 }
 
 function tokenizeLinks(text: string): LinkToken[] {
@@ -157,7 +294,16 @@ function tokenizeLinks(text: string): LinkToken[] {
         const { value, trailing } = splitTrailingPunctuation(raw);
         if (value) {
             const isUrl = /^(?:https?:\/\/|file:\/\/|www\.)/i.test(value);
-            tokens.push({ type: isUrl ? 'url' : 'file', value });
+            if (isUrl) {
+                tokens.push({ type: 'url', value });
+            } else {
+                const parsed = parseFileReference(value);
+                if (parsed?.path) {
+                    tokens.push({ type: 'file', value });
+                } else {
+                    tokens.push({ type: 'text', value });
+                }
+            }
         }
         if (trailing) {
             tokens.push({ type: 'text', value: trailing });
@@ -188,10 +334,13 @@ const hasScheme = (value: string) => /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value);
 const isFileHref = (value: string) => {
     if (!value) return false;
     if (value.startsWith('#')) return false;
-    if (/^file:\/\//i.test(value)) return true;
-    if (/^[a-zA-Z]:[\\/]/.test(value)) return true;
-    if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return true;
-    return !hasScheme(value);
+    const parsed = parseFileReference(value);
+    if (!parsed?.path) return false;
+    const candidate = parsed.path;
+    if (/^file:\/\//i.test(candidate)) return true;
+    if (/^[a-zA-Z]:[\\/]/.test(candidate)) return true;
+    if (candidate.startsWith('/') || candidate.startsWith('./') || candidate.startsWith('../')) return true;
+    return !hasScheme(candidate);
 };
 
 const normalizeFileHref = (value: string) => {
@@ -213,6 +362,7 @@ const normalizeFileHref = (value: string) => {
 
 function AgentStepView({
     steps,
+    messageId,
     streaming,
     pendingPermission,
     onPermissionDecision,
@@ -221,7 +371,9 @@ function AgentStepView({
     onRollbackMessage,
     onRevertPatch,
     patchRevertBusy,
-    onOpenWorkFile
+    onOpenWorkFile,
+    debugActive,
+    onOpenDebugCall
 }: AgentStepViewProps) {
     const [expandedObservations, setExpandedObservations] = useState<Record<string, boolean>>({});
     const [translatedSearchSteps, setTranslatedSearchSteps] = useState<Record<string, boolean>>({});
@@ -266,31 +418,39 @@ function AgentStepView({
         }
     };
 
-    const handleOpenFile = async (filePath: string) => {
-        if (!filePath) return;
+    const handleOpenFile = async (rawValue: string, line?: number, column?: number) => {
+        if (!rawValue) return;
+        const parsed = parseFileReference(rawValue);
+        if (!parsed?.path) return;
+        const normalizedPath = normalizeFileHref(parsed.path);
+        const targetLine = parsed.line ?? line;
+        const targetColumn = parsed.column ?? column;
         if (onOpenWorkFile) {
             try {
-                await onOpenWorkFile(filePath);
+                await onOpenWorkFile(normalizedPath, targetLine, targetColumn);
                 return;
             } catch (error) {
                 console.error('Failed to open work window for file:', error);
             }
         }
         try {
-            await openPath(filePath);
+            await openPath(normalizedPath);
         } catch {
             // ignore open errors
         }
     };
 
-    const handleOpenFileFolder = async (filePath: string) => {
-        if (!filePath) return;
+    const handleOpenFileFolder = async (rawValue: string) => {
+        if (!rawValue) return;
+        const parsed = parseFileReference(rawValue);
+        if (!parsed?.path) return;
+        const normalizedPath = normalizeFileHref(parsed.path);
         try {
-            await revealItemInDir(filePath);
+            await revealItemInDir(normalizedPath);
         } catch {
             try {
-                const parent = getParentPath(filePath);
-                await openPath(parent || filePath);
+                const parent = getParentPath(normalizedPath);
+                await openPath(parent || normalizedPath);
             } catch {
                 // ignore open errors
             }
@@ -333,7 +493,10 @@ function AgentStepView({
                     onContextMenu={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
-                        setFileMenu({ path: token.value, x: event.clientX, y: event.clientY });
+                        const parsed = parseFileReference(token.value);
+                        if (parsed?.path) {
+                            setFileMenu({ path: normalizeFileHref(parsed.path), x: event.clientX, y: event.clientY });
+                        }
                     }}
                 >
                     {token.value}
@@ -384,23 +547,42 @@ function AgentStepView({
     const handleContentClick: MouseEventHandler<HTMLDivElement> = (event) => {
         const target = event.target as HTMLElement;
         const link = target.closest<HTMLAnchorElement>('a');
-        if (!link || !link.href) return;
-        const rawHref = link.getAttribute('href') || '';
-        const href = rawHref || link.href;
-        if (isFileHref(rawHref || href)) {
-            event.preventDefault();
-            event.stopPropagation();
-            const filePath = normalizeFileHref(rawHref || href);
-            if (onOpenWorkFile) {
-                void onOpenWorkFile(filePath);
+        if (link && link.href) {
+            const rawHref = link.getAttribute('href') || '';
+            const href = rawHref || link.href;
+            if (isFileHref(rawHref || href)) {
+                event.preventDefault();
+                event.stopPropagation();
+                const parsed = parseFileReference(rawHref || href);
+                if (!parsed?.path) return;
+                const filePath = normalizeFileHref(parsed.path);
+                if (onOpenWorkFile) {
+                    void onOpenWorkFile(filePath, parsed.line, parsed.column);
+                    return;
+                }
+                void handleOpenFile(filePath, parsed.line, parsed.column);
                 return;
             }
-            void handleOpenFile(filePath);
+            event.preventDefault();
+            event.stopPropagation();
+            handleOpenLink(href);
             return;
         }
-        event.preventDefault();
-        event.stopPropagation();
-        handleOpenLink(href);
+        const codeEl = target.closest('code');
+        if (codeEl && !target.closest('.code-block-container')) {
+            const text = codeEl.textContent || '';
+            const parsed = parseFileReference(text);
+            if (parsed?.path && parsed.line) {
+                event.preventDefault();
+                event.stopPropagation();
+                const filePath = normalizeFileHref(parsed.path);
+                if (onOpenWorkFile) {
+                    void onOpenWorkFile(filePath, parsed.line, parsed.column);
+                    return;
+                }
+                void handleOpenFile(filePath, parsed.line, parsed.column);
+            }
+        }
     };
 
     const handleCopyError = (stepKey: string, text: string) => {
@@ -499,11 +681,10 @@ function AgentStepView({
         return idx;
     })();
 
-    return (
-        <>
-            <div className="agent-steps">
-            {steps.map((step, index) => {
+    const renderGroupedSteps = () => {
+        const items = steps.map((step, index) => {
                 const category = STEP_CATEGORY[step.step_type] || 'other';
+                const iteration = getIterationValue(step);
                 const stepKey = `${step.step_type}-${index}`;
                 const isObservation = step.step_type === 'observation';
                 const isAction = step.step_type === 'action' || step.step_type === 'action_delta';
@@ -543,8 +724,10 @@ function AgentStepView({
                 }
                 const showObservationToggle = isObservation && observationHasMore && !isApplyPatch;
 
-                return (
-                    <Fragment key={`${step.step_type}-${index}`}>
+                return {
+                    iteration,
+                    element: (
+                        <Fragment key={`${step.step_type}-${index}`}>
                         <div className={`agent-step ${category}${isAction ? ' action' : ''}`}>
                             <div className="agent-step-header">
                                     <span className="agent-step-category">{CATEGORY_LABELS[category]}</span>
@@ -602,7 +785,7 @@ function AgentStepView({
                                                             <button
                                                                 type="button"
                                                                 className="patch-summary-btn danger"
-                                                                onClick={() => onRevertPatch(applyPatchResult!.revert_patch || '')}
+                                                                onClick={() => onRevertPatch(applyPatchResult!.revert_patch || '', messageId)}
                                                                 disabled={patchRevertBusy}
                                                             >
                                                                 {patchRevertBusy ? '处理中...' : '撤销'}
@@ -619,7 +802,21 @@ function AgentStepView({
                                                     )}
                                                     {(applyPatchResult.summary || []).map((item, idx) => (
                                                         <div key={`${item.path}-${idx}`} className="patch-summary-item">
-                                                            <span className="patch-summary-path">{item.path}</span>
+                                                            {onOpenWorkFile ? (
+                                                                <button
+                                                                    type="button"
+                                                                    className="patch-summary-path clickable"
+                                                                    onClick={(event) => {
+                                                                        event.preventDefault();
+                                                                        event.stopPropagation();
+                                                                        void onOpenWorkFile(item.path);
+                                                                    }}
+                                                                >
+                                                                    {item.path}
+                                                                </button>
+                                                            ) : (
+                                                                <span className="patch-summary-path">{item.path}</span>
+                                                            )}
                                                             <span className="patch-summary-counts">
                                                                 +{item.added} -{item.removed}
                                                             </span>
@@ -649,10 +846,14 @@ function AgentStepView({
                                     ref={isThought ? (el) => { thoughtRefs.current[stepKey] = el; } : undefined}
                                     onScroll={isThought ? handleThoughtScroll(stepKey) : undefined}
                                 >
-                                    {renderRichContent(displayContent, (event) => {
-                                        handleMarkdownClick(event);
-                                        handleContentClick(event);
-                                    })}
+                                    {isAction ? (
+                                        <div className="action-raw">{displayContent}</div>
+                                    ) : (
+                                        renderRichContent(displayContent, (event) => {
+                                            handleMarkdownClick(event);
+                                            handleContentClick(event);
+                                        })
+                                    )}
                                     {hasErrorDetails && (
                                         <>
                                             <div className="error-actions">
@@ -703,9 +904,17 @@ function AgentStepView({
                             )}
                         </div>
                         {pendingPermission && index === permissionAnchorIndex && permissionCard}
-                    </Fragment>
-                );
-            })}
+                        </Fragment>
+                    )
+                };
+            });
+        return groupStepElements(items, { debugActive, onOpenDebugCall });
+    };
+
+    return (
+        <>
+            <div className="agent-steps">
+            {renderGroupedSteps()}
             {pendingPermission && permissionAnchorIndex < 0 && permissionCard}
             {streaming && (
                 <div className="agent-step status">

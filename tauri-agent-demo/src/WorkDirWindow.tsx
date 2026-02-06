@@ -28,11 +28,29 @@ const getInitialOpenFile = () => {
   }
 };
 
+const getInitialOpenLine = () => {
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get('line');
+  if (!raw) return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
+};
+
+const getInitialOpenColumn = () => {
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get('col');
+  if (!raw) return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
+};
+
 function WorkDirWindow() {
   const [rootPath, setRootPath] = useState(getInitialPath);
   const [openFileRequest, setOpenFileRequest] = useState(() => {
     const initial = getInitialOpenFile();
-    return initial ? { path: initial, nonce: Date.now() } : null;
+    const line = getInitialOpenLine();
+    const column = getInitialOpenColumn();
+    return initial ? { path: initial, line, column, nonce: Date.now() } : null;
   });
   const [ping, setPing] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
@@ -70,11 +88,11 @@ function WorkDirWindow() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     const label = (appWindow as { label?: string }).label;
-    listen<{ path: string; target?: string }>('workdir:open-file', (event) => {
+    listen<{ path: string; line?: number; column?: number; target?: string }>('workdir:open-file', (event) => {
       if (label && event.payload?.target && event.payload.target !== label) return;
       const path = event.payload?.path;
       if (!path) return;
-      setOpenFileRequest({ path, nonce: Date.now() });
+      setOpenFileRequest({ path, line: event.payload?.line, column: event.payload?.column, nonce: Date.now() });
     }).then((stop) => {
       unlisten = stop;
     });

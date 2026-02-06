@@ -108,6 +108,7 @@ class ChatSessionCreate(BaseModel):
 class ChatSessionUpdate(BaseModel):
     title: Optional[str] = None
     work_path: Optional[str] = None
+    config_id: Optional[str] = None
 
 
 class AttachmentInput(BaseModel):
@@ -167,3 +168,4 @@ class RollbackRequest(BaseModel):
 class PatchRevertRequest(BaseModel):
     session_id: str
     revert_patch: str
+    message_id: Optional[int] = None

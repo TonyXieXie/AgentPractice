@@ -76,6 +76,14 @@ class AgentExecutor:
             if request_overrides and request_overrides.get("work_path"):
                 work_path = request_overrides.get("work_path")
 
+            message_id = None
+            if request_overrides:
+                message_id = request_overrides.get("message_id")
+                if message_id is None:
+                    debug_ctx = request_overrides.get("_debug")
+                    if isinstance(debug_ctx, dict):
+                        message_id = debug_ctx.get("message_id")
+
             shell_unrestricted = False
             if agent_mode:
                 if agent_mode == "super":
@@ -89,7 +97,8 @@ class AgentExecutor:
                 "shell_unrestricted": shell_unrestricted,
                 "agent_mode": agent_mode or "default",
                 "session_id": session_id,
-                "work_path": work_path
+                "work_path": work_path,
+                "message_id": message_id
             })
 
             async for step in self.strategy.execute(

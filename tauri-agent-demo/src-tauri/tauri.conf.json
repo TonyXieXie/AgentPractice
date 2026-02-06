@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "GYY",
-        "width": 800,
-        "height": 600,
+        "width": 1200,
+        "height": 950,
         "decorations": false
       }
     ],
@@ -31,6 +31,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "externalBin": [
+      "../python-backend/target/tauri-agent-backend"
     ]
   }
 }

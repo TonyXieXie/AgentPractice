@@ -1,4 +1,4 @@
-﻿import { useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+﻿import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { Message, LLMCall } from '../types';
 import './DebugPanel.css';
 
@@ -6,13 +6,15 @@ interface DebugPanelProps {
     messages: Message[];
     llmCalls: LLMCall[];
     onClose: () => void;
+    focusTarget?: { key: string; messageId?: number; iteration?: number; callId?: number } | null;
 }
 
-function DebugPanel({ messages, llmCalls, onClose }: DebugPanelProps) {
+function DebugPanel({ messages, llmCalls, onClose, focusTarget }: DebugPanelProps) {
     const [expandedMessageId, setExpandedMessageId] = useState<string | null>(null);
     const [expandedCallId, setExpandedCallId] = useState<string | null>(null);
     const [rawStreamVisible, setRawStreamVisible] = useState<Record<string, boolean>>({});
     const [panelWidth, setPanelWidth] = useState(400);
+    const [focusedCallId, setFocusedCallId] = useState<number | null>(null);
     const panelRef = useRef<HTMLDivElement>(null);
 
     const toggleExpandMessage = (id: string) => {
@@ -46,6 +48,43 @@ function DebugPanel({ messages, llmCalls, onClose }: DebugPanelProps) {
     const toggleRawStream = (id: string) => {
         setRawStreamVisible((prev) => ({ ...prev, [id]: !prev[id] }));
     };
+
+    useEffect(() => {
+        if (!focusTarget) return;
+        const { callId, messageId, iteration } = focusTarget;
+        let targetCall: LLMCall | undefined;
+        if (typeof callId === 'number') {
+            targetCall = llmCalls.find((item) => item.id === callId);
+        }
+        if (!targetCall && typeof messageId === 'number' && typeof iteration === 'number') {
+            targetCall = llmCalls.find((item) => item.message_id === messageId && item.iteration === iteration);
+        }
+        if (!targetCall) return;
+        const messageKey = typeof targetCall.message_id === 'number' ? `msg-${targetCall.message_id}` : null;
+        if (messageKey) {
+            setExpandedMessageId(messageKey);
+        }
+        const callKey = `call-${targetCall.id}`;
+        setExpandedCallId(callKey);
+        setFocusedCallId(targetCall.id);
+
+        const attemptScroll = () => {
+            const container = panelRef.current;
+            if (!container) return false;
+            const node = container.querySelector<HTMLElement>(`[data-call-id="${targetCall.id}"]`);
+            if (node && 'scrollIntoView' in node) {
+                node.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                return true;
+            }
+            return false;
+        };
+
+        if (!attemptScroll()) {
+            window.setTimeout(() => {
+                attemptScroll();
+            }, 60);
+        }
+    }, [focusTarget, llmCalls]);
 
     const copyToClipboard = async (text: string) => {
         try {
@@ -128,8 +167,9 @@ function DebugPanel({ messages, llmCalls, onClose }: DebugPanelProps) {
         const hasRawEvents = Boolean(call.response_json && (call.response_json as any).events);
         const hasProcessed = Boolean(call.processed_json);
         const showRawStream = Boolean(rawStreamVisible[callKey]);
+        const isFocused = focusedCallId === call.id;
         return (
-            <div key={call.id} className="debug-message">
+            <div key={call.id} className={`debug-message${isFocused ? ' focused' : ''}`} data-call-id={call.id}>
                 <div className="debug-message-header" onClick={() => toggleExpandCall(callKey)}>
                     <div className="message-title">
                         <span className="role-badge call">LLM</span>

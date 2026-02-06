@@ -81,11 +81,11 @@ export async function deleteConfig(configId: string): Promise<void> {
     if (!response.ok) throw new Error('Failed to delete config');
 }
 
-export async function revertPatch(sessionId: string, revertPatch: string): Promise<PatchRevertResponse> {
+export async function revertPatch(sessionId: string, revertPatch: string, messageId?: number): Promise<PatchRevertResponse> {
     const response = await fetch(`${API_BASE_URL}/patch/revert`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, revert_patch: revertPatch }),
+        body: JSON.stringify({ session_id: sessionId, revert_patch: revertPatch, message_id: messageId }),
     });
     if (!response.ok) {
         throw await buildApiError(response, 'Failed to revert patch');

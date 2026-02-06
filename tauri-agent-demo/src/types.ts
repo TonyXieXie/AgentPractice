@@ -101,6 +101,7 @@ export interface ChatSessionCreate {
 export interface ChatSessionUpdate {
     title?: string;
     work_path?: string | null;
+    config_id?: string;
 }
 
 export interface LLMCall {

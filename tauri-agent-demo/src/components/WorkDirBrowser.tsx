@@ -1,4 +1,13 @@
-﻿import { Fragment, useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent } from 'react';
+﻿import {
+  Fragment,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from 'react';
 import MarkdownIt from 'markdown-it';
 import texmath from 'markdown-it-texmath';
 import katex from 'katex';
@@ -20,6 +29,14 @@ type OpenFile = {
   error?: string;
 };
 
+type EditorState = {
+  value: string;
+  base: string;
+  dirty: boolean;
+  saving: boolean;
+  error?: string;
+};
+
 type Pane = {
   id: string;
   openFiles: OpenFile[];
@@ -29,7 +46,7 @@ type Pane = {
 type WorkDirBrowserProps = {
   open: boolean;
   rootPath: string;
-  openFileRequest?: { path: string; nonce: number } | null;
+  openFileRequest?: { path: string; line?: number; column?: number; nonce: number } | null;
   onClose?: () => void;
   onPickWorkPath?: () => void;
   onOpenInExplorer?: () => void;
@@ -225,6 +242,25 @@ function WorkDirBrowser({
     targetPath: string;
     revealPath: string | null;
   } | null>(null);
+  const [editorMenu, setEditorMenu] = useState<{
+    x: number;
+    y: number;
+    path: string;
+  } | null>(null);
+  const [draggingTab, setDraggingTab] = useState<{ path: string; paneId: string } | null>(null);
+  const [dragOverPaneId, setDragOverPaneId] = useState<string | null>(null);
+  const [dragOverIntent, setDragOverIntent] = useState<'move' | 'new-right' | null>(null);
+  const [pendingJump, setPendingJump] = useState<{
+    path: string;
+    line: number;
+    column?: number;
+    nonce: number;
+  } | null>(null);
+  const [dragGhost, setDragGhost] = useState<{ x: number; y: number; visible: boolean }>({
+    x: 0,
+    y: 0,
+    visible: false,
+  });
   const [newFolderTarget, setNewFolderTarget] = useState<string | null>(null);
   const [newFolderName, setNewFolderName] = useState('');
   const [newFolderError, setNewFolderError] = useState<string | null>(null);
@@ -235,14 +271,31 @@ function WorkDirBrowser({
   const [creatingFile, setCreatingFile] = useState(false);
   const [watchError, setWatchError] = useState<string | null>(null);
   const [watchStatus, setWatchStatus] = useState<string | null>(null);
+  const [editorByPath, setEditorByPath] = useState<Record<string, EditorState>>({});
   const previousRootRef = useRef<string>('');
   const panesRef = useRef<Pane[]>([]);
+  const editorByPathRef = useRef<Record<string, EditorState>>({});
   const createFolderInputRef = useRef<HTMLInputElement>(null);
   const createFileInputRef = useRef<HTMLInputElement>(null);
   const splitContainerRef = useRef<HTMLDivElement>(null);
+  const editorGutterRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const editorRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
+  const dragStateRef = useRef<{
+    path: string;
+    paneId: string;
+    startX: number;
+    startY: number;
+    dragging: boolean;
+  } | null>(null);
+  const dragOverPaneRef = useRef<string | null>(null);
+  const dragOverIntentRef = useRef<'move' | 'new-right' | null>(null);
+  const suppressTabClickRef = useRef(false);
+  const dragGhostRef = useRef<{ x: number; y: number; visible: boolean }>({ x: 0, y: 0, visible: false });
+  const dragGhostRafRef = useRef<number | null>(null);
   const dirLoadingRef = useRef<Record<string, boolean>>({});
   const expandedDirsRef = useRef<Record<string, boolean>>({});
   const refreshTimerRef = useRef<number | null>(null);
+  const refreshFilesTimerRef = useRef<number | null>(null);
   const pendingDirRefreshRef = useRef<Record<string, boolean>>({});
   const unwatchRef = useRef<UnwatchFn | null>(null);
 
@@ -260,6 +313,7 @@ function WorkDirBrowser({
     setDirLoading({});
     setDirErrors({});
     setExpandedDirs({});
+    setEditorByPath({});
     setPanes((prev) => {
       prev.forEach((pane) => pane.openFiles.forEach(revokeFileUrl));
       return [nextPane];
@@ -289,6 +343,36 @@ function WorkDirBrowser({
 
   useEffect(() => {
     panesRef.current = panes;
+  }, [panes]);
+
+  useEffect(() => {
+    editorByPathRef.current = editorByPath;
+  }, [editorByPath]);
+
+  useEffect(() => {
+    if (panes.length === 0) return;
+    setEditorByPath((prev) => {
+      let changed = false;
+      let next = prev;
+      panes.forEach((pane) => {
+        pane.openFiles.forEach((file) => {
+          if (file.kind !== 'text' || file.content == null) return;
+          const existing = prev[file.path];
+          if (!existing) {
+            if (!changed) next = { ...prev };
+            next[file.path] = { value: file.content ?? '', base: file.content ?? '', dirty: false, saving: false };
+            changed = true;
+            return;
+          }
+          if (!existing.dirty && existing.base !== file.content) {
+            if (!changed) next = { ...prev };
+            next[file.path] = { ...existing, value: file.content ?? '', base: file.content ?? '', dirty: false };
+            changed = true;
+          }
+        });
+      });
+      return changed ? next : prev;
+    });
   }, [panes]);
 
   useEffect(() => {
@@ -336,7 +420,7 @@ function WorkDirBrowser({
 
   useEffect(() => {
     if (!isResizing) return;
-    const handleMove = (event: MouseEvent) => {
+    const handleMove = (event: globalThis.MouseEvent) => {
       const state = resizeRef.current;
       if (!state) return;
       const delta = (event.clientX - state.startX) / state.containerWidth;
@@ -383,6 +467,17 @@ function WorkDirBrowser({
       window.removeEventListener('blur', dismiss);
     };
   }, [contextMenu]);
+
+  useEffect(() => {
+    if (!editorMenu) return;
+    const dismiss = () => setEditorMenu(null);
+    window.addEventListener('mousedown', dismiss);
+    window.addEventListener('blur', dismiss);
+    return () => {
+      window.removeEventListener('mousedown', dismiss);
+      window.removeEventListener('blur', dismiss);
+    };
+  }, [editorMenu]);
 
   useEffect(() => {
     if (!newFolderTarget) return;
@@ -484,6 +579,61 @@ function WorkDirBrowser({
     }, 120);
   };
 
+  const shouldRefreshOpenFile = (filePath: string, changedPaths?: string[]) => {
+    if (!changedPaths || changedPaths.length === 0) return false;
+    const fileNorm = normalizePath(filePath);
+    return changedPaths.some((changed) => {
+      const changedNorm = normalizePath(changed);
+      if (changedNorm === fileNorm) return true;
+      return isPathWithin(fileNorm, changedNorm) || isPathWithin(changedNorm, fileNorm);
+    });
+  };
+
+  const refreshOpenFileContent = async (file: OpenFile, changedPaths?: string[]) => {
+    if (!shouldRefreshOpenFile(file.path, changedPaths)) return;
+    const editorState = editorByPathRef.current[file.path];
+    if (editorState?.dirty) return;
+    if (!findFileLocation(file.path)) return;
+    try {
+      if (file.kind === 'image') {
+        const bytes = await readFile(file.path);
+        if (!findFileLocation(file.path)) return;
+        const url = URL.createObjectURL(new Blob([bytes], { type: getMimeType(file.ext) }));
+        updateFile(file.path, { url });
+      } else {
+        const text = await readTextFile(file.path);
+        if (!findFileLocation(file.path)) return;
+        updateFile(file.path, { content: text });
+      }
+    } catch (error) {
+      updateFile(file.path, { error: formatError(error) });
+    }
+  };
+
+  const refreshOpenFiles = (paths?: string[]) => {
+    const openFiles = panesRef.current.flatMap((pane) => pane.openFiles);
+    if (openFiles.length === 0) return;
+    const normalized = paths
+      ? paths.map((value) => normalizeWatchPath(value)).filter((value) => value.length > 0)
+      : undefined;
+    openFiles.forEach((file) => {
+      void refreshOpenFileContent(file, normalized);
+    });
+  };
+
+  const scheduleRefreshOpenFiles = (paths?: string[]) => {
+    if (refreshFilesTimerRef.current != null) {
+      window.clearTimeout(refreshFilesTimerRef.current);
+    }
+    const snapshot = paths
+      ? paths.map((value) => normalizeWatchPath(value)).filter((value) => value.length > 0)
+      : undefined;
+    refreshFilesTimerRef.current = window.setTimeout(() => {
+      refreshFilesTimerRef.current = null;
+      refreshOpenFiles(snapshot);
+    }, 160);
+  };
+
   const describeWatchPaths = (paths?: string[]) => {
     if (!paths || paths.length === 0) return '未知路径';
     const normalized = paths.map((value) => normalizeWatchPath(value));
@@ -506,6 +656,7 @@ function WorkDirBrowser({
             if (!active) return;
             setWatchStatus(`监听事件：${describeWatchPaths(event?.paths)}`);
             scheduleRefreshDirs(event?.paths);
+            scheduleRefreshOpenFiles(event?.paths);
           },
           { recursive: true }
         );
@@ -534,6 +685,10 @@ function WorkDirBrowser({
       if (refreshTimerRef.current != null) {
         window.clearTimeout(refreshTimerRef.current);
         refreshTimerRef.current = null;
+      }
+      if (refreshFilesTimerRef.current != null) {
+        window.clearTimeout(refreshFilesTimerRef.current);
+        refreshFilesTimerRef.current = null;
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -571,11 +726,66 @@ function WorkDirBrowser({
     void openFile(path, name);
   };
 
+  const requestJumpToLine = (path: string, line?: number, column?: number) => {
+    if (!line || line < 1) return;
+    setPendingJump({ path, line, column, nonce: Date.now() });
+  };
+
+  const getLineOffset = (text: string, line: number, column?: number) => {
+    const lines = text.split('\n');
+    const maxLine = Math.max(1, lines.length);
+    const targetLine = Math.min(Math.max(1, line), maxLine);
+    let offset = 0;
+    for (let i = 0; i < targetLine - 1; i += 1) {
+      offset += lines[i].length + 1;
+    }
+    if (column && column > 1) {
+      const lineLength = lines[targetLine - 1]?.length ?? 0;
+      offset += Math.min(column - 1, lineLength);
+    }
+    return { offset, line: targetLine };
+  };
+
+  const scrollToLine = (path: string, line: number, column?: number) => {
+    const editor = editorRefs.current[path];
+    if (!editor) return false;
+    const text = editor.value ?? editorByPathRef.current[path]?.value ?? '';
+    const { offset, line: targetLine } = getLineOffset(text, line, column);
+    editor.focus();
+    editor.setSelectionRange(offset, offset);
+    const style = getComputedStyle(editor);
+    let lineHeight = parseFloat(style.lineHeight || '');
+    if (!Number.isFinite(lineHeight)) {
+      const fontSize = parseFloat(style.fontSize || '14');
+      lineHeight = fontSize * 1.55;
+    }
+    const targetTop = Math.max(0, (targetLine - 1) * lineHeight - lineHeight * 2);
+    editor.scrollTop = targetTop;
+    const gutter = editorGutterRefs.current[path];
+    if (gutter) {
+      gutter.scrollTop = editor.scrollTop;
+    }
+    return true;
+  };
+
   useEffect(() => {
     if (!open || !openFileRequest?.path) return;
-    void openFileFromExternal(openFileRequest.path);
+    const normalized = normalizeWatchPath(openFileRequest.path);
+    if (!normalized) return;
+    void openFileFromExternal(normalized);
+    if (openFileRequest.line) {
+      requestJumpToLine(normalized, openFileRequest.line, openFileRequest.column);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, openFileRequest?.nonce]);
+
+  useEffect(() => {
+    if (!pendingJump) return;
+    const success = scrollToLine(pendingJump.path, pendingJump.line, pendingJump.column);
+    if (success) {
+      setPendingJump(null);
+    }
+  }, [pendingJump, panes, editorByPath]);
 
   const findFileLocation = (path: string, list = panesRef.current) => {
     for (const pane of list) {
@@ -598,12 +808,94 @@ function WorkDirBrowser({
         if (!pane.openFiles.some((file) => file.path === path)) return pane;
         return {
           ...pane,
-          openFiles: pane.openFiles.map((file) =>
-            file.path === path ? { ...file, ...update } : file
-          ),
+          openFiles: pane.openFiles.map((file) => {
+            if (file.path !== path) return file;
+            if (update.url && file.url && update.url !== file.url) {
+              URL.revokeObjectURL(file.url);
+            }
+            return { ...file, ...update };
+          }),
         };
       })
     );
+  };
+
+  const beginEditFile = (file: OpenFile) => {
+    if (file.kind !== 'text') return;
+    setEditorByPath((prev) => {
+      const existing = prev[file.path];
+      if (existing) {
+        return {
+          ...prev,
+          [file.path]: { ...existing, error: undefined },
+        };
+      }
+      const base = file.content ?? '';
+      return {
+        ...prev,
+        [file.path]: { value: base, base, dirty: false, saving: false },
+      };
+    });
+  };
+
+  const updateEditorValue = (path: string, value: string) => {
+    setEditorByPath((prev) => {
+      const current = prev[path];
+      if (!current) return prev;
+      const dirty = value !== current.base;
+      return {
+        ...prev,
+        [path]: { ...current, value, dirty },
+      };
+    });
+  };
+
+  const cancelEditFile = (path: string) => {
+    setEditorByPath((prev) => {
+      const current = prev[path];
+      if (!current) return prev;
+      return {
+        ...prev,
+        [path]: { ...current, value: current.base, dirty: false, error: undefined },
+      };
+    });
+  };
+
+  const saveEditFile = async (path: string) => {
+    const current = editorByPath[path];
+    if (!current || current.saving) return;
+    setEditorByPath((prev) => ({
+      ...prev,
+      [path]: { ...current, saving: true, error: undefined },
+    }));
+    try {
+      await writeTextFile(path, current.value);
+      updateFile(path, { content: current.value });
+      setEditorByPath((prev) => {
+        const latest = prev[path];
+        if (!latest) return prev;
+        return {
+          ...prev,
+          [path]: { ...latest, base: current.value, dirty: false, saving: false },
+        };
+      });
+    } catch (error) {
+      setEditorByPath((prev) => {
+        const latest = prev[path];
+        if (!latest) return prev;
+        return {
+          ...prev,
+          [path]: { ...latest, saving: false, error: formatError(error) },
+        };
+      });
+    }
+  };
+
+  const handleEditorKeyDown = (path: string) => (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+      event.preventDefault();
+      void saveEditFile(path);
+    }
   };
 
   const openFile = async (path: string, name: string) => {
@@ -644,6 +936,9 @@ function WorkDirBrowser({
         const text = await readTextFile(path);
         if (!findFileLocation(path)) return;
         updateFile(path, { content: text, loading: false });
+        if (kind === 'text') {
+          beginEditFile({ path, name, ext, kind, content: text });
+        }
       }
     } catch (error) {
       updateFile(path, { error: formatError(error), loading: false });
@@ -686,6 +981,7 @@ function WorkDirBrowser({
     if (nextActivePaneId && nextActivePaneId !== activePaneId) {
       setActivePaneId(nextActivePaneId);
     }
+    cancelEditFile(path);
   };
 
   const moveFileToPane = (path: string, fromPaneId: string, toPaneId: string) => {
@@ -695,8 +991,7 @@ function WorkDirBrowser({
     }
     let movedFile: OpenFile | null = null;
     setPanes((prev) => {
-      let removedIndex = -1;
-      let next = prev.flatMap((pane, idx) => {
+      let next = prev.flatMap((pane) => {
         if (pane.id !== fromPaneId) return [pane];
         const fileIndex = pane.openFiles.findIndex((file) => file.path === path);
         if (fileIndex < 0) return [pane];
@@ -707,7 +1002,6 @@ function WorkDirBrowser({
           nextActive = nextFiles[fileIndex - 1]?.path || nextFiles[fileIndex]?.path || nextFiles[0]?.path || null;
         }
         if (nextFiles.length === 0 && prev.length > 1) {
-          removedIndex = idx;
           return [];
         }
         return [{ ...pane, openFiles: nextFiles, activePath: nextActive }];
@@ -854,29 +1148,152 @@ function WorkDirBrowser({
   const activePane = panes.find((pane) => pane.id === activePaneId) || panes[0] || null;
   const activePath = activePane?.activePath ?? null;
 
-  const handleTabDragStart = (event: DragEvent<HTMLDivElement>, paneId: string, path: string) => {
-    event.dataTransfer.setData('application/x-workdir-file', JSON.stringify({ paneId, path }));
-    event.dataTransfer.setData('text/plain', path);
-    event.dataTransfer.effectAllowed = 'move';
+  const resolvePaneFromPoint = (x: number, y: number) => {
+    if (typeof document === 'undefined') return null;
+    const el = document.elementFromPoint(x, y) as HTMLElement | null;
+    if (!el) return null;
+    const paneEl = el.closest<HTMLElement>('.workdir-pane');
+    if (!paneEl) return null;
+    return paneEl;
   };
 
-  const handlePaneDrop = (event: DragEvent<HTMLDivElement>, paneId: string) => {
-    event.preventDefault();
-    const raw =
-      event.dataTransfer.getData('application/x-workdir-file') || event.dataTransfer.getData('text/plain');
-    if (!raw) return;
-    let payload: { paneId?: string; path?: string } | null = null;
-    try {
-      payload = JSON.parse(raw);
-    } catch {
-      payload = { path: raw };
+  const updateDragGhost = (x: number, y: number, visible: boolean) => {
+    dragGhostRef.current = { x, y, visible };
+    if (dragGhostRafRef.current !== null) return;
+    dragGhostRafRef.current = window.requestAnimationFrame(() => {
+      dragGhostRafRef.current = null;
+      setDragGhost({ ...dragGhostRef.current });
+    });
+  };
+
+  const clearTabDrag = () => {
+    dragStateRef.current = null;
+    dragOverPaneRef.current = null;
+    dragOverIntentRef.current = null;
+    setDraggingTab(null);
+    setDragOverPaneId(null);
+    setDragOverIntent(null);
+    updateDragGhost(0, 0, false);
+  };
+
+  const splitPaneAndMoveFile = (path: string, fromPaneId: string) => {
+    const newPane = createPane();
+    setPanes((prev) => {
+      const fromIndex = prev.findIndex((pane) => pane.id === fromPaneId);
+      if (fromIndex < 0) return prev;
+      const fromPane = prev[fromIndex];
+      const fileIndex = fromPane.openFiles.findIndex((file) => file.path === path);
+      if (fileIndex < 0) return prev;
+      const movedFile = fromPane.openFiles[fileIndex];
+      const nextFiles = fromPane.openFiles.filter((file) => file.path !== path);
+      let nextActive = fromPane.activePath;
+      if (fromPane.activePath === path) {
+        nextActive =
+          nextFiles[fileIndex - 1]?.path ||
+          nextFiles[fileIndex]?.path ||
+          nextFiles[0]?.path ||
+          null;
+      }
+      const nextPane = { ...fromPane, openFiles: nextFiles, activePath: nextActive };
+      const newPaneEntry: Pane = { ...newPane, openFiles: [movedFile], activePath: path };
+      const next = [...prev];
+      next.splice(fromIndex, 1, nextPane);
+      next.splice(fromIndex + 1, 0, newPaneEntry);
+      return next;
+    });
+    setPaneSizes((sizes) => {
+      const existingIds = panesRef.current.map((pane) => pane.id);
+      const fromIndex = existingIds.indexOf(fromPaneId);
+      if (fromIndex < 0) return sizes;
+      const insertIndex = fromIndex + 1;
+      const nextIds = [
+        ...existingIds.slice(0, insertIndex),
+        newPane.id,
+        ...existingIds.slice(insertIndex),
+      ];
+      const current = sizes[fromPaneId] ?? 1 / Math.max(1, existingIds.length || 1);
+      const half = current / 2;
+      const next = { ...sizes, [fromPaneId]: half, [newPane.id]: half };
+      return ensurePaneSizes(next, nextIds);
+    });
+    setActivePaneId(newPane.id);
+  };
+
+  const handleTabPointerDown = (event: ReactPointerEvent<HTMLDivElement>, paneId: string, path: string) => {
+    if (event.button !== 0) return;
+    dragStateRef.current = {
+      paneId,
+      path,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragging: false,
+    };
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const state = dragStateRef.current;
+      if (!state) return;
+      const dx = moveEvent.clientX - state.startX;
+      const dy = moveEvent.clientY - state.startY;
+      if (!state.dragging) {
+        if (Math.hypot(dx, dy) < 4) return;
+        state.dragging = true;
+        setDraggingTab({ path: state.path, paneId: state.paneId });
+        updateDragGhost(moveEvent.clientX, moveEvent.clientY, true);
+      }
+      if (state.dragging) {
+        updateDragGhost(moveEvent.clientX, moveEvent.clientY, true);
+      }
+      const paneEl = resolvePaneFromPoint(moveEvent.clientX, moveEvent.clientY);
+      const overPaneId = paneEl?.dataset?.paneId || null;
+      let intent: 'move' | 'new-right' | null = overPaneId ? 'move' : null;
+      if (overPaneId && panesRef.current.length === 1 && paneEl) {
+        const rect = paneEl.getBoundingClientRect();
+        const threshold = rect.left + rect.width * 0.6;
+        if (moveEvent.clientX >= threshold) {
+          intent = 'new-right';
+        }
+      }
+      dragOverPaneRef.current = overPaneId;
+      dragOverIntentRef.current = intent;
+      setDragOverPaneId(overPaneId);
+      setDragOverIntent(intent);
+    };
+    const handlePointerUp = () => {
+      const state = dragStateRef.current;
+      const overPaneId = dragOverPaneRef.current;
+      const intent = dragOverIntentRef.current;
+      if (state?.dragging) {
+        if (intent === 'new-right' && overPaneId && overPaneId === state.paneId) {
+          splitPaneAndMoveFile(state.path, state.paneId);
+          suppressTabClickRef.current = true;
+        } else if (overPaneId && overPaneId !== state.paneId) {
+          moveFileToPane(state.path, state.paneId, overPaneId);
+          suppressTabClickRef.current = true;
+        }
+        if (suppressTabClickRef.current) {
+          window.setTimeout(() => {
+            suppressTabClickRef.current = false;
+          }, 200);
+        }
+      }
+      updateDragGhost(0, 0, false);
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      clearTabDrag();
+    };
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp, { once: true });
+  };
+
+  const handleTabClick = (paneId: string, path: string) => {
+    if (suppressTabClickRef.current) {
+      suppressTabClickRef.current = false;
+      return;
     }
-    if (!payload?.path || !payload.paneId) return;
-    moveFileToPane(payload.path, payload.paneId, paneId);
+    setPaneActivePath(paneId, path);
   };
 
   const handleSplitterMouseDown = (
-    event: MouseEvent<HTMLDivElement>,
+    event: ReactMouseEvent<HTMLDivElement>,
     leftId: string,
     rightId: string
   ) => {
@@ -900,7 +1317,7 @@ function WorkDirBrowser({
     setIsResizing(true);
   };
 
-  const handleMarkdownLinkClick = (event: MouseEvent<HTMLDivElement>) => {
+  const handleMarkdownLinkClick = (event: ReactMouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
     const link = target.closest<HTMLAnchorElement>('a');
     if (!link) return;
@@ -1108,17 +1525,19 @@ function WorkDirBrowser({
                   ? pane.openFiles.find((file) => file.path === pane.activePath) || null
                   : null;
                 const paneSize = paneSizes[pane.id] ?? 1 / Math.max(1, panes.length);
+                const isDragTarget =
+                  draggingTab &&
+                  dragOverPaneId === pane.id &&
+                  (draggingTab.paneId !== pane.id || dragOverIntent === 'new-right');
                 return (
                   <Fragment key={pane.id}>
                     <div
-                      className={`workdir-pane${pane.id === activePaneId ? ' active' : ''}`}
+                      className={`workdir-pane${pane.id === activePaneId ? ' active' : ''}${
+                        isDragTarget ? ' drag-target' : ''
+                      }`}
                       style={{ flex: `0 0 ${(paneSize * 100).toFixed(4)}%` }}
+                      data-pane-id={pane.id}
                       onMouseDown={() => setActivePaneId(pane.id)}
-                      onDragOver={(event) => {
-                        event.preventDefault();
-                        event.dataTransfer.dropEffect = 'move';
-                      }}
-                      onDrop={(event) => handlePaneDrop(event, pane.id)}
                     >
                       <div className="workdir-tabs">
                         <div className="workdir-tabs-list">
@@ -1128,18 +1547,27 @@ function WorkDirBrowser({
                           {pane.openFiles.map((file) => (
                             <div
                               key={file.path}
-                              className={`workdir-tab${file.path === pane.activePath ? ' active' : ''}`}
-                              onClick={() => setPaneActivePath(pane.id, file.path)}
-                              draggable
-                              onDragStart={(event) => handleTabDragStart(event, pane.id, file.path)}
+                              className={`workdir-tab${file.path === pane.activePath ? ' active' : ''}${
+                                draggingTab?.path === file.path && draggingTab?.paneId === pane.id
+                                  ? ' dragging'
+                                  : ''
+                              }`}
+                              onClick={() => handleTabClick(pane.id, file.path)}
+                              onPointerDown={(event) => handleTabPointerDown(event, pane.id, file.path)}
                             >
                               <span className="workdir-tab-label">{file.name}</span>
+                              {editorByPath[file.path]?.dirty && (
+                                <span className="workdir-tab-dirty" title="未保存" aria-label="未保存" />
+                              )}
                               <button
                                 type="button"
                                 className="workdir-tab-close"
                                 onClick={(event) => {
                                   event.stopPropagation();
                                   closeFile(pane.id, file.path);
+                                }}
+                                onPointerDown={(event) => {
+                                  event.stopPropagation();
                                 }}
                                 aria-label={`关闭 ${file.name}`}
                                 title="关闭"
@@ -1203,7 +1631,7 @@ function WorkDirBrowser({
                           !paneActiveFile.loading &&
                           !paneActiveFile.error &&
                           paneActiveFile.kind === 'image' && (
-                            <div className="workdir-image-viewer">
+                            <div className="workdir-image-viewer workdir-viewer-body">
                               {paneActiveFile.url ? (
                                 <img src={paneActiveFile.url} alt={paneActiveFile.name} />
                               ) : (
@@ -1216,7 +1644,7 @@ function WorkDirBrowser({
                           !paneActiveFile.error &&
                           paneActiveFile.kind === 'markdown' && (
                             <div
-                              className="workdir-markdown"
+                              className="workdir-markdown workdir-viewer-body"
                               onClick={handleMarkdownLinkClick}
                               dangerouslySetInnerHTML={{ __html: markdown.render(paneActiveFile.content || '') }}
                             />
@@ -1224,22 +1652,79 @@ function WorkDirBrowser({
                       {paneActiveFile &&
                         !paneActiveFile.loading &&
                         !paneActiveFile.error &&
-                        paneActiveFile.kind === 'text' && (
-                          <div className="workdir-text-viewer">
-                            {(() => {
-                              const lines = (paneActiveFile.content ?? '').split('\n');
-                              const width = String(Math.max(1, lines.length)).length;
-                              return lines.map((line, index) => (
-                                <div key={`${paneActiveFile.path}-line-${index + 1}`} className="workdir-text-line">
-                                  <span className="workdir-text-gutter" style={{ width: `${width}ch` }}>
-                                    {index + 1}
-                                  </span>
-                                  <span className="workdir-text-content">{line || ' '}</span>
+                        paneActiveFile.kind === 'text' && (() => {
+                          const editorState = editorByPath[paneActiveFile.path];
+                          const isEditing = true;
+                          const sourceText = editorState?.value ?? paneActiveFile.content ?? '';
+                          const lines = sourceText.split('\n');
+                          const width = String(Math.max(1, lines.length)).length;
+                          const gutterWidth = Math.max(2, width + 2);
+                          return (
+                            <div className="workdir-text-container">
+                              {editorState?.error && (
+                                <div className="workdir-text-error workdir-viewer-body">保存失败：{editorState.error}</div>
+                              )}
+                              {isEditing ? (
+                                <div className="workdir-text-editor">
+                                  <div
+                                    className="workdir-text-gutter-column"
+                                    style={{ width: `${gutterWidth}ch` }}
+                                    ref={(el) => {
+                                      editorGutterRefs.current[paneActiveFile.path] = el;
+                                    }}
+                                  >
+                                    {lines.map((_, index) => (
+                                      <div
+                                        key={`${paneActiveFile.path}-editor-line-${index + 1}`}
+                                        className="workdir-text-gutter-line"
+                                      >
+                                        {index + 1}
+                                      </div>
+                                    ))}
+                                  </div>
+                                  <textarea
+                                    className="workdir-text-area"
+                                    ref={(el) => {
+                                      editorRefs.current[paneActiveFile.path] = el;
+                                    }}
+                                    value={editorState?.value ?? ''}
+                                    onChange={(event) => updateEditorValue(paneActiveFile.path, event.currentTarget.value)}
+                                    onContextMenu={(event) => {
+                                      event.preventDefault();
+                                      event.stopPropagation();
+                                      setEditorMenu({
+                                        x: event.clientX,
+                                        y: event.clientY,
+                                        path: paneActiveFile.path,
+                                      });
+                                    }}
+                                    onScroll={(event) => {
+                                      const gutter = editorGutterRefs.current[paneActiveFile.path];
+                                      if (gutter) {
+                                        gutter.scrollTop = event.currentTarget.scrollTop;
+                                      }
+                                    }}
+                                    onKeyDown={handleEditorKeyDown(paneActiveFile.path)}
+                                    spellCheck={false}
+                                    wrap="off"
+                                    disabled={editorState?.saving}
+                                  />
                                 </div>
-                              ));
-                            })()}
-                          </div>
-                        )}
+                              ) : (
+                                <div className="workdir-text-viewer workdir-viewer-body">
+                                  {lines.map((line, index) => (
+                                    <div key={`${paneActiveFile.path}-line-${index + 1}`} className="workdir-text-line">
+                                      <span className="workdir-text-gutter" style={{ width: `${gutterWidth}ch` }}>
+                                        {index + 1}
+                                      </span>
+                                      <span className="workdir-text-content">{line || ' '}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
                     {index < panes.length - 1 && (
@@ -1296,6 +1781,31 @@ function WorkDirBrowser({
         </div>
       )}
 
+      {editorMenu && (
+        <div
+          className="workdir-context-menu"
+          style={{
+            top: Math.min(editorMenu.y, window.innerHeight - 120),
+            left: Math.min(editorMenu.x, window.innerWidth - 200),
+          }}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            className="workdir-context-item"
+            disabled={!editorByPath[editorMenu.path]?.dirty}
+            onClick={() => {
+              const path = editorMenu.path;
+              setEditorMenu(null);
+              cancelEditFile(path);
+            }}
+          >
+            还原未保存
+          </button>
+        </div>
+      )}
+
       {newFolderTarget && (
         <div
           className="workdir-dialog-backdrop"
@@ -1345,6 +1855,24 @@ function WorkDirBrowser({
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {dragGhost.visible && (
+        <div
+          className="workdir-drag-ghost"
+          style={{ transform: `translate3d(${dragGhost.x + 12}px, ${dragGhost.y + 12}px, 0)` }}
+        >
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M4 2h5l3 3v9H4z"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.2"
+              strokeLinejoin="round"
+            />
+            <path d="M9 2v3h3" fill="none" stroke="currentColor" strokeWidth="1.2" />
+          </svg>
         </div>
       )}
 

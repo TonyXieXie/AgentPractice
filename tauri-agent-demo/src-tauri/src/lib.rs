@@ -1,16 +1,110 @@
+use std::{
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    sync::Mutex,
+};
+
+use tauri::{Manager, RunEvent};
+
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+struct BackendChild(Mutex<Option<Child>>);
+
+fn resolve_backend_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|_| "Failed to resolve resource directory.".to_string())?;
+    let exe_name = if cfg!(windows) {
+        "tauri-agent-backend.exe"
+    } else {
+        "tauri-agent-backend"
+    };
+    let candidate = resource_dir.join(exe_name);
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    let fallback = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(exe_name)));
+    if let Some(path) = fallback {
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "Backend sidecar not found at {}.",
+        candidate.display()
+    ))
+}
+
+fn spawn_backend<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Child, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Failed to resolve app data directory.".to_string())?;
+    std::fs::create_dir_all(&app_data_dir)
+        .map_err(|err| format!("Failed to create app data directory: {err}"))?;
+
+    let db_path = app_data_dir.join("chat_app.db");
+    let app_config_path = app_data_dir.join("app_config.json");
+    let tools_config_path = app_data_dir.join("tools_config.json");
+    let backend_path = resolve_backend_path(app)?;
+
+    let mut command = Command::new(backend_path);
+    command.arg("--host").arg("127.0.0.1").arg("--port").arg("8000");
+    command.env("TAURI_AGENT_DATA_DIR", &app_data_dir);
+    command.env("TAURI_AGENT_DB_PATH", &db_path);
+    command.env("APP_CONFIG_PATH", &app_config_path);
+    command.env("TOOLS_CONFIG_PATH", &tools_config_path);
+    command.current_dir(&app_data_dir);
+    if !tauri::is_dev() {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+
+    command
+        .spawn()
+        .map_err(|err| format!("Failed to spawn backend sidecar: {err}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let context = tauri::generate_context!();
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![greet])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .setup(|app| {
+            match spawn_backend(&app.handle()) {
+                Ok(child) => {
+                    app.manage(BackendChild(Mutex::new(Some(child))));
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    if !tauri::is_dev() {
+                        return Err(err.into());
+                    }
+                }
+            }
+            Ok(())
+        })
+        .build(context)
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
+            if let Some(state) = app_handle.try_state::<BackendChild>() {
+                if let Ok(mut guard) = state.0.lock() {
+                    if let Some(mut child) = guard.take() {
+                        let _ = child.kill();
+                    }
+                }
+            }
+        }
+    });
 }

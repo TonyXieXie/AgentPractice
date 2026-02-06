@@ -633,8 +633,8 @@ body {
 .input-attachments {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
-  padding: 2px 4px;
+  gap: 8px;
+  padding: 2px 2px 0;
 }
 
 .input-attachment {
@@ -642,16 +642,16 @@ body {
 }
 
 .input-attachment .attachment-thumb img {
-  width: 72px;
-  height: 72px;
+  width: 30px;
+  height: 30px;
 }
 
 .attachment-remove {
   position: absolute;
   top: -6px;
   right: -6px;
-  width: 20px;
-  height: 20px;
+  width: 16px;
+  height: 16px;
   border-radius: 999px;
   border: 1px solid rgba(248, 113, 113, 0.55);
   background: rgba(15, 17, 21, 0.9);
@@ -661,6 +661,7 @@ body {
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.15s, transform 0.15s;
+  z-index: 2;
 }
 
 .input-attachment:hover .attachment-remove {

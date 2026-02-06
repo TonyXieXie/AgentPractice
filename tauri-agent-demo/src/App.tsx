@@ -2,7 +2,7 @@
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { readDir } from '@tauri-apps/plugin-fs';
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import './App.css';
 import { Message, MessageAttachment, LLMConfig, LLMCall, ToolPermissionRequest, ReasoningEffort, AgentMode } from './types';
@@ -51,7 +51,10 @@ const AGENT_MODE_OPTIONS: { value: AgentMode; label: string; description: string
 
 const MAX_CONCURRENT_STREAMS = 10;
 const WORK_PATH_MAX_LENGTH = 200;
+const MAIN_WINDOW_BOUNDS_KEY = 'mainWindowBounds';
 const WORKDIR_BOUNDS_KEY = 'workdirWindowBounds';
+const MAIN_DEFAULT_WIDTH = 1200;
+const MAIN_DEFAULT_HEIGHT = 950;
 const WORKDIR_DEFAULT_WIDTH = 1200;
 const WORKDIR_DEFAULT_HEIGHT = 800;
 const DEFAULT_MAX_CONTEXT_TOKENS = 200000;
@@ -62,6 +65,30 @@ type WorkdirBounds = {
   y?: number;
   width?: number;
   height?: number;
+};
+
+type MainWindowBounds = {
+  width?: number;
+  height?: number;
+};
+
+const getMainWindowBounds = (): MainWindowBounds => {
+  const fallback: MainWindowBounds = {
+    width: MAIN_DEFAULT_WIDTH,
+    height: MAIN_DEFAULT_HEIGHT,
+  };
+  try {
+    const raw = localStorage.getItem(MAIN_WINDOW_BOUNDS_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<MainWindowBounds> | null;
+    if (!parsed || typeof parsed !== 'object') return fallback;
+    const next: MainWindowBounds = { ...fallback };
+    if (Number.isFinite(parsed.width)) next.width = Math.max(800, Math.round(parsed.width as number));
+    if (Number.isFinite(parsed.height)) next.height = Math.max(600, Math.round(parsed.height as number));
+    return next;
+  } catch {
+    return fallback;
+  }
 };
 
 const getWorkdirWindowBounds = (): WorkdirBounds | null => {
@@ -124,6 +151,75 @@ const isAbsolutePath = (value: string) =>
 
 const isBareFilename = (value: string) =>
   Boolean(value) && !/[\\/]/.test(value) && !value.startsWith('./') && !value.startsWith('../');
+
+const FILE_EXT_PATTERN = /\.[A-Za-z0-9]{1,10}$/;
+const FILE_HASH_PATTERN = /^(.*)#L(\d+)(?:C(\d+))?$/i;
+const FILE_LINE_PATTERN = /^(.*?)(?::(\d+))(?:[:#](\d+))?$/;
+
+const hasScheme = (value: string) => /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value);
+
+const ESCAPE_SEGMENTS = new Set(['n', 'r', 't', 'b', 'f', 'v', '0']);
+
+const looksLikeFilePath = (value: string) => {
+  if (!value) return false;
+  if (/^file:\/\//i.test(value)) return true;
+  if (/^[a-zA-Z]:[\\/]/.test(value)) {
+    const rest = value.slice(3);
+    const firstSegment = rest.split(/[\\/]/)[0];
+    if (firstSegment.length === 1 && ESCAPE_SEGMENTS.has(firstSegment.toLowerCase())) {
+      return false;
+    }
+    return true;
+  }
+  if (value.startsWith('\\\\')) return true;
+  if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return true;
+  return FILE_EXT_PATTERN.test(value);
+};
+
+const normalizeFileHref = (value: string) => {
+  if (!value) return '';
+  if (value.startsWith('file://')) {
+    try {
+      const url = new URL(value);
+      let pathname = decodeURIComponent(url.pathname || '');
+      if (/^\/[A-Za-z]:\//.test(pathname)) {
+        pathname = pathname.slice(1);
+      }
+      return pathname;
+    } catch {
+      return value;
+    }
+  }
+  return value;
+};
+
+const parseFileLocation = (rawValue: string) => {
+  const trimmed = rawValue.trim();
+  if (!trimmed) return { path: '' };
+  const hashMatch = trimmed.match(FILE_HASH_PATTERN);
+  if (hashMatch) {
+    const path = hashMatch[1];
+    if (looksLikeFilePath(path) && (!hasScheme(path) || /^[a-zA-Z]:[\\/]/.test(path) || /^file:\/\//i.test(path))) {
+      return {
+        path,
+        line: Number(hashMatch[2]),
+        column: hashMatch[3] ? Number(hashMatch[3]) : undefined,
+      };
+    }
+  }
+  const lineMatch = trimmed.match(FILE_LINE_PATTERN);
+  if (lineMatch) {
+    const path = lineMatch[1];
+    if (looksLikeFilePath(path) && (!hasScheme(path) || /^[a-zA-Z]:[\\/]/.test(path) || /^file:\/\//i.test(path))) {
+      return {
+        path,
+        line: Number(lineMatch[2]),
+        column: lineMatch[3] ? Number(lineMatch[3]) : undefined,
+      };
+    }
+  }
+  return { path: trimmed };
+};
 
 const joinPath = (base: string, child: string) => {
   if (!base) return child;
@@ -316,6 +412,7 @@ function App() {
   const [allConfigs, setAllConfigs] = useState<LLMConfig[]>([]);
   const [showConfigSelector, setShowConfigSelector] = useState(false);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
+  const [debugFocus, setDebugFocus] = useState<{ key: string; messageId: number; iteration: number; callId?: number } | null>(null);
   const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
   const [agentMode, setAgentMode] = useState<AgentMode>('default');
   const [showReasoningSelector, setShowReasoningSelector] = useState(false);
@@ -347,6 +444,12 @@ function App() {
     loadDefaultConfig();
     loadAllConfigs();
   }, []);
+
+  useEffect(() => {
+    const bounds = getMainWindowBounds();
+    if (!bounds?.width || !bounds?.height) return;
+    appWindow.setSize(new LogicalSize(bounds.width, bounds.height)).catch(() => undefined);
+  }, [appWindow]);
 
   useEffect(() => {
     currentSessionIdRef.current = currentSessionId;
@@ -482,6 +585,44 @@ function App() {
     };
   }, [appWindow]);
 
+  useEffect(() => {
+    let timer: number | null = null;
+    let unlisten: (() => void) | null = null;
+
+    const saveBounds = async () => {
+      try {
+        const isMax = await appWindow.isMaximized();
+        if (isMax) return;
+        const size = await appWindow.outerSize();
+        const payload = {
+          width: Math.max(800, Math.round(size.width)),
+          height: Math.max(600, Math.round(size.height)),
+        };
+        localStorage.setItem(MAIN_WINDOW_BOUNDS_KEY, JSON.stringify(payload));
+      } catch {
+        // ignore
+      }
+    };
+
+    const scheduleSave = () => {
+      if (timer) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        void saveBounds();
+      }, 300);
+    };
+
+    appWindow.onResized(scheduleSave).then((stop) => {
+      unlisten = stop;
+    });
+    window.addEventListener('beforeunload', scheduleSave);
+
+    return () => {
+      if (timer) window.clearTimeout(timer);
+      if (unlisten) unlisten();
+      window.removeEventListener('beforeunload', scheduleSave);
+    };
+  }, [appWindow]);
+
   const handleTitlebarMinimize = async () => {
     try {
       await appWindow.minimize();
@@ -522,11 +663,7 @@ function App() {
     if (!container) return;
     const behavior: ScrollBehavior = container.scrollHeight > container.clientHeight ? 'smooth' : 'auto';
     const scrollToBottom = () => {
-      if ('scrollTo' in container) {
-        container.scrollTo({ top: container.scrollHeight, behavior });
-      } else {
-        container.scrollTop = container.scrollHeight;
-      }
+      container.scrollTo({ top: container.scrollHeight, behavior });
     };
     requestAnimationFrame(scrollToBottom);
   }, [messages]);
@@ -569,6 +706,12 @@ function App() {
       refreshSessionDebug(currentSessionId);
     }
   }, [showDebugPanel, currentSessionId, sessionRefreshTrigger]);
+
+  useEffect(() => {
+    if (!showDebugPanel && debugFocus) {
+      setDebugFocus(null);
+    }
+  }, [showDebugPanel, debugFocus]);
 
   useEffect(() => {
     if (getInFlightCount() === 0) {
@@ -1171,9 +1314,21 @@ function App() {
     }
   };
 
+  const handleOpenDebugCall = (messageId: number, iteration: number) => {
+    if (!showDebugPanel) return;
+    const call = llmCalls.find((item) => item.message_id === messageId && item.iteration === iteration);
+    const key = `${messageId}-${iteration}-${call?.id ?? 'none'}-${Date.now()}`;
+    setDebugFocus({ key, messageId, iteration, callId: call?.id });
+  };
+
   const handleSwitchConfig = async (configId: string) => {
     try {
       const config = await getConfig(configId);
+      const sessionId = currentSessionIdRef.current;
+      if (sessionId) {
+        await updateSession(sessionId, { config_id: config.id });
+        setSessionRefreshTrigger((prev) => prev + 1);
+      }
       setCurrentConfig(config);
       setShowConfigSelector(false);
     } catch (error) {
@@ -1202,7 +1357,12 @@ function App() {
     await applyWorkPath(sessionKey, currentSessionIdRef.current, selected);
   };
 
-  const openWorkDirWindow = async (path: string, openFilePath?: string) => {
+  const openWorkDirWindow = async (
+    path: string,
+    openFilePath?: string,
+    openLine?: number,
+    openColumn?: number
+  ) => {
     const label = makeWorkdirLabel(path);
     const existing = await WebviewWindow.getByLabel(label);
     if (existing) {
@@ -1215,14 +1375,16 @@ function App() {
       void existing.emit('workdir:ping', { target: label });
       void existing.emit('workdir:set', { path, target: label });
       if (openFilePath) {
-        void existing.emit('workdir:open-file', { path: openFilePath, target: label });
+        void existing.emit('workdir:open-file', { path: openFilePath, line: openLine, column: openColumn, target: label });
       }
       return;
     }
 
     const bounds = getWorkdirWindowBounds();
     const url = openFilePath
-      ? `/?window=workdir&path=${encodeURIComponent(path)}&open=${encodeURIComponent(openFilePath)}`
+      ? `/?window=workdir&path=${encodeURIComponent(path)}&open=${encodeURIComponent(openFilePath)}${
+        openLine ? `&line=${encodeURIComponent(String(openLine))}` : ''
+      }${openColumn ? `&col=${encodeURIComponent(String(openColumn))}` : ''}`
       : `/?window=workdir&path=${encodeURIComponent(path)}`;
     const win = new WebviewWindow(label, {
       title: 'GYY',
@@ -1237,7 +1399,7 @@ function App() {
     win.once('tauri://created', () => {
       void win.emit('workdir:set', { path, target: label });
       if (openFilePath) {
-        void win.emit('workdir:open-file', { path: openFilePath, target: label });
+        void win.emit('workdir:open-file', { path: openFilePath, line: openLine, column: openColumn, target: label });
       }
     });
 
@@ -1246,8 +1408,13 @@ function App() {
     });
   };
 
-  const openWorkdirForFile = async (filePath: string) => {
-    const trimmed = filePath.trim();
+  const openWorkdirForFile = async (filePath: string, line?: number, column?: number) => {
+    const parsed = parseFileLocation(filePath);
+    const rawPath = parsed.path || filePath;
+    const normalizedInput = normalizeFileHref(rawPath);
+    const targetLine = line ?? parsed.line;
+    const targetColumn = column ?? parsed.column;
+    const trimmed = normalizedInput.trim();
     if (!trimmed) return;
 
     let resolvedPath = trimmed;
@@ -1265,7 +1432,7 @@ function App() {
       alert('请先选择工作路径。');
       return;
     }
-    await openWorkDirWindow(root, resolvedPath);
+    await openWorkDirWindow(root, resolvedPath, targetLine, targetColumn);
   };
 
   const openWorkPathInExplorer = async (path: string) => {
@@ -1615,7 +1782,7 @@ function App() {
     await rollbackToMessage(messageId, { keepInput });
   };
 
-  const handleRevertPatch = async (revertPatchContent: string) => {
+  const handleRevertPatch = async (revertPatchContent: string, messageId?: number) => {
     if (!currentSessionId) {
       alert('请先选择会话。');
       return;
@@ -1628,7 +1795,7 @@ function App() {
     }
     setPatchRevertBusy(true);
     try {
-      await revertPatch(currentSessionId, revertPatchContent);
+      await revertPatch(currentSessionId, revertPatchContent, messageId);
       await handleSelectSession(currentSessionId);
       setSessionRefreshTrigger((prev) => prev + 1);
       await refreshSessionDebug(currentSessionId);
@@ -1800,6 +1967,7 @@ function App() {
                       {msg.role === 'assistant' && (steps.length > 0 || showPermission) ? (
                         <AgentStepView
                           steps={steps}
+                          messageId={msg.id}
                           streaming={streaming}
                           pendingPermission={showPermission ? currentPendingPermission : null}
                           onPermissionDecision={handlePermissionDecision}
@@ -1815,6 +1983,8 @@ function App() {
                           onRevertPatch={handleRevertPatch}
                           patchRevertBusy={patchRevertBusy}
                           onOpenWorkFile={openWorkdirForFile}
+                          debugActive={showDebugPanel}
+                          onOpenDebugCall={(iteration) => handleOpenDebugCall(msg.id, iteration)}
                         />
                       ) : msg.role === 'user' ? (
                         <>
@@ -1911,19 +2081,6 @@ function App() {
               </div>
             )}
 
-            <input
-              onChange={(e) => {
-                setInputMsg(e.currentTarget.value);
-                autoScrollRef.current = true;
-              }}
-              onPaste={handlePaste}
-              onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
-              value={inputMsg}
-              placeholder={currentConfig ? 'Type a message...' : 'Please configure an LLM'}
-              disabled={!currentConfig}
-              ref={inputRef}
-            />
-
             {pendingAttachments.length > 0 && (
               <div className="input-attachments">
                 {pendingAttachments.map((attachment) => (
@@ -1950,6 +2107,19 @@ function App() {
                 ))}
               </div>
             )}
+
+            <input
+              onChange={(e) => {
+                setInputMsg(e.currentTarget.value);
+                autoScrollRef.current = true;
+              }}
+              onPaste={handlePaste}
+              onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
+              value={inputMsg}
+              placeholder={currentConfig ? 'Type a message...' : 'Please configure an LLM'}
+              disabled={!currentConfig}
+              ref={inputRef}
+            />
 
             <div className="input-footer">
               {currentConfig && (
@@ -2179,7 +2349,15 @@ function App() {
       </div>
 
       {showDebugPanel && (
-        <DebugPanel messages={messages} llmCalls={llmCalls} onClose={() => setShowDebugPanel(false)} />
+        <DebugPanel
+          messages={messages}
+          llmCalls={llmCalls}
+          onClose={() => {
+            setShowDebugPanel(false);
+            setDebugFocus(null);
+          }}
+          focusTarget={debugFocus}
+        />
       )}
 
       {showConfigManager && (

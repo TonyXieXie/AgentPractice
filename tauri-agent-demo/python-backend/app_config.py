@@ -40,6 +40,10 @@ def _get_config_file_path() -> Path:
     if env_path:
         return _normalize_config_path(Path(env_path))
 
+    tauri_data_dir = os.getenv("TAURI_AGENT_DATA_DIR")
+    if tauri_data_dir:
+        return _normalize_config_path(Path(tauri_data_dir))
+
     root = _get_project_root()
     default_path = root / "app_config.json"
     if default_path.exists():

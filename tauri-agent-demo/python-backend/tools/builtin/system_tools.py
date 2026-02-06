@@ -96,6 +96,34 @@ def _resolve_path(raw_path: str, tool_name: str, action: str) -> Path:
     return path
 
 
+def _maybe_create_snapshot() -> None:
+    tool_ctx = get_tool_context()
+    session_id = tool_ctx.get("session_id")
+    message_id = tool_ctx.get("message_id")
+    if not session_id or not message_id:
+        if not session_id:
+            return
+        try:
+            from database import db
+            message_id = db.get_latest_assistant_message_id(str(session_id))
+        except Exception:
+            return
+        if not message_id:
+            return
+    try:
+        message_id = int(message_id)
+    except (TypeError, ValueError):
+        return
+
+    work_path = tool_ctx.get("work_path")
+    root = Path(work_path).expanduser().resolve() if work_path else _get_root_path()
+    try:
+        from ghost_snapshot import ensure_snapshot
+        ensure_snapshot(str(session_id), message_id, str(root))
+    except Exception:
+        return
+
+
 def _parse_json_input(input_data: str) -> Dict[str, Any]:
     if not input_data:
         return {}
@@ -143,6 +171,22 @@ def _find_all_matches(lines: list, pattern: list) -> list:
         return matches
     for idx in range(0, len(lines) - len(pattern) + 1):
         if lines[idx:idx + len(pattern)] == pattern:
+            matches.append(idx)
+    return matches
+
+
+def _normalize_match_line(line: str) -> str:
+    return (line or "").strip()
+
+
+def _find_all_matches_relaxed(lines: list, pattern: list) -> list:
+    matches = []
+    if not pattern:
+        return matches
+    normalized_lines = [_normalize_match_line(line) for line in lines]
+    normalized_pattern = [_normalize_match_line(line) for line in pattern]
+    for idx in range(0, len(lines) - len(pattern) + 1):
+        if normalized_lines[idx:idx + len(pattern)] == normalized_pattern:
             matches.append(idx)
     return matches
 
@@ -250,15 +294,20 @@ def _apply_update_hunks(lines: list, hunks: list) -> list:
             raise ValueError("Hunk has no context. Add more surrounding lines.")
         matches = _find_all_matches(updated, pattern)
         if len(matches) == 0:
-            raise ValueError("Hunk context not found. Provide more context.")
-        if len(matches) > 1:
+            matches = _find_all_matches_relaxed(updated, pattern)
+            if len(matches) == 0:
+                raise ValueError("Hunk context not found. Provide more context.")
+            if len(matches) > 1:
+                raise ValueError("Hunk context is not unique after whitespace relaxation. Provide more context.")
+        elif len(matches) > 1:
             raise ValueError("Hunk context is not unique. Provide more context.")
         start = matches[0]
+        matched_slice = updated[start:start + len(pattern)]
         new_segment = []
         pattern_idx = 0
         for prefix, text in hunk:
             if prefix == " ":
-                new_segment.append(text)
+                new_segment.append(matched_slice[pattern_idx])
                 pattern_idx += 1
             elif prefix == "-":
                 pattern_idx += 1
@@ -581,6 +630,7 @@ class WriteFileTool(Tool):
             raise ValueError("Missing path or content.")
         mode = (data.get("mode") or "write").lower()
         encoding = data.get("encoding") or "utf-8"
+        _maybe_create_snapshot()
         file_path = _resolve_path(str(path), self.name, "write")
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_mode = "a" if mode == "append" else "w"
@@ -827,6 +877,7 @@ class ApplyPatchTool(Tool):
         if not patch_text:
             raise ValueError("Missing patch content.")
         try:
+            _maybe_create_snapshot()
             result = _apply_patch_text(patch_text)
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:

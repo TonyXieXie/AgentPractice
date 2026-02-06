@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import json
 import os
+import argparse
 import shlex
 import base64
 from io import BytesIO
@@ -34,6 +35,7 @@ from tools.context import set_tool_context, reset_tool_context
 from tools.builtin.system_tools import ApplyPatchTool
 from stream_control import stream_stop_registry
 from app_config import get_app_config, update_app_config, get_app_config_path
+from ghost_snapshot import restore_snapshot
 
 app = FastAPI(title="Tauri Agent Chat Backend")
 
@@ -483,6 +485,10 @@ def create_session(session: ChatSessionCreate):
 
 @app.put("/sessions/{session_id}", response_model=ChatSession)
 def update_session(session_id: str, update: ChatSessionUpdate):
+    if update.config_id is not None:
+        config = db.get_config(update.config_id)
+        if not config:
+            raise HTTPException(status_code=404, detail="Config not found")
     session = db.update_session(session_id, update)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -517,11 +523,34 @@ def get_session_agent_steps(session_id: str):
 
 @app.post("/sessions/{session_id}/rollback")
 def rollback_session(session_id: str, request: RollbackRequest):
+    target = db.get_message(session_id, request.message_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Message not found in session")
+    if target.get("role") != "user":
+        raise HTTPException(status_code=400, detail="Rollback target must be a user message.")
+
+    snapshot = db.get_snapshot_for_rollback(session_id, request.message_id)
+    if snapshot:
+        try:
+            restore_snapshot(snapshot.get("tree_hash"), snapshot.get("work_path"))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Snapshot restore failed: {str(e)}")
+
     result = db.rollback_session(session_id, request.message_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Message not found in session")
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
+
+    if snapshot:
+        try:
+            db.delete_file_snapshots_from(session_id, request.message_id)
+        except Exception:
+            pass
+        result["snapshot_restored"] = True
+    else:
+        result["snapshot_restored"] = False
+
     return result
 
 # ==================== Attachments ====================
@@ -1089,25 +1118,46 @@ async def revert_patch(request: PatchRevertRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    token = set_tool_context({
-        "shell_unrestricted": False,
-        "agent_mode": "default",
-        "session_id": session.id,
-        "work_path": session.work_path
-    })
-    try:
-        tool = ApplyPatchTool()
-        result_text = await tool.execute(json.dumps({"patch": request.revert_patch}))
-    finally:
-        reset_tool_context(token)
+    snapshot_restored = False
+    snapshot_error = None
+    if request.message_id:
+        snapshot = db.get_file_snapshot(session.id, request.message_id)
+        if snapshot:
+            try:
+                restore_snapshot(snapshot.get("tree_hash"), snapshot.get("work_path"))
+                snapshot_restored = True
+            except Exception as e:
+                snapshot_error = str(e)
 
-    try:
-        result = json.loads(result_text)
-    except Exception:
-        result = {"ok": False, "error": result_text}
+    result_text = ""
+    result: Dict[str, Any] = {"ok": False}
 
-    if not result.get("ok"):
-        raise HTTPException(status_code=400, detail=result.get("error", "Patch revert failed"))
+    if not snapshot_restored:
+        token = set_tool_context({
+            "shell_unrestricted": False,
+            "agent_mode": "default",
+            "session_id": session.id,
+            "work_path": session.work_path
+        })
+        try:
+            tool = ApplyPatchTool()
+            result_text = await tool.execute(json.dumps({"patch": request.revert_patch}))
+        finally:
+            reset_tool_context(token)
+
+        try:
+            result = json.loads(result_text)
+        except Exception:
+            result = {"ok": False, "error": result_text}
+
+        if not result.get("ok"):
+            detail = result.get("error", "Patch revert failed")
+            if snapshot_error:
+                detail = f"{detail} (snapshot restore failed: {snapshot_error})"
+            raise HTTPException(status_code=400, detail=detail)
+    else:
+        result = {"ok": True, "snapshot_restored": True}
+        result_text = json.dumps(result, ensure_ascii=False)
 
     user_msg = db.create_message(ChatMessageCreate(
         session_id=session.id,
@@ -1127,7 +1177,7 @@ async def revert_patch(request: PatchRevertRequest):
         step_type="observation",
         content=result_text,
         sequence=0,
-        metadata={"tool": "apply_patch", "patch_event": "revert"}
+        metadata={"tool": "apply_patch" if not snapshot_restored else "snapshot_restore", "patch_event": "revert"}
     )
     db.save_agent_step(
         message_id=assistant_msg.id,
@@ -1194,7 +1244,12 @@ def update_tool_permission(request_id: int, update: ToolPermissionRequestUpdate)
     return updated
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Tauri Agent Backend")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--reload", action="store_true")
+    args = parser.parse_args()
     print("Starting FastAPI server...")
     print("Supported LLMs: OpenAI, ZhipuAI, Deepseek")
-    print("Database: SQLite (chat_app.db)")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    print(f"Database: SQLite ({os.getenv('TAURI_AGENT_DB_PATH', 'chat_app.db')})")
+    uvicorn.run(app, host=args.host, port=args.port, reload=args.reload)

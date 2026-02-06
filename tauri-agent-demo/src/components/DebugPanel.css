@@ -85,6 +85,11 @@
     overflow: hidden;
 }
 
+.debug-message.focused {
+    border-color: rgba(56, 189, 248, 0.5);
+    box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.2) inset;
+}
+
 .debug-message-header {
     padding: 10px 12px;
     cursor: pointer;

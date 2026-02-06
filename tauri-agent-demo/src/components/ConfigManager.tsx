@@ -158,6 +158,51 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         setShowForm(true);
     };
 
+    const getCopyName = (baseName: string) => {
+        const existingNames = new Set(configs.map((item) => item.name));
+        const baseCopy = `${baseName} (copy)`;
+        if (!existingNames.has(baseCopy)) {
+            return baseCopy;
+        }
+        let index = 2;
+        while (existingNames.has(`${baseName} (copy ${index})`)) {
+            index += 1;
+        }
+        return `${baseName} (copy ${index})`;
+    };
+
+    const handleCopy = async (config: LLMConfig) => {
+        const copyData: LLMConfigCreate = {
+            name: getCopyName(config.name),
+            api_format: config.api_format,
+            api_profile: config.api_profile,
+            api_key: config.api_key,
+            base_url: config.base_url || '',
+            model: config.model,
+            temperature: config.temperature,
+            max_tokens: config.max_tokens,
+            max_context_tokens: config.max_context_tokens ?? 200000,
+            is_default: false,
+            reasoning_effort: config.reasoning_effort,
+            reasoning_summary: config.reasoning_summary,
+        };
+        try {
+            await createConfig(copyData);
+            await loadConfigs();
+            onConfigCreated?.();
+        } catch (error: any) {
+            console.error('Failed to copy config:', error);
+            let errorMessage = 'Failed to copy config';
+            if (error.message) {
+                errorMessage += `: ${error.message}`;
+            }
+            if (error.message?.includes('fetch')) {
+                errorMessage += '\n\nPlease verify:\n1) Backend is running\n2) http://127.0.0.1:8000 is reachable';
+            }
+            alert(errorMessage);
+        }
+    };
+
     const handleDelete = (config: LLMConfig) => {
         setDeleteTarget(config);
     };
@@ -238,7 +283,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     };
 
     return (
-        <div className="modal-overlay" onClick={onClose}>
+        <div className="modal-overlay">
             <div className="modal-content" onClick={(e) => e.stopPropagation()}>
                 <div className="modal-header">
                     <h2>配置管理</h2>
@@ -267,48 +312,111 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                     </div>
 
                     {activeTab === 'models' ? (
-                        !showForm ? (
-                            <>
-                                <button className="add-btn" onClick={() => setShowForm(true)}>
-                                    + Add Config
-                                </button>
+                        <>
+                            <button className="add-btn" onClick={() => setShowForm(true)}>
+                                + Add Config
+                            </button>
 
-                                <div className="configs-list">
-                                    {configs.length === 0 ? (
-                                        <p className="empty-message">No configs yet.</p>
-                                    ) : (
-                                        configs.map((config) => (
-                                            <div key={config.id} className="config-item">
-                                                <div className="config-info">
-                                                    <h3>
-                                                        {config.name}
-                                                        {config.is_default && <span className="badge">Default</span>}
-                                                    </h3>
-                                                    <p className="config-detail">
-                                                        <strong>Format:</strong> {config.api_format} |
-                                                        <strong> Profile:</strong> {config.api_profile}
-                                                    </p>
-                                                    <p className="config-detail">
-                                                        <strong>Model:</strong> {config.model}
-                                                    </p>
-                                                    <p className="config-detail">
-                                                        <strong>Temp:</strong> {config.temperature} |
-                                                        <strong> Max Tokens:</strong> {config.max_tokens} |
-                                                        <strong> Max Context:</strong> {config.max_context_tokens ?? 200000}
-                                                    </p>
-                                                </div>
-                                                <div className="config-actions">
-                                                    <button onClick={() => handleEdit(config)}>Edit</button>
-                                                    <button onClick={() => handleDelete(config)} className="delete-btn">Delete</button>
-                                                </div>
+                            <div className="configs-list">
+                                {configs.length === 0 ? (
+                                    <p className="empty-message">No configs yet.</p>
+                                ) : (
+                                    configs.map((config) => (
+                                        <div key={config.id} className="config-item">
+                                            <div className="config-info">
+                                                <h3>
+                                                    {config.name}
+                                                    {config.is_default && <span className="badge">Default</span>}
+                                                </h3>
+                                                <p className="config-detail">
+                                                    <strong>Format:</strong> {config.api_format} |
+                                                    <strong> Profile:</strong> {config.api_profile}
+                                                </p>
+                                                <p className="config-detail">
+                                                    <strong>Model:</strong> {config.model}
+                                                </p>
+                                                <p className="config-detail">
+                                                    <strong>Temp:</strong> {config.temperature} |
+                                                    <strong> Max Tokens:</strong> {config.max_tokens} |
+                                                    <strong> Max Context:</strong> {config.max_context_tokens ?? 200000}
+                                                </p>
                                             </div>
-                                        ))
-                                    )}
-                                </div>
-                            </>
-                        ) : (
+                                            <div className="config-actions">
+                                                <button className="icon-btn" onClick={() => handleEdit(config)} aria-label="Edit" title="Edit">
+                                                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                                                        <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25z" />
+                                                        <path d="M20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" />
+                                                    </svg>
+                                                </button>
+                                                <button className="icon-btn" onClick={() => handleCopy(config)} aria-label="Copy" title="Copy">
+                                                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                                                        <path d="M16 1H4a2 2 0 00-2 2v12h2V3h12V1z" />
+                                                        <path d="M20 5H8a2 2 0 00-2 2v14a2 2 0 002 2h12a2 2 0 002-2V7a2 2 0 00-2-2zm0 16H8V7h12v14z" />
+                                                    </svg>
+                                                </button>
+                                                <button className="icon-btn delete-btn" onClick={() => handleDelete(config)} aria-label="Delete" title="Delete">
+                                                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                                                        <path d="M6 7h12l-1 14H7L6 7z" />
+                                                        <path d="M9 4h6l1 2H8l1-2z" />
+                                                    </svg>
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        </>
+                    ) : (
+                        <form onSubmit={handleGlobalSave} className="config-form">
+                            <h3>全局配置</h3>
+
+                            <div className="form-group">
+                                <label>LLM 超时（秒）</label>
+                                <input
+                                    type="number"
+                                    min="1"
+                                    max="3600"
+                                    step="1"
+                                    value={globalTimeoutSec}
+                                    onChange={(e) => {
+                                        setGlobalTimeoutSec(e.target.value);
+                                        setGlobalSaved(false);
+                                    }}
+                                    disabled={globalLoading || globalSaving}
+                                />
+                                <small>应用于所有模型请求。默认 180 秒。</small>
+                            </div>
+
+                            <div className="form-actions">
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        setGlobalSaved(false);
+                                        loadAppConfig();
+                                    }}
+                                    disabled={globalLoading || globalSaving}
+                                >
+                                    重置
+                                </button>
+                                <button type="submit" disabled={globalLoading || globalSaving}>
+                                    {globalSaving ? 'Saving...' : 'Save'}
+                                </button>
+                            </div>
+                            {globalSaved && <div className="save-hint">已保存</div>}
+                        </form>
+                    )}
+                </div>
+            </div>
+
+            {showForm && activeTab === 'models' && (
+                <div className="modal-overlay modal-overlay-nested">
+                    <div className="modal-content modal-content-nested" onClick={(e) => e.stopPropagation()}>
+                        <div className="modal-header">
+                            <h2>{editingConfig ? 'Edit Config' : 'Create Config'}</h2>
+                            <button className="close-btn" onClick={resetForm}>X</button>
+                        </div>
+                        <div className="modal-body">
                             <form onSubmit={handleSubmit} className="config-form">
-                                <h3>{editingConfig ? 'Edit Config' : 'Create Config'}</h3>
 
                                 <div className="form-group">
                                     <label>Name *</label>
@@ -442,48 +550,10 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     </button>
                                 </div>
                             </form>
-                        )
-                    ) : (
-                        <form onSubmit={handleGlobalSave} className="config-form">
-                            <h3>全局配置</h3>
-
-                            <div className="form-group">
-                                <label>LLM 超时（秒）</label>
-                                <input
-                                    type="number"
-                                    min="1"
-                                    max="3600"
-                                    step="1"
-                                    value={globalTimeoutSec}
-                                    onChange={(e) => {
-                                        setGlobalTimeoutSec(e.target.value);
-                                        setGlobalSaved(false);
-                                    }}
-                                    disabled={globalLoading || globalSaving}
-                                />
-                                <small>应用于所有模型请求。默认 180 秒。</small>
-                            </div>
-
-                            <div className="form-actions">
-                                <button
-                                    type="button"
-                                    onClick={() => {
-                                        setGlobalSaved(false);
-                                        loadAppConfig();
-                                    }}
-                                    disabled={globalLoading || globalSaving}
-                                >
-                                    重置
-                                </button>
-                                <button type="submit" disabled={globalLoading || globalSaving}>
-                                    {globalSaving ? 'Saving...' : 'Save'}
-                                </button>
-                            </div>
-                            {globalSaved && <div className="save-hint">已保存</div>}
-                        </form>
-                    )}
+                        </div>
+                    </div>
                 </div>
-            </div>
+            )}
             <ConfirmDialog
                 open={Boolean(deleteTarget)}
                 title="Delete config"

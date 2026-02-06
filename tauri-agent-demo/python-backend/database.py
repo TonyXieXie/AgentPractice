@@ -1,15 +1,19 @@
 ﻿from typing import List, Optional, Dict, Any
 import json
+import os
 from datetime import datetime
 import sqlite3
 import uuid
 from models import LLMConfig, LLMConfigCreate, LLMConfigUpdate, ChatMessage, ChatMessageCreate, ChatSession, ChatSessionCreate, ChatSessionUpdate
 
-DATABASE_PATH = "chat_app.db"
+DATABASE_PATH = os.getenv("TAURI_AGENT_DB_PATH", "chat_app.db")
 
 class Database:
     def __init__(self, db_path: str = DATABASE_PATH):
         self.db_path = db_path
+        parent = os.path.dirname(self.db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self.init_database()
     
     def get_connection(self):
@@ -228,6 +232,18 @@ class Database:
             )
         ''')
 
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS file_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                message_id INTEGER,
+                tree_hash TEXT NOT NULL,
+                work_path TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, message_id)
+            )
+        ''')
+
         try:
             cursor.execute('ALTER TABLE tool_permission_requests ADD COLUMN session_id TEXT')
         except sqlite3.OperationalError:
@@ -255,6 +271,8 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_llm_calls_session ON llm_calls(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_permission_status ON tool_permission_requests(status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_session ON file_snapshots(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_message ON file_snapshots(session_id, message_id)')
         
         conn.commit()
         conn.close()
@@ -507,6 +525,10 @@ class Database:
             fields.append("work_path = ?")
             values.append(update.work_path)
 
+        if update.config_id is not None:
+            fields.append("config_id = ?")
+            values.append(update.config_id)
+
         if fields:
             fields.append("updated_at = ?")
             values.append(datetime.now().isoformat())
@@ -636,6 +658,37 @@ class Database:
             messages.reverse()
 
         return messages
+
+    def get_message(self, session_id: str, message_id: int) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, session_id, role, content, timestamp
+            FROM chat_messages
+            WHERE id = ? AND session_id = ?
+        ''', (message_id, session_id))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def get_latest_assistant_message_id(self, session_id: str) -> Optional[int]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id
+            FROM chat_messages
+            WHERE session_id = ? AND role = 'assistant'
+            ORDER BY id DESC
+            LIMIT 1
+        ''', (session_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        try:
+            return int(row["id"])
+        except (TypeError, ValueError):
+            return None
 
     def save_message_attachment(
         self,
@@ -857,6 +910,83 @@ class Database:
         row = cursor.fetchone()
         conn.close()
         return dict(row) if row else None
+
+    # ==================== File Snapshots ====================
+
+    def get_file_snapshot(self, session_id: str, message_id: int) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT *
+            FROM file_snapshots
+            WHERE session_id = ? AND message_id = ?
+            ORDER BY created_at ASC
+            LIMIT 1
+        ''', (session_id, message_id))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def create_file_snapshot(self, session_id: str, message_id: int, tree_hash: str, work_path: str) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        created_at = datetime.now().isoformat()
+        try:
+            cursor.execute('''
+                INSERT INTO file_snapshots (session_id, message_id, tree_hash, work_path, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (session_id, message_id, tree_hash, work_path, created_at))
+            snapshot_id = cursor.lastrowid
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.close()
+            return self.get_file_snapshot(session_id, message_id)
+
+        cursor.execute('''
+            SELECT *
+            FROM file_snapshots
+            WHERE id = ?
+        ''', (snapshot_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def get_snapshot_for_rollback(self, session_id: str, user_message_id: int) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id
+            FROM chat_messages
+            WHERE session_id = ? AND id > ? AND role = 'assistant'
+            ORDER BY id ASC
+            LIMIT 1
+        ''', (session_id, user_message_id))
+        msg_row = cursor.fetchone()
+        if not msg_row:
+            conn.close()
+            return None
+
+        assistant_id = msg_row["id"]
+        cursor.execute('''
+            SELECT *
+            FROM file_snapshots
+            WHERE session_id = ? AND message_id = ?
+            ORDER BY created_at ASC
+            LIMIT 1
+        ''', (session_id, assistant_id))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def delete_file_snapshots_from(self, session_id: str, message_id: int) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            DELETE FROM file_snapshots
+            WHERE session_id = ? AND message_id >= ?
+        ''', (session_id, message_id))
+        conn.commit()
+        conn.close()
 
     # ==================== LLM Calls Debug ====================
 
