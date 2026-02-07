@@ -33,6 +33,10 @@ body {
   -webkit-app-region: drag;
 }
 
+body[data-platform="mac"] .app-titlebar {
+  display: none;
+}
+
 .titlebar-left {
   display: inline-flex;
   align-items: center;

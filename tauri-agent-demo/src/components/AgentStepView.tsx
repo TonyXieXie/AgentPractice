@@ -47,6 +47,9 @@ const STEP_CATEGORY: Record<AgentStep['step_type'], Category> = {
     error: 'error'
 };
 
+const IS_MAC = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent);
+const MAC_ABSOLUTE_PREFIX = /^(Users|Volumes|private|System|Library|Applications|opt|etc|var|tmp)[\\/]/;
+
 const markdown = new MarkdownIt({
     html: false,
     linkify: true,
@@ -445,6 +448,11 @@ const isFileHref = (value: string) => {
 
 const normalizeFileHref = (value: string) => {
     if (!value) return '';
+    if (IS_MAC && !value.startsWith('/') && !value.startsWith('./') && !value.startsWith('../')) {
+        if (!/^[a-zA-Z]:[\\/]/.test(value) && !/^file:\/\//i.test(value) && MAC_ABSOLUTE_PREFIX.test(value)) {
+            value = `/${value}`;
+        }
+    }
     if (value.startsWith('file://')) {
         try {
             const url = new URL(value);

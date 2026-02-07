@@ -57,6 +57,11 @@ function WorkDirWindow() {
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
   useEffect(() => {
+    if (!/mac/i.test(navigator.userAgent)) return;
+    document.body.dataset.platform = 'mac';
+  }, []);
+
+  useEffect(() => {
     let unlisten: (() => void) | undefined;
     const label = (appWindow as { label?: string }).label;
     listen<{ path: string; target?: string }>('workdir:set', (event) => {

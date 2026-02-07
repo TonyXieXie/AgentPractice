@@ -29,12 +29,16 @@ venv/
 env/
 ENV/
 .venv/
+venv.invalid.*/
 
 # Database files (runtime data)
 # Note: chat_app.db is kept in git for project setup
 # *.db
 # *.sqlite
 # *.sqlite3
+
+# Local runtime DB copies
+python-backend/chat_app.db
 
 # Python distribution / packaging
 .Python
@@ -60,6 +64,9 @@ wheels/
 src-tauri/target/
 src-tauri/Cargo.lock
 
+# Backend binaries
+python-backend/target/
+
 # ========================================
 # Editor directories and files
 # ========================================
@@ -83,6 +90,13 @@ Thumbs.db
 Desktop.ini
 .Spotlight-V100
 .Trashes
+
+# Local helper scripts
+*.command
+
+# Local status/setup notes
+INSTALL-STATUS.md
+SETUP-MAC.md
 
 # ========================================
 # Environment variables

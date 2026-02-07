@@ -36,6 +36,10 @@ body {
   -webkit-app-region: drag;
 }
 
+body[data-platform="mac"] .workdir-titlebar {
+  display: none;
+}
+
 .workdir-titlebar-left {
   display: inline-flex;
   align-items: center;

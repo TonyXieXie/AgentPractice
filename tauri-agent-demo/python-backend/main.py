@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI, HTTPException, Response
+﻿from fastapi import FastAPI, HTTPException, Response, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -48,6 +48,30 @@ app.add_middleware(
 )
 
 register_builtin_tools()
+
+# ==================== Local File Read ====================
+
+@app.get("/local-file")
+def read_local_file(path: str = Query(...), max_bytes: int = Query(2_000_000)):
+    if not path:
+        raise HTTPException(status_code=400, detail="Missing path")
+    safe_path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(safe_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        size = os.path.getsize(safe_path)
+        if max_bytes and size > max_bytes:
+            raise HTTPException(status_code=413, detail="File too large")
+        with open(safe_path, "rb") as file:
+            raw = file.read(max_bytes + 1 if max_bytes else None)
+        if max_bytes and len(raw) > max_bytes:
+            raise HTTPException(status_code=413, detail="File too large")
+        content = raw.decode("utf-8", errors="replace")
+        return {"content": content}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read file: {exc}")
 
 # ==================== Title Generation ====================
 

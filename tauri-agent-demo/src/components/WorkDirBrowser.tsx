@@ -14,10 +14,16 @@ import texmath from 'markdown-it-texmath';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
 import { mkdir, readDir, readFile, readTextFile, watchImmediate, writeTextFile, type DirEntry, type UnwatchFn } from '@tauri-apps/plugin-fs';
+import { API_BASE_URL } from '../api';
 import { openPath, openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import './WorkDirBrowser.css';
 
 type FileKind = 'text' | 'markdown' | 'image' | 'unknown';
+
+const IS_MAC = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent);
+const MAC_ABSOLUTE_PREFIX = /^(Users|Volumes|private|System|Library|Applications|opt|etc|var|tmp)[\\/]/;
+const READ_TEXT_TIMEOUT_MS = 3000;
+const READ_BACKEND_TIMEOUT_MS = 4000;
 
 type OpenFile = {
   path: string;
@@ -200,6 +206,65 @@ const getMimeType = (ext: string) => {
   }
 };
 
+const decodeUtf8 = (bytes: Uint8Array) => {
+  try {
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  } catch {
+    return new TextDecoder().decode(bytes);
+  }
+};
+
+const readTextFileSafe = async (path: string) => {
+  let timer: number | null = null;
+  const timeout = new Promise<Uint8Array | string>((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error('Read timeout')), READ_TEXT_TIMEOUT_MS);
+  });
+  try {
+    if (IS_MAC) {
+      const bytes = (await Promise.race([readFile(path), timeout])) as Uint8Array;
+      return decodeUtf8(bytes);
+    }
+    return await Promise.race([readTextFile(path), timeout]);
+  } finally {
+    if (timer != null) {
+      window.clearTimeout(timer);
+    }
+  }
+};
+
+const readTextFromBackend = async (path: string) => {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), READ_BACKEND_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${API_BASE_URL}/local-file?path=${encodeURIComponent(path)}`, {
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `Backend read failed (${response.status})`);
+    }
+    const data = await response.json();
+    return String(data?.content ?? '');
+  } finally {
+    window.clearTimeout(timeout);
+  }
+};
+
+const readTextFileWithFallback = async (path: string) => {
+  if (IS_MAC) {
+    try {
+      return await readTextFromBackend(path);
+    } catch {
+      return await readTextFileSafe(path);
+    }
+  }
+  try {
+    return await readTextFileSafe(path);
+  } catch {
+    return await readTextFromBackend(path);
+  }
+};
+
 const joinPath = (base: string, child: string) => {
   if (!base) return child;
   const separator = base.includes('\\') ? '\\' : '/';
@@ -233,10 +298,19 @@ const normalizeWatchPath = (path: string) => {
       if (/^\/[A-Za-z]:\//.test(pathname)) {
         pathname = pathname.slice(1);
       }
+      if (IS_MAC && MAC_ABSOLUTE_PREFIX.test(pathname)) {
+        return `/${pathname}`;
+      }
       return pathname;
     } catch {
+      if (IS_MAC && MAC_ABSOLUTE_PREFIX.test(path)) {
+        return `/${path}`;
+      }
       return path;
     }
+  }
+  if (IS_MAC && MAC_ABSOLUTE_PREFIX.test(path)) {
+    return `/${path}`;
   }
   return path;
 };
@@ -312,6 +386,7 @@ function WorkDirBrowser({
   const [highlightLine, setHighlightLine] = useState<{ path: string; line: number; nonce: number } | null>(null);
   const mermaidRootRef = useRef<HTMLDivElement | null>(null);
   const mermaidInitializedRef = useRef(false);
+  const pendingOpenFilesRef = useRef<Set<string>>(new Set());
   const MERMAID_MIN_SCALE = 0.2;
   const MERMAID_MAX_SCALE = 4;
   const MERMAID_ZOOM_STEP = 0.15;
@@ -1163,28 +1238,42 @@ function WorkDirBrowser({
   };
 
   const openFile = async (path: string, name: string) => {
+    if (pendingOpenFilesRef.current.has(path)) {
+      const existing = findFileLocation(path);
+      if (existing) {
+        setPaneActivePath(existing.paneId, path);
+      }
+      return;
+    }
     const existing = findFileLocation(path);
     if (existing) {
       setPaneActivePath(existing.paneId, path);
       return;
     }
 
+    pendingOpenFilesRef.current.add(path);
+
     const ext = getFileExt(name);
     const kind = getFileKind(ext);
     const newFile: OpenFile = { path, name, ext, kind, loading: true };
     const targetPaneId = activePaneId || panesRef.current[0]?.id;
-    if (!targetPaneId) return;
+    if (!targetPaneId) {
+      pendingOpenFilesRef.current.delete(path);
+      return;
+    }
 
-    setPanes((prev) =>
-      prev.map((pane) => {
+    setPanes((prev) => {
+      const next = prev.map((pane) => {
         if (pane.id !== targetPaneId) return pane;
         return {
           ...pane,
           openFiles: [...pane.openFiles, newFile],
           activePath: path,
         };
-      })
-    );
+      });
+      panesRef.current = next;
+      return next;
+    });
     setActivePaneId(targetPaneId);
 
     try {
@@ -1197,7 +1286,7 @@ function WorkDirBrowser({
         }
         updateFile(path, { url, loading: false });
       } else {
-        const text = await readTextFile(path);
+        const text = await readTextFileWithFallback(path);
         if (!findFileLocation(path)) return;
         updateFile(path, { content: text, loading: false });
         if (kind === 'text') {
@@ -1206,6 +1295,8 @@ function WorkDirBrowser({
       }
     } catch (error) {
       updateFile(path, { error: formatError(error), loading: false });
+    } finally {
+      pendingOpenFilesRef.current.delete(path);
     }
   };
 

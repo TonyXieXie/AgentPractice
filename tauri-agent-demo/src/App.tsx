@@ -49,6 +49,7 @@ const AGENT_MODE_OPTIONS: { value: AgentMode; label: string; description: string
   { value: 'super', label: '超级', description: '允许所有操作' },
 ];
 
+const IS_MAC = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent);
 const MAX_CONCURRENT_STREAMS = 10;
 const WORK_PATH_MAX_LENGTH = 200;
 const MAIN_WINDOW_BOUNDS_KEY = 'mainWindowBounds';
@@ -160,6 +161,17 @@ const TRAILING_PUNCTUATION = /[)\],.;:!?}]+$/;
 const hasScheme = (value: string) => /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value);
 
 const ESCAPE_SEGMENTS = new Set(['n', 'r', 't', 'b', 'f', 'v', '0']);
+const MAC_ABSOLUTE_PREFIX = /^(Users|Volumes|private|System|Library|Applications|opt|etc|var|tmp)[\\/]/;
+
+const normalizeMacAbsolutePath = (value: string) => {
+  if (!IS_MAC) return value;
+  if (!value) return value;
+  if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return value;
+  if (/^[a-zA-Z]:[\\/]/.test(value)) return value;
+  if (/^file:\/\//i.test(value)) return value;
+  if (MAC_ABSOLUTE_PREFIX.test(value)) return `/${value}`;
+  return value;
+};
 
 const looksLikeFilePath = (value: string) => {
   if (!value) return false;
@@ -188,12 +200,12 @@ const normalizeFileHref = (value: string) => {
       if (/^\/[A-Za-z]:\//.test(pathname)) {
         pathname = pathname.slice(1);
       }
-      return pathname;
+      return normalizeMacAbsolutePath(pathname);
     } catch {
-      return value;
+      return normalizeMacAbsolutePath(value);
     }
   }
-  return value;
+  return normalizeMacAbsolutePath(value);
 };
 
 const stripTrailingPunctuation = (value: string) => {
@@ -452,12 +464,19 @@ function App() {
   const permissionBusyBySessionRef = useRef<Record<string, boolean>>({});
   const processingQueueRef = useRef(false);
   const pendingQueueRunRef = useRef(false);
+  const lastWorkFileOpenRef = useRef<{ key: string; at: number } | null>(null);
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
   useEffect(() => {
     loadDefaultConfig();
     loadAllConfigs();
   }, []);
+
+  useEffect(() => {
+    if (!IS_MAC) return;
+    appWindow.setDecorations(true).catch(() => undefined);
+    document.body.dataset.platform = 'mac';
+  }, [appWindow]);
 
   useEffect(() => {
     const bounds = getMainWindowBounds();
@@ -1407,14 +1426,11 @@ function App() {
       height: bounds?.height ?? WORKDIR_DEFAULT_HEIGHT,
       x: bounds?.x,
       y: bounds?.y,
-      decorations: false,
+      decorations: IS_MAC,
     });
 
     win.once('tauri://created', () => {
       void win.emit('workdir:set', { path, target: label });
-      if (openFilePath) {
-        void win.emit('workdir:open-file', { path: openFilePath, line: openLine, column: openColumn, target: label });
-      }
     });
 
     win.once('tauri://error', (event) => {
@@ -1446,6 +1462,13 @@ function App() {
       alert('请先选择工作路径。');
       return;
     }
+    const key = `${resolvedPath}::${targetLine ?? ''}:${targetColumn ?? ''}`;
+    const now = Date.now();
+    const lastOpen = lastWorkFileOpenRef.current;
+    if (lastOpen && lastOpen.key === key && now - lastOpen.at < 400) {
+      return;
+    }
+    lastWorkFileOpenRef.current = { key, at: now };
     await openWorkDirWindow(root, resolvedPath, targetLine, targetColumn);
   };
 
