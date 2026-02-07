@@ -39,7 +39,8 @@
       "tree",
       "ren",
       "rm",
-      "del"
+      "del",
+      "find"
     ],
     "timeout_sec": 30,
     "max_output": 20000

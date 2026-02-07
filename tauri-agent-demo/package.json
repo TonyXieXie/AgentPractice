@@ -19,6 +19,7 @@
     "katex": "^0.16.28",
     "markdown-it": "^14.1.0",
     "markdown-it-texmath": "^1.0.0",
+    "mermaid": "^10.9.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

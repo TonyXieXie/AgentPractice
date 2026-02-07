@@ -681,6 +681,13 @@
   align-items: flex-start;
 }
 
+.workdir-text-gutter-line.highlight {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.18);
+  border-radius: 6px;
+  padding-right: 6px;
+}
+
 .workdir-text-area {
   width: 100%;
   min-height: 100%;
@@ -812,4 +819,57 @@
 
 .workdir-markdown .katex-display .katex {
   font-size: 1.05rem;
+}
+
+.workdir-markdown .mermaid-block {
+  margin: 0.6rem 0;
+  padding: 10px;
+  border-radius: 8px;
+  background: #0f172a;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  overflow-x: auto;
+  position: relative;
+}
+
+.workdir-markdown .mermaid-controls {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 6px;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.workdir-markdown .mermaid-block:hover .mermaid-controls {
+  opacity: 1;
+}
+
+.workdir-markdown .mermaid-control {
+  background: rgba(15, 23, 42, 0.9);
+  color: #e2e8f0;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 6px;
+  width: 30px;
+  height: 26px;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.workdir-markdown .mermaid-viewport {
+  overflow: hidden;
+  max-height: 70vh;
+  user-select: none;
+  touch-action: none;
+}
+
+.workdir-markdown .mermaid {
+  display: flex;
+  justify-content: center;
+}
+
+.workdir-markdown .mermaid svg {
+  max-width: 100%;
+  height: auto;
 }

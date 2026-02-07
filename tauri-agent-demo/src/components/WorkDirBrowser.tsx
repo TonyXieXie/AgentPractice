@@ -9,6 +9,7 @@
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import MarkdownIt from 'markdown-it';
+import mermaid from 'mermaid';
 import texmath from 'markdown-it-texmath';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
@@ -67,6 +68,58 @@ markdown.use(texmath, {
   delimiters: ['brackets', 'dollars', 'beg_end'],
   katexOptions: { throwOnError: false, errorColor: '#f87171' },
 });
+
+const defaultFence = markdown.renderer.rules.fence;
+markdown.renderer.rules.fence = (tokens, idx, options, env, self) => {
+  const token = tokens[idx];
+  const info = (token.info || '').trim();
+  const lang = info ? info.split(/\s+/g)[0].toLowerCase() : '';
+  if (lang === 'mermaid') {
+    const code = markdown.utils.escapeHtml(token.content || '');
+    const encoded = encodeURIComponent(token.content || '');
+    return [
+      '<div class="mermaid-block">',
+      '<div class="mermaid-controls">',
+      '<button type="button" class="mermaid-control" data-action="zoom-in" aria-label="Zoom in">+</button>',
+      '<button type="button" class="mermaid-control" data-action="zoom-out" aria-label="Zoom out">-</button>',
+      '<button type="button" class="mermaid-control" data-action="reset" aria-label="Reset zoom">Reset</button>',
+      '</div>',
+      '<div class="mermaid-viewport">',
+      `<div class="mermaid" data-raw="${encoded}">${code}</div>`,
+      '</div>',
+      '</div>',
+    ].join('');
+  }
+  if (defaultFence) {
+    return defaultFence(tokens, idx, options, env, self);
+  }
+  return self.renderToken(tokens, idx, options);
+};
+
+const MERMAID_START_RE =
+  /^(?:graph|flowchart|sequenceDiagram|classDiagram|stateDiagram(?:-v2)?|erDiagram|gantt|journey|pie|gitGraph|mindmap|timeline|quadrantChart|sankey-beta)\b/i;
+const MERMAID_HINT_RE =
+  /(-->|==>|subgraph|participant|class|state|section|task|journey|pie|gantt|mindmap|timeline|quadrantChart|sankey|flowchart|graph)\b/i;
+
+const injectMermaidFences = (content: string) => {
+  if (!content) return content;
+  if (/```mermaid/i.test(content)) return content;
+  const normalized = content.replace(/\r\n/g, '\n');
+  const parts = normalized.split(/\n{2,}/);
+  let changed = false;
+  const next = parts.map((part) => {
+    const trimmed = part.trim();
+    if (!trimmed) return part;
+    if (MERMAID_START_RE.test(trimmed) && MERMAID_HINT_RE.test(trimmed)) {
+      changed = true;
+      return `\`\`\`mermaid\n${trimmed}\n\`\`\``;
+    }
+    return part;
+  });
+  return changed ? next.join('\n\n') : normalized;
+};
+
+const renderMarkdown = (content: string) => markdown.render(injectMermaidFences(content || ''));
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico']);
 const MARKDOWN_EXTENSIONS = new Set(['md', 'markdown', 'mdx']);
@@ -256,6 +309,12 @@ function WorkDirBrowser({
     column?: number;
     nonce: number;
   } | null>(null);
+  const [highlightLine, setHighlightLine] = useState<{ path: string; line: number; nonce: number } | null>(null);
+  const mermaidRootRef = useRef<HTMLDivElement | null>(null);
+  const mermaidInitializedRef = useRef(false);
+  const MERMAID_MIN_SCALE = 0.2;
+  const MERMAID_MAX_SCALE = 4;
+  const MERMAID_ZOOM_STEP = 0.15;
   const [dragGhost, setDragGhost] = useState<{ x: number; y: number; visible: boolean }>({
     x: 0,
     y: 0,
@@ -340,6 +399,197 @@ function WorkDirBrowser({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, rootPath]);
+
+  const ensureMermaid = () => {
+    if (mermaidInitializedRef.current) return;
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: 'strict',
+      theme: 'dark',
+    });
+    mermaidInitializedRef.current = true;
+  };
+
+  const setupMermaidInteractions = () => {
+    const root = mermaidRootRef.current;
+    if (!root) return;
+    const blocks = root.querySelectorAll<HTMLElement>('.mermaid-block');
+    blocks.forEach((block) => {
+      const viewport = block.querySelector<HTMLElement>('.mermaid-viewport');
+      if (!viewport) return;
+
+      const readState = () => {
+        const scale = Number.parseFloat(block.dataset.scale || '1');
+        const x = Number.parseFloat(block.dataset.x || '0');
+        const y = Number.parseFloat(block.dataset.y || '0');
+        return {
+          scale: Number.isFinite(scale) ? scale : 1,
+          x: Number.isFinite(x) ? x : 0,
+          y: Number.isFinite(y) ? y : 0,
+        };
+      };
+
+      const applyTransform = () => {
+        const svg = block.querySelector<SVGElement>('.mermaid svg');
+        if (!svg) return;
+        const { scale, x, y } = readState();
+        svg.style.transformOrigin = '0 0';
+        svg.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+        svg.style.cursor = block.dataset.dragging === 'true' ? 'grabbing' : 'grab';
+      };
+
+      if (!block.dataset.scale) {
+        block.dataset.scale = '1';
+        block.dataset.x = '0';
+        block.dataset.y = '0';
+      }
+
+      applyTransform();
+
+      if (block.dataset.mermaidInteractive === 'true') return;
+      block.dataset.mermaidInteractive = 'true';
+
+      const clamp = (value: number) =>
+        Math.min(MERMAID_MAX_SCALE, Math.max(MERMAID_MIN_SCALE, value));
+
+      const setState = (next: { scale: number; x: number; y: number }) => {
+        block.dataset.scale = String(next.scale);
+        block.dataset.x = String(next.x);
+        block.dataset.y = String(next.y);
+        applyTransform();
+      };
+
+      const handleWheel = (event: WheelEvent) => {
+        if (!event.ctrlKey && !event.metaKey) return;
+        event.preventDefault();
+        const state = readState();
+        const direction = event.deltaY > 0 ? -1 : 1;
+        const factor = direction > 0 ? 1 + MERMAID_ZOOM_STEP : 1 - MERMAID_ZOOM_STEP;
+        const nextScale = clamp(state.scale * factor);
+        setState({ ...state, scale: nextScale });
+      };
+
+      const handlePointerDown = (event: PointerEvent) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        viewport.setPointerCapture(event.pointerId);
+        const state = readState();
+        block.dataset.dragging = 'true';
+        block.dataset.startX = String(event.clientX);
+        block.dataset.startY = String(event.clientY);
+        block.dataset.originX = String(state.x);
+        block.dataset.originY = String(state.y);
+        applyTransform();
+      };
+
+      const handlePointerMove = (event: PointerEvent) => {
+        if (block.dataset.dragging !== 'true') return;
+        const startX = Number.parseFloat(block.dataset.startX || '0');
+        const startY = Number.parseFloat(block.dataset.startY || '0');
+        const originX = Number.parseFloat(block.dataset.originX || '0');
+        const originY = Number.parseFloat(block.dataset.originY || '0');
+        const dx = event.clientX - startX;
+        const dy = event.clientY - startY;
+        const state = readState();
+        setState({ ...state, x: originX + dx, y: originY + dy });
+      };
+
+      const handlePointerUp = (event: PointerEvent) => {
+        if (block.dataset.dragging !== 'true') return;
+        block.dataset.dragging = 'false';
+        viewport.releasePointerCapture(event.pointerId);
+        applyTransform();
+      };
+
+      const handleDoubleClick = () => {
+        setState({ scale: 1, x: 0, y: 0 });
+      };
+
+      const handleControlClick = (event: MouseEvent) => {
+        const target = event.target as HTMLElement;
+        const actionEl = target.closest<HTMLElement>('.mermaid-control');
+        if (!actionEl) return;
+        const action = actionEl.dataset.action || '';
+        const state = readState();
+        if (action === 'zoom-in') {
+          setState({ ...state, scale: clamp(state.scale + MERMAID_ZOOM_STEP) });
+        } else if (action === 'zoom-out') {
+          setState({ ...state, scale: clamp(state.scale - MERMAID_ZOOM_STEP) });
+        } else if (action === 'reset') {
+          setState({ scale: 1, x: 0, y: 0 });
+        }
+        event.preventDefault();
+        event.stopPropagation();
+      };
+
+      viewport.addEventListener('wheel', handleWheel, { passive: false });
+      viewport.addEventListener('pointerdown', handlePointerDown);
+      viewport.addEventListener('pointermove', handlePointerMove);
+      viewport.addEventListener('pointerup', handlePointerUp);
+      viewport.addEventListener('pointercancel', handlePointerUp);
+      viewport.addEventListener('dblclick', handleDoubleClick);
+      block.addEventListener('click', handleControlClick);
+    });
+  };
+
+  const runMermaid = () => {
+    const root = mermaidRootRef.current;
+    if (!root) return;
+    const nodes = Array.from(root.querySelectorAll<HTMLElement>('.mermaid'));
+    if (!nodes.length) return;
+    ensureMermaid();
+    const pendingNodes = nodes.filter((node) => !node.querySelector('svg'));
+    if (!pendingNodes.length) {
+      setupMermaidInteractions();
+      return;
+    }
+    pendingNodes.forEach((node) => {
+      node.removeAttribute('data-processed');
+      const raw = node.dataset.raw;
+      if (raw) {
+        try {
+          node.textContent = decodeURIComponent(raw);
+        } catch {
+          node.textContent = raw;
+        }
+      }
+    });
+    mermaid.run({ nodes: pendingNodes }).then(
+      () => {
+        setupMermaidInteractions();
+        pendingNodes.forEach((node, idx) => {
+          if (node.querySelector('svg')) return;
+          const raw = node.dataset.raw;
+          if (!raw) return;
+          let source = raw;
+          try {
+            source = decodeURIComponent(raw);
+          } catch {
+            // ignore decode errors
+          }
+          const id = `mermaid-${Date.now()}-${idx}`;
+          mermaid.render(id, source).then(
+            ({ svg }) => {
+              node.innerHTML = svg;
+              setupMermaidInteractions();
+            },
+            () => {
+              // ignore render errors
+            }
+          );
+        });
+      },
+      () => {
+        // ignore render errors
+      }
+    );
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const frame = window.requestAnimationFrame(() => runMermaid());
+    return () => window.cancelAnimationFrame(frame);
+  }, [open, panes, expandedDirs, dirCache]);
 
   useEffect(() => {
     panesRef.current = panes;
@@ -731,28 +981,26 @@ function WorkDirBrowser({
     setPendingJump({ path, line, column, nonce: Date.now() });
   };
 
-  const getLineOffset = (text: string, line: number, column?: number) => {
+  const getLineOffset = (text: string, line: number, _column?: number) => {
     const lines = text.split('\n');
     const maxLine = Math.max(1, lines.length);
     const targetLine = Math.min(Math.max(1, line), maxLine);
-    let offset = 0;
+    let startOffset = 0;
     for (let i = 0; i < targetLine - 1; i += 1) {
-      offset += lines[i].length + 1;
+      startOffset += lines[i].length + 1;
     }
-    if (column && column > 1) {
-      const lineLength = lines[targetLine - 1]?.length ?? 0;
-      offset += Math.min(column - 1, lineLength);
-    }
-    return { offset, line: targetLine };
+    const lineLength = lines[targetLine - 1]?.length ?? 0;
+    const endOffset = startOffset + lineLength;
+    return { startOffset, endOffset, line: targetLine };
   };
 
   const scrollToLine = (path: string, line: number, column?: number) => {
     const editor = editorRefs.current[path];
     if (!editor) return false;
     const text = editor.value ?? editorByPathRef.current[path]?.value ?? '';
-    const { offset, line: targetLine } = getLineOffset(text, line, column);
+    const { startOffset, endOffset, line: targetLine } = getLineOffset(text, line, column);
     editor.focus();
-    editor.setSelectionRange(offset, offset);
+    editor.setSelectionRange(startOffset, endOffset);
     const style = getComputedStyle(editor);
     let lineHeight = parseFloat(style.lineHeight || '');
     if (!Number.isFinite(lineHeight)) {
@@ -784,8 +1032,24 @@ function WorkDirBrowser({
     const success = scrollToLine(pendingJump.path, pendingJump.line, pendingJump.column);
     if (success) {
       setPendingJump(null);
+      setHighlightLine({ path: pendingJump.path, line: pendingJump.line, nonce: Date.now() });
     }
   }, [pendingJump, panes, editorByPath]);
+
+  useEffect(() => {
+    if (!highlightLine) return;
+    const openPaths = panesRef.current.flatMap((pane) => pane.openFiles.map((file) => file.path));
+    if (!openPaths.includes(highlightLine.path)) {
+      setHighlightLine(null);
+    }
+  }, [panes, highlightLine]);
+
+  const clearHighlight = (path?: string) => {
+    if (!highlightLine) return;
+    if (!path || highlightLine.path === path) {
+      setHighlightLine(null);
+    }
+  };
 
   const findFileLocation = (path: string, list = panesRef.current) => {
     for (const pane of list) {
@@ -1412,6 +1676,7 @@ function WorkDirBrowser({
   const content = (
     <div
       className={`workdir-window${mode === 'window' ? ' embedded' : ''}${headerVisible ? '' : ' no-header'}`}
+      ref={mermaidRootRef}
       onClick={(event) => {
         event.stopPropagation();
         if (contextMenu) setContextMenu(null);
@@ -1642,11 +1907,11 @@ function WorkDirBrowser({
                         {paneActiveFile &&
                           !paneActiveFile.loading &&
                           !paneActiveFile.error &&
-                          paneActiveFile.kind === 'markdown' && (
+                        paneActiveFile.kind === 'markdown' && (
                             <div
                               className="workdir-markdown workdir-viewer-body"
                               onClick={handleMarkdownLinkClick}
-                              dangerouslySetInnerHTML={{ __html: markdown.render(paneActiveFile.content || '') }}
+                              dangerouslySetInnerHTML={{ __html: renderMarkdown(paneActiveFile.content || '') }}
                             />
                           )}
                       {paneActiveFile &&
@@ -1667,32 +1932,39 @@ function WorkDirBrowser({
                               {isEditing ? (
                                 <div className="workdir-text-editor">
                                   <div
-                                    className="workdir-text-gutter-column"
-                                    style={{ width: `${gutterWidth}ch` }}
-                                    ref={(el) => {
-                                      editorGutterRefs.current[paneActiveFile.path] = el;
-                                    }}
-                                  >
-                                    {lines.map((_, index) => (
-                                      <div
-                                        key={`${paneActiveFile.path}-editor-line-${index + 1}`}
-                                        className="workdir-text-gutter-line"
-                                      >
-                                        {index + 1}
-                                      </div>
-                                    ))}
-                                  </div>
-                                  <textarea
-                                    className="workdir-text-area"
-                                    ref={(el) => {
-                                      editorRefs.current[paneActiveFile.path] = el;
-                                    }}
-                                    value={editorState?.value ?? ''}
-                                    onChange={(event) => updateEditorValue(paneActiveFile.path, event.currentTarget.value)}
-                                    onContextMenu={(event) => {
-                                      event.preventDefault();
-                                      event.stopPropagation();
-                                      setEditorMenu({
+                                      className="workdir-text-gutter-column"
+                                      style={{ width: `${gutterWidth}ch` }}
+                                      ref={(el) => {
+                                        editorGutterRefs.current[paneActiveFile.path] = el;
+                                      }}
+                                      onMouseDown={() => clearHighlight(paneActiveFile.path)}
+                                    >
+                                      {lines.map((_, index) => {
+                                        const isHighlighted =
+                                          highlightLine?.path === paneActiveFile.path &&
+                                          highlightLine.line === index + 1;
+                                        return (
+                                          <div
+                                            key={`${paneActiveFile.path}-editor-line-${index + 1}`}
+                                            className={`workdir-text-gutter-line${isHighlighted ? ' highlight' : ''}`}
+                                          >
+                                            {index + 1}
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                    <textarea
+                                      className="workdir-text-area"
+                                      ref={(el) => {
+                                        editorRefs.current[paneActiveFile.path] = el;
+                                      }}
+                                      value={editorState?.value ?? ''}
+                                      onChange={(event) => updateEditorValue(paneActiveFile.path, event.currentTarget.value)}
+                                      onMouseDown={() => clearHighlight(paneActiveFile.path)}
+                                      onContextMenu={(event) => {
+                                        event.preventDefault();
+                                        event.stopPropagation();
+                                        setEditorMenu({
                                         x: event.clientX,
                                         y: event.clientY,
                                         path: paneActiveFile.path,

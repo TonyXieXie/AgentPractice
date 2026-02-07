@@ -153,8 +153,9 @@ const isBareFilename = (value: string) =>
   Boolean(value) && !/[\\/]/.test(value) && !value.startsWith('./') && !value.startsWith('../');
 
 const FILE_EXT_PATTERN = /\.[A-Za-z0-9]{1,10}$/;
-const FILE_HASH_PATTERN = /^(.*)#L(\d+)(?:C(\d+))?$/i;
-const FILE_LINE_PATTERN = /^(.*?)(?::(\d+))(?:[:#](\d+))?$/;
+const FILE_HASH_PATTERN = /^(.*)#L(\d+)(?:C(\d+))?(?:-L?(\d+))?$/i;
+const FILE_LINE_PATTERN = /^(.*?)(?::(\d+))(?:-(\d+))?(?:[:#](\d+))?$/;
+const TRAILING_PUNCTUATION = /[)\],.;:!?}]+$/;
 
 const hasScheme = (value: string) => /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value);
 
@@ -162,6 +163,7 @@ const ESCAPE_SEGMENTS = new Set(['n', 'r', 't', 'b', 'f', 'v', '0']);
 
 const looksLikeFilePath = (value: string) => {
   if (!value) return false;
+  if (/^www\./i.test(value)) return false;
   if (/^file:\/\//i.test(value)) return true;
   if (/^[a-zA-Z]:[\\/]/.test(value)) {
     const rest = value.slice(3);
@@ -173,6 +175,7 @@ const looksLikeFilePath = (value: string) => {
   }
   if (value.startsWith('\\\\')) return true;
   if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return true;
+  if (value.includes('/') || value.includes('\\')) return true;
   return FILE_EXT_PATTERN.test(value);
 };
 
@@ -193,10 +196,18 @@ const normalizeFileHref = (value: string) => {
   return value;
 };
 
+const stripTrailingPunctuation = (value: string) => {
+  const match = value.match(TRAILING_PUNCTUATION);
+  if (!match) return value;
+  return value.slice(0, -match[0].length);
+};
+
 const parseFileLocation = (rawValue: string) => {
   const trimmed = rawValue.trim();
   if (!trimmed) return { path: '' };
-  const hashMatch = trimmed.match(FILE_HASH_PATTERN);
+  const normalized = stripTrailingPunctuation(trimmed);
+  const candidate = normalized || trimmed;
+  const hashMatch = candidate.match(FILE_HASH_PATTERN);
   if (hashMatch) {
     const path = hashMatch[1];
     if (looksLikeFilePath(path) && (!hasScheme(path) || /^[a-zA-Z]:[\\/]/.test(path) || /^file:\/\//i.test(path))) {
@@ -207,18 +218,21 @@ const parseFileLocation = (rawValue: string) => {
       };
     }
   }
-  const lineMatch = trimmed.match(FILE_LINE_PATTERN);
+  const lineMatch = candidate.match(FILE_LINE_PATTERN);
   if (lineMatch) {
     const path = lineMatch[1];
     if (looksLikeFilePath(path) && (!hasScheme(path) || /^[a-zA-Z]:[\\/]/.test(path) || /^file:\/\//i.test(path))) {
       return {
         path,
         line: Number(lineMatch[2]),
-        column: lineMatch[3] ? Number(lineMatch[3]) : undefined,
+        column: lineMatch[4] ? Number(lineMatch[4]) : undefined,
       };
     }
   }
-  return { path: trimmed };
+  if (looksLikeFilePath(candidate) && (!hasScheme(candidate) || /^[a-zA-Z]:[\\/]/.test(candidate) || /^file:\/\//i.test(candidate))) {
+    return { path: candidate };
+  }
+  return { path: '' };
 };
 
 const joinPath = (base: string, child: string) => {

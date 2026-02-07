@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, Fragment, type MouseEventHandler, type ReactElement } from 'react';
+import { useState, useEffect, useRef, useMemo, Fragment, type MouseEventHandler, type ReactElement } from 'react';
+import mermaid from 'mermaid';
 import MarkdownIt from 'markdown-it';
 import texmath from 'markdown-it-texmath';
 import katex from 'katex';
@@ -64,8 +65,24 @@ markdown.renderer.rules.fence = (tokens, idx, _options, _env, _self) => {
     const lang = info ? info.split(/\s+/g)[0] : '';
     const safeLang = lang.replace(/[^a-zA-Z0-9_-]/g, '');
     const label = safeLang || 'text';
-    const code = markdown.utils.escapeHtml(token.content || '');
+    const raw = token.content || '';
+    const code = markdown.utils.escapeHtml(raw);
     const langClass = safeLang ? `language-${safeLang}` : '';
+    if (safeLang.toLowerCase() === 'mermaid') {
+        const encoded = encodeURIComponent(raw);
+        return [
+            '<div class="mermaid-block">',
+            '<div class="mermaid-controls">',
+            '<button type="button" class="mermaid-control" data-action="zoom-in" aria-label="Zoom in">+</button>',
+            '<button type="button" class="mermaid-control" data-action="zoom-out" aria-label="Zoom out">-</button>',
+            '<button type="button" class="mermaid-control" data-action="reset" aria-label="Reset zoom">Reset</button>',
+            '</div>',
+            '<div class="mermaid-viewport">',
+            `<div class="mermaid" data-raw="${encoded}">${code}</div>`,
+            '</div>',
+            '</div>'
+        ].join('');
+    }
     return [
         '<div class="code-block-container">',
         '<div class="code-block-header">',
@@ -77,6 +94,40 @@ markdown.renderer.rules.fence = (tokens, idx, _options, _env, _self) => {
     ].join('');
 };
 
+markdown.renderer.rules.code_inline = (tokens, idx, _options, _env, _self) => {
+    const token = tokens[idx];
+    const content = token.content || '';
+    const escaped = markdown.utils.escapeHtml(content);
+    const parsed = parseFileReference(content.trim());
+    if (parsed?.path) {
+        return `<code class="file-code-link">${escaped}</code>`;
+    }
+    return `<code>${escaped}</code>`;
+};
+
+const MERMAID_START_RE =
+    /^(?:graph|flowchart|sequenceDiagram|classDiagram|stateDiagram(?:-v2)?|erDiagram|gantt|journey|pie|gitGraph|mindmap|timeline|quadrantChart|sankey-beta)\b/i;
+const MERMAID_HINT_RE =
+    /(-->|==>|subgraph|participant|class|state|section|task|journey|pie|gantt|mindmap|timeline|quadrantChart|sankey|flowchart|graph)\b/i;
+
+const injectMermaidFences = (content: string) => {
+    if (!content) return content;
+    if (/```mermaid/i.test(content)) return content;
+    const normalized = content.replace(/\r\n/g, '\n');
+    const parts = normalized.split(/\n{2,}/);
+    let changed = false;
+    const next = parts.map((part) => {
+        const trimmed = part.trim();
+        if (!trimmed) return part;
+        if (MERMAID_START_RE.test(trimmed) && MERMAID_HINT_RE.test(trimmed)) {
+            changed = true;
+            return `\`\`\`mermaid\n${trimmed}\n\`\`\``;
+        }
+        return part;
+    });
+    return changed ? next.join('\n\n') : normalized;
+};
+
 function renderRichContent(content: string, onClick?: MouseEventHandler<HTMLDivElement>) {
     const normalized = (content || '')
         .replace(/\r\n/g, '\n')
@@ -86,7 +137,7 @@ function renderRichContent(content: string, onClick?: MouseEventHandler<HTMLDivE
         .replace(/\\\\\)/g, '\\)')
         .replace(/^\s*\\\[\s*$/gm, '\n\\[\n')
         .replace(/^\s*\\\]\s*$/gm, '\n\\]\n');
-    const html = markdown.render(normalized);
+    const html = markdown.render(injectMermaidFences(normalized));
     return <div className="content-markdown" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
@@ -101,6 +152,8 @@ type ApplyPatchResult = {
     revert_patch?: string;
     error?: string;
 };
+
+type DiffChunk = { path: string; diff: string };
 
 function parseApplyPatchResult(content: string): ApplyPatchResult | null {
     if (!content) return null;
@@ -124,6 +177,50 @@ function decodeUnicodeEscapes(content: string) {
     return content
         .replace(/\\\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
         .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+function extractJsonFinalAnswer(content: string) {
+    const trimmed = content.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+    try {
+        const parsed = JSON.parse(trimmed) as Record<string, unknown> | null;
+        if (!parsed || typeof parsed !== 'object') return null;
+        const keys = ['final_answer', 'answer', 'final', 'output', 'response', 'content'];
+        for (const key of keys) {
+            const value = parsed[key];
+            if (typeof value === 'string' && value.trim()) return value;
+        }
+    } catch {
+        // ignore parse errors
+    }
+    return null;
+}
+
+function splitDiffByFile(diff: string, fallbackPath?: string): DiffChunk[] {
+    if (!diff) return [];
+    const lines = diff.replace(/\r\n/g, '\n').split('\n');
+    const chunks: DiffChunk[] = [];
+    let currentPath = '';
+    let buffer: string[] = [];
+    const flush = () => {
+        if (!buffer.length) return;
+        const path = currentPath || fallbackPath || 'patch';
+        chunks.push({ path, diff: buffer.join('\n') });
+        buffer = [];
+    };
+    for (const line of lines) {
+        const match = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+        if (match) {
+            flush();
+            currentPath = match[2] || match[1] || currentPath;
+        }
+        buffer.push(line);
+    }
+    flush();
+    if (!chunks.length && diff.trim()) {
+        chunks.push({ path: fallbackPath || 'patch', diff });
+    }
+    return chunks;
 }
 
 type StepItem = {
@@ -212,7 +309,8 @@ type LinkToken =
     | { type: 'url'; value: string }
     | { type: 'file'; value: string };
 
-const LINK_PATTERN = /((?:https?|file):\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+|[a-zA-Z]:\\[^\s<>"'`]+|\\\\[^\s<>"'`]+|\/[^\s<>"'`]+|[^\s<>"'`]+\.[A-Za-z0-9]{1,10}:\d+(?::\d+)?)/g;
+const LINK_PATTERN =
+    /((?:https?|file):\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+|[a-zA-Z]:\\[^\s<>"'`]+|\\\\[^\s<>"'`]+|\/[^\s<>"'`]+|[^\s<>"'`]+[\\/][^\s<>"'`]+(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)|[^\s<>"'`]+\.[A-Za-z0-9]{1,10}(?::\d+(?::\d+)?|#L\d+(?:C\d+)?))/g;
 const TRAILING_PUNCTUATION = /[),.;:!?]+$/;
 const FILE_EXT_PATTERN = /\.[A-Za-z0-9]{1,10}$/;
 const ESCAPE_SEGMENTS = new Set(['n', 'r', 't', 'b', 'f', 'v', '0']);
@@ -232,6 +330,7 @@ function splitTrailingPunctuation(value: string) {
 
 function looksLikeFilePath(value: string) {
     if (!value) return false;
+    if (/^www\./i.test(value)) return false;
     if (/^file:\/\//i.test(value)) return true;
     if (/^[a-zA-Z]:[\\/]/.test(value)) {
         const rest = value.slice(3);
@@ -243,6 +342,7 @@ function looksLikeFilePath(value: string) {
     }
     if (value.startsWith('\\\\')) return true;
     if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return true;
+    if (value.includes('/') || value.includes('\\')) return true;
     return FILE_EXT_PATTERN.test(value);
 }
 
@@ -383,6 +483,12 @@ function AgentStepView({
     const [expandedPatches, setExpandedPatches] = useState<Record<string, boolean>>({});
     const thoughtRefs = useRef<Record<string, HTMLDivElement | null>>({});
     const [fileMenu, setFileMenu] = useState<{ path: string; x: number; y: number } | null>(null);
+    const [patchSummaryExpanded, setPatchSummaryExpanded] = useState(false);
+    const mermaidRootRef = useRef<HTMLDivElement | null>(null);
+    const mermaidInitializedRef = useRef(false);
+    const MERMAID_MIN_SCALE = 0.2;
+    const MERMAID_MAX_SCALE = 4;
+    const MERMAID_ZOOM_STEP = 0.15;
 
     useEffect(() => {
         steps.forEach((step, index) => {
@@ -407,6 +513,347 @@ function AgentStepView({
             window.removeEventListener('blur', dismiss);
         };
     }, [fileMenu]);
+
+    const ensureMermaid = () => {
+        if (mermaidInitializedRef.current) return;
+        mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: 'strict',
+            theme: 'dark'
+        });
+        mermaidInitializedRef.current = true;
+    };
+
+    const setupMermaidInteractions = () => {
+        const root = mermaidRootRef.current;
+        if (!root) return;
+        const blocks = root.querySelectorAll<HTMLElement>('.mermaid-block');
+        blocks.forEach((block) => {
+            const viewport = block.querySelector<HTMLElement>('.mermaid-viewport');
+            if (!viewport) return;
+
+            const readState = () => {
+                const scale = Number.parseFloat(block.dataset.scale || '1');
+                const x = Number.parseFloat(block.dataset.x || '0');
+                const y = Number.parseFloat(block.dataset.y || '0');
+                return {
+                    scale: Number.isFinite(scale) ? scale : 1,
+                    x: Number.isFinite(x) ? x : 0,
+                    y: Number.isFinite(y) ? y : 0
+                };
+            };
+
+            const applyTransform = () => {
+                const svg = block.querySelector<SVGElement>('.mermaid svg');
+                if (!svg) return;
+                const { scale, x, y } = readState();
+                svg.style.transformOrigin = '0 0';
+                svg.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+                svg.style.cursor = block.dataset.dragging === 'true' ? 'grabbing' : 'grab';
+            };
+
+            if (!block.dataset.scale) {
+                block.dataset.scale = '1';
+                block.dataset.x = '0';
+                block.dataset.y = '0';
+            }
+
+            applyTransform();
+
+            if (block.dataset.mermaidInteractive === 'true') return;
+            block.dataset.mermaidInteractive = 'true';
+
+            const clamp = (value: number) =>
+                Math.min(MERMAID_MAX_SCALE, Math.max(MERMAID_MIN_SCALE, value));
+
+            const setState = (next: { scale: number; x: number; y: number }) => {
+                block.dataset.scale = String(next.scale);
+                block.dataset.x = String(next.x);
+                block.dataset.y = String(next.y);
+                applyTransform();
+            };
+
+            const handleWheel = (event: WheelEvent) => {
+                if (!event.ctrlKey && !event.metaKey) return;
+                event.preventDefault();
+                const state = readState();
+                const direction = event.deltaY > 0 ? -1 : 1;
+                const factor = direction > 0 ? 1 + MERMAID_ZOOM_STEP : 1 - MERMAID_ZOOM_STEP;
+                const nextScale = clamp(state.scale * factor);
+                setState({ ...state, scale: nextScale });
+            };
+
+            const handlePointerDown = (event: PointerEvent) => {
+                if (event.button !== 0) return;
+                event.preventDefault();
+                viewport.setPointerCapture(event.pointerId);
+                const state = readState();
+                block.dataset.dragging = 'true';
+                block.dataset.startX = String(event.clientX);
+                block.dataset.startY = String(event.clientY);
+                block.dataset.originX = String(state.x);
+                block.dataset.originY = String(state.y);
+                applyTransform();
+            };
+
+            const handlePointerMove = (event: PointerEvent) => {
+                if (block.dataset.dragging !== 'true') return;
+                const startX = Number.parseFloat(block.dataset.startX || '0');
+                const startY = Number.parseFloat(block.dataset.startY || '0');
+                const originX = Number.parseFloat(block.dataset.originX || '0');
+                const originY = Number.parseFloat(block.dataset.originY || '0');
+                const dx = event.clientX - startX;
+                const dy = event.clientY - startY;
+                const state = readState();
+                setState({ ...state, x: originX + dx, y: originY + dy });
+            };
+
+            const handlePointerUp = (event: PointerEvent) => {
+                if (block.dataset.dragging !== 'true') return;
+                block.dataset.dragging = 'false';
+                viewport.releasePointerCapture(event.pointerId);
+                applyTransform();
+            };
+
+            const handleDoubleClick = () => {
+                setState({ scale: 1, x: 0, y: 0 });
+            };
+
+            const handleControlClick = (event: MouseEvent) => {
+                const target = event.target as HTMLElement;
+                const actionEl = target.closest<HTMLElement>('.mermaid-control');
+                if (!actionEl) return;
+                const action = actionEl.dataset.action || '';
+                const state = readState();
+                if (action === 'zoom-in') {
+                    setState({ ...state, scale: clamp(state.scale + MERMAID_ZOOM_STEP) });
+                } else if (action === 'zoom-out') {
+                    setState({ ...state, scale: clamp(state.scale - MERMAID_ZOOM_STEP) });
+                } else if (action === 'reset') {
+                    setState({ scale: 1, x: 0, y: 0 });
+                }
+                event.preventDefault();
+                event.stopPropagation();
+            };
+
+            viewport.addEventListener('wheel', handleWheel, { passive: false });
+            viewport.addEventListener('pointerdown', handlePointerDown);
+            viewport.addEventListener('pointermove', handlePointerMove);
+            viewport.addEventListener('pointerup', handlePointerUp);
+            viewport.addEventListener('pointercancel', handlePointerUp);
+            viewport.addEventListener('dblclick', handleDoubleClick);
+            block.addEventListener('click', handleControlClick);
+        });
+    };
+
+    const runMermaid = () => {
+        const root = mermaidRootRef.current;
+        if (!root) return;
+        const nodes = Array.from(root.querySelectorAll<HTMLElement>('.mermaid'));
+        if (!nodes.length) return;
+        ensureMermaid();
+        const pendingNodes = nodes.filter((node) => !node.querySelector('svg'));
+        if (!pendingNodes.length) {
+            setupMermaidInteractions();
+            return;
+        }
+        pendingNodes.forEach((node) => {
+            node.removeAttribute('data-processed');
+            const raw = node.dataset.raw;
+            if (raw) {
+                try {
+                    node.textContent = decodeURIComponent(raw);
+                } catch {
+                    node.textContent = raw;
+                }
+            }
+        });
+        mermaid.run({ nodes: pendingNodes }).then(
+            () => {
+                setupMermaidInteractions();
+                pendingNodes.forEach((node, idx) => {
+                    if (node.querySelector('svg')) return;
+                    const raw = node.dataset.raw;
+                    if (!raw) return;
+                    let source = raw;
+                    try {
+                        source = decodeURIComponent(raw);
+                    } catch {
+                        // ignore decode errors
+                    }
+                    const id = `mermaid-${Date.now()}-${idx}`;
+                    mermaid.render(id, source).then(
+                        ({ svg }) => {
+                            node.innerHTML = svg;
+                            setupMermaidInteractions();
+                        },
+                        () => {
+                            // ignore render errors
+                        }
+                    );
+                });
+            },
+            () => {
+                // ignore render errors
+            }
+        );
+    };
+
+    const markFileCodeLinks = () => {
+        const root = mermaidRootRef.current;
+        if (!root) return;
+        const nodes = root.querySelectorAll<HTMLElement>('.content-markdown code');
+        nodes.forEach((node) => {
+            if (node.closest('pre')) {
+                node.classList.remove('file-code-link');
+                return;
+            }
+            const text = node.textContent?.trim() ?? '';
+            const parsed = parseFileReference(text);
+            if (parsed?.path) {
+                node.classList.add('file-code-link');
+            } else {
+                node.classList.remove('file-code-link');
+            }
+        });
+    };
+
+    const markFileTextLinks = () => {
+        const root = mermaidRootRef.current;
+        if (!root) return;
+        const containers = root.querySelectorAll<HTMLElement>('.content-markdown');
+        containers.forEach((container) => {
+            const walker = document.createTreeWalker(
+                container,
+                NodeFilter.SHOW_TEXT,
+                {
+                    acceptNode: (node) => {
+                        const text = node.nodeValue || '';
+                        if (!text.trim()) return NodeFilter.FILTER_REJECT;
+                        const parent = (node as Text).parentElement;
+                        if (!parent) return NodeFilter.FILTER_REJECT;
+                        if (parent.closest('a, button, code, pre, .code-block-container, .mermaid')) {
+                            return NodeFilter.FILTER_REJECT;
+                        }
+                        return NodeFilter.FILTER_ACCEPT;
+                    }
+                } as unknown as NodeFilter
+            );
+            const textNodes: Text[] = [];
+            while (walker.nextNode()) {
+                textNodes.push(walker.currentNode as Text);
+            }
+            textNodes.forEach((node) => {
+                const text = node.nodeValue || '';
+                const tokens = tokenizeLinks(text);
+                if (tokens.length === 1 && tokens[0].type === 'text') return;
+                const fragment = document.createDocumentFragment();
+                tokens.forEach((token) => {
+                    if (token.type === 'file') {
+                        const button = document.createElement('button');
+                        button.type = 'button';
+                        button.className = 'file-link file-link-inline';
+                        button.textContent = token.value;
+                        button.addEventListener('click', (event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            handleOpenFile(token.value);
+                        });
+                        fragment.appendChild(button);
+                    } else {
+                        fragment.appendChild(document.createTextNode(token.value));
+                    }
+                });
+                node.parentNode?.replaceChild(fragment, node);
+            });
+        });
+    };
+
+    useEffect(() => {
+        if (!steps.length && !pendingPermission) return;
+        const frame = window.requestAnimationFrame(() => {
+            runMermaid();
+            markFileCodeLinks();
+            markFileTextLinks();
+        });
+        return () => window.cancelAnimationFrame(frame);
+    }, [steps, streaming, pendingPermission]);
+
+    const patchAggregate = useMemo(() => {
+        const entries: {
+            summaries: { path: string; added: number; removed: number }[];
+            revertPatch?: string;
+            diff?: string;
+            index: number;
+        }[] = [];
+        steps.forEach((step, index) => {
+            if (step.step_type !== 'observation') return;
+            const toolName = String(step.metadata?.tool || '').toLowerCase();
+            if (toolName !== 'apply_patch') return;
+            const content = String(step.content || '').replace(/\r\n/g, '\n');
+            const result = parseApplyPatchResult(content);
+            if (!result || !result.ok) return;
+            const summaries = (result.summary || [])
+                .filter((item) => item && typeof item.path === 'string')
+                .map((item) => ({ path: item.path, added: item.added ?? 0, removed: item.removed ?? 0 }));
+            entries.push({
+                summaries,
+                revertPatch: result.revert_patch,
+                diff: result.diff || '',
+                index
+            });
+        });
+        const fileOrder: string[] = [];
+        const fileStats = new Map<string, { added: number; removed: number }>();
+        entries.forEach((entry) => {
+            entry.summaries.forEach((item) => {
+                if (!fileStats.has(item.path)) {
+                    fileStats.set(item.path, { added: 0, removed: 0 });
+                    fileOrder.push(item.path);
+                }
+                const stats = fileStats.get(item.path)!;
+                stats.added += item.added || 0;
+                stats.removed += item.removed || 0;
+            });
+        });
+        const summary = fileOrder.map((path) => ({
+            path,
+            added: fileStats.get(path)?.added ?? 0,
+            removed: fileStats.get(path)?.removed ?? 0
+        }));
+        const fileGroupsMap = new Map<string, { path: string; added: number; removed: number; diffs: string[] }>();
+        summary.forEach((item) => {
+            fileGroupsMap.set(item.path, { ...item, diffs: [] });
+        });
+        entries.forEach((entry) => {
+            const fallbackPath = entry.summaries.length === 1 ? entry.summaries[0].path : undefined;
+            splitDiffByFile(entry.diff || '', fallbackPath).forEach((chunk) => {
+                const key = chunk.path;
+                let group = fileGroupsMap.get(key);
+                if (!group) {
+                    group = { path: key, added: 0, removed: 0, diffs: [] };
+                    fileGroupsMap.set(key, group);
+                }
+                if (chunk.diff.trim()) {
+                    group.diffs.push(chunk.diff);
+                }
+            });
+        });
+        const fileGroups = Array.from(fileGroupsMap.values());
+        const revertPatch = entries
+            .map((entry) => entry.revertPatch)
+            .filter((patch): patch is string => Boolean(patch))
+            .reverse()
+            .join('\n');
+        return {
+            entries,
+            summary,
+            fileGroups,
+            revertPatch,
+            patchCount: entries.length,
+            fileCount: fileOrder.length
+        };
+    }, [steps]);
 
     const handleOpenLink = async (href: string) => {
         if (!href) return;
@@ -484,7 +931,7 @@ function AgentStepView({
                 <button
                     key={`${token.type}-${idx}`}
                     type="button"
-                    className="file-link"
+                    className="file-link file-link-pill"
                     onClick={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
@@ -572,7 +1019,7 @@ function AgentStepView({
         if (codeEl && !target.closest('.code-block-container')) {
             const text = codeEl.textContent || '';
             const parsed = parseFileReference(text);
-            if (parsed?.path && parsed.line) {
+            if (parsed?.path) {
                 event.preventDefault();
                 event.stopPropagation();
                 const filePath = normalizeFileHref(parsed.path);
@@ -605,7 +1052,7 @@ function AgentStepView({
 
     if (!steps.length && !pendingPermission) {
         return (
-            <div className="agent-steps empty">
+            <div className="agent-steps empty" ref={mermaidRootRef}>
                 <span>No agent output yet.</span>
             </div>
         );
@@ -631,6 +1078,14 @@ function AgentStepView({
             return -1;
         })()
         : -1;
+
+    const showPatchSummary = !streaming && patchAggregate.summary.length > 0;
+
+    useEffect(() => {
+        if (showPatchSummary) {
+            setPatchSummaryExpanded(false);
+        }
+    }, [showPatchSummary]);
 
     const permissionCard = pendingPermission ? (
         <div className="agent-step tool permission">
@@ -669,18 +1124,6 @@ function AgentStepView({
         </div>
     ) : null;
 
-    const lastPatchIndex = (() => {
-        let idx = -1;
-        steps.forEach((step, index) => {
-            if (step.step_type !== 'observation') return;
-            const toolName = String(step.metadata?.tool || '').toLowerCase();
-            if (toolName === 'apply_patch') {
-                idx = index;
-            }
-        });
-        return idx;
-    })();
-
     const renderGroupedSteps = () => {
         const items = steps.map((step, index) => {
                 const category = STEP_CATEGORY[step.step_type] || 'other';
@@ -701,7 +1144,9 @@ function AgentStepView({
                     /\bsearch\s*\[/i.test(rawContent) || /\bsearch\s*\(/i.test(rawContent) || lowerContent.startsWith('search');
                 const canTranslateSearch = isAction && (toolName === 'search' || looksLikeSearchCall) && hasUnicodeEscapes(rawContent);
                 const isTranslated = !!translatedSearchSteps[stepKey];
-                const displayContent = canTranslateSearch && isTranslated ? decodeUnicodeEscapes(rawContent) : rawContent;
+                const baseContent = canTranslateSearch && isTranslated ? decodeUnicodeEscapes(rawContent) : rawContent;
+                const finalAnswerFromJson = category === 'final' ? extractJsonFinalAnswer(baseContent) : null;
+                const displayContent = finalAnswerFromJson ?? baseContent;
                 const errorDetails = isError ? String(step.metadata?.traceback || '') : '';
                 const hasErrorDetails = Boolean(errorDetails);
                 const errorExpanded = !!expandedErrors[stepKey];
@@ -722,6 +1167,8 @@ function AgentStepView({
                         applyPatchResult = parseApplyPatchResult(observationText);
                     }
                 }
+                const patchExpandedDefault = patchAggregate.patchCount > 1;
+                const patchExpanded = isApplyPatch ? expandedPatches[stepKey] ?? patchExpandedDefault : false;
                 const showObservationToggle = isObservation && observationHasMore && !isApplyPatch;
 
                 return {
@@ -775,29 +1222,22 @@ function AgentStepView({
                                                             onClick={() =>
                                                                 setExpandedPatches((prev) => ({
                                                                     ...prev,
-                                                                    [stepKey]: !prev[stepKey]
+                                                                    [stepKey]: !(prev[stepKey] ?? true)
                                                                 }))
                                                             }
                                                         >
-                                                            {expandedPatches[stepKey] ? '收起' : '展开'}
+                                                            {patchExpanded ? '收起' : '展开'}
                                                         </button>
-                                                        {index === lastPatchIndex && onRevertPatch && applyPatchResult.revert_patch && (
-                                                            <button
-                                                                type="button"
-                                                                className="patch-summary-btn danger"
-                                                                onClick={() => onRevertPatch(applyPatchResult!.revert_patch || '', messageId)}
-                                                                disabled={patchRevertBusy}
-                                                            >
-                                                                {patchRevertBusy ? '处理中...' : '撤销'}
-                                                            </button>
-                                                        )}
                                                     </div>
                                                 </div>
                                                 <div className="patch-summary-list">
                                                     {(applyPatchResult.summary || []).length === 0 && (
                                                         <div className="patch-summary-item">
                                                             <span className="patch-summary-path">无变更</span>
-                                                            <span className="patch-summary-counts">+0 -0</span>
+                                                            <span className="patch-summary-counts">
+                                                                <span className="patch-count plus">+0</span>
+                                                                <span className="patch-count minus">-0</span>
+                                                            </span>
                                                         </div>
                                                     )}
                                                     {(applyPatchResult.summary || []).map((item, idx) => (
@@ -818,12 +1258,13 @@ function AgentStepView({
                                                                 <span className="patch-summary-path">{item.path}</span>
                                                             )}
                                                             <span className="patch-summary-counts">
-                                                                +{item.added} -{item.removed}
+                                                                <span className="patch-count plus">+{item.added}</span>
+                                                                <span className="patch-count minus">-{item.removed}</span>
                                                             </span>
                                                         </div>
                                                     ))}
                                                 </div>
-                                                {expandedPatches[stepKey] && applyPatchResult.diff && (
+                                                {patchExpanded && applyPatchResult.diff && (
                                                     <DiffView content={applyPatchResult.diff} />
                                                 )}
                                             </div>
@@ -913,8 +1354,115 @@ function AgentStepView({
 
     return (
         <>
-            <div className="agent-steps">
+            <div className="agent-steps" ref={mermaidRootRef}>
             {renderGroupedSteps()}
+            {showPatchSummary && (
+                <div className="agent-step tool">
+                    <div className="agent-step-header">
+                        <span className="agent-step-category">Tool Call</span>
+                        <div className="agent-step-header-actions">
+                            <span className="agent-step-type">修改总结</span>
+                        </div>
+                    </div>
+                    <div className="agent-step-content observation">
+                        <div className="patch-result">
+                            <div className="patch-summary-header">
+                                <span className="patch-summary-title">修改总结</span>
+                                <div className="patch-summary-actions">
+                                    <button
+                                        type="button"
+                                        className="patch-summary-btn simple"
+                                        onClick={() => setPatchSummaryExpanded((prev) => !prev)}
+                                    >
+                                        {patchSummaryExpanded ? '收起' : '展开'}
+                                    </button>
+                                    {onRevertPatch && patchAggregate.revertPatch && (
+                                        <button
+                                            type="button"
+                                            className="patch-summary-btn simple danger"
+                                            onClick={() => onRevertPatch(patchAggregate.revertPatch, messageId)}
+                                            disabled={patchRevertBusy}
+                                        >
+                                            {patchRevertBusy ? '处理中...' : '撤销'}
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                                    {!patchSummaryExpanded ? (
+                                        <div className="patch-summary-list">
+                                            {patchAggregate.summary.map((item) => (
+                                                <div key={`patch-summary-${item.path}`} className="patch-summary-item">
+                                                    {onOpenWorkFile ? (
+                                                        <button
+                                                            type="button"
+                                                            className="patch-summary-path clickable"
+                                                            onClick={(event) => {
+                                                                event.preventDefault();
+                                                                event.stopPropagation();
+                                                                void onOpenWorkFile(item.path);
+                                                            }}
+                                                        >
+                                                            {item.path}
+                                                        </button>
+                                                    ) : (
+                                                        <span className="patch-summary-path">{item.path}</span>
+                                                    )}
+                                                    <span className="patch-summary-counts">
+                                                        <span className="patch-count plus">+{item.added}</span>
+                                                        <span className="patch-count minus">-{item.removed}</span>
+                                                    </span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <>
+                                    <div className="patch-summary-list">
+                                        {patchAggregate.summary.map((item) => (
+                                            <div key={`patch-summary-${item.path}`} className="patch-summary-item">
+                                                {onOpenWorkFile ? (
+                                                    <button
+                                                        type="button"
+                                                        className="patch-summary-path clickable"
+                                                        onClick={(event) => {
+                                                            event.preventDefault();
+                                                            event.stopPropagation();
+                                                            void onOpenWorkFile(item.path);
+                                                        }}
+                                                    >
+                                                        {item.path}
+                                                    </button>
+                                                ) : (
+                                                    <span className="patch-summary-path">{item.path}</span>
+                                                )}
+                                            <span className="patch-summary-counts">
+                                                <span className="patch-count plus">+{item.added}</span>
+                                                <span className="patch-count minus">-{item.removed}</span>
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                                    {patchAggregate.fileGroups
+                                        .filter((group) => group.diffs.length > 0)
+                                        .map((group) => (
+                                            <div key={`patch-detail-${group.path}`} className="patch-detail">
+                                                <div className="patch-detail-header">
+                                                    <span className="patch-detail-path">{group.path}</span>
+                                                    <span className="patch-detail-counts">
+                                                        <span className="patch-count plus">+{group.added}</span>
+                                                        <span className="patch-count minus">-{group.removed}</span>
+                                                    </span>
+                                                </div>
+                                                {group.diffs.map((diff, idx) => (
+                                                    <DiffView key={`patch-detail-${group.path}-${idx}`} content={diff} />
+                                                ))}
+                                            </div>
+                                        ))}
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
             {pendingPermission && permissionAnchorIndex < 0 && permissionCard}
             {streaming && (
                 <div className="agent-step status">
