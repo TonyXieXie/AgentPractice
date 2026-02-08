@@ -11,7 +11,7 @@ This module provides basic tools that are included by default:
 
 from ..base import Tool, ToolParameter
 from ..config import is_tool_enabled
-from .system_tools import ReadFileTool, WriteFileTool, RunShellTool, TavilySearchTool, RgTool, ApplyPatchTool
+from .system_tools import ReadFileTool, WriteFileTool, RunShellTool, TavilySearchTool, RgTool, ApplyPatchTool, CodeAstTool
 
 
 class CalculatorTool(Tool):
@@ -119,3 +119,5 @@ def register_builtin_tools():
         ToolRegistry.register(WriteFileTool())
     if is_tool_enabled("run_shell"):
         ToolRegistry.register(RunShellTool())
+    if is_tool_enabled("code_ast"):
+        ToolRegistry.register(CodeAstTool())

@@ -6,6 +6,7 @@
     "read_file": true,
     "write_file": true,
     "run_shell": true,
+    "code_ast": true,
     "calculator": false,
     "weather": false
   },
@@ -50,5 +51,13 @@
     "provider": "tavily",
     "max_results": 5,
     "search_depth": "advanced"
+  },
+  "ast": {
+    "max_bytes": 200000,
+    "max_nodes": 2000,
+    "max_depth": 12,
+    "max_files": 50,
+    "max_symbols": 2000,
+    "include_text": false
   }
 }

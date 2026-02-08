@@ -720,6 +720,7 @@ class ReActAgent(AgentStrategy):
                 "Tool definitions are provided separately via the API tools field.\n\n"
                 "Guidelines:\n"
                 "- If a tool is needed, call it with JSON arguments that match its schema.\n"
+                "- Use code_ast to get a structural outline of files before deep edits.\n"
                 "- Prefer rg for searching file contents.\n"
                 "- Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.\n"
                 "- apply_patch format (strict):\n"
@@ -745,6 +746,7 @@ class ReActAgent(AgentStrategy):
 Available tool names: {tool_names}
 Tool definitions are provided separately via the API tools field.
 Guidelines:
+- Use code_ast to get a structural outline of files before deep edits.
 - Prefer rg for searching file contents.
 - Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.
 - apply_patch format (strict):
