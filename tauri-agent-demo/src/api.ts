@@ -12,7 +12,8 @@
     ChatResponse,
     LLMCall,
     ToolPermissionRequest,
-    PatchRevertResponse
+    PatchRevertResponse,
+    ToolDefinition
 } from './types';
 
 export const API_BASE_URL = 'http://127.0.0.1:8000';
@@ -115,6 +116,14 @@ export async function updateAppConfig(update: AppConfigUpdate): Promise<AppConfi
             throw new Error('App config endpoint not found. Please restart the backend.');
         }
         throw await buildApiError(response, 'Failed to update app config');
+    }
+    return response.json();
+}
+
+export async function getTools(): Promise<ToolDefinition[]> {
+    const response = await fetch(`${API_BASE_URL}/tools`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to fetch tools');
     }
     return response.json();
 }
@@ -366,4 +375,3 @@ export function getAttachmentUrl(attachmentId: number, options?: { thumbnail?: b
     const query = params.toString();
     return query ? `${API_BASE_URL}/attachments/${attachmentId}?${query}` : `${API_BASE_URL}/attachments/${attachmentId}`;
 }
-

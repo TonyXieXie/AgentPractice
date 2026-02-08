@@ -94,6 +94,7 @@ class ChatSession(BaseModel):
     title: str
     config_id: str
     work_path: Optional[str] = None
+    agent_profile: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     message_count: Optional[int] = 0
@@ -103,12 +104,14 @@ class ChatSessionCreate(BaseModel):
     title: str = "New Chat"
     config_id: str
     work_path: Optional[str] = None
+    agent_profile: Optional[str] = None
 
 
 class ChatSessionUpdate(BaseModel):
     title: Optional[str] = None
     work_path: Optional[str] = None
     config_id: Optional[str] = None
+    agent_profile: Optional[str] = None
 
 
 class AttachmentInput(BaseModel):
@@ -125,6 +128,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     config_id: Optional[str] = None
     work_path: Optional[str] = None
+    agent_profile: Optional[str] = None
     agent_mode: Optional[AgentMode] = None
     shell_unrestricted: Optional[bool] = None
     attachments: Optional[List[AttachmentInput]] = None

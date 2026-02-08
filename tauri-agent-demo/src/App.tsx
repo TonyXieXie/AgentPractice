@@ -5,10 +5,20 @@ import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import './App.css';
-import { Message, MessageAttachment, LLMConfig, LLMCall, ToolPermissionRequest, ReasoningEffort, AgentMode } from './types';
+import {
+  Message,
+  MessageAttachment,
+  LLMConfig,
+  LLMCall,
+  ToolPermissionRequest,
+  ReasoningEffort,
+  AgentMode,
+  AgentConfig
+} from './types';
 import {
   sendMessageAgentStream,
   getDefaultConfig,
+  getAppConfig,
   getConfig,
   getConfigs,
   getSession,
@@ -410,6 +420,7 @@ type QueueItem = {
   sessionKey: string;
   configId: string;
   agentMode: AgentMode;
+  agentProfileId?: string | null;
   workPath?: string;
   enqueuedAt: number;
   attachments?: PendingAttachment[];
@@ -441,6 +452,9 @@ function App() {
   const [debugFocus, setDebugFocus] = useState<{ key: string; messageId: number; iteration: number; callId?: number } | null>(null);
   const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
   const [agentMode, setAgentMode] = useState<AgentMode>('default');
+  const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null);
+  const [currentAgentProfileId, setCurrentAgentProfileId] = useState<string | null>(null);
+  const [showProfileSelector, setShowProfileSelector] = useState(false);
   const [showReasoningSelector, setShowReasoningSelector] = useState(false);
   const [showAgentModeSelector, setShowAgentModeSelector] = useState(false);
   const [queueTick, setQueueTick] = useState(0);
@@ -470,6 +484,7 @@ function App() {
   useEffect(() => {
     loadDefaultConfig();
     loadAllConfigs();
+    loadAgentConfig();
   }, []);
 
   useEffect(() => {
@@ -702,7 +717,7 @@ function App() {
   }, [messages]);
 
   useEffect(() => {
-    if (!showConfigSelector && !showReasoningSelector && !showAgentModeSelector) return;
+    if (!showConfigSelector && !showReasoningSelector && !showAgentModeSelector && !showProfileSelector) return;
     const handleClickOutside = (event: MouseEvent) => {
       const target = event.target as HTMLElement;
       if (showConfigSelector && !target.closest('.model-selector-inline')) {
@@ -714,6 +729,9 @@ function App() {
       if (showAgentModeSelector && !target.closest('.agent-mode-selector-inline')) {
         setShowAgentModeSelector(false);
       }
+      if (showProfileSelector && !target.closest('.agent-profile-selector-inline')) {
+        setShowProfileSelector(false);
+      }
     };
 
     document.addEventListener('click', handleClickOutside);
@@ -721,7 +739,7 @@ function App() {
     return () => {
       document.removeEventListener('click', handleClickOutside);
     };
-  }, [showConfigSelector, showReasoningSelector, showAgentModeSelector]);
+  }, [showConfigSelector, showReasoningSelector, showAgentModeSelector, showProfileSelector]);
 
   useEffect(() => {
     if (!workPathMenu) return;
@@ -813,6 +831,28 @@ function App() {
       setAllConfigs(configs);
     } catch (error) {
       console.error('Failed to load configs:', error);
+    }
+  };
+
+  const resolveAgentProfileId = (config: AgentConfig | null, desired?: string | null) => {
+    if (!config) return desired ?? null;
+    const profiles = config.profiles || [];
+    if (!profiles.length) return desired ?? null;
+    if (desired && profiles.some((profile) => profile.id === desired)) return desired;
+    if (config.default_profile && profiles.some((profile) => profile.id === config.default_profile)) {
+      return config.default_profile;
+    }
+    return profiles[0].id;
+  };
+
+  const loadAgentConfig = async () => {
+    try {
+      const appConfig = await getAppConfig();
+      const agent = (appConfig?.agent || null) as AgentConfig | null;
+      setAgentConfig(agent);
+      setCurrentAgentProfileId((prev) => resolveAgentProfileId(agent, prev));
+    } catch (error) {
+      console.error('Failed to load agent config:', error);
     }
   };
 
@@ -1011,6 +1051,7 @@ function App() {
           session_id: targetSessionId || undefined,
           config_id: item.configId,
           agent_mode: item.agentMode,
+          agent_profile: item.agentProfileId || undefined,
           work_path: item.workPath || undefined,
           attachments: attachmentPayload,
         },
@@ -1574,6 +1615,7 @@ function App() {
       sessionKey,
       configId: currentConfig.id,
       agentMode,
+      agentProfileId: resolveAgentProfileId(agentConfig, currentAgentProfileId),
       workPath,
       enqueuedAt: Date.now(),
       attachments: attachments.length ? [...attachments] : undefined,
@@ -1721,6 +1763,7 @@ function App() {
       const sessionWorkPath = session.work_path || '';
       workPathBySessionRef.current[session.id] = sessionWorkPath;
       setCurrentWorkPath(sessionWorkPath);
+      setCurrentAgentProfileId(resolveAgentProfileId(agentConfig, session.agent_profile || null));
 
       if (!cached || (!isStreamingSession && !hasStreaming)) {
         const [msgs, steps] = await Promise.all([
@@ -1878,6 +1921,9 @@ function App() {
     () => Boolean(permissionBusyBySessionRef.current[currentSessionKey]),
     [currentSessionKey, permissionTick]
   );
+  const agentProfiles = agentConfig?.profiles || [];
+  const resolvedAgentProfileId = resolveAgentProfileId(agentConfig, currentAgentProfileId);
+  const currentAgentProfile = agentProfiles.find((profile) => profile.id === resolvedAgentProfileId) || null;
   const currentReasoning = (currentConfig?.reasoning_effort || 'medium') as ReasoningEffort;
   const workPathDisplay = useMemo(() => formatWorkPath(currentWorkPath), [currentWorkPath]);
   const contextUsage = useMemo(() => {
@@ -2237,6 +2283,48 @@ function App() {
                     )}
                   </div>
 
+                  {agentProfiles.length > 0 && (
+                    <div className="agent-profile-selector-inline">
+                      <button
+                        type="button"
+                        className={`agent-profile-selector-btn ${showProfileSelector ? 'active' : ''}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setShowProfileSelector(!showProfileSelector);
+                        }}
+                        disabled={!currentConfig}
+                        aria-label={`Agent profile: ${currentAgentProfile?.name || resolvedAgentProfileId || ''}`}
+                        title={`Agent profile: ${currentAgentProfile?.name || resolvedAgentProfileId || ''}`}
+                      >
+                        <span className="selector-text">
+                          {currentAgentProfile?.name || resolvedAgentProfileId || 'Profile'}
+                        </span>
+                        <span className="dropdown-arrow">{'\u25be'}</span>
+                      </button>
+
+                      {showProfileSelector && (
+                        <div className="agent-profile-dropdown-inline">
+                          {agentProfiles.map((profile) => (
+                            <div
+                              key={profile.id}
+                              className={`agent-profile-option ${profile.id === resolvedAgentProfileId ? 'active' : ''}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setCurrentAgentProfileId(profile.id);
+                                setShowProfileSelector(false);
+                              }}
+                            >
+                              <div className="agent-profile-name">{profile.name}</div>
+                              {profile.id === agentConfig?.default_profile && (
+                                <div className="agent-profile-meta">Default</div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div className="reasoning-selector-inline">
                     <button
                       className={`reasoning-selector-btn ${showReasoningSelector ? 'active' : ''}`}
@@ -2403,11 +2491,13 @@ function App() {
           onClose={() => {
             setShowConfigManager(false);
             loadAllConfigs();
+            loadAgentConfig();
           }}
           onConfigCreated={() => {
             loadDefaultConfig();
             setSessionRefreshTrigger((prev) => prev + 1);
             loadAllConfigs();
+            loadAgentConfig();
           }}
         />
       )}

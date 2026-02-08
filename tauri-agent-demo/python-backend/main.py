@@ -27,6 +27,7 @@ from llm_client import create_llm_client
 from message_processor import message_processor
 
 from agents.executor import create_agent_executor
+from agents.prompt_builder import build_agent_prompt_and_tools
 from agents.base import AgentStep
 from tools.builtin import register_builtin_tools
 from tools.base import ToolRegistry
@@ -612,6 +613,8 @@ async def chat(request: ChatRequest):
             session = db.get_session(request.session_id)
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
+            if request.agent_profile is not None and request.agent_profile != getattr(session, "agent_profile", None):
+                session = db.update_session(session.id, ChatSessionUpdate(agent_profile=request.agent_profile)) or session
         else:
             config_id = request.config_id
             if not config_id:
@@ -627,7 +630,8 @@ async def chat(request: ChatRequest):
             session = db.create_session(ChatSessionCreate(
                 title="New Chat",
                 config_id=config_id,
-                work_path=request.work_path
+                work_path=request.work_path,
+                agent_profile=request.agent_profile
             ))
             new_session_created = True
         is_first_turn = (session.message_count or 0) == 0
@@ -731,12 +735,15 @@ async def chat_stream(request: ChatRequest):
             session = db.get_session(request.session_id)
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
+            if request.agent_profile is not None and request.agent_profile != getattr(session, "agent_profile", None):
+                session = db.update_session(session.id, ChatSessionUpdate(agent_profile=request.agent_profile)) or session
         else:
             config_id = request.config_id if request.config_id else db.get_all_configs()[0].id
             session = db.create_session(ChatSessionCreate(
                 title="New Chat",
                 config_id=config_id,
-                work_path=request.work_path
+                work_path=request.work_path,
+                agent_profile=request.agent_profile
             ))
             new_session_created = True
         is_first_turn = (session.message_count or 0) == 0
@@ -950,12 +957,15 @@ async def chat_agent_stream(request: ChatRequest):
             session = db.get_session(request.session_id)
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
+            if request.agent_profile is not None and request.agent_profile != getattr(session, "agent_profile", None):
+                session = db.update_session(session.id, ChatSessionUpdate(agent_profile=request.agent_profile)) or session
         else:
             config_id = request.config_id or db.get_default_config().id
             session = db.create_session(ChatSessionCreate(
                 title="New Chat",
                 config_id=config_id,
-                work_path=request.work_path
+                work_path=request.work_path,
+                agent_profile=request.agent_profile
             ))
             new_session_created = True
         is_first_turn = (session.message_count or 0) == 0
@@ -987,7 +997,15 @@ async def chat_agent_stream(request: ChatRequest):
         ]
 
         agent_type = request.agent_type_override if hasattr(request, 'agent_type_override') else getattr(session, 'agent_type', 'react')
-        tools = ToolRegistry.get_all()
+        profile_id = request.agent_profile or getattr(session, "agent_profile", None)
+        include_tools = agent_type != "simple"
+        system_prompt, tools, resolved_profile_id = build_agent_prompt_and_tools(
+            profile_id,
+            ToolRegistry.get_all(),
+            include_tools=include_tools
+        )
+        if resolved_profile_id and resolved_profile_id != getattr(session, "agent_profile", None):
+            db.update_session(session.id, ChatSessionUpdate(agent_profile=resolved_profile_id))
 
         llm_client = create_llm_client(config)
 
@@ -996,7 +1014,8 @@ async def chat_agent_stream(request: ChatRequest):
                 agent_type=agent_type,
                 llm_client=llm_client,
                 tools=tools,
-                max_iterations=50
+                max_iterations=50,
+                system_prompt=system_prompt
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))

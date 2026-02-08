@@ -135,6 +135,83 @@
   background: #33373d;
 }
 
+.add-btn.add-inline {
+  width: auto;
+  padding: 6px 10px;
+  margin-bottom: 0;
+  font-size: 0.85rem;
+}
+
+.agent-section {
+  margin-top: 18px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.agent-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.agent-section-header h4 {
+  margin: 0;
+  color: #f1f5f9;
+  font-size: 0.95rem;
+}
+
+.agent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.agent-item {
+  background: #22252a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.agent-info h4 {
+  margin: 0 0 6px 0;
+  color: #f1f5f9;
+  font-size: 0.95rem;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-detail {
+  margin: 0;
+  color: #a3aab4;
+  font-size: 0.82rem;
+}
+
+.checkbox-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px 12px;
+}
+
+.checkbox-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #cbd5e1;
+  font-size: 0.82rem;
+}
+
+.form-error {
+  color: #fca5a5;
+  font-size: 0.8rem;
+}
+
 .configs-list {
   display: flex;
   flex-direction: column;
@@ -255,7 +332,8 @@
 }
 
 .form-group input,
-.form-group select {
+.form-group select,
+.form-group textarea {
   padding: 9px 10px;
   background: #1f2328;
   border: 1px solid rgba(255, 255, 255, 0.12);
@@ -266,7 +344,8 @@
 }
 
 .form-group input:focus,
-.form-group select:focus {
+.form-group select:focus,
+.form-group textarea:focus {
   outline: none;
   border-color: rgba(255, 255, 255, 0.35);
   background: #22272d;

@@ -128,6 +128,7 @@ class Database:
                 title TEXT NOT NULL,
                 config_id TEXT NOT NULL,
                 work_path TEXT,
+                agent_profile TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (config_id) REFERENCES llm_configs(id)
@@ -141,6 +142,11 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN work_path TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN agent_profile TEXT')
         except sqlite3.OperationalError:
             pass
         
@@ -467,9 +473,9 @@ class Database:
         now = datetime.now().isoformat()
 
         cursor.execute('''
-            INSERT INTO chat_sessions (id, title, config_id, work_path, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (session_id, session.title, session.config_id, session.work_path, now, now))
+            INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (session_id, session.title, session.config_id, session.work_path, session.agent_profile, now, now))
         
         conn.commit()
         conn.close()
@@ -528,6 +534,10 @@ class Database:
         if update.config_id is not None:
             fields.append("config_id = ?")
             values.append(update.config_id)
+
+        if update.agent_profile is not None:
+            fields.append("agent_profile = ?")
+            values.append(update.agent_profile)
 
         if fields:
             fields.append("updated_at = ?")

@@ -155,7 +155,8 @@ def create_agent_executor(
         )
     elif agent_type == "react":
         strategy = ReActAgent(
-            max_iterations=kwargs.get("max_iterations", 5)
+            max_iterations=kwargs.get("max_iterations", 5),
+            system_prompt=kwargs.get("system_prompt")
         )
     else:
         raise ValueError(

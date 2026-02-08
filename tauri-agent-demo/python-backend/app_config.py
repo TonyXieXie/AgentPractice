@@ -7,6 +7,52 @@ from typing import Any, Dict, Optional
 _DEFAULT_APP_CONFIG: Dict[str, Any] = {
     "llm": {
         "timeout_sec": 180.0
+    },
+    "agent": {
+        "base_system_prompt": "You are a helpful AI assistant.",
+        "abilities": [
+            {
+                "id": "tools_all",
+                "name": "All Tools",
+                "type": "tooling",
+                "tools": ["*"],
+                "prompt": ""
+            },
+            {
+                "id": "rg_search",
+                "name": "RG Search",
+                "type": "tooling",
+                "tools": ["rg"],
+                "prompt": "Prefer rg for searching file contents."
+            },
+            {
+                "id": "apply_patch",
+                "name": "Apply Patch",
+                "type": "tooling",
+                "tools": ["apply_patch"],
+                "prompt": "Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.\napply_patch format (strict):\n  *** Begin Patch\n  *** Update File: path\n  @@\n  - old line\n  + new line\n  *** End Patch\n- Each change line must start with + or -, and context lines must be included under @@ hunks.\n- Do NOT wrap apply_patch content in code fences; send raw patch text only.\n- apply_patch matches by context; if the match is not unique, request more surrounding context.\n- If apply_patch fails due to context, ask for more context and retry."
+            },
+            {
+                "id": "tool_json",
+                "name": "Tool Arguments JSON",
+                "type": "tool_policy",
+                "prompt": "If a tool is needed, call it with JSON arguments that match its schema."
+            },
+            {
+                "id": "output_concise",
+                "name": "Concise Output",
+                "type": "output_format",
+                "prompt": "Be concise and actionable."
+            }
+        ],
+        "profiles": [
+            {
+                "id": "default",
+                "name": "Default",
+                "abilities": ["tools_all", "rg_search", "apply_patch", "tool_json", "output_concise"]
+            }
+        ],
+        "default_profile": "default"
     }
 }
 

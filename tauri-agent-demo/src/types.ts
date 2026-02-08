@@ -4,16 +4,47 @@ export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | '
 export type ReasoningSummary = 'auto' | 'concise' | 'detailed';
 export type AgentMode = 'default' | 'shell_safe' | 'super';
 
+export interface ToolDefinition {
+    name: string;
+    description?: string;
+    parameters?: Record<string, any>[];
+}
+
+export interface AgentAbility {
+    id: string;
+    name: string;
+    type: string;
+    prompt?: string;
+    tools?: string[];
+    params?: Record<string, any>;
+}
+
+export interface AgentProfile {
+    id: string;
+    name: string;
+    abilities: string[];
+    params?: Record<string, any>;
+}
+
+export interface AgentConfig {
+    base_system_prompt?: string;
+    abilities?: AgentAbility[];
+    profiles?: AgentProfile[];
+    default_profile?: string;
+}
+
 export interface AppConfig {
     llm?: {
         timeout_sec?: number;
     };
+    agent?: AgentConfig;
 }
 
 export interface AppConfigUpdate {
     llm?: {
         timeout_sec?: number;
     };
+    agent?: AgentConfig;
 }
 
 export interface LLMConfig {
@@ -87,6 +118,7 @@ export interface ChatSession {
     title: string;
     config_id: string;
     work_path?: string | null;
+    agent_profile?: string | null;
     created_at: string;
     updated_at: string;
     message_count?: number;
@@ -96,12 +128,14 @@ export interface ChatSessionCreate {
     title?: string;
     config_id: string;
     work_path?: string | null;
+    agent_profile?: string | null;
 }
 
 export interface ChatSessionUpdate {
     title?: string;
     work_path?: string | null;
     config_id?: string;
+    agent_profile?: string | null;
 }
 
 export interface LLMCall {
@@ -159,6 +193,7 @@ export interface ChatRequest {
     session_id?: string;
     config_id?: string;
     work_path?: string | null;
+    agent_profile?: string | null;
     agent_mode?: AgentMode;
     shell_unrestricted?: boolean;
     attachments?: ChatAttachmentInput[];

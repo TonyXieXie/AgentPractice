@@ -27,8 +27,9 @@ class ReActAgent(AgentStrategy):
     - Continues until reaching a final answer
     """
 
-    def __init__(self, max_iterations: int = 5):
+    def __init__(self, max_iterations: int = 5, system_prompt: Optional[str] = None):
         self.max_iterations = max_iterations
+        self.system_prompt = system_prompt or ""
     
     def _merge_debug_context(
         self,
@@ -709,71 +710,38 @@ class ReActAgent(AgentStrategy):
         tools: List[Tool],
         additional_context: Optional[Dict[str, Any]] = None
     ) -> str:
-        tool_names = ", ".join([tool.name for tool in tools]) if tools else "(no tools available)"
         tool_calling = bool(additional_context and additional_context.get("tool_calling"))
-
-        if tool_calling:
-            return (
-                "You are a reasoning + acting assistant. Use tools via function/tool calling when needed.\n\n"
-                "## Tools\n"
-                f"Available tool names: {tool_names}\n"
-                "Tool definitions are provided separately via the API tools field.\n\n"
-                "Guidelines:\n"
-                "- If a tool is needed, call it with JSON arguments that match its schema.\n"
-                "- Prefer rg for searching file contents.\n"
-                "- Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.\n"
-                "- apply_patch format (strict):\n"
-                "  *** Begin Patch\n"
-                "  *** Update File: path\n"
-                "  @@\n"
-                "  - old line\n"
-                "  + new line\n"
-                "  *** End Patch\n"
-                "- Each change line must start with + or -, and context lines must be included under @@ hunks.\n"
-                "- Do NOT wrap apply_patch content in code fences; send raw patch text only.\n"
-                "- apply_patch matches by context; if the match is not unique, request more surrounding context.\n"
-                "- If apply_patch fails due to context, ask for more context and retry.\n"
-                "- If no tool is needed, answer directly.\n"
-            )
-
         scratchpad = additional_context.get("scratchpad", []) if additional_context else []
         scratchpad_text = "\n".join(scratchpad) if scratchpad else "(first iteration)"
 
-        prompt = f"""You are a reasoning + acting assistant. Follow the format exactly.
+        base_prompt = (self.system_prompt or "").strip()
+        sections: List[str] = []
+        if base_prompt:
+            sections.append(base_prompt)
 
-## Tools
-Available tool names: {tool_names}
-Tool definitions are provided separately via the API tools field.
-Guidelines:
-- Prefer rg for searching file contents.
-- Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.
-- apply_patch format (strict):
-  *** Begin Patch
-  *** Update File: path
-  @@
-  - old line
-  + new line
-  *** End Patch
-- Do NOT wrap apply_patch content in code fences; send raw patch text only.
-- If apply_patch context is not unique, request more surrounding context.
-- If apply_patch fails due to context, request more context and retry.
+        if tool_calling:
+            sections.append(
+                "You are a reasoning + acting assistant. Use tools via function/tool calling when needed.\n\n"
+                "Guidelines:\n"
+                "- Provide JSON arguments that match the tool schema.\n"
+                "- If no tool is needed, answer directly."
+            )
+            return "\n\n".join(sections).strip()
 
-## Output Format (strict)
-Thought: <your reasoning>
-Action: <tool name>
-Action Input: <tool input>
-
-System will reply with:
-Observation: <tool output>
-
-Repeat as needed, then finish with:
-Thought: I now know the final answer.
-Final Answer: <your final answer>
-
-## Scratchpad
-{scratchpad_text}
-"""
-        return prompt
+        sections.append(
+            "You are a reasoning + acting assistant. Follow the format exactly.\n\n"
+            "## Output Format (strict)\n"
+            "Thought: <your reasoning>\n"
+            "Action: <tool name>\n"
+            "Action Input: <tool input>\n\n"
+            "System will reply with:\n"
+            "Observation: <tool output>\n\n"
+            "Repeat as needed, then finish with:\n"
+            "Thought: I now know the final answer.\n"
+            "Final Answer: <your final answer>"
+        )
+        sections.append(f"## Scratchpad\n{scratchpad_text}")
+        return "\n\n".join(sections).strip()
 
     def _parse_reaction(self, text: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
         thought_match = re.search(r"Thought:\s*(.+?)(?=\n(?:Action|Final Answer):|$)", text, re.DOTALL | re.IGNORECASE)
