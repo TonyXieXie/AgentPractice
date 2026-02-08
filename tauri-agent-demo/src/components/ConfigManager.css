@@ -13,8 +13,24 @@
 }
 
 .modal-overlay-nested {
-  background-color: rgba(0, 0, 0, 0.75);
+  background-color: rgba(0, 0, 0, 0.55);
   z-index: 1100;
+}
+
+.modal-overlay-nested .modal-content {
+  position: relative;
+  z-index: 1;
+  border-color: rgba(255, 255, 255, 0.16);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.6);
+}
+
+.inline-modal {
+  margin-top: 12px;
+  background: #1b1d20;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
 }
 
 @keyframes fadeIn {

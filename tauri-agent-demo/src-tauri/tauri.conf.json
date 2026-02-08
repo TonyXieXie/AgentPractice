@@ -15,7 +15,8 @@
         "title": "GYY",
         "width": 1200,
         "height": 950,
-        "decorations": false
+        "decorations": false,
+        "devtools": true
       }
     ],
     "security": {

@@ -42,6 +42,32 @@ const ABILITY_TYPE_OPTIONS: { value: string; label: string }[] = [
     { value: 'examples', label: '示例' }
 ];
 
+const normalizeTools = (tools: unknown): ToolDefinition[] => {
+    if (!Array.isArray(tools)) return [];
+    const normalized: ToolDefinition[] = [];
+    const seen = new Set<string>();
+    for (const item of tools) {
+        let name = '';
+        let description: string | undefined;
+        let parameters: Record<string, any>[] | undefined;
+        if (typeof item === 'string') {
+            name = item.trim();
+        } else if (item && typeof item === 'object') {
+            const candidate = item as Partial<ToolDefinition> & { name?: unknown };
+            if (typeof candidate.name === 'string') {
+                name = candidate.name.trim();
+                description = typeof candidate.description === 'string' ? candidate.description : undefined;
+                parameters = Array.isArray(candidate.parameters) ? candidate.parameters : undefined;
+            }
+        }
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        normalized.push({ name, description, parameters });
+    }
+    return normalized;
+};
+
+
 export default function ConfigManager({ onClose, onConfigCreated }: ConfigManagerProps) {
     type ConfigTab = 'models' | 'global' | 'agents';
     const [configs, setConfigs] = useState<LLMConfig[]>([]);
@@ -142,7 +168,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const loadTools = async () => {
         try {
             const tools = await getTools();
-            setAvailableTools(Array.isArray(tools) ? tools : []);
+            setAvailableTools(normalizeTools(tools));
         } catch (error) {
             console.error('Failed to load tools:', error);
         }
@@ -280,7 +306,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             }
         }
 
-        const normalizedTools = abilityForm.tools.includes('*') ? ['*'] : abilityForm.tools;
+        const cleanedTools = abilityForm.tools.filter((tool) => typeof tool === 'string' && tool.trim());
+        const normalizedTools = cleanedTools.includes('*') ? ['*'] : cleanedTools;
 
         if (editingAbilityId) {
             const index = abilities.findIndex((ability) => ability.id === editingAbilityId);
@@ -716,6 +743,135 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                         + Add Ability
                                     </button>
                                 </div>
+                                {showAbilityForm && (
+                                    <div className="inline-modal">
+                                        <div className="modal-header">
+                                            <h2>{editingAbilityId ? 'Edit Ability' : 'Create Ability'}</h2>
+                                            <button
+                                                type="button"
+                                                className="close-btn"
+                                                onClick={() => setShowAbilityForm(false)}
+                                            >
+                                                X
+                                            </button>
+                                        </div>
+                                        <div className="modal-body">
+                                            <div className="config-form">
+                                                <div className="form-group">
+                                                    <label>Name *</label>
+                                                    <input
+                                                        type="text"
+                                                        value={abilityForm.name}
+                                                        onChange={(e) =>
+                                                            setAbilityForm({ ...abilityForm, name: e.target.value })
+                                                        }
+                                                        placeholder="Ability name"
+                                                        required
+                                                    />
+                                                </div>
+
+                                                <div className="form-group">
+                                                    <label>Type *</label>
+                                                    <select
+                                                        value={abilityForm.type}
+                                                        onChange={(e) =>
+                                                            setAbilityForm({ ...abilityForm, type: e.target.value })
+                                                        }
+                                                    >
+                                                        {ABILITY_TYPE_OPTIONS.map((option) => (
+                                                            <option key={option.value} value={option.value}>
+                                                                {option.label}
+                                                            </option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+
+                                                <div className="form-group">
+                                                    <label>Tools</label>
+                                                    <div className="checkbox-grid">
+                                                        <label className="checkbox-inline">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={allToolsSelected}
+                                                                onChange={(e) => {
+                                                                    if (e.target.checked) {
+                                                                        setAbilityForm({ ...abilityForm, tools: ['*'] });
+                                                                    } else {
+                                                                        setAbilityForm({ ...abilityForm, tools: [] });
+                                                                    }
+                                                                }}
+                                                            />
+                                                            All tools
+                                                        </label>
+                                                        {availableTools.map((tool) => {
+                                                            const checked = abilityForm.tools.includes(tool.name);
+                                                            return (
+                                                                <label key={tool.name} className="checkbox-inline">
+                                                                    <input
+                                                                        type="checkbox"
+                                                                        checked={checked}
+                                                                        disabled={allToolsSelected}
+                                                                        onChange={(e) => {
+                                                                            const next = new Set(
+                                                                                abilityForm.tools.filter((name) => name !== '*')
+                                                                            );
+                                                                            if (e.target.checked) {
+                                                                                next.add(tool.name);
+                                                                            } else {
+                                                                                next.delete(tool.name);
+                                                                            }
+                                                                            setAbilityForm({
+                                                                                ...abilityForm,
+                                                                                tools: Array.from(next)
+                                                                            });
+                                                                        }}
+                                                                    />
+                                                                    {tool.name}
+                                                                </label>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                </div>
+
+                                                <div className="form-group">
+                                                    <label>Prompt</label>
+                                                    <textarea
+                                                        rows={6}
+                                                        value={abilityForm.prompt}
+                                                        onChange={(e) =>
+                                                            setAbilityForm({ ...abilityForm, prompt: e.target.value })
+                                                        }
+                                                        placeholder="Prompt text (optional)"
+                                                    />
+                                                </div>
+
+                                                <div className="form-group">
+                                                    <label>Params (JSON)</label>
+                                                    <textarea
+                                                        rows={4}
+                                                        value={abilityForm.paramsText}
+                                                        onChange={(e) =>
+                                                            setAbilityForm({ ...abilityForm, paramsText: e.target.value })
+                                                        }
+                                                        placeholder='{"key": "value"}'
+                                                    />
+                                                    <small>可选。支持 {'{{param}}'} 占位符。</small>
+                                                </div>
+
+                                                {abilityFormError && <div className="form-error">{abilityFormError}</div>}
+
+                                                <div className="form-actions">
+                                                    <button type="button" onClick={() => setShowAbilityForm(false)}>
+                                                        Cancel
+                                                    </button>
+                                                    <button type="button" onClick={handleSaveAbility}>
+                                                        Save
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
                                 <div className="agent-list">
                                     {(agentConfig.abilities || []).length === 0 ? (
                                         <p className="empty-message">No abilities yet.</p>
@@ -727,8 +883,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                                     <p className="agent-detail">
                                                         <strong>Type:</strong> {ability.type || 'misc'}{' '}
                                                         <strong>Tools:</strong>{' '}
-                                                        {(ability.tools || []).length > 0
-                                                            ? ability.tools?.join(', ')
+                                                        {Array.isArray(ability.tools) && ability.tools.length > 0
+                                                            ? ability.tools.join(', ')
                                                             : '-'}
                                                     </p>
                                                 </div>
@@ -771,6 +927,105 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                         + Add Profile
                                     </button>
                                 </div>
+                                {showProfileForm && (
+                                    <div className="inline-modal">
+                                        <div className="modal-header">
+                                            <h2>{editingProfileId ? 'Edit Profile' : 'Create Profile'}</h2>
+                                            <button
+                                                type="button"
+                                                className="close-btn"
+                                                onClick={() => setShowProfileForm(false)}
+                                            >
+                                                X
+                                            </button>
+                                        </div>
+                                        <div className="modal-body">
+                                            <div className="config-form">
+                                                <div className="form-group">
+                                                    <label>Name *</label>
+                                                    <input
+                                                        type="text"
+                                                        value={profileForm.name}
+                                                        onChange={(e) =>
+                                                            setProfileForm({ ...profileForm, name: e.target.value })
+                                                        }
+                                                        placeholder="Profile name"
+                                                        required
+                                                    />
+                                                </div>
+
+                                                <div className="form-group">
+                                                    <label>Abilities</label>
+                                                    <div className="checkbox-grid">
+                                                        {(agentConfig.abilities || []).map((ability) => {
+                                                            const checked = profileForm.abilities.includes(ability.id);
+                                                            return (
+                                                                <label key={ability.id} className="checkbox-inline">
+                                                                    <input
+                                                                        type="checkbox"
+                                                                        checked={checked}
+                                                                        onChange={(e) => {
+                                                                            const next = new Set(profileForm.abilities);
+                                                                            if (e.target.checked) {
+                                                                                next.add(ability.id);
+                                                                            } else {
+                                                                                next.delete(ability.id);
+                                                                            }
+                                                                            setProfileForm({
+                                                                                ...profileForm,
+                                                                                abilities: Array.from(next)
+                                                                            });
+                                                                        }}
+                                                                    />
+                                                                    {ability.name}
+                                                                </label>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                </div>
+
+                                                <div className="form-group">
+                                                    <label>Params (JSON)</label>
+                                                    <textarea
+                                                        rows={4}
+                                                        value={profileForm.paramsText}
+                                                        onChange={(e) =>
+                                                            setProfileForm({ ...profileForm, paramsText: e.target.value })
+                                                        }
+                                                        placeholder='{"key": "value"}'
+                                                    />
+                                                </div>
+
+                                                <div className="form-group checkbox-group">
+                                                    <label>
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={profileForm.isDefault}
+                                                            onChange={(e) =>
+                                                                setProfileForm({
+                                                                    ...profileForm,
+                                                                    isDefault: e.target.checked
+                                                                })
+                                                            }
+                                                        />
+                                                        Set as default
+                                                    </label>
+                                                </div>
+
+                                                {profileFormError && <div className="form-error">{profileFormError}</div>}
+
+                                                <div className="form-actions">
+                                                    <button type="button" onClick={() => setShowProfileForm(false)}>
+                                                        Cancel
+                                                    </button>
+                                                    <button type="button" onClick={handleSaveProfile}>
+                                                        Save
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
                                 <div className="agent-list">
                                     {(agentConfig.profiles || []).length === 0 ? (
                                         <p className="empty-message">No profiles yet.</p>
@@ -853,11 +1108,11 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             </div>
 
             {showForm && activeTab === 'models' && (
-                <div className="modal-overlay modal-overlay-nested">
+                <div className="modal-overlay modal-overlay-nested" onClick={resetForm}>
                     <div className="modal-content modal-content-nested" onClick={(e) => e.stopPropagation()}>
                         <div className="modal-header">
                             <h2>{editingConfig ? 'Edit Config' : 'Create Config'}</h2>
-                            <button className="close-btn" onClick={resetForm}>X</button>
+                            <button type="button" className="close-btn" onClick={resetForm}>X</button>
                         </div>
                         <div className="modal-body">
                             <form onSubmit={handleSubmit} className="config-form">
@@ -994,199 +1249,6 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     </button>
                                 </div>
                             </form>
-                        </div>
-                    </div>
-                </div>
-            )}
-            {showAbilityForm && activeTab === 'agents' && (
-                <div className="modal-overlay modal-overlay-nested">
-                    <div className="modal-content modal-content-nested" onClick={(e) => e.stopPropagation()}>
-                        <div className="modal-header">
-                            <h2>{editingAbilityId ? 'Edit Ability' : 'Create Ability'}</h2>
-                            <button className="close-btn" onClick={() => setShowAbilityForm(false)}>X</button>
-                        </div>
-                        <div className="modal-body">
-                            <div className="config-form">
-                                <div className="form-group">
-                                    <label>Name *</label>
-                                    <input
-                                        type="text"
-                                        value={abilityForm.name}
-                                        onChange={(e) => setAbilityForm({ ...abilityForm, name: e.target.value })}
-                                        placeholder="Ability name"
-                                        required
-                                    />
-                                </div>
-
-                                <div className="form-group">
-                                    <label>Type *</label>
-                                    <select
-                                        value={abilityForm.type}
-                                        onChange={(e) => setAbilityForm({ ...abilityForm, type: e.target.value })}
-                                    >
-                                        {ABILITY_TYPE_OPTIONS.map((option) => (
-                                            <option key={option.value} value={option.value}>{option.label}</option>
-                                        ))}
-                                    </select>
-                                </div>
-
-                                <div className="form-group">
-                                    <label>Tools</label>
-                                    <div className="checkbox-grid">
-                                        <label className="checkbox-inline">
-                                            <input
-                                                type="checkbox"
-                                                checked={allToolsSelected}
-                                                onChange={(e) => {
-                                                    if (e.target.checked) {
-                                                        setAbilityForm({ ...abilityForm, tools: ['*'] });
-                                                    } else {
-                                                        setAbilityForm({ ...abilityForm, tools: [] });
-                                                    }
-                                                }}
-                                            />
-                                            All tools
-                                        </label>
-                                        {availableTools.map((tool) => {
-                                            const checked = abilityForm.tools.includes(tool.name);
-                                            return (
-                                                <label key={tool.name} className="checkbox-inline">
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={checked}
-                                                        disabled={allToolsSelected}
-                                                        onChange={(e) => {
-                                                            const next = new Set(abilityForm.tools.filter((name) => name !== '*'));
-                                                            if (e.target.checked) {
-                                                                next.add(tool.name);
-                                                            } else {
-                                                                next.delete(tool.name);
-                                                            }
-                                                            setAbilityForm({ ...abilityForm, tools: Array.from(next) });
-                                                        }}
-                                                    />
-                                                    {tool.name}
-                                                </label>
-                                            );
-                                        })}
-                                    </div>
-                                </div>
-
-                                <div className="form-group">
-                                    <label>Prompt</label>
-                                    <textarea
-                                        rows={6}
-                                        value={abilityForm.prompt}
-                                        onChange={(e) => setAbilityForm({ ...abilityForm, prompt: e.target.value })}
-                                        placeholder="Prompt text (optional)"
-                                    />
-                                </div>
-
-                                <div className="form-group">
-                                    <label>Params (JSON)</label>
-                                    <textarea
-                                        rows={4}
-                                        value={abilityForm.paramsText}
-                                        onChange={(e) => setAbilityForm({ ...abilityForm, paramsText: e.target.value })}
-                                        placeholder='{"key": "value"}'
-                                    />
-                                    <small>可选。支持 {{param}} 占位符。</small>
-                                </div>
-
-                                {abilityFormError && <div className="form-error">{abilityFormError}</div>}
-
-                                <div className="form-actions">
-                                    <button type="button" onClick={() => setShowAbilityForm(false)}>
-                                        Cancel
-                                    </button>
-                                    <button type="button" onClick={handleSaveAbility}>
-                                        Save
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-            {showProfileForm && activeTab === 'agents' && (
-                <div className="modal-overlay modal-overlay-nested">
-                    <div className="modal-content modal-content-nested" onClick={(e) => e.stopPropagation()}>
-                        <div className="modal-header">
-                            <h2>{editingProfileId ? 'Edit Profile' : 'Create Profile'}</h2>
-                            <button className="close-btn" onClick={() => setShowProfileForm(false)}>X</button>
-                        </div>
-                        <div className="modal-body">
-                            <div className="config-form">
-                                <div className="form-group">
-                                    <label>Name *</label>
-                                    <input
-                                        type="text"
-                                        value={profileForm.name}
-                                        onChange={(e) => setProfileForm({ ...profileForm, name: e.target.value })}
-                                        placeholder="Profile name"
-                                        required
-                                    />
-                                </div>
-
-                                <div className="form-group">
-                                    <label>Abilities</label>
-                                    <div className="checkbox-grid">
-                                        {(agentConfig.abilities || []).map((ability) => {
-                                            const checked = profileForm.abilities.includes(ability.id);
-                                            return (
-                                                <label key={ability.id} className="checkbox-inline">
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={checked}
-                                                        onChange={(e) => {
-                                                            const next = new Set(profileForm.abilities);
-                                                            if (e.target.checked) {
-                                                                next.add(ability.id);
-                                                            } else {
-                                                                next.delete(ability.id);
-                                                            }
-                                                            setProfileForm({ ...profileForm, abilities: Array.from(next) });
-                                                        }}
-                                                    />
-                                                    {ability.name}
-                                                </label>
-                                            );
-                                        })}
-                                    </div>
-                                </div>
-
-                                <div className="form-group">
-                                    <label>Params (JSON)</label>
-                                    <textarea
-                                        rows={4}
-                                        value={profileForm.paramsText}
-                                        onChange={(e) => setProfileForm({ ...profileForm, paramsText: e.target.value })}
-                                        placeholder='{"key": "value"}'
-                                    />
-                                </div>
-
-                                <div className="form-group checkbox-group">
-                                    <label>
-                                        <input
-                                            type="checkbox"
-                                            checked={profileForm.isDefault}
-                                            onChange={(e) => setProfileForm({ ...profileForm, isDefault: e.target.checked })}
-                                        />
-                                        Set as default
-                                    </label>
-                                </div>
-
-                                {profileFormError && <div className="form-error">{profileFormError}</div>}
-
-                                <div className="form-actions">
-                                    <button type="button" onClick={() => setShowProfileForm(false)}>
-                                        Cancel
-                                    </button>
-                                    <button type="button" onClick={handleSaveProfile}>
-                                        Save
-                                    </button>
-                                </div>
-                            </div>
                         </div>
                     </div>
                 </div>
