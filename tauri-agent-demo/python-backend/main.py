@@ -73,6 +73,13 @@ def read_local_file(path: str = Query(...), max_bytes: int = Query(2_000_000)):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to read file: {exc}")
 
+@app.get("/local-file-exists")
+def local_file_exists(path: str = Query(...)):
+    if not path:
+        raise HTTPException(status_code=400, detail="Missing path")
+    safe_path = os.path.abspath(os.path.expanduser(path))
+    return {"exists": os.path.isfile(safe_path)}
+
 # ==================== Title Generation ====================
 
 TITLE_MAX_CHARS = 40

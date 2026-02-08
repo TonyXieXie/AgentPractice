@@ -5,7 +5,7 @@ import texmath from 'markdown-it-texmath';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
 import { openPath, openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
-import { AgentStep } from '../api';
+import { API_BASE_URL, AgentStep } from '../api';
 import { ToolPermissionRequest } from '../types';
 import DiffView from './DiffView';
 import './AgentStepView.css';
@@ -24,6 +24,7 @@ interface AgentStepViewProps {
     onRevertPatch?: (patch: string, messageId?: number) => void;
     patchRevertBusy?: boolean;
     onOpenWorkFile?: (filePath: string, line?: number, column?: number) => void;
+    currentWorkPath?: string;
     debugActive?: boolean;
     onOpenDebugCall?: (iteration: number) => void;
 }
@@ -49,6 +50,7 @@ const STEP_CATEGORY: Record<AgentStep['step_type'], Category> = {
 
 const IS_MAC = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent);
 const MAC_ABSOLUTE_PREFIX = /^(Users|Volumes|private|System|Library|Applications|opt|etc|var|tmp)[\\/]/;
+const FILE_EXISTS_TIMEOUT_MS = 1500;
 
 const markdown = new MarkdownIt({
     html: false,
@@ -311,9 +313,12 @@ type LinkToken =
     | { type: 'text'; value: string }
     | { type: 'url'; value: string }
     | { type: 'file'; value: string };
+type FileCheckStatus = 'exists' | 'missing' | 'error';
+type FileCheckEntry = { status: FileCheckStatus; checkedAt: number };
+type FileLinkStatus = FileCheckStatus | 'pending' | 'unknown';
 
 const LINK_PATTERN =
-    /((?:https?|file):\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+|[a-zA-Z]:\\[^\s<>"'`]+|\\\\[^\s<>"'`]+|\/[^\s<>"'`]+|[^\s<>"'`]+[\\/][^\s<>"'`]+(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)|[^\s<>"'`]+\.[A-Za-z0-9]{1,10}(?::\d+(?::\d+)?|#L\d+(?:C\d+)?))/g;
+    /((?:https?|file):\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+|[a-zA-Z]:\\[^\s<>"'`]+|\\\\[^\s<>"'`]+|\/[^\s<>"'`]+|[^\s<>"'`]+[\\/][^\s<>"'`]+\.[A-Za-z0-9]{1,10}(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)?|[^\s<>"'`]+\.[A-Za-z0-9]{1,10}(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)?)/g;
 const TRAILING_PUNCTUATION = /[),.;:!?]+$/;
 const FILE_EXT_PATTERN = /\.[A-Za-z0-9]{1,10}$/;
 const ESCAPE_SEGMENTS = new Set(['n', 'r', 't', 'b', 'f', 'v', '0']);
@@ -345,7 +350,7 @@ function looksLikeFilePath(value: string) {
     }
     if (value.startsWith('\\\\')) return true;
     if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return true;
-    if (value.includes('/') || value.includes('\\')) return true;
+    if (value.includes('/') || value.includes('\\')) return FILE_EXT_PATTERN.test(value);
     return FILE_EXT_PATTERN.test(value);
 }
 
@@ -432,7 +437,17 @@ function getParentPath(filePath: string) {
     return parent || trimmed;
 }
 
+function joinPath(base: string, child: string) {
+    if (!base) return child;
+    const separator = base.includes('\\') ? '\\' : '/';
+    if (base.endsWith('\\') || base.endsWith('/')) {
+        return `${base}${child}`;
+    }
+    return `${base}${separator}${child}`;
+}
+
 const hasScheme = (value: string) => /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value);
+const isAbsolutePath = (value: string) => /^(?:[a-zA-Z]:[\\/]|\\\\|\/)/.test(value);
 
 const isFileHref = (value: string) => {
     if (!value) return false;
@@ -480,6 +495,7 @@ function AgentStepView({
     onRevertPatch,
     patchRevertBusy,
     onOpenWorkFile,
+    currentWorkPath,
     debugActive,
     onOpenDebugCall
 }: AgentStepViewProps) {
@@ -494,6 +510,9 @@ function AgentStepView({
     const [patchSummaryExpanded, setPatchSummaryExpanded] = useState(false);
     const mermaidRootRef = useRef<HTMLDivElement | null>(null);
     const mermaidInitializedRef = useRef(false);
+    const [fileValidationTick, setFileValidationTick] = useState(0);
+    const fileExistsCacheRef = useRef<Map<string, FileCheckEntry>>(new Map());
+    const pendingFileChecksRef = useRef<Set<string>>(new Set());
     const MERMAID_MIN_SCALE = 0.2;
     const MERMAID_MAX_SCALE = 4;
     const MERMAID_ZOOM_STEP = 0.15;
@@ -726,6 +745,68 @@ function AgentStepView({
         });
     };
 
+    const resolvePathForCheck = (rawPath: string) => {
+        const parsed = parseFileReference(rawPath);
+        const normalized = normalizeFileHref(parsed?.path ?? rawPath);
+        if (!normalized) return { path: '', checkable: false };
+        if (isAbsolutePath(normalized)) return { path: normalized, checkable: true };
+        if (!currentWorkPath) return { path: normalized, checkable: false };
+        if (normalized.startsWith('./') || normalized.startsWith('../') || normalized.includes('/') || normalized.includes('\\')) {
+            return { path: joinPath(currentWorkPath, normalized), checkable: true };
+        }
+        return { path: normalized, checkable: false };
+    };
+
+    const checkFileExists = async (resolvedPath: string) => {
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), FILE_EXISTS_TIMEOUT_MS);
+        try {
+            const response = await fetch(
+                `${API_BASE_URL}/local-file-exists?path=${encodeURIComponent(resolvedPath)}`,
+                { signal: controller.signal }
+            );
+            if (!response.ok) {
+                throw new Error(`Backend check failed (${response.status})`);
+            }
+            const data = await response.json();
+            const exists = Boolean(data?.exists);
+            fileExistsCacheRef.current.set(resolvedPath, { status: exists ? 'exists' : 'missing', checkedAt: Date.now() });
+        } catch {
+            fileExistsCacheRef.current.set(resolvedPath, { status: 'error', checkedAt: Date.now() });
+        } finally {
+            pendingFileChecksRef.current.delete(resolvedPath);
+            window.clearTimeout(timeout);
+            setFileValidationTick((prev) => prev + 1);
+        }
+    };
+
+    const ensureFileCheck = (rawPath: string) => {
+        const { path, checkable } = resolvePathForCheck(rawPath);
+        if (!checkable || !path) return;
+        const cached = fileExistsCacheRef.current.get(path);
+        if (cached && cached.status !== 'error') return;
+        if (cached && cached.status === 'error' && Date.now() - cached.checkedAt < 10_000) return;
+        if (pendingFileChecksRef.current.has(path)) return;
+        pendingFileChecksRef.current.add(path);
+        void checkFileExists(path);
+    };
+
+    const getFileLinkStatus = (rawPath: string) => {
+        const { path, checkable } = resolvePathForCheck(rawPath);
+        if (!checkable || !path) return { status: 'unknown', checkable: false };
+        const cached = fileExistsCacheRef.current.get(path);
+        if (!cached) {
+            ensureFileCheck(rawPath);
+            return { status: 'pending', checkable: true };
+        }
+        if (cached.status === 'error' && Date.now() - cached.checkedAt >= 10_000) {
+            fileExistsCacheRef.current.delete(path);
+            ensureFileCheck(rawPath);
+            return { status: 'pending', checkable: true };
+        }
+        return { status: cached.status, checkable: true };
+    };
+
     const markFileTextLinks = () => {
         const root = mermaidRootRef.current;
         if (!root) return;
@@ -758,6 +839,12 @@ function AgentStepView({
                 const fragment = document.createDocumentFragment();
                 tokens.forEach((token) => {
                     if (token.type === 'file') {
+                        const linkStatus = getFileLinkStatus(token.value);
+                        const shouldLink = !linkStatus.checkable || linkStatus.status === 'exists';
+                        if (!shouldLink) {
+                            fragment.appendChild(document.createTextNode(token.value));
+                            return;
+                        }
                         const button = document.createElement('button');
                         button.type = 'button';
                         button.className = 'file-link file-link-inline';
@@ -785,7 +872,7 @@ function AgentStepView({
             markFileTextLinks();
         });
         return () => window.cancelAnimationFrame(frame);
-    }, [steps, streaming, pendingPermission]);
+    }, [steps, streaming, pendingPermission, fileValidationTick]);
 
     const patchAggregate = useMemo(() => {
         const entries: {
@@ -936,26 +1023,35 @@ function AgentStepView({
                 );
             }
             return (
-                <button
-                    key={`${token.type}-${idx}`}
-                    type="button"
-                    className="file-link file-link-pill"
-                    onClick={(event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        handleOpenFile(token.value);
-                    }}
-                    onContextMenu={(event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        const parsed = parseFileReference(token.value);
-                        if (parsed?.path) {
-                            setFileMenu({ path: normalizeFileHref(parsed.path), x: event.clientX, y: event.clientY });
-                        }
-                    }}
-                >
-                    {token.value}
-                </button>
+                (() => {
+                    const linkStatus = getFileLinkStatus(token.value);
+                    const shouldLink = !linkStatus.checkable || linkStatus.status === 'exists';
+                    if (!shouldLink) {
+                        return <Fragment key={`${token.type}-${idx}`}>{token.value}</Fragment>;
+                    }
+                    return (
+                        <button
+                            key={`${token.type}-${idx}`}
+                            type="button"
+                            className="file-link file-link-pill"
+                            onClick={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                handleOpenFile(token.value);
+                            }}
+                            onContextMenu={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                const parsed = parseFileReference(token.value);
+                                if (parsed?.path) {
+                                    setFileMenu({ path: normalizeFileHref(parsed.path), x: event.clientX, y: event.clientY });
+                                }
+                            }}
+                        >
+                            {token.value}
+                        </button>
+                    );
+                })()
             );
         });
     };

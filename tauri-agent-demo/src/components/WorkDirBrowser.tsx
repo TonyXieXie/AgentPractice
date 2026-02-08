@@ -18,7 +18,7 @@ import { API_BASE_URL } from '../api';
 import { openPath, openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import './WorkDirBrowser.css';
 
-type FileKind = 'text' | 'markdown' | 'image' | 'unknown';
+type FileKind = 'text' | 'markdown' | 'image' | 'pdf' | 'unknown';
 
 const IS_MAC = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent);
 const MAC_ABSOLUTE_PREFIX = /^(Users|Volumes|private|System|Library|Applications|opt|etc|var|tmp)[\\/]/;
@@ -128,8 +128,13 @@ const injectMermaidFences = (content: string) => {
 const renderMarkdown = (content: string) => markdown.render(injectMermaidFences(content || ''));
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico']);
+const PDF_EXTENSIONS = new Set(['pdf']);
 const MARKDOWN_EXTENSIONS = new Set(['md', 'markdown', 'mdx']);
 const MIN_PANE_RATIO = 0.12;
+const SIDEBAR_WIDTH_KEY = 'workdirSidebarWidth';
+const SIDEBAR_DEFAULT_WIDTH = 240;
+const SIDEBAR_MIN_WIDTH = 180;
+const SIDEBAR_MAX_WIDTH = 520;
 
 const createPane = (): Pane => ({
   id: `pane-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
@@ -181,6 +186,7 @@ const getFileKind = (ext: string): FileKind => {
   if (!ext) return 'text';
   if (MARKDOWN_EXTENSIONS.has(ext)) return 'markdown';
   if (IMAGE_EXTENSIONS.has(ext)) return 'image';
+  if (PDF_EXTENSIONS.has(ext)) return 'pdf';
   return 'text';
 };
 
@@ -201,6 +207,8 @@ const getMimeType = (ext: string) => {
       return 'image/svg+xml';
     case 'ico':
       return 'image/x-icon';
+    case 'pdf':
+      return 'application/pdf';
     default:
       return 'application/octet-stream';
   }
@@ -383,6 +391,19 @@ function WorkDirBrowser({
     column?: number;
     nonce: number;
   } | null>(null);
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    try {
+      const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+      const value = raw ? Number(raw) : NaN;
+      if (Number.isFinite(value)) {
+        return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, Math.round(value)));
+      }
+    } catch {
+      // ignore
+    }
+    return SIDEBAR_DEFAULT_WIDTH;
+  });
+  const [isSidebarResizing, setIsSidebarResizing] = useState(false);
   const [highlightLine, setHighlightLine] = useState<{ path: string; line: number; nonce: number } | null>(null);
   const mermaidRootRef = useRef<HTMLDivElement | null>(null);
   const mermaidInitializedRef = useRef(false);
@@ -432,6 +453,7 @@ function WorkDirBrowser({
   const refreshFilesTimerRef = useRef<number | null>(null);
   const pendingDirRefreshRef = useRef<Record<string, boolean>>({});
   const unwatchRef = useRef<UnwatchFn | null>(null);
+  const sidebarResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
   const rootName = useMemo(() => (rootPath ? getBaseName(rootPath) : ''), [rootPath]);
 
@@ -474,6 +496,14 @@ function WorkDirBrowser({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, rootPath]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
+    } catch {
+      // ignore
+    }
+  }, [sidebarWidth]);
 
   const ensureMermaid = () => {
     if (mermaidInitializedRef.current) return;
@@ -1277,7 +1307,7 @@ function WorkDirBrowser({
     setActivePaneId(targetPaneId);
 
     try {
-      if (kind === 'image') {
+      if (kind === 'image' || kind === 'pdf') {
         const bytes = await readFile(path);
         const url = URL.createObjectURL(new Blob([bytes], { type: getMimeType(ext) }));
         if (!findFileLocation(path)) {
@@ -1672,6 +1702,34 @@ function WorkDirBrowser({
     setIsResizing(true);
   };
 
+  const handleSidebarResizeStart = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startWidth = sidebarWidth;
+    sidebarResizeRef.current = { startX: event.clientX, startWidth };
+    setIsSidebarResizing(true);
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      if (!sidebarResizeRef.current) return;
+      const delta = moveEvent.clientX - sidebarResizeRef.current.startX;
+      const nextWidth = Math.min(
+        SIDEBAR_MAX_WIDTH,
+        Math.max(SIDEBAR_MIN_WIDTH, Math.round(sidebarResizeRef.current.startWidth + delta))
+      );
+      setSidebarWidth(nextWidth);
+    };
+
+    const handlePointerUp = () => {
+      sidebarResizeRef.current = null;
+      setIsSidebarResizing(false);
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp, { once: true });
+  };
+
   const handleMarkdownLinkClick = (event: ReactMouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
     const link = target.closest<HTMLAnchorElement>('a');
@@ -1811,8 +1869,8 @@ function WorkDirBrowser({
           )}
         </div>
       ) : (
-        <div className="workdir-body">
-          <div className="workdir-sidebar">
+        <div className={`workdir-body${isSidebarResizing ? ' resizing-sidebar' : ''}`}>
+          <div className="workdir-sidebar" style={{ width: sidebarWidth }}>
             <div className="workdir-sidebar-title">资源管理器</div>
             <div
               className="workdir-tree"
@@ -1870,6 +1928,14 @@ function WorkDirBrowser({
               {expandedDirs[rootPath] && renderEntries(rootPath, 1)}
             </div>
           </div>
+
+          <div
+            className="workdir-sidebar-resizer"
+            onPointerDown={handleSidebarResizeStart}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize sidebar"
+          />
 
           <div className="workdir-editor">
             <div
@@ -1992,6 +2058,18 @@ function WorkDirBrowser({
                                 <img src={paneActiveFile.url} alt={paneActiveFile.name} />
                               ) : (
                                 <span>图片加载失败。</span>
+                              )}
+                            </div>
+                          )}
+                        {paneActiveFile &&
+                          !paneActiveFile.loading &&
+                          !paneActiveFile.error &&
+                          paneActiveFile.kind === 'pdf' && (
+                            <div className="workdir-pdf-viewer workdir-viewer-body">
+                              {paneActiveFile.url ? (
+                                <iframe src={paneActiveFile.url} title={paneActiveFile.name} />
+                              ) : (
+                                <span>PDF 加载失败。</span>
                               )}
                             </div>
                           )}

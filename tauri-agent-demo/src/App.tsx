@@ -2020,6 +2020,7 @@ function App() {
                           onRevertPatch={handleRevertPatch}
                           patchRevertBusy={patchRevertBusy}
                           onOpenWorkFile={openWorkdirForFile}
+                          currentWorkPath={currentWorkPath}
                           debugActive={showDebugPanel}
                           onOpenDebugCall={(iteration) => handleOpenDebugCall(msg.id, iteration)}
                         />

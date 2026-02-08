@@ -150,11 +150,43 @@
 }
 
 .workdir-sidebar {
-  width: 240px;
+  flex: 0 0 auto;
   background: #252526;
   border-right: 1px solid #2d2d2d;
   display: flex;
   flex-direction: column;
+}
+
+.workdir-body.resizing-sidebar {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.workdir-body.resizing-sidebar * {
+  cursor: col-resize;
+}
+
+.workdir-sidebar-resizer {
+  width: 6px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.workdir-sidebar-resizer::before {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: rgba(148, 163, 184, 0.12);
+  transition: background 0.2s;
+}
+
+.workdir-sidebar-resizer:hover::before {
+  background: rgba(148, 163, 184, 0.35);
 }
 
 .workdir-sidebar-title {
@@ -185,6 +217,7 @@
   cursor: pointer;
   font-size: 0.76rem;
   user-select: none;
+  min-width: 0;
 }
 
 .workdir-tree-row:hover {
@@ -203,9 +236,14 @@
 
 .workdir-tree-toggle {
   width: 14px;
+  height: 14px;
   text-align: center;
   color: #8a8a8a;
   transition: transform 0.15s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 14px;
 }
 
 .workdir-tree-toggle.expanded {
@@ -213,7 +251,16 @@
 }
 
 .workdir-tree-toggle.hidden {
-  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.workdir-tree-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .workdir-tree-name.dir { color: #d4d4d4; }
@@ -744,6 +791,18 @@
   max-height: 100%;
   border-radius: 6px;
   box-shadow: 0 12px 24px rgba(0, 0, 0, 0.35);
+}
+
+.workdir-pdf-viewer {
+  width: 100%;
+  height: 100%;
+}
+
+.workdir-pdf-viewer iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: #0f1115;
 }
 
 .workdir-markdown {
