@@ -21,6 +21,32 @@ def _get_root_path() -> Path:
     return Path(root).expanduser().resolve()
 
 
+def _get_allowed_roots() -> list:
+    tool_ctx = get_tool_context()
+    roots = []
+    primary = tool_ctx.get("work_path") or get_tool_config().get("project_root") or os.getcwd()
+    if primary:
+        roots.append(Path(primary).expanduser().resolve())
+    extras = tool_ctx.get("extra_work_paths")
+    if isinstance(extras, (list, tuple)):
+        for raw in extras:
+            if not raw:
+                continue
+            try:
+                roots.append(Path(raw).expanduser().resolve())
+            except Exception:
+                continue
+    seen = set()
+    unique = []
+    for root in roots:
+        key = str(root).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
+
+
 def _resolve_rg_executable(root: Path) -> str:
     override = os.environ.get("RG_EXE") or os.environ.get("RIPGREP_EXE")
     if override:
@@ -74,12 +100,13 @@ def _get_agent_mode() -> str:
 
 
 def _resolve_path(raw_path: str, tool_name: str, action: str) -> Path:
-    root = _get_root_path()
+    roots = _get_allowed_roots()
+    root = roots[0] if roots else _get_root_path()
     path = Path(raw_path)
     if not path.is_absolute():
         path = root / path
     path = path.resolve()
-    if not _is_within_root(path, root):
+    if not any(_is_within_root(path, allowed_root) for allowed_root in roots):
         mode = _get_agent_mode()
         if mode == "super":
             return path

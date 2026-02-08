@@ -1,10 +1,13 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import WorkDirBrowser from './components/WorkDirBrowser';
+import { loadExtraWorkPaths, saveExtraWorkPaths } from './workdirStorage';
 import './WorkDirWindow.css';
 
 const WORKDIR_BOUNDS_KEY = 'workdirWindowBounds';
+const DRAFT_SESSION_KEY = '__draft__';
 
 const getInitialPath = () => {
   const params = new URLSearchParams(window.location.search);
@@ -44,8 +47,21 @@ const getInitialOpenColumn = () => {
   return Number.isFinite(value) ? value : undefined;
 };
 
+const getInitialSessionKey = () => {
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get('session');
+  if (!raw) return DRAFT_SESSION_KEY;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+};
+
 function WorkDirWindow() {
+  const [sessionKey, setSessionKey] = useState(getInitialSessionKey);
   const [rootPath, setRootPath] = useState(getInitialPath);
+  const [extraRoots, setExtraRoots] = useState(() => loadExtraWorkPaths(getInitialSessionKey(), getInitialPath()));
   const [openFileRequest, setOpenFileRequest] = useState(() => {
     const initial = getInitialOpenFile();
     const line = getInitialOpenLine();
@@ -54,6 +70,8 @@ function WorkDirWindow() {
   });
   const [ping, setPing] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
+  const [showFileMenu, setShowFileMenu] = useState(false);
+  const fileMenuRef = useRef<HTMLDivElement>(null);
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
   useEffect(() => {
@@ -62,10 +80,35 @@ function WorkDirWindow() {
   }, []);
 
   useEffect(() => {
+    setExtraRoots(loadExtraWorkPaths(sessionKey, rootPath));
+  }, [sessionKey, rootPath]);
+
+  useEffect(() => {
+    if (!showFileMenu) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (!target || !fileMenuRef.current) {
+        setShowFileMenu(false);
+        return;
+      }
+      if (!fileMenuRef.current.contains(target)) {
+        setShowFileMenu(false);
+      }
+    };
+    window.addEventListener('pointerdown', handlePointerDown);
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [showFileMenu]);
+
+  useEffect(() => {
     let unlisten: (() => void) | undefined;
     const label = (appWindow as { label?: string }).label;
-    listen<{ path: string; target?: string }>('workdir:set', (event) => {
+    listen<{ path: string; target?: string; sessionKey?: string }>('workdir:set', (event) => {
       if (label && event.payload?.target && event.payload.target !== label) return;
+      if (event.payload?.sessionKey) {
+        setSessionKey(event.payload.sessionKey);
+      }
       setRootPath(event.payload?.path || '');
     }).then((stop) => {
       unlisten = stop;
@@ -191,6 +234,23 @@ function WorkDirWindow() {
     handleTitlebarMaximize();
   };
 
+  const handleAddFolder = async () => {
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: true,
+        title: '添加文件夹到工作区'
+      });
+      if (!selected) return;
+      const selections = Array.isArray(selected) ? selected : [selected];
+      const next = saveExtraWorkPaths(sessionKey, [...extraRoots, ...selections], rootPath);
+      setExtraRoots(next);
+      setShowFileMenu(false);
+    } catch (error) {
+      console.error('Failed to add extra folder:', error);
+    }
+  };
+
   const titlePath = rootPath || '未设置';
 
   return (
@@ -198,6 +258,29 @@ function WorkDirWindow() {
       <div className="workdir-titlebar" data-tauri-drag-region onDoubleClick={handleTitlebarDoubleClick}>
         <div className="workdir-titlebar-left">
           <div className="workdir-titlebar-appname">GYY</div>
+          <div
+            className="workdir-titlebar-menu"
+            data-tauri-drag-region="false"
+            ref={fileMenuRef}
+          >
+            <button
+              type="button"
+              className={`workdir-menu-btn${showFileMenu ? ' active' : ''}`}
+              data-tauri-drag-region="false"
+              onClick={() => setShowFileMenu((prev) => !prev)}
+              aria-label="文件菜单"
+              title="文件"
+            >
+              文件 <span className="workdir-menu-caret">▾</span>
+            </button>
+            {showFileMenu && (
+              <div className="workdir-menu-dropdown">
+                <button type="button" className="workdir-menu-item" onClick={handleAddFolder}>
+                  添加文件夹...
+                </button>
+              </div>
+            )}
+          </div>
           <div className="workdir-titlebar-divider" />
           <div className="workdir-titlebar-path" title={titlePath}>
             {titlePath}
@@ -264,6 +347,7 @@ function WorkDirWindow() {
         <WorkDirBrowser
           open
           rootPath={rootPath}
+          extraRoots={extraRoots}
           openFileRequest={openFileRequest}
           mode="window"
           showActions={false}

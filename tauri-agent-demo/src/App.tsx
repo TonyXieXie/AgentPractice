@@ -31,6 +31,7 @@ import SessionList from './components/SessionList';
 import DebugPanel from './components/DebugPanel';
 import AgentStepView from './components/AgentStepView';
 import ConfirmDialog from './components/ConfirmDialog';
+import { loadExtraWorkPaths, migrateExtraWorkPaths, saveExtraWorkPaths } from './workdirStorage';
 
 const DRAFT_SESSION_KEY = '__draft__';
 
@@ -147,6 +148,13 @@ const getParentPath = (filePath: string) => {
   return parent || trimmed;
 };
 
+const getBaseName = (filePath: string) => {
+  const trimmed = filePath.replace(/[\\/]+$/, '');
+  const idx = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'));
+  if (idx < 0) return trimmed;
+  return trimmed.slice(idx + 1) || trimmed;
+};
+
 const isAbsolutePath = (value: string) =>
   /^(?:[a-zA-Z]:[\\/]|\\\\|\/)/.test(value);
 
@@ -256,6 +264,18 @@ const joinPath = (base: string, child: string) => {
   return `${base}${separator}${child}`;
 };
 
+const pathExists = async (filePath: string) => {
+  const parent = getParentPath(filePath);
+  const name = getBaseName(filePath);
+  if (!parent || !name) return false;
+  try {
+    const entries = await readDir(parent);
+    return entries.some((entry) => entry.name === name);
+  } catch {
+    return false;
+  }
+};
+
 const findWorkFileByName = async (root: string, fileName: string) => {
   const target = fileName.trim().toLowerCase();
   if (!root || !target) return '';
@@ -295,6 +315,24 @@ const findWorkFileByName = async (root: string, fileName: string) => {
   }
 
   return '';
+};
+
+const resolveRelativePath = async (relativePath: string, roots: string[]) => {
+  if (!relativePath || roots.length === 0) return relativePath;
+  if (isBareFilename(relativePath)) {
+    for (const root of roots) {
+      const matched = await findWorkFileByName(root, relativePath);
+      if (matched) return matched;
+    }
+    return joinPath(roots[0], relativePath);
+  }
+  for (const root of roots) {
+    const candidate = joinPath(root, relativePath);
+    if (await pathExists(candidate)) {
+      return candidate;
+    }
+  }
+  return joinPath(roots[0], relativePath);
 };
 
 const estimateTokensForText = (text: string) => {
@@ -411,6 +449,7 @@ type QueueItem = {
   configId: string;
   agentMode: AgentMode;
   workPath?: string;
+  extraWorkPaths?: string[];
   enqueuedAt: number;
   attachments?: PendingAttachment[];
 };
@@ -960,6 +999,8 @@ function App() {
         setCurrentWorkPath(workPathBySessionRef.current[toKey] || '');
       }
     }
+
+    migrateExtraWorkPaths(fromKey, toKey);
   };
 
   const runStreamForItem = async (
@@ -1012,6 +1053,7 @@ function App() {
           config_id: item.configId,
           agent_mode: item.agentMode,
           work_path: item.workPath || undefined,
+          extra_work_paths: item.extraWorkPaths && item.extraWorkPaths.length > 0 ? item.extraWorkPaths : undefined,
           attachments: attachmentPayload,
         },
         abortController.signal
@@ -1394,8 +1436,10 @@ function App() {
     path: string,
     openFilePath?: string,
     openLine?: number,
-    openColumn?: number
+    openColumn?: number,
+    sessionKeyOverride?: string
   ) => {
+    const sessionKey = sessionKeyOverride || getCurrentSessionKey();
     const label = makeWorkdirLabel(path);
     const existing = await WebviewWindow.getByLabel(label);
     if (existing) {
@@ -1406,7 +1450,7 @@ function App() {
         // ignore focus errors
       }
       void existing.emit('workdir:ping', { target: label });
-      void existing.emit('workdir:set', { path, target: label });
+      void existing.emit('workdir:set', { path, target: label, sessionKey });
       if (openFilePath) {
         void existing.emit('workdir:open-file', { path: openFilePath, line: openLine, column: openColumn, target: label });
       }
@@ -1414,11 +1458,12 @@ function App() {
     }
 
     const bounds = getWorkdirWindowBounds();
+    const sessionParam = sessionKey ? `&session=${encodeURIComponent(sessionKey)}` : '';
     const url = openFilePath
-      ? `/?window=workdir&path=${encodeURIComponent(path)}&open=${encodeURIComponent(openFilePath)}${
+      ? `/?window=workdir&path=${encodeURIComponent(path)}${sessionParam}&open=${encodeURIComponent(openFilePath)}${
         openLine ? `&line=${encodeURIComponent(String(openLine))}` : ''
       }${openColumn ? `&col=${encodeURIComponent(String(openColumn))}` : ''}`
-      : `/?window=workdir&path=${encodeURIComponent(path)}`;
+      : `/?window=workdir&path=${encodeURIComponent(path)}${sessionParam}`;
     const win = new WebviewWindow(label, {
       title: 'GYY',
       url,
@@ -1430,7 +1475,7 @@ function App() {
     });
 
     win.once('tauri://created', () => {
-      void win.emit('workdir:set', { path, target: label });
+      void win.emit('workdir:set', { path, target: label, sessionKey });
     });
 
     win.once('tauri://error', (event) => {
@@ -1447,17 +1492,19 @@ function App() {
     const trimmed = normalizedInput.trim();
     if (!trimmed) return;
 
+    const sessionKey = getCurrentSessionKey();
+    const extraRoots = loadExtraWorkPaths(sessionKey, currentWorkPath);
+    const rootCandidates = [currentWorkPath, ...extraRoots].filter((value) => value);
+
     let resolvedPath = trimmed;
-    if (!isAbsolutePath(trimmed) && currentWorkPath) {
-      if (isBareFilename(trimmed)) {
-        const matched = await findWorkFileByName(currentWorkPath, trimmed);
-        resolvedPath = matched || joinPath(currentWorkPath, trimmed);
-      } else {
-        resolvedPath = joinPath(currentWorkPath, trimmed);
-      }
+    if (!isAbsolutePath(trimmed) && rootCandidates.length > 0) {
+      resolvedPath = await resolveRelativePath(trimmed, rootCandidates);
     }
 
-    const root = currentWorkPath || (isAbsolutePath(resolvedPath) ? getParentPath(resolvedPath) : '');
+    const root =
+      currentWorkPath ||
+      rootCandidates[0] ||
+      (isAbsolutePath(resolvedPath) ? getParentPath(resolvedPath) : '');
     if (!root) {
       alert('请先选择工作路径。');
       return;
@@ -1469,7 +1516,7 @@ function App() {
       return;
     }
     lastWorkFileOpenRef.current = { key, at: now };
-    await openWorkDirWindow(root, resolvedPath, targetLine, targetColumn);
+    await openWorkDirWindow(root, resolvedPath, targetLine, targetColumn, sessionKey);
   };
 
   const openWorkPathInExplorer = async (path: string) => {
@@ -1494,7 +1541,7 @@ function App() {
       await handleWorkPathPick();
       return;
     }
-    await openWorkDirWindow(currentWorkPath);
+    await openWorkDirWindow(currentWorkPath, undefined, undefined, undefined, getCurrentSessionKey());
   };
 
   const handleWorkPathContextMenu = (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -1566,6 +1613,7 @@ function App() {
         workPath = selected;
       }
     }
+    const extraWorkPaths = loadExtraWorkPaths(sessionKey, workPath);
 
     const queueItem: QueueItem = {
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -1575,6 +1623,7 @@ function App() {
       configId: currentConfig.id,
       agentMode,
       workPath,
+      extraWorkPaths,
       enqueuedAt: Date.now(),
       attachments: attachments.length ? [...attachments] : undefined,
     };
@@ -1758,6 +1807,7 @@ function App() {
   const handleNewChat = async () => {
     const sourceKey = getCurrentSessionKey();
     const sourcePath = getSessionWorkPath(sourceKey);
+    const sourceExtraPaths = loadExtraWorkPaths(sourceKey, sourcePath);
 
     stashCurrentMessages();
     currentSessionIdRef.current = null;
@@ -1768,10 +1818,12 @@ function App() {
 
     if (sourcePath) {
       setSessionWorkPath(DRAFT_SESSION_KEY, sourcePath);
+      saveExtraWorkPaths(DRAFT_SESSION_KEY, sourceExtraPaths, sourcePath);
       return;
     }
 
     setSessionWorkPath(DRAFT_SESSION_KEY, '');
+    saveExtraWorkPaths(DRAFT_SESSION_KEY, sourceExtraPaths);
     const selected = await pickWorkPath();
     if (selected) {
       await applyWorkPath(DRAFT_SESSION_KEY, null, selected);

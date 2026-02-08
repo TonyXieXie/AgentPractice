@@ -1029,6 +1029,8 @@ async def chat_agent_stream(request: ChatRequest):
                     },
                     "work_path": request.work_path or getattr(session, 'work_path', None)
                 }
+                if request.extra_work_paths:
+                    request_overrides["extra_work_paths"] = [str(p) for p in request.extra_work_paths if p]
                 request_overrides["_stop_event"] = stop_event
                 if llm_image_urls:
                     request_overrides["user_content"] = user_content

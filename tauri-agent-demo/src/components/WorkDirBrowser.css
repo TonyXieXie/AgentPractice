@@ -234,6 +234,24 @@
   color: #ffffff;
 }
 
+.workdir-tree-row.root.extra {
+  color: #e2e8f0;
+}
+
+.workdir-tree-root + .workdir-tree-root {
+  margin-top: 6px;
+}
+
+.workdir-tree-tag {
+  font-size: 0.64rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #93c5fd;
+  background: rgba(59, 130, 246, 0.16);
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+
 .workdir-tree-toggle {
   width: 14px;
   height: 14px;
