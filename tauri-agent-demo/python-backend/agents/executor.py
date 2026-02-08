@@ -75,6 +75,9 @@ class AgentExecutor:
             work_path = None
             if request_overrides and request_overrides.get("work_path"):
                 work_path = request_overrides.get("work_path")
+            extra_work_paths = None
+            if request_overrides and request_overrides.get("extra_work_paths"):
+                extra_work_paths = request_overrides.get("extra_work_paths")
 
             message_id = None
             if request_overrides:
@@ -98,6 +101,7 @@ class AgentExecutor:
                 "agent_mode": agent_mode or "default",
                 "session_id": session_id,
                 "work_path": work_path,
+                "extra_work_paths": extra_work_paths,
                 "message_id": message_id
             })
 

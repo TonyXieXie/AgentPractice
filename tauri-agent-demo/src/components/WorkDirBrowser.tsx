@@ -53,6 +53,7 @@ type Pane = {
 type WorkDirBrowserProps = {
   open: boolean;
   rootPath: string;
+  extraRoots?: string[];
   openFileRequest?: { path: string; line?: number; column?: number; nonce: number } | null;
   onClose?: () => void;
   onPickWorkPath?: () => void;
@@ -339,6 +340,7 @@ const formatError = (error: unknown) => {
 function WorkDirBrowser({
   open,
   rootPath,
+  extraRoots = [],
   openFileRequest,
   onClose,
   onPickWorkPath,
@@ -452,10 +454,28 @@ function WorkDirBrowser({
   const refreshTimerRef = useRef<number | null>(null);
   const refreshFilesTimerRef = useRef<number | null>(null);
   const pendingDirRefreshRef = useRef<Record<string, boolean>>({});
-  const unwatchRef = useRef<UnwatchFn | null>(null);
+  const unwatchRef = useRef<UnwatchFn[]>([]);
   const sidebarResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
-  const rootName = useMemo(() => (rootPath ? getBaseName(rootPath) : ''), [rootPath]);
+  const primaryRootNorm = useMemo(() => (rootPath ? normalizePath(rootPath) : ''), [rootPath]);
+  const allRoots = useMemo(() => {
+    const candidates = [rootPath, ...extraRoots].filter((value) => Boolean(value && value.trim()));
+    const seen = new Set<string>();
+    const result: string[] = [];
+    candidates.forEach((value) => {
+      const normalized = normalizePath(value);
+      if (!normalized) return;
+      if (seen.has(normalized)) return;
+      seen.add(normalized);
+      result.push(value);
+    });
+    return result;
+  }, [rootPath, extraRoots]);
+  const extraRootList = useMemo(
+    () => allRoots.filter((value) => normalizePath(value) !== primaryRootNorm),
+    [allRoots, primaryRootNorm]
+  );
+  const watchRoots = useMemo(() => (rootPath ? allRoots : []), [rootPath, allRoots]);
 
   const revokeFileUrl = (file: OpenFile) => {
     if (file.url) {
@@ -488,14 +508,21 @@ function WorkDirBrowser({
 
   useEffect(() => {
     if (!open || !rootPath) return;
-    if (!expandedDirs[rootPath]) {
-      setExpandedDirs((prev) => ({ ...prev, [rootPath]: true }));
-    }
-    if (!dirCache[rootPath] && !dirLoading[rootPath]) {
-      void loadDir(rootPath);
+    if (allRoots.length === 0) return;
+    const expandedUpdates: Record<string, boolean> = {};
+    allRoots.forEach((root) => {
+      if (!expandedDirs[root]) {
+        expandedUpdates[root] = true;
+      }
+      if (!dirCache[root] && !dirLoading[root]) {
+        void loadDir(root);
+      }
+    });
+    if (Object.keys(expandedUpdates).length > 0) {
+      setExpandedDirs((prev) => ({ ...prev, ...expandedUpdates }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, rootPath]);
+  }, [open, rootPath, allRoots]);
 
   useEffect(() => {
     try {
@@ -998,15 +1025,13 @@ function WorkDirBrowser({
   };
 
   useEffect(() => {
-    if (!open || !rootPath) return;
+    if (!open || watchRoots.length === 0) return;
     let active = true;
 
-    const startWatch = async () => {
+    const startWatch = async (root: string) => {
       try {
-        setWatchError(null);
-        setWatchStatus('监听已启动');
         const unwatch = await watchImmediate(
-          rootPath,
+          root,
           (event) => {
             if (!active) return;
             setWatchStatus(`监听事件：${describeWatchPaths(event?.paths)}`);
@@ -1019,24 +1044,26 @@ function WorkDirBrowser({
           unwatch();
           return;
         }
-        if (unwatchRef.current) {
-          unwatchRef.current();
-        }
-        unwatchRef.current = unwatch;
+        unwatchRef.current.push(unwatch);
       } catch (error) {
         setWatchError(`监听失败：${formatError(error)}`);
-        setWatchStatus(null);
       }
     };
 
-    void startWatch();
+    const startAll = async () => {
+      setWatchError(null);
+      setWatchStatus(watchRoots.length > 1 ? `监听已启动（${watchRoots.length}）` : '监听已启动');
+      unwatchRef.current.forEach((fn) => fn());
+      unwatchRef.current = [];
+      await Promise.all(watchRoots.map((root) => startWatch(root)));
+    };
+
+    void startAll();
 
     return () => {
       active = false;
-      if (unwatchRef.current) {
-        unwatchRef.current();
-        unwatchRef.current = null;
-      }
+      unwatchRef.current.forEach((fn) => fn());
+      unwatchRef.current = [];
       if (refreshTimerRef.current != null) {
         window.clearTimeout(refreshTimerRef.current);
         refreshTimerRef.current = null;
@@ -1047,7 +1074,7 @@ function WorkDirBrowser({
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, rootPath]);
+  }, [open, watchRoots]);
 
   const openFileFromExternal = async (rawPath: string) => {
     const path = normalizeWatchPath(rawPath);
@@ -1055,23 +1082,24 @@ function WorkDirBrowser({
     const name = getBaseName(path);
     if (!name) return;
 
-    if (rootPath) {
-      const normalizedRoot = normalizePath(rootPath);
+    if (allRoots.length > 0) {
       const normalizedFile = normalizePath(path);
-      if (isPathWithin(normalizedFile, normalizedRoot)) {
+      const matchedRoot = allRoots.find((root) => isPathWithin(normalizedFile, normalizePath(root)));
+      if (matchedRoot) {
+        const normalizedRoot = normalizePath(matchedRoot);
         const relative = normalizedFile.slice(normalizedRoot.length).replace(/^\/+/, '');
         const parts = relative ? relative.split('/') : [];
         const dirParts = parts.slice(0, -1);
-        const expandedUpdates: Record<string, boolean> = { [rootPath]: true };
-        let current = rootPath;
+        const expandedUpdates: Record<string, boolean> = { [matchedRoot]: true };
+        let current = matchedRoot;
         for (const part of dirParts) {
           current = joinPath(current, part);
           expandedUpdates[current] = true;
         }
         setExpandedDirs((prev) => ({ ...prev, ...expandedUpdates }));
-        void loadDir(rootPath);
+        void loadDir(matchedRoot);
         Object.keys(expandedUpdates).forEach((dir) => {
-          if (dir !== rootPath) {
+          if (dir !== matchedRoot) {
             void loadDir(dir);
           }
         });
@@ -1816,6 +1844,54 @@ function WorkDirBrowser({
     });
   };
 
+  const renderRootTree = (root: string, isPrimary: boolean) => {
+    const rootLabel = getBaseName(root) || root;
+    const showWatchStatus = isPrimary;
+    return (
+      <div key={root} className="workdir-tree-root">
+        <div
+          className={`workdir-tree-row root${isPrimary ? '' : ' extra'}`}
+          onClick={() => toggleDir(root)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            setContextMenu({
+              x: event.clientX,
+              y: event.clientY,
+              targetPath: root,
+              revealPath: root,
+            });
+          }}
+        >
+          <span className={`workdir-tree-toggle${expandedDirs[root] ? ' expanded' : ''}`}>▸</span>
+          <span className="workdir-tree-name dir">{rootLabel}</span>
+          {!isPrimary && <span className="workdir-tree-tag">附加</span>}
+        </div>
+        {dirErrors[root] && (
+          <div className="workdir-tree-error" style={{ paddingLeft: 20 }}>
+            读取失败：{dirErrors[root]}
+          </div>
+        )}
+        {dirLoading[root] && (
+          <div className="workdir-tree-loading" style={{ paddingLeft: 20 }}>
+            加载中...
+          </div>
+        )}
+        {showWatchStatus && watchError && (
+          <div className="workdir-tree-error" style={{ paddingLeft: 20 }}>
+            {watchError}
+          </div>
+        )}
+        {showWatchStatus && !watchError && watchStatus && (
+          <div className="workdir-tree-status" style={{ paddingLeft: 20 }}>
+            {watchStatus}
+          </div>
+        )}
+        {expandedDirs[root] && renderEntries(root, 1)}
+      </div>
+    );
+  };
+
   if (!open) return null;
 
   const closeVisible = showClose ?? mode === 'overlay';
@@ -1887,45 +1963,8 @@ function WorkDirBrowser({
                 });
               }}
             >
-              <div
-                className="workdir-tree-row root"
-                onClick={() => toggleDir(rootPath)}
-                onContextMenu={(event) => {
-                  if (!rootPath) return;
-                  event.preventDefault();
-                  event.stopPropagation();
-                  setContextMenu({
-                    x: event.clientX,
-                    y: event.clientY,
-                    targetPath: rootPath,
-                    revealPath: rootPath,
-                  });
-                }}
-              >
-                <span className={`workdir-tree-toggle${expandedDirs[rootPath] ? ' expanded' : ''}`}>▸</span>
-                <span className="workdir-tree-name dir">{rootName || rootPath}</span>
-              </div>
-              {dirErrors[rootPath] && (
-                <div className="workdir-tree-error" style={{ paddingLeft: 20 }}>
-                  读取失败：{dirErrors[rootPath]}
-                </div>
-              )}
-              {dirLoading[rootPath] && (
-                <div className="workdir-tree-loading" style={{ paddingLeft: 20 }}>
-                  加载中...
-                </div>
-              )}
-              {watchError && (
-                <div className="workdir-tree-error" style={{ paddingLeft: 20 }}>
-                  {watchError}
-                </div>
-              )}
-              {!watchError && watchStatus && (
-                <div className="workdir-tree-status" style={{ paddingLeft: 20 }}>
-                  {watchStatus}
-                </div>
-              )}
-              {expandedDirs[rootPath] && renderEntries(rootPath, 1)}
+              {rootPath && renderRootTree(rootPath, true)}
+              {extraRootList.map((root) => renderRootTree(root, false))}
             </div>
           </div>
 

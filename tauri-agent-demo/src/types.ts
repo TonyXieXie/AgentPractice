@@ -194,6 +194,7 @@ export interface ChatRequest {
     config_id?: string;
     work_path?: string | null;
     agent_profile?: string | null;
+    extra_work_paths?: string[] | null;
     agent_mode?: AgentMode;
     shell_unrestricted?: boolean;
     attachments?: ChatAttachmentInput[];

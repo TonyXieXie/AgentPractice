@@ -129,6 +129,7 @@ class ChatRequest(BaseModel):
     config_id: Optional[str] = None
     work_path: Optional[str] = None
     agent_profile: Optional[str] = None
+    extra_work_paths: Optional[List[str]] = None
     agent_mode: Optional[AgentMode] = None
     shell_unrestricted: Optional[bool] = None
     attachments: Optional[List[AttachmentInput]] = None
