@@ -20,6 +20,7 @@ class ToolParameter(BaseModel):
     description: str
     required: bool = True
     default: Any = None
+    items: Optional[Dict[str, Any]] = None
 
 
 class Tool(ABC):
@@ -81,6 +82,8 @@ def _build_tool_parameters_schema(tool: "Tool") -> Dict[str, Any]:
         }
         if param.default is not None:
             schema["default"] = param.default
+        if param_type == "array":
+            schema["items"] = param.items or {"type": "string"}
         properties[param.name] = schema
         if param.required:
             required.append(param.name)

@@ -1465,7 +1465,7 @@ class CodeAstTool(Tool):
             ToolParameter(
                 name="language",
                 type="string",
-                description="Optional language override (python, typescript, tsx, javascript, rust, json).",
+                description="Optional language override (python, typescript, tsx, javascript, rust, json, c, cpp).",
                 required=False
             ),
             ToolParameter(
