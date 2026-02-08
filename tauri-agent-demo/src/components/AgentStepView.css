@@ -409,6 +409,212 @@
     gap: 6px;
 }
 
+.ast-view {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: #0f131a;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 8px;
+}
+
+.ast-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.ast-title {
+    font-size: 0.76rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #cbd5e1;
+}
+
+.ast-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.ast-action-btn {
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: rgba(255, 255, 255, 0.06);
+    color: #cbd5e1;
+    cursor: pointer;
+    padding: 2px 10px;
+    font-size: 0.68rem;
+    transition: all 0.2s ease;
+}
+
+.ast-action-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.ast-summary {
+    color: #94a3b8;
+    font-size: 0.74rem;
+}
+
+.ast-files {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.ast-file {
+    background: #10161f;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 6px 8px;
+}
+
+.ast-file > summary {
+    cursor: pointer;
+    list-style: none;
+}
+
+.ast-file > summary::-webkit-details-marker {
+    display: none;
+}
+
+.ast-file-header {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.ast-file-path {
+    font-family: 'Courier New', monospace;
+    font-size: 0.78rem;
+    color: #e5e7eb;
+    word-break: break-all;
+}
+
+.ast-file-path.clickable {
+    background: none;
+    border: none;
+    color: #93c5fd;
+    cursor: pointer;
+    padding: 0;
+    text-align: left;
+}
+
+.ast-file-path.clickable:hover {
+    text-decoration: underline;
+}
+
+.ast-file-meta {
+    font-size: 0.7rem;
+    color: #94a3b8;
+}
+
+.ast-file-body {
+    margin-top: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ast-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.ast-section-title {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #93c5fd;
+    font-weight: 600;
+}
+
+.ast-list {
+    margin: 0;
+    padding-left: 16px;
+    color: #cbd5e1;
+    font-size: 0.78rem;
+}
+
+.ast-tree {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.ast-node summary {
+    cursor: pointer;
+    list-style: none;
+}
+
+.ast-node summary::-webkit-details-marker {
+    color: #64748b;
+}
+
+.ast-node-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.ast-node-label {
+    font-family: 'Courier New', monospace;
+    font-size: 0.78rem;
+    color: #e5e7eb;
+}
+
+.ast-node-meta {
+    font-size: 0.68rem;
+    color: #94a3b8;
+}
+
+.ast-children {
+    margin-left: 12px;
+    padding-left: 8px;
+    border-left: 1px dashed rgba(255, 255, 255, 0.12);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.ast-leaf {
+    padding-left: 18px;
+}
+
+.ast-error {
+    color: #fca5a5;
+    font-size: 0.76rem;
+    background: rgba(248, 113, 113, 0.08);
+    border: 1px solid rgba(248, 113, 113, 0.2);
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+
+.ast-empty {
+    color: #9ca3af;
+    font-size: 0.76rem;
+}
+
+.ast-raw {
+    background: #0b0f16;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    color: #e5e7eb;
+    font-family: 'Courier New', monospace;
+    font-size: 0.72rem;
+    line-height: 1.4;
+    max-height: 240px;
+    overflow: auto;
+    padding: 8px;
+    white-space: pre-wrap;
+}
+
 .patch-result {
     display: flex;
     flex-direction: column;

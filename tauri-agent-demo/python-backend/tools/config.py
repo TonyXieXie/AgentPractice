@@ -12,6 +12,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "read_file": True,
         "write_file": True,
         "run_shell": True,
+        "code_ast": True,
         "calculator": False,
         "weather": False
     },
@@ -39,6 +40,14 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "max_results": 5,
         "search_depth": "basic",
         "min_score": 0.4
+    },
+    "ast": {
+        "max_bytes": 200000,
+        "max_nodes": 2000,
+        "max_depth": 12,
+        "max_files": 50,
+        "max_symbols": 2000,
+        "include_text": False
     }
 }
 

@@ -710,6 +710,7 @@ class ReActAgent(AgentStrategy):
         tools: List[Tool],
         additional_context: Optional[Dict[str, Any]] = None
     ) -> str:
+        tool_names = ", ".join([tool.name for tool in tools]) if tools else "(no tools available)"
         tool_calling = bool(additional_context and additional_context.get("tool_calling"))
         scratchpad = additional_context.get("scratchpad", []) if additional_context else []
         scratchpad_text = "\n".join(scratchpad) if scratchpad else "(first iteration)"
@@ -722,14 +723,48 @@ class ReActAgent(AgentStrategy):
         if tool_calling:
             sections.append(
                 "You are a reasoning + acting assistant. Use tools via function/tool calling when needed.\n\n"
+                "## Tools\n"
+                f"Available tool names: {tool_names}\n"
+                "Tool definitions are provided separately via the API tools field.\n\n"
                 "Guidelines:\n"
-                "- Provide JSON arguments that match the tool schema.\n"
+                "- If a tool is needed, call it with JSON arguments that match its schema.\n"
+                "- Use code_ast to get a structural outline of files before deep edits.\n"
+                "- Prefer rg for searching file contents.\n"
+                "- Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.\n"
+                "- apply_patch format (strict):\n"
+                "  *** Begin Patch\n"
+                "  *** Update File: path\n"
+                "  @@\n"
+                "  - old line\n"
+                "  + new line\n"
+                "  *** End Patch\n"
+                "- Each change line must start with + or -, and context lines must be included under @@ hunks.\n"
+                "- Do NOT wrap apply_patch content in code fences; send raw patch text only.\n"
+                "- apply_patch matches by context; if the match is not unique, request more surrounding context.\n"
+                "- If apply_patch fails due to context, ask for more context and retry.\n"
                 "- If no tool is needed, answer directly."
             )
             return "\n\n".join(sections).strip()
 
         sections.append(
             "You are a reasoning + acting assistant. Follow the format exactly.\n\n"
+            "## Tools\n"
+            f"Available tool names: {tool_names}\n"
+            "Tool definitions are provided separately via the API tools field.\n"
+            "Guidelines:\n"
+            "- Use code_ast to get a structural outline of files before deep edits.\n"
+            "- Prefer rg for searching file contents.\n"
+            "- Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.\n"
+            "- apply_patch format (strict):\n"
+            "  *** Begin Patch\n"
+            "  *** Update File: path\n"
+            "  @@\n"
+            "  - old line\n"
+            "  + new line\n"
+            "  *** End Patch\n"
+            "- Do NOT wrap apply_patch content in code fences; send raw patch text only.\n"
+            "- If apply_patch context is not unique, request more surrounding context.\n"
+            "- If apply_patch fails due to context, request more context and retry.\n\n"
             "## Output Format (strict)\n"
             "Thought: <your reasoning>\n"
             "Action: <tool name>\n"

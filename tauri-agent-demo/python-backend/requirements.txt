@@ -3,3 +3,5 @@ uvicorn==0.32.1
 pydantic==2.10.3
 httpx==0.28.1
 Pillow==10.4.0
+tree_sitter==0.20.4
+tree_sitter_languages==1.10.2
