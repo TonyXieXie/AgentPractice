@@ -1004,6 +1004,15 @@ _AST_EXT_LANGUAGE = {
     ".cjs": "javascript",
     ".ts": "typescript",
     ".tsx": "tsx",
+    ".c": "c",
+    ".h": "cpp",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".cxx": "cpp",
+    ".hh": "cpp",
+    ".hpp": "cpp",
+    ".hxx": "cpp",
+    ".inl": "cpp",
     ".rs": "rust",
     ".json": "json"
 }
@@ -1017,6 +1026,11 @@ _AST_LANGUAGE_ALIASES = {
     "typescript": "typescript",
     "tsx": "tsx",
     "jsx": "javascript",
+    "c": "c",
+    "cpp": "cpp",
+    "c++": "cpp",
+    "cc": "cpp",
+    "cxx": "cpp",
     "rs": "rust",
     "rust": "rust",
     "json": "json"
@@ -1458,7 +1472,8 @@ class CodeAstTool(Tool):
                 name="extensions",
                 type="array",
                 description="Optional file extensions filter for directory mode (e.g. ['.py', '.ts']).",
-                required=False
+                required=False,
+                items={"type": "string"}
             ),
             ToolParameter(
                 name="max_files",
