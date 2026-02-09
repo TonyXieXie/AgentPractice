@@ -13,7 +13,8 @@
     LLMCall,
     ToolPermissionRequest,
     PatchRevertResponse,
-    ToolDefinition
+    ToolDefinition,
+    AstRequest
 } from './types';
 
 export const API_BASE_URL = 'http://127.0.0.1:8000';
@@ -124,6 +125,18 @@ export async function getTools(): Promise<ToolDefinition[]> {
     const response = await fetch(`${API_BASE_URL}/tools`);
     if (!response.ok) {
         throw await buildApiError(response, 'Failed to fetch tools');
+    }
+    return response.json();
+}
+
+export async function runAstTool(payload: AstRequest): Promise<any> {
+    const response = await fetch(`${API_BASE_URL}/tools/ast`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to run AST tool');
     }
     return response.json();
 }

@@ -73,6 +73,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const [configs, setConfigs] = useState<LLMConfig[]>([]);
     const [activeTab, setActiveTab] = useState<ConfigTab>('models');
     const [globalTimeoutSec, setGlobalTimeoutSec] = useState('180');
+    const [globalReactMaxIterations, setGlobalReactMaxIterations] = useState('50');
     const [globalLoading, setGlobalLoading] = useState(false);
     const [globalSaving, setGlobalSaving] = useState(false);
     const [globalSaved, setGlobalSaved] = useState(false);
@@ -118,12 +119,17 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         is_default: false,
     });
 
-    const normalizeAgentConfig = (data?: AgentConfig | null): AgentConfig => ({
-        base_system_prompt: data?.base_system_prompt ?? '',
-        abilities: Array.isArray(data?.abilities) ? data!.abilities : [],
-        profiles: Array.isArray(data?.profiles) ? data!.profiles : [],
-        default_profile: data?.default_profile ?? '',
-    });
+    const normalizeAgentConfig = (data?: AgentConfig | null): AgentConfig => {
+        const parsedMax = Number.parseInt(String(data?.react_max_iterations ?? ''), 10);
+        const reactMaxIterations = Number.isFinite(parsedMax) ? Math.min(200, Math.max(1, parsedMax)) : 50;
+        return {
+            base_system_prompt: data?.base_system_prompt ?? '',
+            react_max_iterations: reactMaxIterations,
+            abilities: Array.isArray(data?.abilities) ? data!.abilities : [],
+            profiles: Array.isArray(data?.profiles) ? data!.profiles : [],
+            default_profile: data?.default_profile ?? '',
+        };
+    };
 
     useEffect(() => {
         loadConfigs();
@@ -148,6 +154,10 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             const timeoutValue = data?.llm?.timeout_sec;
             if (timeoutValue !== undefined && timeoutValue !== null) {
                 setGlobalTimeoutSec(String(timeoutValue));
+            }
+            const reactMax = data?.agent?.react_max_iterations;
+            if (reactMax !== undefined && reactMax !== null) {
+                setGlobalReactMaxIterations(String(reactMax));
             }
             setAgentConfig(normalizeAgentConfig(data?.agent));
         } catch (error: any) {
@@ -212,10 +222,25 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             setGlobalSaving(false);
             return;
         }
+        const reactMaxValue = Number.parseInt(globalReactMaxIterations, 10);
+        if (!Number.isFinite(reactMaxValue) || reactMaxValue < 1 || reactMaxValue > 200) {
+            alert('ReAct max iterations must be an integer between 1 and 200.');
+            setGlobalSaving(false);
+            return;
+        }
         try {
-            const updated = await updateAppConfig({ llm: { timeout_sec: timeoutValue } });
+            const updated = await updateAppConfig({
+                llm: { timeout_sec: timeoutValue },
+                agent: { react_max_iterations: reactMaxValue }
+            });
             if (updated?.llm?.timeout_sec !== undefined && updated?.llm?.timeout_sec !== null) {
                 setGlobalTimeoutSec(String(updated.llm.timeout_sec));
+            }
+            if (updated?.agent?.react_max_iterations !== undefined && updated?.agent?.react_max_iterations !== null) {
+                setGlobalReactMaxIterations(String(updated.agent.react_max_iterations));
+            }
+            if (updated?.agent) {
+                setAgentConfig(normalizeAgentConfig(updated.agent));
             }
             setGlobalSaved(true);
         } catch (error: any) {
@@ -697,6 +722,23 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     disabled={globalLoading || globalSaving}
                                 />
                                 <small>应用于所有模型请求。默认 180 秒。</small>
+                            </div>
+
+                            <div className="form-group">
+                                <label>ReAct 最大迭代次数</label>
+                                <input
+                                    type="number"
+                                    min="1"
+                                    max="200"
+                                    step="1"
+                                    value={globalReactMaxIterations}
+                                    onChange={(e) => {
+                                        setGlobalReactMaxIterations(e.target.value);
+                                        setGlobalSaved(false);
+                                    }}
+                                    disabled={globalLoading || globalSaving}
+                                />
+                                <small>ReAct agent 每次对话允许的最大循环步数（1-200）。</small>
                             </div>
 
                             <div className="form-actions">

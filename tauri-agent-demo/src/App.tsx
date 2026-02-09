@@ -440,6 +440,24 @@ const getLatestRequestPayload = (calls: LLMCall[], history: Message[]) => {
   return null;
 };
 
+const buildEstimatedRequestPayload = (
+  history: Message[],
+  userMessage: string,
+  baseSystemPrompt?: string,
+  maxHistory: number = 20
+) => {
+  const trimmed = history.length > maxHistory ? history.slice(-maxHistory) : history;
+  const messages = trimmed.map((msg) => ({
+    role: msg.role,
+    content: msg.content,
+  }));
+  if (baseSystemPrompt && baseSystemPrompt.trim()) {
+    messages.unshift({ role: 'system', content: baseSystemPrompt });
+  }
+  messages.push({ role: 'user', content: userMessage });
+  return { messages };
+};
+
 type PendingAttachment = {
   id: string;
   name: string;
@@ -463,6 +481,7 @@ type QueueItem = {
   extraWorkPaths?: string[];
   enqueuedAt: number;
   attachments?: PendingAttachment[];
+  estimatedRequest?: Record<string, any>;
 };
 
 type InFlightState = {
@@ -471,6 +490,12 @@ type InFlightState = {
   activeAssistantId: number | null;
   tempAssistantId: number;
   sessionKey: string;
+};
+
+type PendingContextEstimate = {
+  sessionKey: string;
+  queueId: string;
+  payload: Record<string, any>;
 };
 
 function App() {
@@ -490,6 +515,7 @@ function App() {
   const [showDebugPanel, setShowDebugPanel] = useState(false);
   const [debugFocus, setDebugFocus] = useState<{ key: string; messageId: number; iteration: number; callId?: number } | null>(null);
   const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
+  const [pendingContextEstimate, setPendingContextEstimate] = useState<PendingContextEstimate | null>(null);
   const [agentMode, setAgentMode] = useState<AgentMode>('default');
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null);
   const [currentAgentProfileId, setCurrentAgentProfileId] = useState<string | null>(null);
@@ -940,6 +966,20 @@ function App() {
   const bumpInFlight = () => setInFlightTick((prev) => prev + 1);
   const bumpPermissions = () => setPermissionTick((prev) => prev + 1);
 
+  const clearPendingContextForItem = (queueId: string) => {
+    setPendingContextEstimate((prev) => {
+      if (!prev || prev.queueId !== queueId) return prev;
+      return null;
+    });
+  };
+
+  const clearPendingContextForSession = (sessionKey: string) => {
+    setPendingContextEstimate((prev) => {
+      if (!prev || prev.sessionKey !== sessionKey) return prev;
+      return null;
+    });
+  };
+
   const getInFlightCount = () => Object.keys(inFlightBySessionRef.current).length;
 
   const getSessionQueue = (sessionKey: string) => queueBySessionRef.current[sessionKey] || [];
@@ -1065,6 +1105,7 @@ function App() {
       content: userMessage,
       timestamp: new Date().toISOString(),
       attachments: tempAttachments,
+      raw_request: item.estimatedRequest,
     };
 
     const tempAssistantMsg: Message = {
@@ -1082,6 +1123,7 @@ function App() {
       }
     };
 
+    clearPendingContextForSession(activeSessionKey);
     updateSessionMessages(activeSessionKey, (prev) => [...prev, tempUserMsg, tempAssistantMsg]);
 
     try {
@@ -1655,6 +1697,12 @@ function App() {
       }
     }
     const extraWorkPaths = loadExtraWorkPaths(sessionKey, workPath);
+    const historyForEstimate = messagesCacheRef.current[sessionKey] || [];
+    const estimatedRequest = buildEstimatedRequestPayload(
+      historyForEstimate,
+      message,
+      agentConfig?.base_system_prompt || ''
+    );
 
     const queueItem: QueueItem = {
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -1668,8 +1716,14 @@ function App() {
       extraWorkPaths,
       enqueuedAt: Date.now(),
       attachments: attachments.length ? [...attachments] : undefined,
+      estimatedRequest,
     };
 
+    setPendingContextEstimate({
+      sessionKey,
+      queueId: queueItem.id,
+      payload: estimatedRequest,
+    });
     enqueueSessionQueue(sessionKey, queueItem);
     processQueues();
   };
@@ -1701,6 +1755,7 @@ function App() {
   const handleRemoveQueuedItem = (itemId: string) => {
     const sessionKey = getCurrentSessionKey();
     removeSessionQueueItem(sessionKey, itemId);
+    clearPendingContextForItem(itemId);
     processQueues();
   };
 
@@ -1957,6 +2012,10 @@ function App() {
   const latestAssistantId =
     [...messages].reverse().find((msg) => msg.role === 'assistant')?.id ?? null;
   const currentSessionKey = getSessionKey(currentSessionId);
+  const debugExtraWorkPaths = useMemo(
+    () => loadExtraWorkPaths(currentSessionKey, currentWorkPath),
+    [currentSessionKey, currentWorkPath]
+  );
   const isStreamingCurrent = useMemo(
     () => Boolean(inFlightBySessionRef.current[currentSessionKey]),
     [currentSessionKey, inFlightTick]
@@ -1980,11 +2039,15 @@ function App() {
   const workPathDisplay = useMemo(() => formatWorkPath(currentWorkPath), [currentWorkPath]);
   const contextUsage = useMemo(() => {
     const maxTokens = currentConfig?.max_context_tokens || DEFAULT_MAX_CONTEXT_TOKENS;
-    const lastRequest = getLatestRequestPayload(llmCalls, messages);
+    const pendingRequest =
+      pendingContextEstimate && pendingContextEstimate.sessionKey === getCurrentSessionKey()
+        ? pendingContextEstimate.payload
+        : null;
+    const lastRequest = pendingRequest || getLatestRequestPayload(llmCalls, messages);
     const usedTokens = estimateTokensFromRequest(lastRequest);
     const ratio = maxTokens > 0 ? Math.min(1, usedTokens / maxTokens) : 0;
     return { usedTokens, maxTokens, ratio };
-  }, [currentConfig?.max_context_tokens, llmCalls, messages]);
+  }, [currentConfig?.max_context_tokens, llmCalls, messages, pendingContextEstimate]);
   const contextRing = useMemo(() => {
     const circumference = 2 * Math.PI * CONTEXT_RING_RADIUS;
     const dashOffset = circumference * (1 - contextUsage.ratio);
@@ -2530,6 +2593,11 @@ function App() {
         <DebugPanel
           messages={messages}
           llmCalls={llmCalls}
+          currentSessionId={currentSessionId}
+          workPath={currentWorkPath}
+          extraWorkPaths={debugExtraWorkPaths}
+          agentMode={agentMode}
+          onOpenWorkFile={openWorkdirForFile}
           onClose={() => {
             setShowDebugPanel(false);
             setDebugFocus(null);

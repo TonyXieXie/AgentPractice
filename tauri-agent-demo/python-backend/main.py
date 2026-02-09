@@ -20,7 +20,7 @@ from models import (
     ChatSession, ChatSessionCreate, ChatSessionUpdate,
     ChatRequest, ChatResponse, ExportRequest,
     ToolPermissionRequest, ToolPermissionRequestUpdate,
-    ChatStopRequest, RollbackRequest, PatchRevertRequest
+    ChatStopRequest, RollbackRequest, PatchRevertRequest, AstRequest
 )
 from database import db
 from llm_client import create_llm_client
@@ -33,7 +33,7 @@ from tools.builtin import register_builtin_tools
 from tools.base import ToolRegistry
 from tools.config import get_tool_config, update_tool_config, get_tool_config_path
 from tools.context import set_tool_context, reset_tool_context
-from tools.builtin.system_tools import ApplyPatchTool
+from tools.builtin.system_tools import ApplyPatchTool, CodeAstTool
 from stream_control import stream_stop_registry
 from app_config import get_app_config, update_app_config, get_app_config_path
 from ghost_snapshot import restore_snapshot
@@ -1008,13 +1008,20 @@ async def chat_agent_stream(request: ChatRequest):
             db.update_session(session.id, ChatSessionUpdate(agent_profile=resolved_profile_id))
 
         llm_client = create_llm_client(config)
+        app_config = get_app_config()
+        agent_config = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
+        react_max_iterations = agent_config.get("react_max_iterations", 50)
+        try:
+            react_max_iterations = int(react_max_iterations)
+        except (TypeError, ValueError):
+            react_max_iterations = 50
 
         try:
             executor = create_agent_executor(
                 agent_type=agent_type,
                 llm_client=llm_client,
                 tools=tools,
-                max_iterations=50,
+                max_iterations=react_max_iterations,
                 system_prompt=system_prompt
             )
         except ValueError as e:
@@ -1252,6 +1259,61 @@ async def revert_patch(request: PatchRevertRequest):
 def get_tools():
     tools = ToolRegistry.get_all()
     return [tool.to_dict() for tool in tools]
+
+@app.post("/tools/ast")
+async def run_ast(request: AstRequest):
+    session = None
+    if request.session_id:
+        session = db.get_session(request.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+    work_path = request.work_path or (session.work_path if session else None)
+    token = set_tool_context({
+        "shell_unrestricted": False,
+        "agent_mode": request.agent_mode or "default",
+        "session_id": session.id if session else request.session_id,
+        "work_path": work_path,
+        "extra_work_paths": request.extra_work_paths
+    })
+    try:
+        tool = CodeAstTool()
+        payload: Dict[str, Any] = {"path": request.path}
+        if request.mode:
+            payload["mode"] = request.mode
+        if request.language:
+            payload["language"] = request.language
+        if request.extensions:
+            payload["extensions"] = request.extensions
+        if request.max_files is not None:
+            payload["max_files"] = request.max_files
+        if request.max_symbols is not None:
+            payload["max_symbols"] = request.max_symbols
+        if request.max_nodes is not None:
+            payload["max_nodes"] = request.max_nodes
+        if request.max_depth is not None:
+            payload["max_depth"] = request.max_depth
+        if request.max_bytes is not None:
+            payload["max_bytes"] = request.max_bytes
+        if request.include_positions is not None:
+            payload["include_positions"] = request.include_positions
+        if request.include_text is not None:
+            payload["include_text"] = request.include_text
+
+        result_text = await tool.execute(json.dumps(payload))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AST tool error: {exc}")
+    finally:
+        reset_tool_context(token)
+
+    try:
+        return json.loads(result_text)
+    except Exception:
+        return {"ok": False, "error": result_text}
 
 @app.post("/chat/stop")
 def stop_chat(request: ChatStopRequest):

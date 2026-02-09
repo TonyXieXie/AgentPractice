@@ -1,4 +1,13 @@
-import { useState, useEffect, useRef, useMemo, Fragment, type MouseEventHandler, type ReactElement } from 'react';
+import {
+    useState,
+    useEffect,
+    useLayoutEffect,
+    useRef,
+    useMemo,
+    Fragment,
+    type MouseEventHandler,
+    type ReactElement
+} from 'react';
 import mermaid from 'mermaid';
 import MarkdownIt from 'markdown-it';
 import texmath from 'markdown-it-texmath';
@@ -6,8 +15,9 @@ import katex from 'katex';
 import 'katex/dist/katex.min.css';
 import { openPath, openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { API_BASE_URL, AgentStep } from '../api';
-import { ToolPermissionRequest } from '../types';
+import { ToolPermissionRequest, AstPayload } from '../types';
 import DiffView from './DiffView';
+import AstViewer from './AstViewer';
 import './AgentStepView.css';
 
 type Category = 'thought' | 'tool' | 'final' | 'error' | 'other';
@@ -133,7 +143,7 @@ const injectMermaidFences = (content: string) => {
     return changed ? next.join('\n\n') : normalized;
 };
 
-function renderRichContent(content: string, onClick?: MouseEventHandler<HTMLDivElement>) {
+function renderMarkdownHtml(content: string) {
     const normalized = (content || '')
         .replace(/\r\n/g, '\n')
         .replace(/\\\\\[/g, '\\[')
@@ -142,8 +152,22 @@ function renderRichContent(content: string, onClick?: MouseEventHandler<HTMLDivE
         .replace(/\\\\\)/g, '\\)')
         .replace(/^\s*\\\[\s*$/gm, '\n\\[\n')
         .replace(/^\s*\\\]\s*$/gm, '\n\\]\n');
-    const html = markdown.render(injectMermaidFences(normalized));
-    return <div className="content-markdown" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
+    return markdown.render(injectMermaidFences(normalized));
+}
+
+function RichContent({ content, onClick }: { content: string; onClick?: MouseEventHandler<HTMLDivElement> }) {
+    const containerRef = useRef<HTMLDivElement | null>(null);
+    const html = useMemo(() => renderMarkdownHtml(content), [content]);
+
+    useLayoutEffect(() => {
+        const el = containerRef.current;
+        if (!el) return;
+        if (el.dataset.html === html) return;
+        el.innerHTML = html;
+        el.dataset.html = html;
+    }, [html]);
+
+    return <div className="content-markdown" onClick={onClick} ref={containerRef} />;
 }
 
 function looksLikeDiff(content: string) {
@@ -156,46 +180,6 @@ type ApplyPatchResult = {
     diff?: string;
     revert_patch?: string;
     error?: string;
-};
-
-type AstNode = {
-    type?: string;
-    name?: string;
-    attr?: string;
-    value?: string;
-    text?: string;
-    start?: [number, number];
-    end?: [number, number];
-    children?: AstNode[];
-};
-
-type AstSymbol = {
-    kind?: string;
-    name?: string;
-    parent?: string;
-    signature?: string;
-    bases?: string[];
-    start?: [number, number];
-    end?: [number, number];
-};
-
-type AstPayload = {
-    ok?: boolean;
-    path?: string;
-    mode?: string;
-    language?: string;
-    files?: AstPayload[];
-    symbols?: AstSymbol[];
-    imports?: any[];
-    ast?: AstNode;
-    truncated?: boolean;
-    error?: string;
-};
-
-type OutlineNode = {
-    id: string;
-    symbol: AstSymbol;
-    children: OutlineNode[];
 };
 
 const parseAstPayload = (raw: string): AstPayload | null => {
@@ -220,53 +204,6 @@ const parseAstPayload = (raw: string): AstPayload | null => {
         }
     }
     return null;
-};
-
-const formatAstRange = (node?: { start?: [number, number]; end?: [number, number] }) => {
-    if (!node?.start || !node?.end) return '';
-    const [sLine, sCol] = node.start;
-    const [eLine, eCol] = node.end;
-    if (!sLine || !sCol || !eLine || !eCol) return '';
-    return `L${sLine}:${sCol}-L${eLine}:${eCol}`;
-};
-
-const formatAstNodeLabel = (node: AstNode) => {
-    const parts: string[] = [];
-    if (node.type) parts.push(node.type);
-    if (node.name) parts.push(node.name);
-    if (node.attr) parts.push(`.${node.attr}`);
-    if (node.value) parts.push(`= ${node.value}`);
-    if (node.text) parts.push(`"${node.text}"`);
-    return parts.join(' ');
-};
-
-const buildOutlineTree = (symbols: AstSymbol[] = []) => {
-    const nodes: OutlineNode[] = symbols.map((symbol, index) => ({
-        id: `${symbol.kind || 'symbol'}-${symbol.name || 'anon'}-${index}`,
-        symbol,
-        children: []
-    }));
-    const byName = new Map<string, OutlineNode[]>();
-    nodes.forEach((node) => {
-        const name = node.symbol.name;
-        if (!name) return;
-        const bucket = byName.get(name) || [];
-        bucket.push(node);
-        byName.set(name, bucket);
-    });
-    const roots: OutlineNode[] = [];
-    nodes.forEach((node) => {
-        const parentName = node.symbol.parent;
-        if (parentName) {
-            const parentBucket = byName.get(parentName);
-            if (parentBucket && parentBucket.length > 0) {
-                parentBucket[0].children.push(node);
-                return;
-            }
-        }
-        roots.push(node);
-    });
-    return roots;
 };
 
 type DiffChunk = { path: string; diff: string };
@@ -796,14 +733,219 @@ function AgentStepView({
             setupMermaidInteractions();
             return;
         }
-        pendingNodes.forEach((node) => {
+        const logMermaid = (level: 'debug' | 'warn' | 'error', message: string, detail?: unknown) => {
+            if (level === 'debug' && !debugActive) return;
+            const payload = detail === undefined ? ['[mermaid]', message] : ['[mermaid]', message, detail];
+            if (level === 'debug') {
+                console.debug(...payload);
+            } else if (level === 'warn') {
+                console.warn(...payload);
+            } else {
+                console.error(...payload);
+            }
+        };
+        logMermaid('debug', 'runMermaid', { total: nodes.length, pending: pendingNodes.length });
+        const mermaidParser = (
+            mermaid as unknown as {
+                parse?: (text: string, parseOptions?: { suppressErrors?: boolean }) => Promise<boolean | void>;
+            }
+        ).parse;
+        const normalizeMermaidSource = (value: string) => {
+            if (!value) return value;
+            let changed = false;
+            const arrowTokens = ['-->', '==>', '-.->', '<-->', '<--', '<=='];
+            const matchArrow = (text: string, index: number) => {
+                for (const arrow of arrowTokens) {
+                    if (text.startsWith(arrow, index)) return arrow;
+                }
+                return null;
+            };
+            const splitConcatenatedEdges = (line: string) => {
+                if (!/(-->|==>|-\.\->|<--|<-->)/.test(line)) return line;
+                let out = '';
+                let i = 0;
+                let depthSquare = 0;
+                let depthRound = 0;
+                let depthCurly = 0;
+                let inSingle = false;
+                let inDouble = false;
+                let foundEdge = false;
+                const isEscaped = (text: string, index: number) => {
+                    let backslashes = 0;
+                    for (let j = index - 1; j >= 0 && text[j] === '\\'; j -= 1) backslashes += 1;
+                    return backslashes % 2 === 1;
+                };
+                while (i < line.length) {
+                    const ch = line[i];
+                    if (!inDouble && ch === "'" && !isEscaped(line, i)) {
+                        inSingle = !inSingle;
+                        out += ch;
+                        i += 1;
+                        continue;
+                    }
+                    if (!inSingle && ch === '"' && !isEscaped(line, i)) {
+                        inDouble = !inDouble;
+                        out += ch;
+                        i += 1;
+                        continue;
+                    }
+                    if (!inSingle && !inDouble) {
+                        if (ch === '[') depthSquare += 1;
+                        else if (ch === ']') depthSquare = Math.max(0, depthSquare - 1);
+                        else if (ch === '(') depthRound += 1;
+                        else if (ch === ')') depthRound = Math.max(0, depthRound - 1);
+                        else if (ch === '{') depthCurly += 1;
+                        else if (ch === '}') depthCurly = Math.max(0, depthCurly - 1);
+                    }
+                    if (
+                        !inSingle &&
+                        !inDouble &&
+                        depthSquare === 0 &&
+                        depthRound === 0 &&
+                        depthCurly === 0
+                    ) {
+                        const prev = i > 0 ? line[i - 1] : '';
+                        const canStart = i === 0 || /\s/.test(prev) || /[\]\)\}]/.test(prev);
+                        if (canStart && /[A-Za-z0-9_]/.test(ch)) {
+                            let j = i;
+                            while (j < line.length && /[A-Za-z0-9_]/.test(line[j])) j += 1;
+                            let k = j;
+                            while (k < line.length && /\s/.test(line[k])) k += 1;
+                            const arrow = matchArrow(line, k);
+                            if (arrow) {
+                                if (foundEdge) {
+                                    const trimmed = out.replace(/[ \t]+$/, '');
+                                    out = trimmed.endsWith('\n') ? trimmed : `${trimmed}\n`;
+                                    changed = true;
+                                }
+                                foundEdge = true;
+                            }
+                        }
+                    }
+                    out += ch;
+                    i += 1;
+                }
+                return out;
+            };
+            const normalizeSquareLabels = (input: string) => {
+                let out = '';
+                let inSquare = false;
+                let escaped = false;
+                let buffer = '';
+                const normalizeLabel = (label: string) => {
+                    if (!/[()]/.test(label)) return label;
+                    const trimmed = label.trim();
+                    const isQuoted =
+                        (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+                        (trimmed.startsWith("'") && trimmed.endsWith("'"));
+                    if (!isQuoted) {
+                        let quote = '"';
+                        if (label.includes('"') && !label.includes("'")) {
+                            quote = "'";
+                        } else if (label.includes('"') && label.includes("'")) {
+                            const encoded = label.replace(/\(/g, '&#40;').replace(/\)/g, '&#41;');
+                            if (encoded !== label) changed = true;
+                            return encoded;
+                        }
+                        changed = true;
+                        return `${quote}${label}${quote}`;
+                    }
+                    return label;
+                };
+                for (let i = 0; i < input.length; i += 1) {
+                    const ch = input[i];
+                    if (escaped) {
+                        if (inSquare) {
+                            buffer += ch;
+                        } else {
+                            out += ch;
+                        }
+                        escaped = false;
+                        continue;
+                    }
+                    if (ch === '\\') {
+                        if (inSquare) {
+                            buffer += ch;
+                        } else {
+                            out += ch;
+                        }
+                        escaped = true;
+                        continue;
+                    }
+                    if (ch === '[' && !inSquare) {
+                        inSquare = true;
+                        buffer = '';
+                        out += ch;
+                        continue;
+                    }
+                    if (ch === ']' && inSquare) {
+                        inSquare = false;
+                        out += normalizeLabel(buffer);
+                        out += ch;
+                        continue;
+                    }
+                    if (inSquare) {
+                        buffer += ch;
+                    } else {
+                        out += ch;
+                    }
+                }
+                if (inSquare && buffer) {
+                    out += buffer;
+                }
+                return out;
+            };
+            const normalized = value
+                .replace(/\r\n/g, '\n')
+                .replace(/\r/g, '\n')
+                .replace(/[\u2028\u2029]/g, '\n')
+                .split('\n')
+                .map(splitConcatenatedEdges)
+                .join('\n');
+            const escaped = normalizeSquareLabels(normalized);
+            if (changed) logMermaid('debug', 'normalized mermaid source');
+            return escaped;
+        };
+        pendingNodes.forEach((node, idx) => {
             node.removeAttribute('data-processed');
             const raw = node.dataset.raw;
+            let source = '';
             if (raw) {
                 try {
-                    node.textContent = decodeURIComponent(raw);
+                    source = decodeURIComponent(raw);
                 } catch {
-                    node.textContent = raw;
+                    source = raw;
+                }
+                node.textContent = source;
+            } else {
+                source = node.textContent ?? '';
+            }
+            const normalized = normalizeMermaidSource(source);
+            if (normalized !== source) {
+                source = normalized;
+                node.textContent = source;
+                node.dataset.raw = encodeURIComponent(source);
+                node.dataset.mermaidNormalized = 'true';
+            }
+            if (!source.trim()) {
+                logMermaid('warn', 'empty mermaid source', { index: idx });
+            } else if (typeof mermaidParser === 'function') {
+                try {
+                    void mermaidParser(source, { suppressErrors: false }).catch((error) => {
+                        logMermaid('warn', 'parse failed', {
+                            index: idx,
+                            error,
+                            preview: source.slice(0, 240)
+                        });
+                        node.dataset.mermaidParseError = 'true';
+                    });
+                } catch (error) {
+                    logMermaid('warn', 'parse threw', {
+                        index: idx,
+                        error,
+                        preview: source.slice(0, 240)
+                    });
+                    node.dataset.mermaidParseError = 'true';
                 }
             }
         });
@@ -813,7 +955,10 @@ function AgentStepView({
                 pendingNodes.forEach((node, idx) => {
                     if (node.querySelector('svg')) return;
                     const raw = node.dataset.raw;
-                    if (!raw) return;
+                    if (!raw) {
+                        logMermaid('warn', 'missing data-raw for fallback render', { index: idx });
+                        return;
+                    }
                     let source = raw;
                     try {
                         source = decodeURIComponent(raw);
@@ -826,14 +971,18 @@ function AgentStepView({
                             node.innerHTML = svg;
                             setupMermaidInteractions();
                         },
-                        () => {
-                            // ignore render errors
+                        (error) => {
+                            logMermaid('warn', 'render failed', {
+                                index: idx,
+                                error,
+                                preview: source.slice(0, 240)
+                            });
                         }
                     );
                 });
             },
-            () => {
-                // ignore render errors
+            (error) => {
+                logMermaid('warn', 'run failed', error);
             }
         );
     };
@@ -1168,213 +1317,17 @@ function AgentStepView({
         });
     };
 
-    const renderAstImports = (imports?: any[]) => {
-        if (!imports || imports.length === 0) return null;
-        const formatImport = (imp: any) => {
-            if (!imp) return '';
-            if (typeof imp === 'string') return imp;
-            if (imp.text) return String(imp.text);
-            if (imp.module) {
-                const names = Array.isArray(imp.names) ? imp.names.join(', ') : '';
-                const level = typeof imp.level === 'number' && imp.level > 0 ? '.'.repeat(imp.level) : '';
-                const moduleText = `${level}${imp.module}`;
-                if (names) return `from ${moduleText} import ${names}`;
-                if (imp.as) return `import ${moduleText} as ${imp.as}`;
-                return `import ${moduleText}`;
+    const renderAstPayload = (payload: AstPayload, stepKey: string, expanded: boolean) => (
+        <AstViewer
+            payload={payload}
+            expanded={expanded}
+            rawVisible={!!expandedAstRaw[stepKey]}
+            onToggleRaw={() =>
+                setExpandedAstRaw((prev) => ({ ...prev, [stepKey]: !prev[stepKey] }))
             }
-            if (imp.name) return String(imp.name);
-            return JSON.stringify(imp);
-        };
-        return (
-            <div className="ast-section">
-                <div className="ast-section-title">Imports</div>
-                <ul className="ast-list">
-                    {imports.map((imp, idx) => (
-                        <li key={`import-${idx}`}>{formatImport(imp)}</li>
-                    ))}
-                </ul>
-            </div>
-        );
-    };
-
-    const renderOutlineNode = (node: OutlineNode, depth: number) => {
-        const symbol = node.symbol || {};
-        const labelParts = [symbol.kind, symbol.name].filter(Boolean) as string[];
-        const signature = symbol.signature ? ` ${symbol.signature}` : '';
-        const bases = symbol.bases && symbol.bases.length ? ` bases: ${symbol.bases.join(', ')}` : '';
-        const range = formatAstRange(symbol);
-        const meta = [range, bases].filter(Boolean).join(' ');
-        const content = (
-            <div className="ast-node-row">
-                <span className="ast-node-label">{labelParts.join(' ') || '(symbol)'}{signature}</span>
-                {meta && <span className="ast-node-meta">{meta}</span>}
-            </div>
-        );
-        if (node.children.length === 0) {
-            return (
-                <div key={node.id} className="ast-node ast-leaf" style={{ marginLeft: depth * 12 }}>
-                    {content}
-                </div>
-            );
-        }
-        return (
-            <details key={node.id} className="ast-node" open={depth < 1}>
-                <summary>{content}</summary>
-                <div className="ast-children">
-                    {node.children.map((child) => renderOutlineNode(child, depth + 1))}
-                </div>
-            </details>
-        );
-    };
-
-    const renderAstSymbols = (symbols?: AstSymbol[]) => {
-        if (!symbols || symbols.length === 0) {
-            return <div className="ast-empty">No symbols found.</div>;
-        }
-        const roots = buildOutlineTree(symbols);
-        return (
-            <div className="ast-section">
-                <div className="ast-section-title">Symbols</div>
-                <div className="ast-tree">
-                    {roots.map((node) => renderOutlineNode(node, 0))}
-                </div>
-            </div>
-        );
-    };
-
-    const renderAstTree = (node: AstNode, depth: number) => {
-        const label = formatAstNodeLabel(node) || node.type || '(node)';
-        const range = formatAstRange(node);
-        const hasChildren = Array.isArray(node.children) && node.children.length > 0;
-        const summary = (
-            <div className="ast-node-row">
-                <span className="ast-node-label">{label}</span>
-                {range && <span className="ast-node-meta">{range}</span>}
-            </div>
-        );
-        if (!hasChildren) {
-            return (
-                <div key={`${label}-${depth}`} className="ast-node ast-leaf" style={{ marginLeft: depth * 12 }}>
-                    {summary}
-                </div>
-            );
-        }
-        return (
-            <details key={`${label}-${depth}`} className="ast-node" open={depth < 1}>
-                <summary>{summary}</summary>
-                <div className="ast-children">
-                    {node.children!.map((child, index) => (
-                        <Fragment key={`${child.type || 'node'}-${index}`}>
-                            {renderAstTree(child, depth + 1)}
-                        </Fragment>
-                    ))}
-                </div>
-            </details>
-        );
-    };
-
-    const renderAstFile = (payload: AstPayload, fileIndex: number) => {
-        const filePath = payload.path || `File ${fileIndex + 1}`;
-        const symbolCount = payload.symbols ? payload.symbols.length : 0;
-        const language = payload.language || 'unknown';
-        const mode = payload.mode || 'outline';
-        const truncated = payload.truncated;
-        return (
-            <details key={`ast-file-${fileIndex}`} className="ast-file" open={fileIndex === 0}>
-                <summary>
-                    <div className="ast-file-header">
-                        {onOpenWorkFile && payload.path ? (
-                            <button
-                                type="button"
-                                className="ast-file-path clickable"
-                                onClick={(event) => {
-                                    event.preventDefault();
-                                    event.stopPropagation();
-                                    void onOpenWorkFile(payload.path || filePath);
-                                }}
-                            >
-                                {filePath}
-                            </button>
-                        ) : (
-                            <span className="ast-file-path">{filePath}</span>
-                        )}
-                        <span className="ast-file-meta">
-                            {language} · {mode}{symbolCount ? ` · ${symbolCount} symbols` : ''}
-                            {truncated ? ' · truncated' : ''}
-                        </span>
-                    </div>
-                </summary>
-                <div className="ast-file-body">
-                    {payload.error && <div className="ast-error">{payload.error}</div>}
-                    {!payload.error && payload.mode === 'outline' && (
-                        <>
-                            {renderAstImports(payload.imports)}
-                            {renderAstSymbols(payload.symbols)}
-                        </>
-                    )}
-                    {!payload.error && payload.mode === 'full' && payload.ast && (
-                        <div className="ast-tree">{renderAstTree(payload.ast, 0)}</div>
-                    )}
-                    {!payload.error && payload.mode === 'full' && !payload.ast && (
-                        <div className="ast-empty">No AST tree found.</div>
-                    )}
-                </div>
-            </details>
-        );
-    };
-
-    const renderAstPayload = (payload: AstPayload, stepKey: string, expanded: boolean) => {
-        const fileCount = payload.files ? payload.files.length : 0;
-        const summaryParts = [
-            payload.path ? `path: ${payload.path}` : null,
-            payload.language ? `lang: ${payload.language}` : null,
-            payload.mode ? `mode: ${payload.mode}` : null,
-            fileCount ? `files: ${fileCount}` : null,
-            payload.truncated ? 'truncated' : null
-        ].filter(Boolean);
-        return (
-            <div className="ast-view">
-                <div className="ast-header">
-                    <div className="ast-title">AST Viewer</div>
-                    <div className="ast-actions">
-                        <button
-                            type="button"
-                            className="ast-action-btn"
-                            onClick={() =>
-                                setExpandedAstRaw((prev) => ({ ...prev, [stepKey]: !prev[stepKey] }))
-                            }
-                        >
-                            {expandedAstRaw[stepKey] ? 'Hide raw' : 'Show raw'}
-                        </button>
-                    </div>
-                </div>
-                {!expanded && summaryParts.length > 0 && (
-                    <div className="ast-summary">{summaryParts.join(' · ')}</div>
-                )}
-                {expanded && payload.error && <div className="ast-error">{payload.error}</div>}
-                {expanded && !payload.error && payload.files && payload.files.length > 0 && (
-                    <div className="ast-files">
-                        {payload.files.map((file, idx) => renderAstFile(file, idx))}
-                    </div>
-                )}
-                {expanded && !payload.error && !payload.files && payload.mode === 'outline' && (
-                    <>
-                        {renderAstImports(payload.imports)}
-                        {renderAstSymbols(payload.symbols)}
-                    </>
-                )}
-                {expanded && !payload.error && !payload.files && payload.mode === 'full' && payload.ast && (
-                    <div className="ast-tree">{renderAstTree(payload.ast, 0)}</div>
-                )}
-                {expanded && !payload.error && !payload.files && payload.mode === 'full' && !payload.ast && (
-                    <div className="ast-empty">No AST tree found.</div>
-                )}
-                {expandedAstRaw[stepKey] && (
-                    <pre className="ast-raw">{JSON.stringify(payload, null, 2)}</pre>
-                )}
-            </div>
-        );
-    };
+            onOpenWorkFile={onOpenWorkFile}
+        />
+    );
 
     const handleThoughtScroll = (stepKey: string) => (event: React.UIEvent<HTMLDivElement>) => {
         const el = event.currentTarget;
@@ -1728,10 +1681,13 @@ function AgentStepView({
                                     {isAction ? (
                                         <div className="action-raw">{displayContent}</div>
                                     ) : (
-                                        renderRichContent(displayContent, (event) => {
-                                            handleMarkdownClick(event);
-                                            handleContentClick(event);
-                                        })
+                                        <RichContent
+                                            content={displayContent}
+                                            onClick={(event) => {
+                                                handleMarkdownClick(event);
+                                                handleContentClick(event);
+                                            }}
+                                        />
                                     )}
                                     {hasErrorDetails && (
                                         <>

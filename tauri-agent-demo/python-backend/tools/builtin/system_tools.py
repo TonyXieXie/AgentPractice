@@ -1310,11 +1310,102 @@ def _ts_get_parameters(node: Any, source: bytes) -> Optional[str]:
         return None
     return _ts_node_text(source, params_node, 120)
 
+_TS_IDENTIFIER_TYPES = {
+    "qualified_identifier",
+    "scoped_identifier",
+    "identifier",
+    "field_identifier",
+    "type_identifier",
+    "namespace_identifier",
+    "operator_name",
+    "destructor_name"
+}
+
+_C_LIKE_CLASS_TYPES = ("class_specifier", "struct_specifier", "union_specifier")
+
+
+def _ts_find_first(node: Any, types: Set[str]) -> Optional[Any]:
+    if node is None:
+        return None
+    if node.type in types:
+        return node
+    for child in node.named_children:
+        found = _ts_find_first(child, types)
+        if found is not None:
+            return found
+    return None
+
+
+def _ts_find_identifier_node(node: Any) -> Optional[Any]:
+    if node is None:
+        return None
+    if node.type in _TS_IDENTIFIER_TYPES:
+        return node
+    name_node = node.child_by_field_name("name")
+    if name_node is not None:
+        return name_node
+    for child in node.named_children:
+        found = _ts_find_identifier_node(child)
+        if found is not None:
+            return found
+    return None
+
+
+def _ts_c_like_name(node: Any, source: bytes) -> str:
+    if node is None:
+        return ""
+    name_node = node.child_by_field_name("name")
+    if name_node is not None:
+        return _ts_node_text(source, name_node, 120)
+    decl_node = node.child_by_field_name("declarator")
+    if decl_node is not None:
+        name = _ts_c_like_name(decl_node, source)
+        if name:
+            return name
+    id_node = _ts_find_identifier_node(node)
+    if id_node is None:
+        return ""
+    return _ts_node_text(source, id_node, 120)
+
+
+def _ts_c_like_parameters(node: Any, source: bytes) -> Optional[str]:
+    if node is None:
+        return None
+    params = _ts_get_parameters(node, source)
+    if params:
+        return params
+    params_node = _ts_find_first(node, {"parameter_list"})
+    if params_node is None:
+        return None
+    return _ts_node_text(source, params_node, 120)
+
+
+def _ts_c_like_collect_declarators(node: Any) -> List[Any]:
+    if node is None:
+        return []
+    declarators: List[Any] = []
+    field_decl = node.child_by_field_name("declarator")
+    if field_decl is not None:
+        declarators.append(field_decl)
+    for child in node.named_children:
+        if child.type in ("init_declarator", "declarator", "field_declarator", "function_declarator"):
+            declarators.append(child)
+    deduped: List[Any] = []
+    seen: Set[int] = set()
+    for item in declarators:
+        ident = id(item)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        deduped.append(item)
+    return deduped
+
 
 def _ts_outline(tree: Any, source: bytes, language: str, include_positions: bool, max_symbols: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     symbols: List[Dict[str, Any]] = []
     imports: List[Dict[str, Any]] = []
     lang = (language or "").lower()
+    c_like = lang in ("c", "cpp")
 
     def add_symbol(item: Dict[str, Any]):
         if len(symbols) >= max_symbols:
@@ -1331,9 +1422,23 @@ def _ts_outline(tree: Any, source: bytes, language: str, include_positions: bool
             if include_positions:
                 entry.update(_ts_node_position(node))
             imports.append(entry)
+        elif c_like and node_type in ("preproc_include", "preproc_import"):
+            entry = {"text": _ts_node_text(source, node, 200)}
+            if include_positions:
+                entry.update(_ts_node_position(node))
+            imports.append(entry)
         elif node_type == "class_declaration":
             name = _ts_get_name(node, source)
             item = {"kind": "class", "name": name or "(anonymous)"}
+            if include_positions:
+                item.update(_ts_node_position(node))
+            add_symbol(item)
+            class_stack.append(name or "(anonymous)")
+        elif c_like and node_type in _C_LIKE_CLASS_TYPES:
+            name = _ts_get_name(node, source) or _ts_c_like_name(node, source)
+            kind = "class" if node_type == "class_specifier" else \
+                "struct" if node_type == "struct_specifier" else "union"
+            item = {"kind": kind, "name": name or "(anonymous)"}
             if include_positions:
                 item.update(_ts_node_position(node))
             add_symbol(item)
@@ -1343,6 +1448,30 @@ def _ts_outline(tree: Any, source: bytes, language: str, include_positions: bool
             kind = "interface" if node_type == "interface_declaration" else \
                 "type_alias" if node_type == "type_alias_declaration" else "enum"
             item = {"kind": kind, "name": name or "(anonymous)"}
+            if include_positions:
+                item.update(_ts_node_position(node))
+            add_symbol(item)
+        elif c_like and node_type == "enum_specifier":
+            name = _ts_get_name(node, source) or _ts_c_like_name(node, source)
+            item = {"kind": "enum", "name": name or "(anonymous)"}
+            if include_positions:
+                item.update(_ts_node_position(node))
+            add_symbol(item)
+        elif c_like and node_type == "namespace_definition":
+            name = _ts_get_name(node, source) or _ts_c_like_name(node, source)
+            item = {"kind": "namespace", "name": name or "(anonymous)"}
+            if include_positions:
+                item.update(_ts_node_position(node))
+            add_symbol(item)
+        elif c_like and node_type == "type_definition":
+            name = _ts_c_like_name(node, source)
+            item = {"kind": "typedef", "name": name or "(anonymous)"}
+            if include_positions:
+                item.update(_ts_node_position(node))
+            add_symbol(item)
+        elif c_like and node_type == "alias_declaration":
+            name = _ts_get_name(node, source) or _ts_c_like_name(node, source)
+            item = {"kind": "type_alias", "name": name or "(anonymous)"}
             if include_positions:
                 item.update(_ts_node_position(node))
             add_symbol(item)
@@ -1366,6 +1495,43 @@ def _ts_outline(tree: Any, source: bytes, language: str, include_positions: bool
             if include_positions:
                 item.update(_ts_node_position(node))
             add_symbol(item)
+        elif c_like and node_type == "function_definition":
+            name = _ts_c_like_name(node, source)
+            kind = "method" if class_stack else "function"
+            item = {"kind": kind, "name": name or "(anonymous)"}
+            if class_stack:
+                item["parent"] = class_stack[-1]
+            decl_node = node.child_by_field_name("declarator")
+            if decl_node is not None:
+                func_decl = _ts_find_first(decl_node, {"function_declarator"}) or decl_node
+                params = _ts_c_like_parameters(func_decl, source)
+            else:
+                params = _ts_c_like_parameters(node, source)
+            if params:
+                item["signature"] = params
+            if include_positions:
+                item.update(_ts_node_position(node))
+            add_symbol(item)
+        elif c_like and node_type in ("declaration", "field_declaration"):
+            for decl in _ts_c_like_collect_declarators(node):
+                if len(symbols) >= max_symbols:
+                    break
+                func_decl = _ts_find_first(decl, {"function_declarator"})
+                if func_decl is None and decl.type != "function_declarator":
+                    continue
+                name = _ts_c_like_name(decl, source)
+                if not name:
+                    continue
+                kind = "method" if class_stack else "function"
+                item = {"kind": kind, "name": name}
+                if class_stack:
+                    item["parent"] = class_stack[-1]
+                params = _ts_c_like_parameters(func_decl or decl, source)
+                if params:
+                    item["signature"] = params
+                if include_positions:
+                    item.update(_ts_node_position(node))
+                add_symbol(item)
         elif node_type == "variable_declarator":
             value_node = node.child_by_field_name("value")
             name_node = node.child_by_field_name("name")
@@ -1383,6 +1549,8 @@ def _ts_outline(tree: Any, source: bytes, language: str, include_positions: bool
             walk(child, class_stack)
 
         if node_type == "class_declaration" and class_stack:
+            class_stack.pop()
+        elif c_like and node_type in _C_LIKE_CLASS_TYPES and class_stack:
             class_stack.pop()
 
     walk(tree.root_node, [])

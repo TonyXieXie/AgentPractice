@@ -10,6 +10,7 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
     },
     "agent": {
         "base_system_prompt": "You are a helpful AI assistant.",
+        "react_max_iterations": 50,
         "abilities": [
             {
                 "id": "tools_all",
@@ -128,12 +129,28 @@ def _coerce_timeout(value: Any) -> float:
     return timeout
 
 
+def _coerce_react_max_iterations(value: Any) -> int:
+    try:
+        max_iterations = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("agent.react_max_iterations must be an integer")
+    if max_iterations < 1:
+        raise ValueError("agent.react_max_iterations must be >= 1")
+    if max_iterations > 200:
+        raise ValueError("agent.react_max_iterations must be <= 200")
+    return max_iterations
+
+
 def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(config)
     llm = dict(normalized.get("llm", {}))
     if "timeout_sec" in llm:
         llm["timeout_sec"] = _coerce_timeout(llm["timeout_sec"])
     normalized["llm"] = llm
+    agent = dict(normalized.get("agent", {}))
+    if "react_max_iterations" in agent:
+        agent["react_max_iterations"] = _coerce_react_max_iterations(agent["react_max_iterations"])
+    normalized["agent"] = agent
     return normalized
 
 

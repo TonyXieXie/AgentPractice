@@ -1,6 +1,7 @@
 ﻿import {
   Fragment,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -126,7 +127,30 @@ const injectMermaidFences = (content: string) => {
   return changed ? next.join('\n\n') : normalized;
 };
 
-const renderMarkdown = (content: string) => markdown.render(injectMermaidFences(content || ''));
+const renderMarkdownHtml = (content: string) => markdown.render(injectMermaidFences(content || ''));
+
+function WorkdirMarkdown({
+  content,
+  onClick,
+}: {
+  content: string;
+  onClick?: (event: ReactMouseEvent<HTMLDivElement>) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const html = useMemo(() => renderMarkdownHtml(content), [content]);
+
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    if (el.dataset.html === html) return;
+    el.innerHTML = html;
+    el.dataset.html = html;
+  }, [html]);
+
+  return (
+    <div className="workdir-markdown workdir-viewer-body" onClick={onClick} ref={containerRef} />
+  );
+}
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico']);
 const PDF_EXTENSIONS = new Set(['pdf']);
@@ -2115,11 +2139,10 @@ function WorkDirBrowser({
                         {paneActiveFile &&
                           !paneActiveFile.loading &&
                           !paneActiveFile.error &&
-                        paneActiveFile.kind === 'markdown' && (
-                            <div
-                              className="workdir-markdown workdir-viewer-body"
+                          paneActiveFile.kind === 'markdown' && (
+                            <WorkdirMarkdown
+                              content={paneActiveFile.content || ''}
                               onClick={handleMarkdownLinkClick}
-                              dangerouslySetInnerHTML={{ __html: renderMarkdown(paneActiveFile.content || '') }}
                             />
                           )}
                       {paneActiveFile &&

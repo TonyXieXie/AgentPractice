@@ -28,6 +28,7 @@ export interface AgentProfile {
 
 export interface AgentConfig {
     base_system_prompt?: string;
+    react_max_iterations?: number;
     abilities?: AgentAbility[];
     profiles?: AgentProfile[];
     default_profile?: string;
@@ -186,6 +187,58 @@ export interface PatchRevertResponse {
     result?: ApplyPatchResult;
     user_message_id?: number;
     assistant_message_id?: number;
+}
+
+export interface AstNode {
+    type?: string;
+    name?: string;
+    attr?: string;
+    value?: string;
+    text?: string;
+    start?: [number, number];
+    end?: [number, number];
+    children?: AstNode[];
+}
+
+export interface AstSymbol {
+    kind?: string;
+    name?: string;
+    parent?: string;
+    signature?: string;
+    bases?: string[];
+    start?: [number, number];
+    end?: [number, number];
+}
+
+export interface AstPayload {
+    ok?: boolean;
+    path?: string;
+    mode?: string;
+    language?: string;
+    files?: AstPayload[];
+    symbols?: AstSymbol[];
+    imports?: any[];
+    ast?: AstNode;
+    truncated?: boolean;
+    error?: string;
+}
+
+export interface AstRequest {
+    path: string;
+    mode?: 'outline' | 'full';
+    language?: string;
+    extensions?: string[];
+    max_files?: number;
+    max_symbols?: number;
+    max_nodes?: number;
+    max_depth?: number;
+    max_bytes?: number;
+    include_positions?: boolean;
+    include_text?: boolean;
+    session_id?: string;
+    work_path?: string | null;
+    extra_work_paths?: string[] | null;
+    agent_mode?: AgentMode;
 }
 
 export interface ChatRequest {

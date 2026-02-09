@@ -1,5 +1,7 @@
 ﻿import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
-import { Message, LLMCall } from '../types';
+import { runAstTool } from '../api';
+import { Message, LLMCall, AstPayload, AstRequest, AgentMode } from '../types';
+import AstViewer from './AstViewer';
 import './DebugPanel.css';
 
 interface DebugPanelProps {
@@ -7,14 +9,47 @@ interface DebugPanelProps {
     llmCalls: LLMCall[];
     onClose: () => void;
     focusTarget?: { key: string; messageId?: number; iteration?: number; callId?: number } | null;
+    currentSessionId?: string | null;
+    workPath?: string | null;
+    extraWorkPaths?: string[] | null;
+    agentMode?: AgentMode;
+    onOpenWorkFile?: (filePath: string, line?: number, column?: number) => void;
 }
 
-function DebugPanel({ messages, llmCalls, onClose, focusTarget }: DebugPanelProps) {
+function DebugPanel({
+    messages,
+    llmCalls,
+    onClose,
+    focusTarget,
+    currentSessionId,
+    workPath,
+    extraWorkPaths,
+    agentMode,
+    onOpenWorkFile
+}: DebugPanelProps) {
     const [expandedMessageId, setExpandedMessageId] = useState<string | null>(null);
     const [expandedCallId, setExpandedCallId] = useState<string | null>(null);
     const [rawStreamVisible, setRawStreamVisible] = useState<Record<string, boolean>>({});
     const [panelWidth, setPanelWidth] = useState(400);
     const [focusedCallId, setFocusedCallId] = useState<number | null>(null);
+    const [activeTab, setActiveTab] = useState<'llm' | 'ast'>('llm');
+    const [astForm, setAstForm] = useState({
+        path: '',
+        mode: 'outline',
+        language: '',
+        extensions: '',
+        maxFiles: '',
+        maxSymbols: '',
+        maxNodes: '',
+        maxDepth: '',
+        maxBytes: '',
+        includePositions: true,
+        includeText: false
+    });
+    const [astResult, setAstResult] = useState<AstPayload | null>(null);
+    const [astError, setAstError] = useState<string | null>(null);
+    const [astLoading, setAstLoading] = useState(false);
+    const [astRawVisible, setAstRawVisible] = useState(false);
     const panelRef = useRef<HTMLDivElement>(null);
 
     const toggleExpandMessage = (id: string) => {
@@ -47,6 +82,82 @@ function DebugPanel({ messages, llmCalls, onClose, focusTarget }: DebugPanelProp
 
     const toggleRawStream = (id: string) => {
         setRawStreamVisible((prev) => ({ ...prev, [id]: !prev[id] }));
+    };
+
+    const handleUseWorkDir = () => {
+        if (!workPath) return;
+        setAstForm((prev) => ({ ...prev, path: workPath }));
+    };
+
+    const parseNumberField = (value: string) => {
+        const trimmed = value.trim();
+        if (!trimmed) return undefined;
+        const parsed = Number(trimmed);
+        if (!Number.isFinite(parsed)) return undefined;
+        return Math.max(0, Math.floor(parsed));
+    };
+
+    const parseExtensions = (value: string) => {
+        const trimmed = value.trim();
+        if (!trimmed) return undefined;
+        const parts = trimmed.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
+        return parts.length > 0 ? parts : undefined;
+    };
+
+    const buildAstRequest = (): AstRequest | null => {
+        const path = astForm.path.trim();
+        if (!path) return null;
+        const payload: AstRequest = {
+            path,
+            mode: astForm.mode === 'full' ? 'full' : 'outline',
+            include_positions: astForm.includePositions,
+            include_text: astForm.includeText
+        };
+        const language = astForm.language.trim();
+        if (language) payload.language = language;
+        const extensions = parseExtensions(astForm.extensions);
+        if (extensions) payload.extensions = extensions;
+        const maxFiles = parseNumberField(astForm.maxFiles);
+        if (maxFiles !== undefined) payload.max_files = maxFiles;
+        const maxSymbols = parseNumberField(astForm.maxSymbols);
+        if (maxSymbols !== undefined) payload.max_symbols = maxSymbols;
+        const maxNodes = parseNumberField(astForm.maxNodes);
+        if (maxNodes !== undefined) payload.max_nodes = maxNodes;
+        const maxDepth = parseNumberField(astForm.maxDepth);
+        if (maxDepth !== undefined) payload.max_depth = maxDepth;
+        const maxBytes = parseNumberField(astForm.maxBytes);
+        if (maxBytes !== undefined) payload.max_bytes = maxBytes;
+        if (currentSessionId) payload.session_id = currentSessionId;
+        if (workPath) payload.work_path = workPath;
+        if (extraWorkPaths && extraWorkPaths.length > 0) payload.extra_work_paths = extraWorkPaths;
+        if (agentMode) payload.agent_mode = agentMode;
+        return payload;
+    };
+
+    const handleRunAst = async () => {
+        const payload = buildAstRequest();
+        if (!payload) {
+            setAstError('Please enter a path.');
+            return;
+        }
+        setAstLoading(true);
+        setAstError(null);
+        try {
+            const result = await runAstTool(payload);
+            setAstResult(result as AstPayload);
+            setAstRawVisible(false);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to run AST.';
+            setAstError(message);
+        } finally {
+            setAstLoading(false);
+        }
+    };
+
+    const handleClearAst = () => {
+        setAstResult(null);
+        setAstError(null);
+        setAstRawVisible(false);
     };
 
     useEffect(() => {
@@ -85,6 +196,12 @@ function DebugPanel({ messages, llmCalls, onClose, focusTarget }: DebugPanelProp
             }, 60);
         }
     }, [focusTarget, llmCalls]);
+
+    useEffect(() => {
+        if (focusTarget) {
+            setActiveTab('llm');
+        }
+    }, [focusTarget]);
 
     const copyToClipboard = async (text: string) => {
         try {
@@ -243,14 +360,187 @@ function DebugPanel({ messages, llmCalls, onClose, focusTarget }: DebugPanelProp
         <div className="debug-panel" ref={panelRef} style={{ width: `${panelWidth}px` }}>
             <div className="debug-resize-handle" onMouseDown={handleResizeStart} />
             <div className="debug-header">
-                <h2>Debug</h2>
+                <div className="debug-title">
+                    <h2>Debug</h2>
+                    <div className="debug-tabs">
+                        <button
+                            type="button"
+                            className={`debug-tab${activeTab === 'llm' ? ' active' : ''}`}
+                            onClick={() => setActiveTab('llm')}
+                        >
+                            LLM
+                        </button>
+                        <button
+                            type="button"
+                            className={`debug-tab${activeTab === 'ast' ? ' active' : ''}`}
+                            onClick={() => setActiveTab('ast')}
+                        >
+                            AST
+                        </button>
+                    </div>
+                </div>
                 <button className="close-btn" onClick={onClose}>
                     X
                 </button>
             </div>
 
             <div className="debug-content">
-                {messages.length === 0 ? (
+                {activeTab === 'ast' ? (
+                    <div className="ast-debug">
+                        <form
+                            className="ast-debug-form"
+                            onSubmit={(event) => {
+                                event.preventDefault();
+                                void handleRunAst();
+                            }}
+                        >
+                            <div className="ast-debug-row">
+                                <label>Path</label>
+                                <div className="ast-debug-input-row">
+                                    <input
+                                        className="ast-debug-input"
+                                        value={astForm.path}
+                                        onChange={(event) => setAstForm((prev) => ({ ...prev, path: event.target.value }))}
+                                        placeholder="e.g. src/main.cpp or src/"
+                                    />
+                                    {workPath && (
+                                        <button type="button" className="debug-mini-btn" onClick={handleUseWorkDir}>
+                                            Use work dir
+                                        </button>
+                                    )}
+                                </div>
+                                <div className="ast-debug-hint">
+                                    Relative paths resolve from the current work path.
+                                </div>
+                            </div>
+
+                            <div className="ast-debug-grid">
+                                <div className="ast-debug-field">
+                                    <label>Mode</label>
+                                    <select
+                                        className="ast-debug-select"
+                                        value={astForm.mode}
+                                        onChange={(event) => setAstForm((prev) => ({ ...prev, mode: event.target.value }))}
+                                    >
+                                        <option value="outline">outline</option>
+                                        <option value="full">full</option>
+                                    </select>
+                                </div>
+                                <div className="ast-debug-field">
+                                    <label>Language</label>
+                                    <input
+                                        className="ast-debug-input"
+                                        value={astForm.language}
+                                        onChange={(event) => setAstForm((prev) => ({ ...prev, language: event.target.value }))}
+                                        placeholder="auto"
+                                    />
+                                </div>
+                            </div>
+
+                            <details className="ast-debug-advanced">
+                                <summary>Advanced</summary>
+                                <div className="ast-debug-grid">
+                                    <div className="ast-debug-field">
+                                        <label>Extensions</label>
+                                        <input
+                                            className="ast-debug-input"
+                                            value={astForm.extensions}
+                                            onChange={(event) => setAstForm((prev) => ({ ...prev, extensions: event.target.value }))}
+                                            placeholder=".ts,.tsx,.cpp"
+                                        />
+                                    </div>
+                                    <div className="ast-debug-field">
+                                        <label>Max files</label>
+                                        <input
+                                            className="ast-debug-input"
+                                            value={astForm.maxFiles}
+                                            onChange={(event) => setAstForm((prev) => ({ ...prev, maxFiles: event.target.value }))}
+                                            placeholder="default 50"
+                                        />
+                                    </div>
+                                    <div className="ast-debug-field">
+                                        <label>Max symbols</label>
+                                        <input
+                                            className="ast-debug-input"
+                                            value={astForm.maxSymbols}
+                                            onChange={(event) => setAstForm((prev) => ({ ...prev, maxSymbols: event.target.value }))}
+                                            placeholder="default 2000"
+                                        />
+                                    </div>
+                                    <div className="ast-debug-field">
+                                        <label>Max nodes</label>
+                                        <input
+                                            className="ast-debug-input"
+                                            value={astForm.maxNodes}
+                                            onChange={(event) => setAstForm((prev) => ({ ...prev, maxNodes: event.target.value }))}
+                                            placeholder="default 2000"
+                                        />
+                                    </div>
+                                    <div className="ast-debug-field">
+                                        <label>Max depth</label>
+                                        <input
+                                            className="ast-debug-input"
+                                            value={astForm.maxDepth}
+                                            onChange={(event) => setAstForm((prev) => ({ ...prev, maxDepth: event.target.value }))}
+                                            placeholder="default 12"
+                                        />
+                                    </div>
+                                    <div className="ast-debug-field">
+                                        <label>Max bytes</label>
+                                        <input
+                                            className="ast-debug-input"
+                                            value={astForm.maxBytes}
+                                            onChange={(event) => setAstForm((prev) => ({ ...prev, maxBytes: event.target.value }))}
+                                            placeholder="default 200000"
+                                        />
+                                    </div>
+                                </div>
+                                <div className="ast-debug-checks">
+                                    <label className="ast-debug-check">
+                                        <input
+                                            type="checkbox"
+                                            checked={astForm.includePositions}
+                                            onChange={(event) =>
+                                                setAstForm((prev) => ({ ...prev, includePositions: event.target.checked }))
+                                            }
+                                        />
+                                        Include positions
+                                    </label>
+                                    <label className="ast-debug-check">
+                                        <input
+                                            type="checkbox"
+                                            checked={astForm.includeText}
+                                            onChange={(event) =>
+                                                setAstForm((prev) => ({ ...prev, includeText: event.target.checked }))
+                                            }
+                                        />
+                                        Include text (full mode)
+                                    </label>
+                                </div>
+                            </details>
+
+                            <div className="ast-debug-actions">
+                                <button type="submit" className="debug-btn" disabled={astLoading}>
+                                    {astLoading ? 'Running...' : 'Run AST'}
+                                </button>
+                                <button type="button" className="debug-btn ghost" onClick={handleClearAst}>
+                                    Clear
+                                </button>
+                            </div>
+                        </form>
+
+                        {astError && <div className="ast-error">{astError}</div>}
+                        {astResult && (
+                            <AstViewer
+                                payload={astResult}
+                                expanded
+                                rawVisible={astRawVisible}
+                                onToggleRaw={() => setAstRawVisible((prev) => !prev)}
+                                onOpenWorkFile={onOpenWorkFile}
+                            />
+                        )}
+                    </div>
+                ) : messages.length === 0 ? (
                     <div className="empty-debug">
                         <p>No messages.</p>
                     </div>
@@ -318,7 +608,7 @@ function DebugPanel({ messages, llmCalls, onClose, focusTarget }: DebugPanelProp
                     })
                 )}
 
-                {callsByMessage.orphan.length > 0 && (
+                {activeTab !== 'ast' && callsByMessage.orphan.length > 0 && (
                     <>
                         <div className="debug-group-title">Unlinked LLM Calls</div>
                         {callsByMessage.orphan.map(renderLLMCall)}
@@ -330,3 +620,4 @@ function DebugPanel({ messages, llmCalls, onClose, focusTarget }: DebugPanelProp
 }
 
 export default DebugPanel;
+

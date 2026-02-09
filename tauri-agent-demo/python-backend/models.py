@@ -174,3 +174,21 @@ class PatchRevertRequest(BaseModel):
     session_id: str
     revert_patch: str
     message_id: Optional[int] = None
+
+
+class AstRequest(BaseModel):
+    path: str
+    mode: Optional[Literal["outline", "full"]] = None
+    language: Optional[str] = None
+    extensions: Optional[List[str]] = None
+    max_files: Optional[int] = None
+    max_symbols: Optional[int] = None
+    max_nodes: Optional[int] = None
+    max_depth: Optional[int] = None
+    max_bytes: Optional[int] = None
+    include_positions: Optional[bool] = None
+    include_text: Optional[bool] = None
+    session_id: Optional[str] = None
+    work_path: Optional[str] = None
+    extra_work_paths: Optional[List[str]] = None
+    agent_mode: Optional[AgentMode] = None
