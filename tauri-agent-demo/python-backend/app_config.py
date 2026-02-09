@@ -8,6 +8,18 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
     "llm": {
         "timeout_sec": 180.0
     },
+    "context": {
+        "compression_enabled": False,
+        "compress_start_pct": 75,
+        "compress_target_pct": 55,
+        "min_keep_messages": 12,
+        "keep_recent_calls": 10,
+        "step_calls": 5,
+        "truncate_long_data": True,
+        "long_data_threshold": 4000,
+        "long_data_head_chars": 1200,
+        "long_data_tail_chars": 800
+    },
     "agent": {
         "base_system_prompt": "You are a helpful AI assistant.",
         "react_max_iterations": 50,
@@ -141,12 +153,106 @@ def _coerce_react_max_iterations(value: Any) -> int:
     return max_iterations
 
 
+def _coerce_bool(value: Any, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "y", "on"):
+            return True
+        if lowered in ("false", "0", "no", "n", "off"):
+            return False
+    raise ValueError(f"{field} must be a boolean")
+
+
+def _coerce_int_range(value: Any, field: str, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be an integer")
+    if parsed < min_value or parsed > max_value:
+        raise ValueError(f"{field} must be between {min_value} and {max_value}")
+    return parsed
+
+
+def _normalize_context_config(context: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(context)
+    if "compression_enabled" in normalized:
+        normalized["compression_enabled"] = _coerce_bool(
+            normalized["compression_enabled"], "context.compression_enabled"
+        )
+    if "compress_start_pct" in normalized:
+        normalized["compress_start_pct"] = _coerce_int_range(
+            normalized["compress_start_pct"], "context.compress_start_pct", 1, 100
+        )
+    if "compress_target_pct" in normalized:
+        normalized["compress_target_pct"] = _coerce_int_range(
+            normalized["compress_target_pct"], "context.compress_target_pct", 1, 100
+        )
+    if "min_keep_messages" in normalized:
+        normalized["min_keep_messages"] = _coerce_int_range(
+            normalized["min_keep_messages"], "context.min_keep_messages", 1, 200
+        )
+    if "keep_recent_calls" in normalized:
+        normalized["keep_recent_calls"] = _coerce_int_range(
+            normalized["keep_recent_calls"], "context.keep_recent_calls", 0, 200
+        )
+    if "step_calls" in normalized:
+        normalized["step_calls"] = _coerce_int_range(
+            normalized["step_calls"], "context.step_calls", 1, 200
+        )
+    if "truncate_long_data" in normalized:
+        normalized["truncate_long_data"] = _coerce_bool(
+            normalized["truncate_long_data"], "context.truncate_long_data"
+        )
+    if "long_data_threshold" in normalized:
+        normalized["long_data_threshold"] = _coerce_int_range(
+            normalized["long_data_threshold"], "context.long_data_threshold", 200, 200000
+        )
+    if "long_data_head_chars" in normalized:
+        normalized["long_data_head_chars"] = _coerce_int_range(
+            normalized["long_data_head_chars"], "context.long_data_head_chars", 0, 200000
+        )
+    if "long_data_tail_chars" in normalized:
+        normalized["long_data_tail_chars"] = _coerce_int_range(
+            normalized["long_data_tail_chars"], "context.long_data_tail_chars", 0, 200000
+        )
+
+    start_pct = normalized.get("compress_start_pct")
+    target_pct = normalized.get("compress_target_pct")
+    if start_pct is not None and target_pct is not None and target_pct >= start_pct:
+        raise ValueError("context.compress_target_pct must be less than context.compress_start_pct")
+
+    keep_recent_calls = normalized.get("keep_recent_calls")
+    step_calls = normalized.get("step_calls")
+    if (
+        keep_recent_calls is not None
+        and step_calls is not None
+        and keep_recent_calls > 0
+        and step_calls > keep_recent_calls
+    ):
+        raise ValueError("context.step_calls must be <= context.keep_recent_calls when keep_recent_calls > 0")
+
+    threshold = normalized.get("long_data_threshold")
+    head_chars = normalized.get("long_data_head_chars")
+    tail_chars = normalized.get("long_data_tail_chars")
+    if threshold is not None and head_chars is not None and tail_chars is not None:
+        if head_chars + tail_chars > threshold:
+            raise ValueError("context.long_data_head_chars + context.long_data_tail_chars must be <= context.long_data_threshold")
+
+    return normalized
+
+
 def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(config)
     llm = dict(normalized.get("llm", {}))
     if "timeout_sec" in llm:
         llm["timeout_sec"] = _coerce_timeout(llm["timeout_sec"])
     normalized["llm"] = llm
+    context = dict(normalized.get("context", {}))
+    normalized["context"] = _normalize_context_config(context)
     agent = dict(normalized.get("agent", {}))
     if "react_max_iterations" in agent:
         agent["react_max_iterations"] = _coerce_react_max_iterations(agent["react_max_iterations"])

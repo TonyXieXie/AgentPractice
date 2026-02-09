@@ -30,6 +30,15 @@ const PROFILE_OPTIONS: { value: LLMProfile; label: string }[] = [
     { value: 'zhipu', label: 'Zhipu (GLM)' }
 ];
 
+const DEFAULT_CONTEXT_START_PCT = 75;
+const DEFAULT_CONTEXT_TARGET_PCT = 55;
+const DEFAULT_CONTEXT_MIN_KEEP_MESSAGES = 12;
+const DEFAULT_CONTEXT_KEEP_RECENT_CALLS = 10;
+const DEFAULT_CONTEXT_STEP_CALLS = 5;
+const DEFAULT_CONTEXT_LONG_THRESHOLD = 4000;
+const DEFAULT_CONTEXT_LONG_HEAD_CHARS = 1200;
+const DEFAULT_CONTEXT_LONG_TAIL_CHARS = 800;
+
 const ABILITY_TYPE_OPTIONS: { value: string; label: string }[] = [
     { value: 'tooling', label: '工具说明' },
     { value: 'tool_policy', label: '工具策略' },
@@ -74,6 +83,32 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const [activeTab, setActiveTab] = useState<ConfigTab>('models');
     const [globalTimeoutSec, setGlobalTimeoutSec] = useState('180');
     const [globalReactMaxIterations, setGlobalReactMaxIterations] = useState('50');
+    const [globalContextCompressionEnabled, setGlobalContextCompressionEnabled] = useState(false);
+    const [globalContextCompressStartPct, setGlobalContextCompressStartPct] = useState(
+        String(DEFAULT_CONTEXT_START_PCT)
+    );
+    const [globalContextCompressTargetPct, setGlobalContextCompressTargetPct] = useState(
+        String(DEFAULT_CONTEXT_TARGET_PCT)
+    );
+    const [globalContextMinKeepMessages, setGlobalContextMinKeepMessages] = useState(
+        String(DEFAULT_CONTEXT_MIN_KEEP_MESSAGES)
+    );
+    const [globalContextKeepRecentCalls, setGlobalContextKeepRecentCalls] = useState(
+        String(DEFAULT_CONTEXT_KEEP_RECENT_CALLS)
+    );
+    const [globalContextStepCalls, setGlobalContextStepCalls] = useState(
+        String(DEFAULT_CONTEXT_STEP_CALLS)
+    );
+    const [globalContextTruncateLongData, setGlobalContextTruncateLongData] = useState(true);
+    const [globalContextLongThreshold, setGlobalContextLongThreshold] = useState(
+        String(DEFAULT_CONTEXT_LONG_THRESHOLD)
+    );
+    const [globalContextLongHeadChars, setGlobalContextLongHeadChars] = useState(
+        String(DEFAULT_CONTEXT_LONG_HEAD_CHARS)
+    );
+    const [globalContextLongTailChars, setGlobalContextLongTailChars] = useState(
+        String(DEFAULT_CONTEXT_LONG_TAIL_CHARS)
+    );
     const [globalLoading, setGlobalLoading] = useState(false);
     const [globalSaving, setGlobalSaving] = useState(false);
     const [globalSaved, setGlobalSaved] = useState(false);
@@ -159,6 +194,65 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             if (reactMax !== undefined && reactMax !== null) {
                 setGlobalReactMaxIterations(String(reactMax));
             }
+            const contextConfig = data?.context || {};
+            setGlobalContextCompressionEnabled(Boolean(contextConfig?.compression_enabled));
+            const startPct = Number.parseInt(
+                String(contextConfig?.compress_start_pct ?? DEFAULT_CONTEXT_START_PCT),
+                10
+            );
+            if (Number.isFinite(startPct)) {
+                setGlobalContextCompressStartPct(String(startPct));
+            }
+            const targetPct = Number.parseInt(
+                String(contextConfig?.compress_target_pct ?? DEFAULT_CONTEXT_TARGET_PCT),
+                10
+            );
+            if (Number.isFinite(targetPct)) {
+                setGlobalContextCompressTargetPct(String(targetPct));
+            }
+            const minKeep = Number.parseInt(
+                String(contextConfig?.min_keep_messages ?? DEFAULT_CONTEXT_MIN_KEEP_MESSAGES),
+                10
+            );
+            if (Number.isFinite(minKeep)) {
+                setGlobalContextMinKeepMessages(String(minKeep));
+            }
+            const keepCalls = Number.parseInt(
+                String(contextConfig?.keep_recent_calls ?? DEFAULT_CONTEXT_KEEP_RECENT_CALLS),
+                10
+            );
+            if (Number.isFinite(keepCalls)) {
+                setGlobalContextKeepRecentCalls(String(keepCalls));
+            }
+            const stepCalls = Number.parseInt(
+                String(contextConfig?.step_calls ?? DEFAULT_CONTEXT_STEP_CALLS),
+                10
+            );
+            if (Number.isFinite(stepCalls)) {
+                setGlobalContextStepCalls(String(stepCalls));
+            }
+            setGlobalContextTruncateLongData(Boolean(contextConfig?.truncate_long_data ?? true));
+            const longThreshold = Number.parseInt(
+                String(contextConfig?.long_data_threshold ?? DEFAULT_CONTEXT_LONG_THRESHOLD),
+                10
+            );
+            if (Number.isFinite(longThreshold)) {
+                setGlobalContextLongThreshold(String(longThreshold));
+            }
+            const longHead = Number.parseInt(
+                String(contextConfig?.long_data_head_chars ?? DEFAULT_CONTEXT_LONG_HEAD_CHARS),
+                10
+            );
+            if (Number.isFinite(longHead)) {
+                setGlobalContextLongHeadChars(String(longHead));
+            }
+            const longTail = Number.parseInt(
+                String(contextConfig?.long_data_tail_chars ?? DEFAULT_CONTEXT_LONG_TAIL_CHARS),
+                10
+            );
+            if (Number.isFinite(longTail)) {
+                setGlobalContextLongTailChars(String(longTail));
+            }
             setAgentConfig(normalizeAgentConfig(data?.agent));
         } catch (error: any) {
             console.error('Failed to load app config:', error);
@@ -228,16 +322,121 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             setGlobalSaving(false);
             return;
         }
+        const startPct = Number.parseInt(globalContextCompressStartPct, 10);
+        if (!Number.isFinite(startPct) || startPct < 1 || startPct > 100) {
+            alert('压缩触发阈值必须是 1 到 100 之间的整数。');
+            setGlobalSaving(false);
+            return;
+        }
+        const targetPct = Number.parseInt(globalContextCompressTargetPct, 10);
+        if (!Number.isFinite(targetPct) || targetPct < 1 || targetPct > 100) {
+            alert('压缩目标必须是 1 到 100 之间的整数。');
+            setGlobalSaving(false);
+            return;
+        }
+        if (targetPct >= startPct) {
+            alert('压缩目标必须小于压缩触发阈值。');
+            setGlobalSaving(false);
+            return;
+        }
+        const minKeep = Number.parseInt(globalContextMinKeepMessages, 10);
+        if (!Number.isFinite(minKeep) || minKeep < 1 || minKeep > 200) {
+            alert('最少保留消息数必须是 1 到 200 之间的整数。');
+            setGlobalSaving(false);
+            return;
+        }
+        const keepCalls = Number.parseInt(globalContextKeepRecentCalls, 10);
+        if (!Number.isFinite(keepCalls) || keepCalls < 0 || keepCalls > 200) {
+            alert('保留最近 Calls 必须是 0 到 200 之间的整数。');
+            setGlobalSaving(false);
+            return;
+        }
+        const stepCalls = Number.parseInt(globalContextStepCalls, 10);
+        if (!Number.isFinite(stepCalls) || stepCalls < 1 || stepCalls > 200) {
+            alert('步进压缩 Calls 必须是 1 到 200 之间的整数。');
+            setGlobalSaving(false);
+            return;
+        }
+        if (keepCalls > 0 && stepCalls > keepCalls) {
+            alert('步进压缩 Calls 必须小于等于保留最近 Calls。');
+            setGlobalSaving(false);
+            return;
+        }
+        const longThreshold = Number.parseInt(globalContextLongThreshold, 10);
+        if (!Number.isFinite(longThreshold) || longThreshold < 200 || longThreshold > 200000) {
+            alert('长数据阈值必须是 200 到 200000 之间的整数。');
+            setGlobalSaving(false);
+            return;
+        }
+        const longHead = Number.parseInt(globalContextLongHeadChars, 10);
+        if (!Number.isFinite(longHead) || longHead < 0 || longHead > 200000) {
+            alert('截断头部字符数必须是 0 到 200000 之间的整数。');
+            setGlobalSaving(false);
+            return;
+        }
+        const longTail = Number.parseInt(globalContextLongTailChars, 10);
+        if (!Number.isFinite(longTail) || longTail < 0 || longTail > 200000) {
+            alert('截断尾部字符数必须是 0 到 200000 之间的整数。');
+            setGlobalSaving(false);
+            return;
+        }
+        if (longHead + longTail > longThreshold) {
+            alert('截断头尾字符数之和必须小于等于长数据阈值。');
+            setGlobalSaving(false);
+            return;
+        }
         try {
             const updated = await updateAppConfig({
                 llm: { timeout_sec: timeoutValue },
-                agent: { react_max_iterations: reactMaxValue }
+                agent: { react_max_iterations: reactMaxValue },
+                context: {
+                    compression_enabled: globalContextCompressionEnabled,
+                    compress_start_pct: startPct,
+                    compress_target_pct: targetPct,
+                    min_keep_messages: minKeep,
+                    keep_recent_calls: keepCalls,
+                    step_calls: stepCalls,
+                    truncate_long_data: globalContextTruncateLongData,
+                    long_data_threshold: longThreshold,
+                    long_data_head_chars: longHead,
+                    long_data_tail_chars: longTail
+                }
             });
             if (updated?.llm?.timeout_sec !== undefined && updated?.llm?.timeout_sec !== null) {
                 setGlobalTimeoutSec(String(updated.llm.timeout_sec));
             }
             if (updated?.agent?.react_max_iterations !== undefined && updated?.agent?.react_max_iterations !== null) {
                 setGlobalReactMaxIterations(String(updated.agent.react_max_iterations));
+            }
+            if (updated?.context) {
+                setGlobalContextCompressionEnabled(Boolean(updated.context.compression_enabled));
+                if (updated.context.compress_start_pct !== undefined && updated.context.compress_start_pct !== null) {
+                    setGlobalContextCompressStartPct(String(updated.context.compress_start_pct));
+                }
+                if (updated.context.compress_target_pct !== undefined && updated.context.compress_target_pct !== null) {
+                    setGlobalContextCompressTargetPct(String(updated.context.compress_target_pct));
+                }
+                if (updated.context.min_keep_messages !== undefined && updated.context.min_keep_messages !== null) {
+                    setGlobalContextMinKeepMessages(String(updated.context.min_keep_messages));
+                }
+                if (updated.context.keep_recent_calls !== undefined && updated.context.keep_recent_calls !== null) {
+                    setGlobalContextKeepRecentCalls(String(updated.context.keep_recent_calls));
+                }
+                if (updated.context.step_calls !== undefined && updated.context.step_calls !== null) {
+                    setGlobalContextStepCalls(String(updated.context.step_calls));
+                }
+                if (updated.context.truncate_long_data !== undefined && updated.context.truncate_long_data !== null) {
+                    setGlobalContextTruncateLongData(Boolean(updated.context.truncate_long_data));
+                }
+                if (updated.context.long_data_threshold !== undefined && updated.context.long_data_threshold !== null) {
+                    setGlobalContextLongThreshold(String(updated.context.long_data_threshold));
+                }
+                if (updated.context.long_data_head_chars !== undefined && updated.context.long_data_head_chars !== null) {
+                    setGlobalContextLongHeadChars(String(updated.context.long_data_head_chars));
+                }
+                if (updated.context.long_data_tail_chars !== undefined && updated.context.long_data_tail_chars !== null) {
+                    setGlobalContextLongTailChars(String(updated.context.long_data_tail_chars));
+                }
             }
             if (updated?.agent) {
                 setAgentConfig(normalizeAgentConfig(updated.agent));
@@ -739,6 +938,182 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     disabled={globalLoading || globalSaving}
                                 />
                                 <small>ReAct agent 每次对话允许的最大循环步数（1-200）。</small>
+                            </div>
+
+                            <div className="config-subsection">
+                                <div className="config-subsection-header">
+                                    <h4>Context 管理</h4>
+                                    <span>仅保存参数，压缩逻辑稍后接入。</span>
+                                </div>
+
+                                <div className="form-group checkbox-group">
+                                    <label>
+                                        <input
+                                            type="checkbox"
+                                            checked={globalContextCompressionEnabled}
+                                            onChange={(e) => {
+                                                setGlobalContextCompressionEnabled(e.target.checked);
+                                                setGlobalSaved(false);
+                                            }}
+                                            disabled={globalLoading || globalSaving}
+                                        />
+                                        启用压缩策略
+                                    </label>
+                                </div>
+
+                                <div className="form-row">
+                                    <div className="form-group">
+                                        <label>压缩触发阈值 (%)</label>
+                                        <input
+                                            type="number"
+                                            min="1"
+                                            max="100"
+                                            step="1"
+                                            value={globalContextCompressStartPct}
+                                            onChange={(e) => {
+                                                setGlobalContextCompressStartPct(e.target.value);
+                                                setGlobalSaved(false);
+                                            }}
+                                            disabled={globalLoading || globalSaving}
+                                        />
+                                        <small>当 context 使用率达到此百分比时触发压缩。</small>
+                                    </div>
+                                    <div className="form-group">
+                                        <label>压缩目标 (%)</label>
+                                        <input
+                                            type="number"
+                                            min="1"
+                                            max="100"
+                                            step="1"
+                                            value={globalContextCompressTargetPct}
+                                            onChange={(e) => {
+                                                setGlobalContextCompressTargetPct(e.target.value);
+                                                setGlobalSaved(false);
+                                            }}
+                                            disabled={globalLoading || globalSaving}
+                                        />
+                                        <small>压缩后期望降到的占用比例。</small>
+                                    </div>
+                                </div>
+
+                                <div className="form-group">
+                                    <label>最少保留消息数</label>
+                                    <input
+                                        type="number"
+                                        min="1"
+                                        max="200"
+                                        step="1"
+                                        value={globalContextMinKeepMessages}
+                                        onChange={(e) => {
+                                            setGlobalContextMinKeepMessages(e.target.value);
+                                            setGlobalSaved(false);
+                                        }}
+                                        disabled={globalLoading || globalSaving}
+                                    />
+                                    <small>压缩时至少保留最近 N 条消息。</small>
+                                </div>
+
+                                <div className="form-row">
+                                    <div className="form-group">
+                                        <label>保留最近 Calls</label>
+                                        <input
+                                            type="number"
+                                            min="0"
+                                            max="200"
+                                            step="1"
+                                            value={globalContextKeepRecentCalls}
+                                            onChange={(e) => {
+                                                setGlobalContextKeepRecentCalls(e.target.value);
+                                                setGlobalSaved(false);
+                                            }}
+                                            disabled={globalLoading || globalSaving}
+                                        />
+                                        <small>压缩时保留最近的 LLM Call 数量。</small>
+                                    </div>
+                                    <div className="form-group">
+                                        <label>步进压缩 Calls</label>
+                                        <input
+                                            type="number"
+                                            min="1"
+                                            max="200"
+                                            step="1"
+                                            value={globalContextStepCalls}
+                                            onChange={(e) => {
+                                                setGlobalContextStepCalls(e.target.value);
+                                                setGlobalSaved(false);
+                                            }}
+                                            disabled={globalLoading || globalSaving}
+                                        />
+                                        <small>超标后每次缩减的 Call 数量。</small>
+                                    </div>
+                                </div>
+
+                                <div className="form-group checkbox-group">
+                                    <label>
+                                        <input
+                                            type="checkbox"
+                                            checked={globalContextTruncateLongData}
+                                            onChange={(e) => {
+                                                setGlobalContextTruncateLongData(e.target.checked);
+                                                setGlobalSaved(false);
+                                            }}
+                                            disabled={globalLoading || globalSaving}
+                                        />
+                                        启用长数据截断
+                                    </label>
+                                </div>
+
+                                <div className="form-row">
+                                    <div className="form-group">
+                                        <label>长数据阈值 (chars)</label>
+                                        <input
+                                            type="number"
+                                            min="200"
+                                            max="200000"
+                                            step="1"
+                                            value={globalContextLongThreshold}
+                                            onChange={(e) => {
+                                                setGlobalContextLongThreshold(e.target.value);
+                                                setGlobalSaved(false);
+                                            }}
+                                            disabled={globalLoading || globalSaving}
+                                        />
+                                        <small>超过此长度的参数或输出会被截断。</small>
+                                    </div>
+                                    <div className="form-group">
+                                        <label>保留头部字符数</label>
+                                        <input
+                                            type="number"
+                                            min="0"
+                                            max="200000"
+                                            step="1"
+                                            value={globalContextLongHeadChars}
+                                            onChange={(e) => {
+                                                setGlobalContextLongHeadChars(e.target.value);
+                                                setGlobalSaved(false);
+                                            }}
+                                            disabled={globalLoading || globalSaving}
+                                        />
+                                        <small>截断时保留的头部长度。</small>
+                                    </div>
+                                </div>
+
+                                <div className="form-group">
+                                    <label>保留尾部字符数</label>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        max="200000"
+                                        step="1"
+                                        value={globalContextLongTailChars}
+                                        onChange={(e) => {
+                                            setGlobalContextLongTailChars(e.target.value);
+                                            setGlobalSaved(false);
+                                        }}
+                                        disabled={globalLoading || globalSaving}
+                                    />
+                                    <small>截断时保留的尾部长度。</small>
+                                </div>
                             </div>
 
                             <div className="form-actions">

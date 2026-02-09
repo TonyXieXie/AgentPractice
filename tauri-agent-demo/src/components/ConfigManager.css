@@ -335,6 +335,34 @@
   font-size: 1.05rem;
 }
 
+.config-subsection {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.config-subsection-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.config-subsection-header h4 {
+  margin: 0;
+  font-size: 0.95rem;
+  color: #e2e8f0;
+}
+
+.config-subsection-header span {
+  font-size: 0.75rem;
+  color: #8b949e;
+}
+
 .form-group {
   display: flex;
   flex-direction: column;

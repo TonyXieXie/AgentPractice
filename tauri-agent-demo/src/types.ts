@@ -34,10 +34,24 @@ export interface AgentConfig {
     default_profile?: string;
 }
 
+export interface ContextConfig {
+    compression_enabled?: boolean;
+    compress_start_pct?: number;
+    compress_target_pct?: number;
+    min_keep_messages?: number;
+    keep_recent_calls?: number;
+    step_calls?: number;
+    truncate_long_data?: boolean;
+    long_data_threshold?: number;
+    long_data_head_chars?: number;
+    long_data_tail_chars?: number;
+}
+
 export interface AppConfig {
     llm?: {
         timeout_sec?: number;
     };
+    context?: ContextConfig;
     agent?: AgentConfig;
 }
 
@@ -45,6 +59,7 @@ export interface AppConfigUpdate {
     llm?: {
         timeout_sec?: number;
     };
+    context?: ContextConfig;
     agent?: AgentConfig;
 }
 
@@ -120,6 +135,8 @@ export interface ChatSession {
     config_id: string;
     work_path?: string | null;
     agent_profile?: string | null;
+    context_summary?: string | null;
+    last_compressed_llm_call_id?: number | null;
     created_at: string;
     updated_at: string;
     message_count?: number;

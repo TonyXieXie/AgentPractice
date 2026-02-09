@@ -16,6 +16,125 @@ from .base import AgentStrategy, AgentStep
 from tools.base import Tool, tool_to_openai_function, tool_to_openai_responses_tool
 
 
+TRUNCATION_MARKER_START = "[TRUNCATED_START]"
+TRUNCATION_MARKER_END = "[TRUNCATED_END]"
+TRUNCATION_DELAY_CALLS = 2
+
+
+def _get_prompt_truncation_config(request_overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    cfg = {}
+    if request_overrides and isinstance(request_overrides.get("prompt_truncation"), dict):
+        cfg = request_overrides.get("prompt_truncation", {}) or {}
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "threshold": int(cfg.get("threshold", 4000) or 4000),
+        "head_chars": int(cfg.get("head_chars", 1200) or 1200),
+        "tail_chars": int(cfg.get("tail_chars", 800) or 800)
+    }
+
+
+def _should_truncate(origin_call_seq: Optional[int], current_call_seq: int, cfg: Dict[str, Any]) -> bool:
+    if not cfg.get("enabled"):
+        return False
+    if origin_call_seq is None:
+        return False
+    return current_call_seq >= origin_call_seq + TRUNCATION_DELAY_CALLS
+
+
+def _truncate_text_middle(text: str, cfg: Dict[str, Any]) -> str:
+    if text is None:
+        return ""
+    text_value = str(text)
+    threshold = int(cfg.get("threshold", 4000) or 4000)
+    if threshold <= 0 or len(text_value) <= threshold:
+        return text_value
+    head = max(0, int(cfg.get("head_chars", 0) or 0))
+    tail = max(0, int(cfg.get("tail_chars", 0) or 0))
+    if head + tail >= len(text_value):
+        return text_value
+    omitted = len(text_value) - head - tail
+    head_text = text_value[:head] if head > 0 else ""
+    tail_text = text_value[-tail:] if tail > 0 else ""
+    return (
+        f"{head_text}\n{TRUNCATION_MARKER_START}({omitted} chars omitted)\n"
+        f"{TRUNCATION_MARKER_END}\n{tail_text}"
+    )
+
+
+def _sanitize_tool_call_arguments(call: Dict[str, Any], current_call_seq: int, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    new_call = dict(call)
+    origin = new_call.pop("__origin_call_seq", None)
+    if _should_truncate(origin, current_call_seq, cfg):
+        if "arguments" in new_call:
+            new_call["arguments"] = _truncate_text_middle(new_call.get("arguments", ""), cfg)
+        if "function" in new_call and isinstance(new_call["function"], dict):
+            func = dict(new_call["function"])
+            if "arguments" in func:
+                func["arguments"] = _truncate_text_middle(func.get("arguments", ""), cfg)
+            new_call["function"] = func
+    return new_call
+
+
+def _sanitize_messages_for_prompt(
+    messages: List[Dict[str, Any]],
+    current_call_seq: int,
+    cfg: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    sanitized: List[Dict[str, Any]] = []
+    for msg in messages:
+        new_msg = dict(msg)
+        origin = new_msg.pop("__origin_call_seq", None)
+        if new_msg.get("role") == "tool" and _should_truncate(origin, current_call_seq, cfg):
+            new_msg["content"] = _truncate_text_middle(new_msg.get("content", ""), cfg)
+        if "tool_calls" in new_msg and isinstance(new_msg.get("tool_calls"), list):
+            new_calls = [
+                _sanitize_tool_call_arguments(call, current_call_seq, cfg)
+                for call in new_msg["tool_calls"]
+            ]
+            new_msg["tool_calls"] = new_calls
+        sanitized.append(new_msg)
+    return sanitized
+
+
+def _sanitize_response_input(
+    input_items: List[Dict[str, Any]],
+    current_call_seq: int,
+    cfg: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    sanitized: List[Dict[str, Any]] = []
+    for item in input_items:
+        new_item = dict(item)
+        origin = new_item.pop("__origin_call_seq", None)
+        if _should_truncate(origin, current_call_seq, cfg):
+            item_type = str(new_item.get("type", "") or "")
+            if item_type == "function_call":
+                new_item["arguments"] = _truncate_text_middle(new_item.get("arguments", ""), cfg)
+            elif item_type == "function_call_output":
+                new_item["output"] = _truncate_text_middle(new_item.get("output", ""), cfg)
+        sanitized.append(new_item)
+    return sanitized
+
+
+def _render_scratchpad(
+    scratchpad: List[Any],
+    current_call_seq: int,
+    cfg: Dict[str, Any]
+) -> str:
+    if not scratchpad:
+        return "(first iteration)"
+    rendered: List[str] = []
+    for entry in scratchpad:
+        if isinstance(entry, dict):
+            text = str(entry.get("text", ""))
+            origin = entry.get("origin_call_seq")
+            if _should_truncate(origin, current_call_seq, cfg):
+                text = _truncate_text_middle(text, cfg)
+            rendered.append(text)
+        else:
+            rendered.append(str(entry))
+    return "\n".join(rendered) if rendered else "(first iteration)"
+
+
 class ReActAgent(AgentStrategy):
     """
     ReAct (Reasoning + Acting) Agent.
@@ -114,11 +233,14 @@ class ReActAgent(AgentStrategy):
             openai_tools = [tool_to_openai_function(t) for t in tools] if tools else []
 
         response_input = self._build_responses_input(messages)
+        trunc_cfg = _get_prompt_truncation_config(request_overrides)
+        call_seq = 0
         max_no_answer_attempts = 3
 
         for iteration in range(self.max_iterations):
             no_answer_attempts = 0
             while True:
+                current_call_seq = call_seq
                 llm_overrides = dict(request_overrides) if request_overrides else {}
                 if openai_tools:
                     llm_overrides.setdefault("tools", openai_tools)
@@ -130,7 +252,7 @@ class ReActAgent(AgentStrategy):
                     llm_overrides["_debug"] = debug_ctx
 
                 if openai_format == "openai_responses":
-                    llm_overrides["input"] = response_input
+                    llm_overrides["input"] = _sanitize_response_input(response_input, current_call_seq, trunc_cfg)
 
                     max_connect_retries = 3
                     connect_attempt = 0
@@ -162,7 +284,8 @@ class ReActAgent(AgentStrategy):
                             )
 
                         try:
-                            async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
+                            sanitized_messages = _sanitize_messages_for_prompt(messages, current_call_seq, trunc_cfg)
+                            async for event in llm_client.chat_stream_events(sanitized_messages, llm_overrides if llm_overrides else None):
                                 received_any = True
                                 event_type = event.get("type")
                                 if event_type == "content":
@@ -231,6 +354,7 @@ class ReActAgent(AgentStrategy):
                     if not connect_ok:
                         return
 
+                    call_seq += 1
                     llm_call_id = None
                     if llm_overrides.get("_debug"):
                         llm_call_id = llm_overrides.get("_debug", {}).get("llm_call_id")
@@ -261,6 +385,7 @@ class ReActAgent(AgentStrategy):
                             sanitized_args = "{}" if parse_error else args_text
                             sanitized_call = dict(call)
                             sanitized_call["arguments"] = sanitized_args
+                            sanitized_call["__origin_call_seq"] = current_call_seq
                             sanitized_tool_calls.append(sanitized_call)
                             tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
                             prepared_calls.append({
@@ -290,9 +415,14 @@ class ReActAgent(AgentStrategy):
                                 "type": "function_call",
                                 "call_id": call_id,
                                 "name": call.get("name", ""),
-                                "arguments": call.get("arguments", "")
+                                "arguments": call.get("arguments", ""),
+                                "__origin_call_seq": current_call_seq
                             })
                         output_items = synthetic_items
+                    for item in output_items:
+                        item_type = item.get("type")
+                        if item_type in ("function_call", "function_call_output"):
+                            item.setdefault("__origin_call_seq", current_call_seq)
 
                     if tool_calls:
                         if output_items:
@@ -338,7 +468,8 @@ class ReActAgent(AgentStrategy):
                             response_input.append({
                                 "type": "function_call_output",
                                 "call_id": call_id,
-                                "output": tool_output
+                                "output": tool_output,
+                                "__origin_call_seq": current_call_seq
                             })
 
                         break
@@ -387,7 +518,8 @@ class ReActAgent(AgentStrategy):
                         )
 
                     try:
-                        async for event in llm_client.chat_stream_events(messages, llm_overrides if llm_overrides else None):
+                        sanitized_messages = _sanitize_messages_for_prompt(messages, current_call_seq, trunc_cfg)
+                        async for event in llm_client.chat_stream_events(sanitized_messages, llm_overrides if llm_overrides else None):
                             received_any = True
                             event_type = event.get("type")
                             if event_type == "content":
@@ -453,6 +585,7 @@ class ReActAgent(AgentStrategy):
                 if not connect_ok:
                     return
 
+                call_seq += 1
                 llm_call_id = None
                 if llm_overrides.get("_debug"):
                     llm_call_id = llm_overrides.get("_debug", {}).get("llm_call_id")
@@ -501,6 +634,7 @@ class ReActAgent(AgentStrategy):
                         sanitized_func = dict(function)
                         sanitized_func["arguments"] = sanitized_args
                         sanitized_call["function"] = sanitized_func
+                        sanitized_call["__origin_call_seq"] = current_call_seq
                         sanitized_tool_calls.append(sanitized_call)
                         tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
                         prepared_calls.append({
@@ -522,7 +656,8 @@ class ReActAgent(AgentStrategy):
                     messages.append({
                         "role": "assistant",
                         "content": content_buffer,
-                        "tool_calls": sanitized_tool_calls
+                        "tool_calls": sanitized_tool_calls,
+                        "__origin_call_seq": current_call_seq
                     })
 
                     for prepared in prepared_calls:
@@ -545,11 +680,12 @@ class ReActAgent(AgentStrategy):
                             metadata={"tool": tool_name, "iteration": iteration}
                         )
 
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": tool_output
-                        })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": tool_output,
+                        "__origin_call_seq": current_call_seq
+                    })
 
                     break
 
@@ -595,16 +731,21 @@ class ReActAgent(AgentStrategy):
         session_id: Optional[str],
         request_overrides: Optional[Dict[str, Any]]
     ) -> AsyncGenerator[AgentStep, None]:
-        scratchpad: List[str] = []
+        scratchpad: List[Dict[str, Any]] = []
         user_content = None
         if request_overrides and request_overrides.get("user_content") is not None:
             user_content = request_overrides.get("user_content")
+        trunc_cfg = _get_prompt_truncation_config(request_overrides)
+        call_seq = 0
 
         for iteration in range(self.max_iterations):
+            current_call_seq = call_seq
             prompt = self.build_prompt(user_input, history, tools, {
                 "scratchpad": scratchpad,
                 "iteration": iteration,
-                "tool_calling": False
+                "tool_calling": False,
+                "call_seq": current_call_seq,
+                "prompt_truncation": trunc_cfg
             })
 
             try:
@@ -630,6 +771,7 @@ class ReActAgent(AgentStrategy):
                 return
 
             thought, action, action_input, final_answer = self._parse_reaction(llm_output)
+            call_seq += 1
             llm_call_id = response.get("llm_call_id")
             if llm_call_id:
                 self._update_llm_processed(llm_call_id, {
@@ -653,7 +795,7 @@ class ReActAgent(AgentStrategy):
                     content=thought,
                     metadata={"iteration": iteration}
                 )
-                scratchpad.append(f"Thought: {thought}")
+                scratchpad.append({"text": f"Thought: {thought}", "origin_call_seq": current_call_seq})
 
             if action and action_input:
                 yield AgentStep(
@@ -661,8 +803,8 @@ class ReActAgent(AgentStrategy):
                     content=f"{action}[{action_input}]",
                     metadata={"tool": action, "input": action_input, "iteration": iteration}
                 )
-                scratchpad.append(f"Action: {action}")
-                scratchpad.append(f"Action Input: {action_input}")
+                scratchpad.append({"text": f"Action: {action}", "origin_call_seq": current_call_seq})
+                scratchpad.append({"text": f"Action Input: {action_input}", "origin_call_seq": current_call_seq})
 
                 tool = self._get_tool(tools, action)
                 if tool:
@@ -673,7 +815,7 @@ class ReActAgent(AgentStrategy):
                             content=observation,
                             metadata={"tool": action, "iteration": iteration}
                         )
-                        scratchpad.append(f"Observation: {observation}")
+                        scratchpad.append({"text": f"Observation: {observation}", "origin_call_seq": current_call_seq})
                     except Exception as e:
                         error_msg = f"Tool execution failed: {str(e)}"
                         yield AgentStep(
@@ -681,7 +823,7 @@ class ReActAgent(AgentStrategy):
                             content=error_msg,
                             metadata={"tool": action, "error": str(e), "iteration": iteration}
                         )
-                        scratchpad.append(f"Observation: {error_msg}")
+                        scratchpad.append({"text": f"Observation: {error_msg}", "origin_call_seq": current_call_seq})
                 else:
                     error_msg = f"Tool not found: '{action}'"
                     yield AgentStep(
@@ -689,7 +831,7 @@ class ReActAgent(AgentStrategy):
                         content=error_msg,
                         metadata={"tool": action, "iteration": iteration}
                     )
-                    scratchpad.append(f"Observation: {error_msg}")
+                    scratchpad.append({"text": f"Observation: {error_msg}", "origin_call_seq": current_call_seq})
             else:
                 yield AgentStep(
                     step_type="thought",
@@ -713,7 +855,11 @@ class ReActAgent(AgentStrategy):
         tool_names = ", ".join([tool.name for tool in tools]) if tools else "(no tools available)"
         tool_calling = bool(additional_context and additional_context.get("tool_calling"))
         scratchpad = additional_context.get("scratchpad", []) if additional_context else []
-        scratchpad_text = "\n".join(scratchpad) if scratchpad else "(first iteration)"
+        current_call_seq = int(additional_context.get("call_seq", 0)) if additional_context else 0
+        trunc_cfg = additional_context.get("prompt_truncation") if additional_context else None
+        if not isinstance(trunc_cfg, dict):
+            trunc_cfg = {"enabled": False}
+        scratchpad_text = _render_scratchpad(scratchpad, current_call_seq, trunc_cfg)
 
         base_prompt = (self.system_prompt or "").strip()
         sections: List[str] = []

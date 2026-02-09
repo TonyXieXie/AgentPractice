@@ -129,6 +129,8 @@ class Database:
                 config_id TEXT NOT NULL,
                 work_path TEXT,
                 agent_profile TEXT,
+                context_summary TEXT,
+                last_compressed_llm_call_id INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (config_id) REFERENCES llm_configs(id)
@@ -147,6 +149,16 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN agent_profile TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN context_summary TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN last_compressed_llm_call_id INTEGER')
         except sqlite3.OperationalError:
             pass
         
@@ -549,6 +561,23 @@ class Database:
 
         conn.close()
         return self.get_session(session_id)
+
+    def update_session_context(
+        self,
+        session_id: str,
+        summary: Optional[str],
+        last_call_id: Optional[int]
+    ) -> Optional[ChatSession]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE chat_sessions
+            SET context_summary = ?, last_compressed_llm_call_id = ?, updated_at = ?
+            WHERE id = ?
+        ''', (summary, last_call_id, datetime.now().isoformat(), session_id))
+        conn.commit()
+        conn.close()
+        return self.get_session(session_id)
     
     def delete_session(self, session_id: str) -> bool:
         """Delete session and its messages"""
@@ -680,6 +709,65 @@ class Database:
         row = cursor.fetchone()
         conn.close()
         return dict(row) if row else None
+
+    def get_previous_user_message_id(self, session_id: str, before_message_id: int) -> Optional[int]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id
+            FROM chat_messages
+            WHERE session_id = ? AND role = 'user' AND id < ?
+            ORDER BY id DESC
+            LIMIT 1
+        ''', (session_id, before_message_id))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return int(row["id"])
+
+    def get_dialogue_messages_between(
+        self,
+        session_id: str,
+        start_id: int,
+        end_id: int
+    ) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, role, content, timestamp
+            FROM chat_messages
+            WHERE session_id = ? AND id >= ? AND id <= ? AND role IN ('user', 'assistant')
+            ORDER BY id ASC
+        ''', (session_id, start_id, end_id))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def get_dialogue_messages_after(
+        self,
+        session_id: str,
+        after_id: Optional[int]
+    ) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if after_id is None:
+            cursor.execute('''
+                SELECT id, role, content, timestamp
+                FROM chat_messages
+                WHERE session_id = ? AND role IN ('user', 'assistant')
+                ORDER BY id ASC
+            ''', (session_id,))
+        else:
+            cursor.execute('''
+                SELECT id, role, content, timestamp
+                FROM chat_messages
+                WHERE session_id = ? AND id > ? AND role IN ('user', 'assistant')
+                ORDER BY id ASC
+            ''', (session_id, after_id))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
 
     def get_latest_assistant_message_id(self, session_id: str) -> Optional[int]:
         conn = self.get_connection()
@@ -1086,6 +1174,36 @@ class Database:
                 "created_at": row["created_at"],
             })
         return results
+
+    def get_llm_call_metas_after(self, session_id: str, after_id: int = 0) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, message_id
+            FROM llm_calls
+            WHERE session_id = ? AND id > ?
+            ORDER BY id ASC
+        ''', (session_id, after_id))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def get_max_message_id_for_llm_call(self, session_id: str, call_id: int) -> Optional[int]:
+        if not call_id:
+            return None
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT MAX(message_id) as message_id
+            FROM llm_calls
+            WHERE session_id = ? AND id <= ? AND message_id IS NOT NULL
+        ''', (session_id, call_id))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        value = row["message_id"]
+        return int(value) if value is not None else None
 
     def update_session_agent_type(self, session_id: str, agent_type: str):
         """Update session agent type"""
