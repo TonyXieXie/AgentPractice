@@ -139,6 +139,101 @@ const injectMermaidFences = (content: string) => {
   return changed ? next.join('\n\n') : normalized;
 };
 
+const normalizeMermaidSource = (value: string) => {
+  if (!value) return value;
+  const normalizeSquareLabels = (input: string) => {
+    let out = '';
+    let inSquare = false;
+    let nestedSquare = 0;
+    let escaped = false;
+    let buffer = '';
+    const escapeLabelBrackets = (label: string) => {
+      const replace = (text: string) => text.replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
+      if (label.startsWith('[') && label.endsWith(']') && label.length > 1) {
+        const inner = label.slice(1, -1);
+        return `[${replace(inner)}]`;
+      }
+      return replace(label);
+    };
+    const normalizeLabel = (label: string) => {
+      const bracketEscaped = escapeLabelBrackets(label);
+      if (!/[()]/.test(bracketEscaped)) return bracketEscaped;
+      const trimmed = bracketEscaped.trim();
+      const isQuoted =
+        (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+        (trimmed.startsWith("'") && trimmed.endsWith("'"));
+      if (!isQuoted) {
+        let quote = '"';
+        if (bracketEscaped.includes('"') && !bracketEscaped.includes("'")) {
+          quote = "'";
+        } else if (bracketEscaped.includes('"') && bracketEscaped.includes("'")) {
+          return bracketEscaped.replace(/\(/g, '&#40;').replace(/\)/g, '&#41;');
+        }
+        return `${quote}${bracketEscaped}${quote}`;
+      }
+      return bracketEscaped;
+    };
+    for (let i = 0; i < input.length; i += 1) {
+      const ch = input[i];
+      if (escaped) {
+        if (inSquare) {
+          buffer += ch;
+        } else {
+          out += ch;
+        }
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        if (inSquare) {
+          buffer += ch;
+        } else {
+          out += ch;
+        }
+        escaped = true;
+        continue;
+      }
+      if (ch === '[' && !inSquare) {
+        inSquare = true;
+        nestedSquare = 0;
+        buffer = '';
+        out += ch;
+        continue;
+      }
+      if (ch === '[' && inSquare) {
+        nestedSquare += 1;
+        buffer += ch;
+        continue;
+      }
+      if (ch === ']' && inSquare) {
+        if (nestedSquare > 0) {
+          nestedSquare -= 1;
+          buffer += ch;
+          continue;
+        }
+        inSquare = false;
+        out += normalizeLabel(buffer);
+        out += ch;
+        continue;
+      }
+      if (inSquare) {
+        buffer += ch;
+      } else {
+        out += ch;
+      }
+    }
+    if (inSquare && buffer) {
+      out += buffer;
+    }
+    return out;
+  };
+  const normalized = value
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[\u2028\u2029]/g, '\n');
+  return normalizeSquareLabels(normalized);
+};
+
 const renderMarkdownHtml = (content: string) => markdown.render(injectMermaidFences(content || ''));
 
 function WorkdirMarkdown({
@@ -884,13 +979,22 @@ function WorkDirBrowser({
     pendingNodes.forEach((node) => {
       node.removeAttribute('data-processed');
       const raw = node.dataset.raw;
+      let source = '';
       if (raw) {
         try {
-          node.textContent = decodeURIComponent(raw);
+          source = decodeURIComponent(raw);
         } catch {
-          node.textContent = raw;
+          source = raw;
         }
+      } else {
+        source = node.textContent ?? '';
       }
+      const normalized = normalizeMermaidSource(source);
+      if (normalized !== source) {
+        source = normalized;
+        node.dataset.raw = encodeURIComponent(source);
+      }
+      node.textContent = source;
     });
     mermaid.run({ nodes: pendingNodes }).then(
       () => {

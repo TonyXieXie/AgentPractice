@@ -830,27 +830,42 @@ function AgentStepView({
             const normalizeSquareLabels = (input: string) => {
                 let out = '';
                 let inSquare = false;
+                let nestedSquare = 0;
                 let escaped = false;
                 let buffer = '';
+                const escapeLabelBrackets = (label: string) => {
+                    const replace = (text: string) => text.replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
+                    if (label.startsWith('[') && label.endsWith(']') && label.length > 1) {
+                        const inner = label.slice(1, -1);
+                        const escapedInner = replace(inner);
+                        const next = `[${escapedInner}]`;
+                        if (next !== label) changed = true;
+                        return next;
+                    }
+                    const escapedLabel = replace(label);
+                    if (escapedLabel !== label) changed = true;
+                    return escapedLabel;
+                };
                 const normalizeLabel = (label: string) => {
-                    if (!/[()]/.test(label)) return label;
-                    const trimmed = label.trim();
+                    const bracketEscaped = escapeLabelBrackets(label);
+                    if (!/[()]/.test(bracketEscaped)) return bracketEscaped;
+                    const trimmed = bracketEscaped.trim();
                     const isQuoted =
                         (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
                         (trimmed.startsWith("'") && trimmed.endsWith("'"));
                     if (!isQuoted) {
                         let quote = '"';
-                        if (label.includes('"') && !label.includes("'")) {
+                        if (bracketEscaped.includes('"') && !bracketEscaped.includes("'")) {
                             quote = "'";
-                        } else if (label.includes('"') && label.includes("'")) {
-                            const encoded = label.replace(/\(/g, '&#40;').replace(/\)/g, '&#41;');
-                            if (encoded !== label) changed = true;
+                        } else if (bracketEscaped.includes('"') && bracketEscaped.includes("'")) {
+                            const encoded = bracketEscaped.replace(/\(/g, '&#40;').replace(/\)/g, '&#41;');
+                            if (encoded !== bracketEscaped) changed = true;
                             return encoded;
                         }
                         changed = true;
-                        return `${quote}${label}${quote}`;
+                        return `${quote}${bracketEscaped}${quote}`;
                     }
-                    return label;
+                    return bracketEscaped;
                 };
                 for (let i = 0; i < input.length; i += 1) {
                     const ch = input[i];
@@ -874,11 +889,22 @@ function AgentStepView({
                     }
                     if (ch === '[' && !inSquare) {
                         inSquare = true;
+                        nestedSquare = 0;
                         buffer = '';
                         out += ch;
                         continue;
                     }
+                    if (ch === '[' && inSquare) {
+                        nestedSquare += 1;
+                        buffer += ch;
+                        continue;
+                    }
                     if (ch === ']' && inSquare) {
+                        if (nestedSquare > 0) {
+                            nestedSquare -= 1;
+                            buffer += ch;
+                            continue;
+                        }
                         inSquare = false;
                         out += normalizeLabel(buffer);
                         out += ch;
