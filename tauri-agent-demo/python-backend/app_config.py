@@ -23,6 +23,15 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
     "agent": {
         "base_system_prompt": "You are a helpful AI assistant.",
         "react_max_iterations": 50,
+        "ast_enabled": True,
+        "code_map": {
+            "enabled": True,
+            "max_symbols": 40,
+            "max_files": 20,
+            "max_lines": 30,
+            "weight_refs": 1.0,
+            "weight_mentions": 2.0
+        },
         "abilities": [
             {
                 "id": "tools_all",
@@ -46,6 +55,12 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 "prompt": "Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.\napply_patch format (strict):\n  *** Begin Patch\n  *** Update File: path\n  @@\n  - old line\n  + new line\n  *** End Patch\n- Each change line must start with + or -, and context lines must be included under @@ hunks.\n- Do NOT wrap apply_patch content in code fences; send raw patch text only.\n- apply_patch matches by context; if the match is not unique, request more surrounding context.\n- If apply_patch fails due to context, ask for more context and retry."
             },
             {
+                "id": "code_map",
+                "name": "Code Map",
+                "type": "domain_knowledge",
+                "prompt": "{{code_map_prompt}}"
+            },
+            {
                 "id": "tool_json",
                 "name": "Tool Arguments JSON",
                 "type": "tool_policy",
@@ -62,7 +77,7 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
             {
                 "id": "default",
                 "name": "Default",
-                "abilities": ["tools_all", "rg_search", "apply_patch", "tool_json", "output_concise"]
+                "abilities": ["tools_all", "rg_search", "apply_patch", "code_map", "tool_json", "output_concise"]
             }
         ],
         "default_profile": "default"
@@ -243,6 +258,32 @@ def _normalize_context_config(context: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("context.long_data_head_chars + context.long_data_tail_chars must be <= context.long_data_threshold")
 
     return normalized
+def _coerce_code_map(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("agent.code_map must be an object")
+    result = dict(value)
+    if "enabled" in result:
+        result["enabled"] = bool(result["enabled"])
+    for key, maximum, minimum in (
+        ("max_symbols", 200, 1),
+        ("max_files", 100, 1),
+        ("max_lines", 200, 1)
+    ):
+        if key in result:
+            try:
+                num = int(result[key])
+            except (TypeError, ValueError):
+                raise ValueError(f"agent.code_map.{key} must be an integer")
+            if num < minimum or num > maximum:
+                raise ValueError(f"agent.code_map.{key} must be between {minimum} and {maximum}")
+            result[key] = num
+    for key in ("weight_refs", "weight_mentions"):
+        if key in result:
+            try:
+                result[key] = float(result[key])
+            except (TypeError, ValueError):
+                raise ValueError(f"agent.code_map.{key} must be a number")
+    return result
 
 
 def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -256,6 +297,10 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     agent = dict(normalized.get("agent", {}))
     if "react_max_iterations" in agent:
         agent["react_max_iterations"] = _coerce_react_max_iterations(agent["react_max_iterations"])
+    if "ast_enabled" in agent:
+        agent["ast_enabled"] = _coerce_bool(agent["ast_enabled"], "agent.ast_enabled")
+    if "code_map" in agent:
+        agent["code_map"] = _coerce_code_map(agent["code_map"])
     normalized["agent"] = agent
     return normalized
 

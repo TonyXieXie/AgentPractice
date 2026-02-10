@@ -1,6 +1,6 @@
 ﻿import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
-import { runAstTool } from '../api';
-import { Message, LLMCall, AstPayload, AstRequest, AgentMode } from '../types';
+import { runAstTool, getAstCache, getAstCacheFile, getCodeMap } from '../api';
+import { Message, LLMCall, AstPayload, AstRequest, AgentMode, AstCacheResponse, AstCacheFile, CodeMapResponse } from '../types';
 import AstViewer from './AstViewer';
 import './DebugPanel.css';
 
@@ -32,7 +32,7 @@ function DebugPanel({
     const [rawStreamVisible, setRawStreamVisible] = useState<Record<string, boolean>>({});
     const [panelWidth, setPanelWidth] = useState(400);
     const [focusedCallId, setFocusedCallId] = useState<number | null>(null);
-    const [activeTab, setActiveTab] = useState<'llm' | 'ast'>('llm');
+    const [activeTab, setActiveTab] = useState<'llm' | 'ast' | 'cache'>('llm');
     const [astForm, setAstForm] = useState({
         path: '',
         mode: 'outline',
@@ -49,7 +49,21 @@ function DebugPanel({
     const [astResult, setAstResult] = useState<AstPayload | null>(null);
     const [astError, setAstError] = useState<string | null>(null);
     const [astLoading, setAstLoading] = useState(false);
+    const [astDurationMs, setAstDurationMs] = useState<number | null>(null);
     const [astRawVisible, setAstRawVisible] = useState(false);
+    const [cacheRoot, setCacheRoot] = useState(workPath || '');
+    const [cacheSummary, setCacheSummary] = useState<AstCacheResponse | null>(null);
+    const [cacheError, setCacheError] = useState<string | null>(null);
+    const [cacheLoading, setCacheLoading] = useState(false);
+    const [cacheDurationMs, setCacheDurationMs] = useState<number | null>(null);
+    const [cacheFile, setCacheFile] = useState<AstPayload | null>(null);
+    const [cacheFilePath, setCacheFilePath] = useState<string | null>(null);
+    const [cacheRawVisible, setCacheRawVisible] = useState(false);
+    const [codeMapText, setCodeMapText] = useState<string>('');
+    const [codeMapLoading, setCodeMapLoading] = useState(false);
+    const [codeMapError, setCodeMapError] = useState<string | null>(null);
+    const [codeMapDurationMs, setCodeMapDurationMs] = useState<number | null>(null);
+    const [codeMapUpdatedAt, setCodeMapUpdatedAt] = useState<number | null>(null);
     const panelRef = useRef<HTMLDivElement>(null);
 
     const toggleExpandMessage = (id: string) => {
@@ -104,6 +118,12 @@ function DebugPanel({
         return parts.length > 0 ? parts : undefined;
     };
 
+    const formatDuration = (value?: number | null) => {
+        if (value == null || !Number.isFinite(value)) return '';
+        if (value >= 1000) return `${(value / 1000).toFixed(2)}s`;
+        return `${Math.round(value)}ms`;
+    };
+
     const buildAstRequest = (): AstRequest | null => {
         const path = astForm.path.trim();
         if (!path) return null;
@@ -140,8 +160,10 @@ function DebugPanel({
             setAstError('Please enter a path.');
             return;
         }
+        const start = performance.now();
         setAstLoading(true);
         setAstError(null);
+        setAstDurationMs(null);
         try {
             const result = await runAstTool(payload);
             setAstResult(result as AstPayload);
@@ -151,6 +173,7 @@ function DebugPanel({
             setAstError(message);
         } finally {
             setAstLoading(false);
+            setAstDurationMs(performance.now() - start);
         }
     };
 
@@ -159,6 +182,96 @@ function DebugPanel({
         setAstError(null);
         setAstRawVisible(false);
     };
+
+    const formatEpochTime = (value?: number) => {
+        if (!value) return '';
+        const date = new Date(value * 1000);
+        return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+    };
+
+    const formatTimestamp = (value?: number | null) => {
+        if (!value) return '';
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
+    };
+
+    const loadCacheSummary = async (root: string) => {
+        if (!root) return;
+        const start = performance.now();
+        setCacheLoading(true);
+        setCacheError(null);
+        setCacheDurationMs(null);
+        try {
+            const result = await getAstCache(root);
+            setCacheSummary(result as AstCacheResponse);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to fetch AST cache.';
+            setCacheError(message);
+        } finally {
+            setCacheLoading(false);
+            setCacheDurationMs(performance.now() - start);
+        }
+    };
+
+    const loadCacheFile = async (root: string, path: string) => {
+        if (!root || !path) return;
+        setCacheLoading(true);
+        setCacheError(null);
+        try {
+            const result = await getAstCacheFile(root, path);
+            setCacheFile(result as AstPayload);
+            setCacheFilePath(path);
+            setCacheRawVisible(false);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to fetch AST cache file.';
+            setCacheError(message);
+        } finally {
+            setCacheLoading(false);
+        }
+    };
+
+    const loadCodeMap = async (root: string) => {
+        if (!root) return;
+        if (!currentSessionId) {
+            setCodeMapError('No active session.');
+            return;
+        }
+        const start = performance.now();
+        setCodeMapLoading(true);
+        setCodeMapError(null);
+        setCodeMapDurationMs(null);
+        try {
+            const result = await getCodeMap(currentSessionId, root);
+            const payload = result as CodeMapResponse;
+            setCodeMapText(payload.prompt || '');
+            setCodeMapUpdatedAt(Date.now());
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to fetch code map.';
+            setCodeMapError(message);
+        } finally {
+            setCodeMapLoading(false);
+            setCodeMapDurationMs(performance.now() - start);
+        }
+    };
+
+    useEffect(() => {
+        if (activeTab !== 'cache') return;
+        if (!cacheRoot) return;
+        void loadCacheSummary(cacheRoot);
+        void loadCodeMap(cacheRoot);
+    }, [activeTab, cacheRoot, currentSessionId]);
+
+    useEffect(() => {
+        if (!cacheRoot) {
+            setCacheSummary(null);
+            setCacheFile(null);
+            setCacheFilePath(null);
+            setCodeMapText('');
+            setCacheError(null);
+            setCodeMapError(null);
+            setCodeMapUpdatedAt(null);
+        }
+    }, [cacheRoot]);
 
     useEffect(() => {
         if (!focusTarget) return;
@@ -202,6 +315,12 @@ function DebugPanel({
             setActiveTab('llm');
         }
     }, [focusTarget]);
+
+    useEffect(() => {
+        if (workPath && !cacheRoot) {
+            setCacheRoot(workPath);
+        }
+    }, [workPath, cacheRoot]);
 
     const copyToClipboard = async (text: string) => {
         try {
@@ -377,6 +496,13 @@ function DebugPanel({
                         >
                             AST
                         </button>
+                        <button
+                            type="button"
+                            className={`debug-tab${activeTab === 'cache' ? ' active' : ''}`}
+                            onClick={() => setActiveTab('cache')}
+                        >
+                            Cache
+                        </button>
                     </div>
                 </div>
                 <button className="close-btn" onClick={onClose}>
@@ -385,7 +511,114 @@ function DebugPanel({
             </div>
 
             <div className="debug-content">
-                {activeTab === 'ast' ? (
+                {activeTab === 'cache' ? (
+                    <div className="ast-cache">
+                        <div className="ast-debug-form">
+                            <div className="ast-debug-row">
+                                <label>Root</label>
+                                <div className="ast-debug-input-row">
+                                    <input
+                                        className="ast-debug-input"
+                                        value={cacheRoot}
+                                        onChange={(event) => setCacheRoot(event.target.value)}
+                                        placeholder="work path"
+                                    />
+                                    {workPath && (
+                                        <button
+                                            type="button"
+                                            className="debug-mini-btn"
+                                            onClick={() => setCacheRoot(workPath)}
+                                        >
+                                            Use work dir
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                            <div className="ast-debug-actions">
+                                <button
+                                    type="button"
+                                    className="debug-btn"
+                                    onClick={() => cacheRoot && loadCacheSummary(cacheRoot)}
+                                    disabled={cacheLoading || !cacheRoot}
+                                >
+                                    {cacheLoading ? 'Loading...' : 'Refresh cache'}
+                                </button>
+                                <button
+                                    type="button"
+                                    className="debug-btn ghost"
+                                    onClick={() => cacheRoot && loadCodeMap(cacheRoot)}
+                                    disabled={codeMapLoading || !cacheRoot}
+                                >
+                                    {codeMapLoading ? 'Loading...' : 'Load code map'}
+                                </button>
+                                {cacheDurationMs != null && (
+                                    <span className="ast-debug-timing">cache {formatDuration(cacheDurationMs)}</span>
+                                )}
+                                {codeMapDurationMs != null && (
+                                    <span className="ast-debug-timing">code map {formatDuration(codeMapDurationMs)}</span>
+                                )}
+                            </div>
+                        </div>
+
+                        {cacheError && <div className="ast-error">{cacheError}</div>}
+
+                        <div className="ast-cache-section">
+                            <div className="ast-cache-title">
+                                AST Cache
+                                {cacheSummary?.files && (
+                                    <span className="ast-cache-count">{cacheSummary.files.length} files</span>
+                                )}
+                            </div>
+                            {!cacheSummary?.files || cacheSummary.files.length === 0 ? (
+                                <div className="ast-empty">No cached files.</div>
+                            ) : (
+                                <div className="ast-cache-list">
+                                    {cacheSummary.files.map((file) => {
+                                        const entry = file as AstCacheFile;
+                                        const isActive = cacheFilePath === entry.path;
+                                        return (
+                                            <button
+                                                key={entry.path}
+                                                type="button"
+                                                className={`ast-cache-row${entry.stale ? ' stale' : ''}${isActive ? ' active' : ''}`}
+                                                onClick={() => loadCacheFile(cacheRoot, entry.path)}
+                                            >
+                                                <span className="ast-cache-path">{entry.path}</span>
+                                                <span className="ast-cache-meta">
+                                                    parsed {formatEpochTime(entry.parsed_at)} · mtime {formatEpochTime(entry.file_mtime)}
+                                                    {entry.stale ? ' · stale' : ''}
+                                                </span>
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+
+                        {cacheFile && (
+                            <AstViewer
+                                payload={cacheFile}
+                                expanded
+                                rawVisible={cacheRawVisible}
+                                onToggleRaw={() => setCacheRawVisible((prev) => !prev)}
+                                onOpenWorkFile={onOpenWorkFile}
+                            />
+                        )}
+
+                        <div className="ast-cache-section">
+                            <div className="ast-cache-title">Code Map</div>
+                            {codeMapError && <div className="ast-error">{codeMapError}</div>}
+                            {codeMapUpdatedAt && (
+                                <div className="ast-cache-meta">last refresh {formatTimestamp(codeMapUpdatedAt)}</div>
+                            )}
+                            {codeMapText ? (
+                                <pre className="json-viewer text-viewer">{codeMapText}</pre>
+                            ) : (
+                                <div className="ast-empty">No code map available.</div>
+                            )}
+                        </div>
+                    </div>
+                ) : activeTab === 'ast' ? (
                     <div className="ast-debug">
                         <form
                             className="ast-debug-form"
@@ -526,6 +759,9 @@ function DebugPanel({
                                 <button type="button" className="debug-btn ghost" onClick={handleClearAst}>
                                     Clear
                                 </button>
+                                {astDurationMs != null && (
+                                    <span className="ast-debug-timing">耗时 {formatDuration(astDurationMs)}</span>
+                                )}
                             </div>
                         </form>
 
@@ -608,7 +844,7 @@ function DebugPanel({
                     })
                 )}
 
-                {activeTab !== 'ast' && callsByMessage.orphan.length > 0 && (
+                {activeTab === 'llm' && callsByMessage.orphan.length > 0 && (
                     <>
                         <div className="debug-group-title">Unlinked LLM Calls</div>
                         {callsByMessage.orphan.map(renderLLMCall)}

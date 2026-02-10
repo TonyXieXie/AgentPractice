@@ -597,6 +597,99 @@
   background: #141820;
 }
 
+.workdir-dialog-textarea {
+  min-height: 78px;
+  resize: vertical;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: #0f1216;
+  color: #e5e7eb;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.workdir-dialog-textarea:focus {
+  outline: none;
+  border-color: rgba(255, 255, 255, 0.28);
+  background: #141820;
+}
+
+.ast-settings-dialog {
+  width: min(520px, 90vw);
+}
+
+.workdir-ast-setting-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.workdir-ast-setting-path {
+  font-size: 0.78rem;
+  color: #94a3b8;
+  word-break: break-all;
+}
+
+.workdir-ast-setting-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.workdir-ast-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.workdir-ast-pick-btn {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.05);
+  color: #e5e7eb;
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.workdir-ast-pick-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+}
+
+.workdir-ast-pick-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.workdir-ast-language-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px 10px;
+  padding: 4px 0;
+}
+
+.workdir-ast-language-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+  color: #e5e7eb;
+}
+
+.workdir-ast-language-option input {
+  accent-color: #60a5fa;
+}
+
+.workdir-ast-setting-hint {
+  font-size: 0.75rem;
+  color: #9ca3af;
+}
+
 .workdir-dialog-error {
   font-size: 0.78rem;
   color: #fca5a5;

@@ -14,6 +14,9 @@ import httpx
 from ..base import Tool, ToolParameter
 from ..config import get_tool_config, update_tool_config
 from ..context import get_tool_context
+from app_config import get_app_config
+from ast_settings import get_ast_settings
+from ast_file_filter import collect_ast_files
 
 
 def _get_root_path() -> Path:
@@ -1088,7 +1091,7 @@ def _get_ast_config() -> Dict[str, Any]:
         "max_bytes": _coerce_int(cfg.get("max_bytes", 200000), 200000),
         "max_nodes": _coerce_int(cfg.get("max_nodes", 2000), 2000),
         "max_depth": _coerce_int(cfg.get("max_depth", 12), 12),
-        "max_files": _coerce_int(cfg.get("max_files", 50), 50),
+        "max_files": _coerce_int(cfg.get("max_files", 500), 500),
         "max_symbols": _coerce_int(cfg.get("max_symbols", 2000), 2000),
         "include_text": _coerce_bool(cfg.get("include_text", False), False)
     }
@@ -1591,24 +1594,23 @@ def _ts_full_tree(
     return data
 
 
-def _collect_ast_files(root: Path, extensions: Optional[List[str]], ignore_dirs: Set[str], max_files: int) -> List[Path]:
-    collected: List[Path] = []
-    norm_exts: Optional[Set[str]] = None
-    if extensions:
-        norm_exts = {ext if ext.startswith(".") else "." + ext for ext in extensions}
-    else:
-        norm_exts = set(_AST_EXT_LANGUAGE.keys())
-
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in ignore_dirs]
-        for filename in filenames:
-            if len(collected) >= max_files:
-                return collected
-            path = Path(dirpath) / filename
-            if path.suffix.lower() not in norm_exts:
-                continue
-            collected.append(path)
-    return collected
+def _collect_ast_files(
+    root: Path,
+    extensions: Optional[List[str]],
+    ignore_dirs: Set[str],
+    max_files: int,
+    settings_root: Optional[Path] = None,
+    settings: Optional[Dict[str, Any]] = None
+) -> List[Path]:
+    exts = extensions or list(_AST_EXT_LANGUAGE.keys())
+    return collect_ast_files(
+        scan_root=root,
+        settings_root=settings_root or root,
+        extensions=exts,
+        max_files=max_files,
+        ignore_dir_names=ignore_dirs,
+        settings=settings
+    )
 
 
 class CodeAstTool(Tool):
@@ -1694,18 +1696,19 @@ class CodeAstTool(Tool):
         path = data.get("path") or input_data
         if not path:
             raise ValueError("Missing path.")
+        app_cfg = get_app_config()
+        agent_cfg = app_cfg.get("agent", {}) if isinstance(app_cfg, dict) else {}
+        if not agent_cfg.get("ast_enabled", True):
+            return json.dumps({"ok": False, "path": path, "error": "AST disabled."})
 
         cfg = _get_ast_config()
         mode = str(data.get("mode") or "outline").strip().lower()
         language = data.get("language")
         extensions = data.get("extensions")
-        max_files = _coerce_int(data.get("max_files"), cfg["max_files"])
         max_symbols = _coerce_int(data.get("max_symbols"), cfg["max_symbols"])
         max_nodes = _coerce_int(data.get("max_nodes"), cfg["max_nodes"])
         max_depth = _coerce_int(data.get("max_depth"), cfg["max_depth"])
         max_bytes = _coerce_int(data.get("max_bytes"), cfg["max_bytes"])
-        if max_files <= 0:
-            max_files = cfg["max_files"]
         if max_symbols <= 0:
             max_symbols = cfg["max_symbols"]
         if max_nodes <= 0:
@@ -1721,12 +1724,32 @@ class CodeAstTool(Tool):
         if not target_path.exists():
             raise ValueError(f"Path not found: {target_path}")
 
+        settings_root = _get_root_path()
+        for root in _get_allowed_roots():
+            if _is_within_root(target_path, root):
+                settings_root = root
+                break
+        settings = get_ast_settings(str(settings_root))
+        settings_max_files = settings.get("max_files") if isinstance(settings, dict) else None
+        if settings_max_files is None:
+            settings_max_files = cfg["max_files"]
+        max_files = _coerce_int(data.get("max_files"), settings_max_files)
+        if max_files <= 0:
+            max_files = settings_max_files
+
         if mode not in ("outline", "full"):
             raise ValueError("Invalid mode. Use 'outline' or 'full'.")
 
         if target_path.is_dir():
             ignore_dirs = set(_AST_IGNORE_DIRS)
-            collected_files = _collect_ast_files(target_path, extensions, ignore_dirs, max_files)
+            collected_files = _collect_ast_files(
+                target_path,
+                extensions,
+                ignore_dirs,
+                max_files,
+                settings_root=settings_root,
+                settings=settings
+            )
             results: List[Dict[str, Any]] = []
             total_symbols = 0
             truncated = False

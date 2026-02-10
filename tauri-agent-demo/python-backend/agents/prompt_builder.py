@@ -153,16 +153,23 @@ def _build_tool_lines(tools: List[Tool]) -> List[str]:
     return lines
 
 
-def _build_prompt_context(profile: Dict[str, Any], tools: List[Tool]) -> Dict[str, Any]:
+def _build_prompt_context(
+    profile: Dict[str, Any],
+    tools: List[Tool],
+    extra_context: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     tool_names = ", ".join([tool.name for tool in tools]) if tools else "(no tools available)"
     tool_list = "\n".join(_build_tool_lines(tools)) if tools else ""
     profile_name = _normalize_text(profile.get("name") or profile.get("id"))
-    return {
+    context = {
         "tool_names": tool_names,
         "tool_list": tool_list,
         "tool_count": len(tools),
         "profile_name": profile_name
     }
+    if isinstance(extra_context, dict):
+        context.update(extra_context)
+    return context
 
 
 def build_system_prompt(
@@ -170,12 +177,13 @@ def build_system_prompt(
     profile: Dict[str, Any],
     abilities: List[Dict[str, Any]],
     tools: List[Tool],
-    include_tools: bool = True
+    include_tools: bool = True,
+    extra_context: Optional[Dict[str, Any]] = None
 ) -> str:
     base_prompt = _normalize_text(agent_config.get("base_system_prompt"))
     has_tools = include_tools and bool(tools)
 
-    prompt_context = _build_prompt_context(profile, tools)
+    prompt_context = _build_prompt_context(profile, tools, extra_context)
     profile_params = _as_dict(profile.get("params"))
 
     module_chunks: Dict[str, List[str]] = {}
@@ -237,11 +245,32 @@ def build_system_prompt(
 def build_agent_prompt_and_tools(
     profile_id: Optional[str],
     all_tools: List[Tool],
-    include_tools: bool = True
-) -> Tuple[str, List[Tool], Optional[str]]:
+    include_tools: bool = True,
+    extra_context: Optional[Dict[str, Any]] = None,
+    exclude_ability_ids: Optional[List[str]] = None
+) -> Tuple[str, List[Tool], Optional[str], List[str]]:
     agent_config = _as_dict(get_app_config().get("agent"))
     profile, resolved_id = _resolve_profile(agent_config, profile_id)
     abilities = _collect_abilities(agent_config, profile)
+    ability_ids = [
+        str(ability.get("id"))
+        for ability in abilities
+        if isinstance(ability, dict) and ability.get("id")
+    ]
+    exclude = set([str(item) for item in (exclude_ability_ids or []) if item])
+    prompt_abilities = [
+        ability
+        for ability in abilities
+        if str(ability.get("id")) not in exclude
+    ]
     tools = _resolve_tool_list(abilities, all_tools, include_tools)
-    prompt = build_system_prompt(agent_config, profile, abilities, tools, include_tools=include_tools)
-    return prompt, tools, resolved_id
+    tools = [tool for tool in tools if tool.name != "code_ast"]
+    prompt = build_system_prompt(
+        agent_config,
+        profile,
+        prompt_abilities,
+        tools,
+        include_tools=include_tools,
+        extra_context=extra_context
+    )
+    return prompt, tools, resolved_id, ability_ids

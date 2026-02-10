@@ -14,8 +14,9 @@ import mermaid from 'mermaid';
 import texmath from 'markdown-it-texmath';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { mkdir, readDir, readFile, readTextFile, watchImmediate, writeTextFile, type DirEntry, type UnwatchFn } from '@tauri-apps/plugin-fs';
-import { API_BASE_URL } from '../api';
+import { API_BASE_URL, notifyAstChanges, getAstSettings, updateAstSettings } from '../api';
 import { openPath, openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import './WorkDirBrowser.css';
 
@@ -25,6 +26,17 @@ const IS_MAC = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAge
 const MAC_ABSOLUTE_PREFIX = /^(Users|Volumes|private|System|Library|Applications|opt|etc|var|tmp)[\\/]/;
 const READ_TEXT_TIMEOUT_MS = 3000;
 const READ_BACKEND_TIMEOUT_MS = 4000;
+const AST_DEFAULT_MAX_FILES = 500;
+const AST_LANGUAGE_OPTIONS = [
+  { id: 'python', label: 'Python (.py)' },
+  { id: 'javascript', label: 'JavaScript (.js/.jsx/.mjs/.cjs)' },
+  { id: 'typescript', label: 'TypeScript (.ts)' },
+  { id: 'tsx', label: 'TSX (.tsx)' },
+  { id: 'c', label: 'C (.c)' },
+  { id: 'cpp', label: 'C++ (.h/.hpp/.cpp...)' },
+  { id: 'rust', label: 'Rust (.rs)' },
+  { id: 'json', label: 'JSON (.json)' },
+];
 
 type OpenFile = {
   path: string;
@@ -450,6 +462,16 @@ function WorkDirBrowser({
   const [newFileName, setNewFileName] = useState('');
   const [newFileError, setNewFileError] = useState<string | null>(null);
   const [creatingFile, setCreatingFile] = useState(false);
+  const [astSettingsRoot, setAstSettingsRoot] = useState<string | null>(null);
+  const [astSettingsPath, setAstSettingsPath] = useState<string | null>(null);
+  const [astSettingsLoading, setAstSettingsLoading] = useState(false);
+  const [astSettingsSaving, setAstSettingsSaving] = useState(false);
+  const [astSettingsError, setAstSettingsError] = useState<string | null>(null);
+  const [astIgnorePaths, setAstIgnorePaths] = useState('');
+  const [astIncludeOnlyPaths, setAstIncludeOnlyPaths] = useState('');
+  const [astForceIncludePaths, setAstForceIncludePaths] = useState('');
+  const [astIncludeLanguages, setAstIncludeLanguages] = useState<string[]>([]);
+  const [astMaxFiles, setAstMaxFiles] = useState(String(AST_DEFAULT_MAX_FILES));
   const [watchError, setWatchError] = useState<string | null>(null);
   const [watchStatus, setWatchStatus] = useState<string | null>(null);
   const [editorByPath, setEditorByPath] = useState<Record<string, EditorState>>({});
@@ -477,6 +499,7 @@ function WorkDirBrowser({
   const expandedDirsRef = useRef<Record<string, boolean>>({});
   const refreshTimerRef = useRef<number | null>(null);
   const refreshFilesTimerRef = useRef<number | null>(null);
+  const astNotifyRef = useRef<Record<string, { timer: number | null; paths: Set<string> }>>({});
   const pendingDirRefreshRef = useRef<Record<string, boolean>>({});
   const unwatchRef = useRef<UnwatchFn[]>([]);
   const sidebarResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -521,6 +544,132 @@ function WorkDirBrowser({
     setActivePaneId(nextPane.id);
   };
 
+  const resolveAstSettingsRoot = (targetPath: string) => {
+    if (!targetPath) return rootPath;
+    const normalizedTarget = normalizePath(targetPath);
+    for (const root of allRoots) {
+      if (isPathWithin(normalizedTarget, root)) {
+        return root;
+      }
+    }
+    return rootPath;
+  };
+
+  const parseAstPathList = (value: string) =>
+    value
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+  const pickAstFolder = async (target: 'ignore' | 'include' | 'force') => {
+    if (!astSettingsRoot) return;
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath: astSettingsRoot,
+      });
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      if (!path) return;
+      if (target === 'ignore') {
+        appendAstPath(path, astIgnorePaths, setAstIgnorePaths);
+      } else if (target === 'include') {
+        appendAstPath(path, astIncludeOnlyPaths, setAstIncludeOnlyPaths);
+      } else {
+        appendAstPath(path, astForceIncludePaths, setAstForceIncludePaths);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to pick folder.';
+      setAstSettingsError(message);
+    }
+  };
+
+  const normalizeAstLanguageList = (value: unknown) => {
+    if (!Array.isArray(value)) return [];
+    const allowed = new Set(AST_LANGUAGE_OPTIONS.map((option) => option.id));
+    const seen = new Set<string>();
+    const result: string[] = [];
+    value.forEach((item) => {
+      if (typeof item !== 'string') return;
+      const key = item.trim().toLowerCase();
+      if (!key || !allowed.has(key) || seen.has(key)) return;
+      seen.add(key);
+      result.push(key);
+    });
+    return result;
+  };
+
+  const toggleAstLanguage = (language: string) => {
+    if (!language) return;
+    setAstIncludeLanguages((prev) => {
+      if (prev.includes(language)) {
+        return prev.filter((item) => item !== language);
+      }
+      return [...prev, language];
+    });
+  };
+
+  const appendAstPath = (path: string, current: string, setter: (value: string) => void) => {
+    if (!path) return;
+    const list = parseAstPathList(current);
+    if (list.includes(path)) return;
+    const next = [...list, path].join('\n');
+    setter(next);
+  };
+
+  const openAstSettings = (targetPath: string) => {
+    const root = resolveAstSettingsRoot(targetPath);
+    setAstSettingsRoot(root || null);
+    setAstSettingsPath(targetPath || null);
+    setAstSettingsError(null);
+  };
+
+  const closeAstSettings = () => {
+    if (astSettingsSaving) return;
+    setAstSettingsRoot(null);
+    setAstSettingsPath(null);
+    setAstSettingsError(null);
+  };
+
+  const handleSaveAstSettings = async () => {
+    if (!astSettingsRoot) return;
+    setAstSettingsSaving(true);
+    setAstSettingsError(null);
+    const parsedMax = Number.parseInt(astMaxFiles, 10);
+    const maxFiles = Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : AST_DEFAULT_MAX_FILES;
+    const includeLanguages = AST_LANGUAGE_OPTIONS
+      .map((option) => option.id)
+      .filter((id) => astIncludeLanguages.includes(id));
+    const payload = {
+      root: astSettingsRoot,
+      ignore_paths: parseAstPathList(astIgnorePaths),
+      include_only_paths: parseAstPathList(astIncludeOnlyPaths),
+      force_include_paths: parseAstPathList(astForceIncludePaths),
+      include_languages: includeLanguages,
+      max_files: maxFiles,
+    };
+    try {
+      const result = await updateAstSettings(payload);
+      const settings = result?.settings || payload;
+      const ignoreList = Array.isArray(settings.ignore_paths) ? settings.ignore_paths : payload.ignore_paths;
+      const includeList = Array.isArray(settings.include_only_paths) ? settings.include_only_paths : payload.include_only_paths;
+      const forceList = Array.isArray(settings.force_include_paths) ? settings.force_include_paths : payload.force_include_paths;
+      setAstIgnorePaths(ignoreList.join('\n'));
+      setAstIncludeOnlyPaths(includeList.join('\n'));
+      setAstForceIncludePaths(forceList.join('\n'));
+      const languageList = normalizeAstLanguageList(settings.include_languages ?? includeLanguages);
+      setAstIncludeLanguages(languageList);
+      setAstMaxFiles(String(settings.max_files ?? maxFiles));
+      notifyAstChanges(astSettingsRoot, [astSettingsRoot]).catch(() => undefined);
+      closeAstSettings();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to save AST settings.';
+      setAstSettingsError(message);
+    } finally {
+      setAstSettingsSaving(false);
+    }
+  };
+
   useEffect(() => {
     if (!open) return;
     if (!rootPath) return;
@@ -529,6 +678,39 @@ function WorkDirBrowser({
     }
     previousRootRef.current = rootPath;
   }, [open, rootPath]);
+
+  useEffect(() => {
+    if (!astSettingsRoot) return;
+    let cancelled = false;
+    setAstSettingsLoading(true);
+    setAstSettingsError(null);
+    getAstSettings(astSettingsRoot)
+      .then((result) => {
+        if (cancelled) return;
+        const settings = result?.settings || {};
+        const ignoreList = Array.isArray(settings.ignore_paths) ? settings.ignore_paths : [];
+        const includeList = Array.isArray(settings.include_only_paths) ? settings.include_only_paths : [];
+        const forceList = Array.isArray(settings.force_include_paths) ? settings.force_include_paths : [];
+        setAstIgnorePaths(ignoreList.join('\n'));
+        setAstIncludeOnlyPaths(includeList.join('\n'));
+        setAstForceIncludePaths(forceList.join('\n'));
+        const languageList = normalizeAstLanguageList(settings.include_languages);
+        setAstIncludeLanguages(languageList);
+        const maxFiles = settings.max_files ?? AST_DEFAULT_MAX_FILES;
+        setAstMaxFiles(String(maxFiles));
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        const message = error instanceof Error ? error.message : 'Failed to load AST settings.';
+        setAstSettingsError(message);
+      })
+      .finally(() => {
+        if (!cancelled) setAstSettingsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [astSettingsRoot]);
 
   useEffect(() => {
     if (!open || !rootPath) return;
@@ -1040,6 +1222,28 @@ function WorkDirBrowser({
     }, 160);
   };
 
+  const scheduleAstNotify = (root: string, paths?: string[]) => {
+    const rootNorm = normalizePath(root);
+    if (!rootNorm) return;
+    const normalized = paths
+      ? paths.map((value) => normalizeWatchPath(value)).filter((value) => value.length > 0)
+      : [];
+    if (normalized.length === 0) return;
+
+    const record = astNotifyRef.current[rootNorm] || { timer: null, paths: new Set<string>() };
+    normalized.forEach((value) => record.paths.add(value));
+    astNotifyRef.current[rootNorm] = record;
+    if (record.timer != null) return;
+    record.timer = window.setTimeout(() => {
+      record.timer = null;
+      const batch = Array.from(record.paths);
+      record.paths.clear();
+      void notifyAstChanges(root, batch).catch(() => {
+        // ignore AST notify failures
+      });
+    }, 220);
+  };
+
   const describeWatchPaths = (paths?: string[]) => {
     if (!paths || paths.length === 0) return '未知路径';
     const normalized = paths.map((value) => normalizeWatchPath(value));
@@ -1061,6 +1265,7 @@ function WorkDirBrowser({
             setWatchStatus(`监听事件：${describeWatchPaths(event?.paths)}`);
             scheduleRefreshDirs(event?.paths);
             scheduleRefreshOpenFiles(event?.paths);
+            scheduleAstNotify(root, event?.paths);
           },
           { recursive: true }
         );
@@ -1096,6 +1301,12 @@ function WorkDirBrowser({
         window.clearTimeout(refreshFilesTimerRef.current);
         refreshFilesTimerRef.current = null;
       }
+      Object.values(astNotifyRef.current).forEach((entry) => {
+        if (entry.timer != null) {
+          window.clearTimeout(entry.timer);
+        }
+      });
+      astNotifyRef.current = {};
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, watchRoots]);
@@ -2270,6 +2481,17 @@ function WorkDirBrowser({
           <button
             type="button"
             className="workdir-context-item"
+            onClick={() => {
+              const target = contextMenu.targetPath;
+              setContextMenu(null);
+              openAstSettings(target);
+            }}
+          >
+            AST 分析设置
+          </button>
+          <button
+            type="button"
+            className="workdir-context-item"
             onClick={() => openCreateFolderDialog(contextMenu.targetPath)}
           >
             新建文件夹
@@ -2306,6 +2528,159 @@ function WorkDirBrowser({
           >
             还原未保存
           </button>
+        </div>
+      )}
+
+      {astSettingsRoot && (
+        <div
+          className="workdir-dialog-backdrop"
+          onClick={() => {
+            if (!astSettingsSaving) closeAstSettings();
+          }}
+        >
+          <div className="workdir-dialog ast-settings-dialog" onClick={(event) => event.stopPropagation()}>
+            <div className="workdir-dialog-title">AST 分析设置</div>
+            <div className="workdir-dialog-body">
+              <div className="workdir-ast-setting-row">
+                <label>工作路径</label>
+                <div className="workdir-ast-setting-path">{astSettingsRoot}</div>
+              </div>
+              {astSettingsPath && (
+                <div className="workdir-ast-setting-actions">
+                  <button
+                    type="button"
+                    className="workdir-dialog-btn ghost"
+                    onClick={() => appendAstPath(astSettingsPath, astIgnorePaths, setAstIgnorePaths)}
+                    disabled={astSettingsSaving || astSettingsLoading}
+                  >
+                    忽略当前路径
+                  </button>
+                  <button
+                    type="button"
+                    className="workdir-dialog-btn ghost"
+                    onClick={() => appendAstPath(astSettingsPath, astIncludeOnlyPaths, setAstIncludeOnlyPaths)}
+                    disabled={astSettingsSaving || astSettingsLoading}
+                  >
+                    仅包含当前路径
+                  </button>
+                  <button
+                    type="button"
+                    className="workdir-dialog-btn ghost"
+                    onClick={() => appendAstPath(astSettingsPath, astForceIncludePaths, setAstForceIncludePaths)}
+                    disabled={astSettingsSaving || astSettingsLoading}
+                  >
+                    必定包含当前路径
+                  </button>
+                </div>
+              )}
+
+              <div className="workdir-ast-label-row">
+                <label>忽略路径（每行一个）</label>
+                <button
+                  type="button"
+                  className="workdir-ast-pick-btn"
+                  onClick={() => void pickAstFolder('ignore')}
+                  disabled={astSettingsLoading || astSettingsSaving}
+                >
+                  选择文件夹
+                </button>
+              </div>
+              <textarea
+                className="workdir-dialog-textarea"
+                value={astIgnorePaths}
+                onChange={(event) => setAstIgnorePaths(event.currentTarget.value)}
+                placeholder="例如：D:\\repo\\node_modules"
+                disabled={astSettingsLoading || astSettingsSaving}
+              />
+
+              <div className="workdir-ast-label-row">
+                <label>仅包含路径（每行一个）</label>
+                <button
+                  type="button"
+                  className="workdir-ast-pick-btn"
+                  onClick={() => void pickAstFolder('include')}
+                  disabled={astSettingsLoading || astSettingsSaving}
+                >
+                  选择文件夹
+                </button>
+              </div>
+              <textarea
+                className="workdir-dialog-textarea"
+                value={astIncludeOnlyPaths}
+                onChange={(event) => setAstIncludeOnlyPaths(event.currentTarget.value)}
+                placeholder="仅扫描这些路径及其子目录"
+                disabled={astSettingsLoading || astSettingsSaving}
+              />
+
+              <div className="workdir-ast-label-row">
+                <label>必定包含路径（每行一个）</label>
+                <button
+                  type="button"
+                  className="workdir-ast-pick-btn"
+                  onClick={() => void pickAstFolder('force')}
+                  disabled={astSettingsLoading || astSettingsSaving}
+                >
+                  选择文件夹
+                </button>
+              </div>
+              <textarea
+                className="workdir-dialog-textarea"
+                value={astForceIncludePaths}
+                onChange={(event) => setAstForceIncludePaths(event.currentTarget.value)}
+                placeholder="即使被 gitignore 或忽略规则命中也会扫描"
+                disabled={astSettingsLoading || astSettingsSaving}
+              />
+
+              <label>语言类型过滤（不选表示不过滤）</label>
+              <div className="workdir-ast-language-grid">
+                {AST_LANGUAGE_OPTIONS.map((option) => (
+                  <label key={option.id} className="workdir-ast-language-option">
+                    <input
+                      type="checkbox"
+                      checked={astIncludeLanguages.includes(option.id)}
+                      onChange={() => toggleAstLanguage(option.id)}
+                      disabled={astSettingsLoading || astSettingsSaving}
+                    />
+                    <span>{option.label}</span>
+                  </label>
+                ))}
+              </div>
+              <div className="workdir-ast-setting-hint">不选表示不过滤（全部语言）</div>
+
+              <label>最大分析文件数</label>
+              <input
+                className="workdir-dialog-input"
+                type="number"
+                min={1}
+                value={astMaxFiles}
+                onChange={(event) => setAstMaxFiles(event.currentTarget.value)}
+                disabled={astSettingsLoading || astSettingsSaving}
+              />
+              {astSettingsLoading && <div className="workdir-ast-setting-hint">正在加载设置...</div>}
+              <div className="workdir-ast-setting-hint">
+                优先级：必定包含 &gt; 仅包含 &gt; 忽略 &gt; Git 忽略
+              </div>
+              {astSettingsError && <div className="workdir-dialog-error">{astSettingsError}</div>}
+            </div>
+            <div className="workdir-dialog-actions">
+              <button
+                type="button"
+                className="workdir-dialog-btn ghost"
+                onClick={closeAstSettings}
+                disabled={astSettingsSaving}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="workdir-dialog-btn primary"
+                onClick={() => void handleSaveAstSettings()}
+                disabled={astSettingsSaving || astSettingsLoading}
+              >
+                {astSettingsSaving ? '保存中...' : '保存'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

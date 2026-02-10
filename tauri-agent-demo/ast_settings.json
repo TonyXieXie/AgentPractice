@@ -1,0 +1,24 @@
+{
+  "paths": {
+    "e:\\physx\\physx\\physx\\source\\physxvehicle": {
+      "ignore_paths": [],
+      "include_only_paths": [],
+      "force_include_paths": [],
+      "include_languages": [
+        "cpp"
+      ],
+      "max_files": 500
+    },
+    "d:\\gpusimulation\\plugins\\gpuphysics": {
+      "ignore_paths": [],
+      "include_only_paths": [
+        "D:\\GPUSimulation\\Plugins\\GPUPhysics\\Source\\GPUPhysics"
+      ],
+      "force_include_paths": [],
+      "include_languages": [
+        "cpp"
+      ],
+      "max_files": 500
+    }
+  }
+}

@@ -1,6 +1,7 @@
-﻿import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import { readDir } from '@tauri-apps/plugin-fs';
+import { readDir, watchImmediate, type UnwatchFn } from '@tauri-apps/plugin-fs';
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
@@ -35,6 +36,9 @@ import {
   AgentStep,
   AgentStepWithMessage,
   getAttachmentUrl,
+  getAstSettings,
+  updateAstSettings,
+  notifyAstChanges,
 } from './api';
 import ConfigManager from './components/ConfigManager';
 import SessionList from './components/SessionList';
@@ -71,6 +75,17 @@ const WORKDIR_DEFAULT_WIDTH = 1200;
 const WORKDIR_DEFAULT_HEIGHT = 800;
 const DEFAULT_MAX_CONTEXT_TOKENS = 200000;
 const CONTEXT_RING_RADIUS = 10;
+const AST_DEFAULT_MAX_FILES = 500;
+const AST_LANGUAGE_OPTIONS = [
+  { id: 'python', label: 'Python (.py)' },
+  { id: 'javascript', label: 'JavaScript (.js/.jsx/.mjs/.cjs)' },
+  { id: 'typescript', label: 'TypeScript (.ts)' },
+  { id: 'tsx', label: 'TSX (.tsx)' },
+  { id: 'c', label: 'C (.c)' },
+  { id: 'cpp', label: 'C++ (.h/.hpp/.cpp...)' },
+  { id: 'rust', label: 'Rust (.rs)' },
+  { id: 'json', label: 'JSON (.json)' },
+];
 
 type WorkdirBounds = {
   x?: number;
@@ -360,6 +375,17 @@ const estimateTokensForText = (text: string) => {
   return Math.ceil(ascii / 4) + nonAscii;
 };
 
+const formatTokenCount = (value: number) => {
+  if (!Number.isFinite(value)) return '0';
+  if (value >= 10000) {
+    return `${(value / 1000).toFixed(1)}k`;
+  }
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(2)}k`;
+  }
+  return String(Math.max(0, Math.round(value)));
+};
+
 const collectTextFromContent = (content: any, bucket: string[]) => {
   if (!content) return;
   if (typeof content === 'string') {
@@ -383,49 +409,83 @@ const collectTextFromContent = (content: any, bucket: string[]) => {
   }
 };
 
-const estimateTokensFromRequest = (request: Record<string, any> | null) => {
-  if (!request) return 0;
-  let total = 0;
+const estimateTokensForContent = (content: any) => {
+  if (!content) return 0;
   const texts: string[] = [];
+  collectTextFromContent(content, texts);
+  return texts.reduce((sum, text) => sum + estimateTokensForText(text), 0);
+};
+
+const estimateTokensFromRequestBreakdown = (request: Record<string, any> | null) => {
+  const breakdown = { total: 0, system: 0, history: 0, tools: 0, other: 0 };
+  if (!request) return breakdown;
+
+  const addMessageTokens = (role: string, content: any) => {
+    const tokens = estimateTokensForContent(content) + 4;
+    if (role === 'system' || role === 'developer') {
+      breakdown.system += tokens;
+    } else {
+      breakdown.history += tokens;
+    }
+  };
 
   if (Array.isArray(request.messages)) {
     request.messages.forEach((msg: any) => {
       if (!msg) return;
-      collectTextFromContent(msg.content, texts);
-      total += 4;
+      const role = typeof msg.role === 'string' ? msg.role : '';
+      addMessageTokens(role, msg.content);
     });
   }
 
+  const handleInputItem = (item: any) => {
+    if (!item) return;
+    if (typeof item === 'string') {
+      breakdown.other += estimateTokensForText(item) + 4;
+      return;
+    }
+    if (Array.isArray(item)) {
+      item.forEach(handleInputItem);
+      return;
+    }
+    if (typeof item === 'object') {
+      if (typeof item.role === 'string') {
+        addMessageTokens(item.role, item.content);
+        return;
+      }
+      if (Object.prototype.hasOwnProperty.call(item, 'content')) {
+        breakdown.other += estimateTokensForContent(item.content) + 4;
+        return;
+      }
+      breakdown.other += estimateTokensForContent(item) + 4;
+    }
+  };
+
   if (request.input) {
-    if (typeof request.input === 'string') {
-      texts.push(request.input);
-    } else if (Array.isArray(request.input)) {
-      request.input.forEach((item: any) => {
-        if (item && Array.isArray(item.content)) {
-          item.content.forEach((contentItem: any) => collectTextFromContent(contentItem, texts));
-        } else {
-          collectTextFromContent(item, texts);
-        }
-        total += 4;
-      });
+    if (Array.isArray(request.input)) {
+      request.input.forEach(handleInputItem);
     } else {
-      collectTextFromContent(request.input, texts);
+      handleInputItem(request.input);
     }
   }
 
   if (typeof request.instructions === 'string') {
-    texts.push(request.instructions);
+    breakdown.system += estimateTokensForText(request.instructions);
   }
 
   if (typeof request.prompt === 'string') {
-    texts.push(request.prompt);
+    breakdown.other += estimateTokensForText(request.prompt);
   }
 
-  texts.forEach((text) => {
-    total += estimateTokensForText(text);
-  });
+  if (request.tools) {
+    try {
+      breakdown.tools += estimateTokensForText(JSON.stringify(request.tools));
+    } catch {
+      // ignore tool serialization errors
+    }
+  }
 
-  return total;
+  breakdown.total = breakdown.system + breakdown.history + breakdown.tools + breakdown.other;
+  return breakdown;
 };
 
 const getLatestRequestPayload = (calls: LLMCall[], history: Message[]) => {
@@ -513,12 +573,16 @@ function App() {
   const [allConfigs, setAllConfigs] = useState<LLMConfig[]>([]);
   const [showConfigSelector, setShowConfigSelector] = useState(false);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
+  const showDebugPanelRef = useRef(false);
   const [debugFocus, setDebugFocus] = useState<{ key: string; messageId: number; iteration: number; callId?: number } | null>(null);
   const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
   const [pendingContextEstimate, setPendingContextEstimate] = useState<PendingContextEstimate | null>(null);
+  const debugRefreshRef = useRef<Record<string, { last: number; timer: number | null }>>({});
   const [agentMode, setAgentMode] = useState<AgentMode>('default');
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null);
   const [currentAgentProfileId, setCurrentAgentProfileId] = useState<string | null>(null);
+
+  const astEnabled = agentConfig?.ast_enabled ?? true;
   const [showProfileSelector, setShowProfileSelector] = useState(false);
   const [showReasoningSelector, setShowReasoningSelector] = useState(false);
   const [showAgentModeSelector, setShowAgentModeSelector] = useState(false);
@@ -528,6 +592,18 @@ function App() {
   const [patchRevertBusy, setPatchRevertBusy] = useState(false);
   const [rollbackTarget, setRollbackTarget] = useState<{ messageId: number; keepInput?: boolean } | null>(null);
   const [workPathMenu, setWorkPathMenu] = useState<{ x: number; y: number } | null>(null);
+  const [workPathMenuPlacement, setWorkPathMenuPlacement] = useState<{ x: number; y: number } | null>(null);
+  const workPathMenuRef = useRef<HTMLDivElement | null>(null);
+  const [showAstSettings, setShowAstSettings] = useState(false);
+  const [astSettingsRoot, setAstSettingsRoot] = useState('');
+  const [astSettingsLoading, setAstSettingsLoading] = useState(false);
+  const [astSettingsSaving, setAstSettingsSaving] = useState(false);
+  const [astSettingsError, setAstSettingsError] = useState<string | null>(null);
+  const [astIgnorePaths, setAstIgnorePaths] = useState('');
+  const [astIncludeOnlyPaths, setAstIncludeOnlyPaths] = useState('');
+  const [astForceIncludePaths, setAstForceIncludePaths] = useState('');
+  const [astIncludeLanguages, setAstIncludeLanguages] = useState<string[]>([]);
+  const [astMaxFiles, setAstMaxFiles] = useState(String(AST_DEFAULT_MAX_FILES));
   const [isMaximized, setIsMaximized] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -544,6 +620,8 @@ function App() {
   const processingQueueRef = useRef(false);
   const pendingQueueRunRef = useRef(false);
   const lastWorkFileOpenRef = useRef<{ key: string; at: number } | null>(null);
+  const astWatchRef = useRef<UnwatchFn | null>(null);
+  const astNotifyRef = useRef<{ timer: number | null; paths: Set<string> }>({ timer: null, paths: new Set() });
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
   useEffect(() => {
@@ -807,6 +885,32 @@ function App() {
   }, [showConfigSelector, showReasoningSelector, showAgentModeSelector, showProfileSelector]);
 
   useEffect(() => {
+    showDebugPanelRef.current = showDebugPanel;
+  }, [showDebugPanel]);
+
+  useEffect(() => {
+    if (!workPathMenu) {
+      setWorkPathMenuPlacement(null);
+      return;
+    }
+    setWorkPathMenuPlacement({ x: workPathMenu.x, y: workPathMenu.y });
+  }, [workPathMenu]);
+
+  useLayoutEffect(() => {
+    if (!workPathMenu || !workPathMenuPlacement) return;
+    const el = workPathMenuRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const margin = 12;
+    const maxX = Math.max(margin, window.innerWidth - rect.width - margin);
+    const maxY = Math.max(margin, window.innerHeight - rect.height - margin);
+    const nextX = Math.min(Math.max(workPathMenu.x, margin), maxX);
+    const nextY = Math.min(Math.max(workPathMenu.y, margin), maxY);
+    if (nextX === workPathMenuPlacement.x && nextY === workPathMenuPlacement.y) return;
+    setWorkPathMenuPlacement({ x: nextX, y: nextY });
+  }, [workPathMenu, workPathMenuPlacement]);
+
+  useEffect(() => {
     if (!workPathMenu) return;
     const dismiss = () => setWorkPathMenu(null);
     window.addEventListener('click', dismiss);
@@ -818,16 +922,171 @@ function App() {
   }, [workPathMenu]);
 
   useEffect(() => {
+    const root = currentWorkPath;
+    if (!root || !astEnabled) {
+      if (astWatchRef.current) {
+        astWatchRef.current();
+        astWatchRef.current = null;
+      }
+      if (astNotifyRef.current.timer != null) {
+        window.clearTimeout(astNotifyRef.current.timer);
+        astNotifyRef.current.timer = null;
+      }
+      astNotifyRef.current.paths.clear();
+      return;
+    }
+
+    scheduleAstNotify(root, [root]);
+    let active = true;
+
+    const startWatch = async () => {
+      try {
+        const unwatch = await watchImmediate(
+          root,
+          (event) => {
+            if (!active) return;
+            const paths = Array.isArray(event?.paths) ? event.paths : [];
+            if (paths.length > 0) {
+              scheduleAstNotify(root, paths);
+            } else {
+              scheduleAstNotify(root, [root]);
+            }
+          },
+          { recursive: true }
+        );
+        if (!active) {
+          unwatch();
+          return;
+        }
+        if (astWatchRef.current) {
+          astWatchRef.current();
+        }
+        astWatchRef.current = unwatch;
+      } catch (error) {
+        console.warn('Failed to watch AST root:', error);
+      }
+    };
+
+    void startWatch();
+
+    return () => {
+      active = false;
+      if (astWatchRef.current) {
+        astWatchRef.current();
+        astWatchRef.current = null;
+      }
+      if (astNotifyRef.current.timer != null) {
+        window.clearTimeout(astNotifyRef.current.timer);
+        astNotifyRef.current.timer = null;
+      }
+      astNotifyRef.current.paths.clear();
+    };
+  }, [currentWorkPath, astEnabled]);
+
+  useEffect(() => {
+    if (!showAstSettings || !astSettingsRoot) return;
+    let cancelled = false;
+    setAstSettingsLoading(true);
+    setAstSettingsError(null);
+    getAstSettings(astSettingsRoot)
+      .then((result) => {
+        if (cancelled) return;
+        const settings = result?.settings || {};
+        const ignoreList = Array.isArray(settings.ignore_paths) ? settings.ignore_paths : [];
+        const includeList = Array.isArray(settings.include_only_paths) ? settings.include_only_paths : [];
+        const forceList = Array.isArray(settings.force_include_paths) ? settings.force_include_paths : [];
+        setAstIgnorePaths(ignoreList.join('\n'));
+        setAstIncludeOnlyPaths(includeList.join('\n'));
+        setAstForceIncludePaths(forceList.join('\n'));
+        const languageList = normalizeAstLanguageList(settings.include_languages);
+        setAstIncludeLanguages(languageList);
+        const maxFiles = settings.max_files ?? AST_DEFAULT_MAX_FILES;
+        setAstMaxFiles(String(maxFiles));
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        const message = error instanceof Error ? error.message : 'Failed to load AST settings.';
+        setAstSettingsError(message);
+      })
+      .finally(() => {
+        if (!cancelled) setAstSettingsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showAstSettings, astSettingsRoot]);
+
+  useEffect(() => {
     if (showDebugPanel && currentSessionId) {
       refreshSessionDebug(currentSessionId);
     }
   }, [showDebugPanel, currentSessionId, sessionRefreshTrigger]);
 
   useEffect(() => {
+    if (showDebugPanel) return;
+    Object.values(debugRefreshRef.current).forEach((entry) => {
+      if (entry.timer != null) {
+        window.clearTimeout(entry.timer);
+      }
+    });
+    debugRefreshRef.current = {};
+  }, [showDebugPanel]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(debugRefreshRef.current).forEach((entry) => {
+        if (entry.timer != null) {
+          window.clearTimeout(entry.timer);
+        }
+      });
+      debugRefreshRef.current = {};
+    };
+  }, []);
+
+  useEffect(() => {
     if (!showDebugPanel && debugFocus) {
       setDebugFocus(null);
     }
   }, [showDebugPanel, debugFocus]);
+
+  const handleSaveAstSettings = async () => {
+    if (!astSettingsRoot) return;
+    setAstSettingsSaving(true);
+    setAstSettingsError(null);
+    const parsedMax = Number.parseInt(astMaxFiles, 10);
+    const maxFiles = Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : AST_DEFAULT_MAX_FILES;
+    const includeLanguages = AST_LANGUAGE_OPTIONS
+      .map((option) => option.id)
+      .filter((id) => astIncludeLanguages.includes(id));
+    const payload = {
+      root: astSettingsRoot,
+      ignore_paths: parseAstPathList(astIgnorePaths),
+      include_only_paths: parseAstPathList(astIncludeOnlyPaths),
+      force_include_paths: parseAstPathList(astForceIncludePaths),
+      include_languages: includeLanguages,
+      max_files: maxFiles,
+    };
+    try {
+      const result = await updateAstSettings(payload);
+      const settings = result?.settings || payload;
+      const ignoreList = Array.isArray(settings.ignore_paths) ? settings.ignore_paths : payload.ignore_paths;
+      const includeList = Array.isArray(settings.include_only_paths) ? settings.include_only_paths : payload.include_only_paths;
+      const forceList = Array.isArray(settings.force_include_paths) ? settings.force_include_paths : payload.force_include_paths;
+      setAstIgnorePaths(ignoreList.join('\n'));
+      setAstIncludeOnlyPaths(includeList.join('\n'));
+      setAstForceIncludePaths(forceList.join('\n'));
+      const languageList = normalizeAstLanguageList(settings.include_languages ?? includeLanguages);
+      setAstIncludeLanguages(languageList);
+      setAstMaxFiles(String(settings.max_files ?? maxFiles));
+      scheduleAstNotify(astSettingsRoot, [astSettingsRoot]);
+      closeAstSettings();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to save AST settings.';
+      setAstSettingsError(message);
+    } finally {
+      setAstSettingsSaving(false);
+    }
+  };
 
   useEffect(() => {
     if (getInFlightCount() === 0) {
@@ -949,6 +1208,20 @@ function App() {
     }
   };
 
+  const scheduleAstNotify = (root: string, paths?: string[]) => {
+    if (!root || !astEnabled) return;
+    const record = astNotifyRef.current;
+    const normalized = paths && paths.length > 0 ? paths : [root];
+    normalized.filter(Boolean).forEach((value) => record.paths.add(value));
+    if (record.timer != null) return;
+    record.timer = window.setTimeout(() => {
+      record.timer = null;
+      const batch = Array.from(record.paths);
+      record.paths.clear();
+      void notifyAstChanges(root, batch).catch(() => undefined);
+    }, 240);
+  };
+
   const applyWorkPath = async (sessionKey: string, sessionId: string | null, nextPath: string) => {
     if (!nextPath) return;
     setSessionWorkPath(sessionKey, nextPath);
@@ -959,6 +1232,9 @@ function App() {
       } catch (error) {
         console.error('Failed to update work path:', error);
       }
+    }
+    if (sessionKey === getCurrentSessionKey()) {
+      scheduleAstNotify(nextPath, [nextPath]);
     }
   };
 
@@ -1372,6 +1648,9 @@ function App() {
             return { ...msg, metadata: nextMetadata };
           })
         );
+
+        const debugSessionId = activeSessionKey === DRAFT_SESSION_KEY ? null : activeSessionKey;
+        scheduleDebugRefresh(debugSessionId);
       }
 
       updateSessionMessages(activeSessionKey, (prev) =>
@@ -1472,6 +1751,32 @@ function App() {
     }
   };
 
+  const scheduleDebugRefresh = (sessionId: string | null | undefined) => {
+    if (!showDebugPanelRef.current || !sessionId) return;
+    if (currentSessionIdRef.current && sessionId !== currentSessionIdRef.current) return;
+    const key = sessionId;
+    const now = Date.now();
+    const minInterval = 600;
+    const entry = debugRefreshRef.current[key] || { last: 0, timer: null };
+    const elapsed = now - entry.last;
+    if (elapsed >= minInterval) {
+      entry.last = now;
+      debugRefreshRef.current[key] = entry;
+      void refreshSessionDebug(key);
+      return;
+    }
+    if (entry.timer != null) return;
+    entry.timer = window.setTimeout(() => {
+      entry.timer = null;
+      entry.last = Date.now();
+      debugRefreshRef.current[key] = entry;
+      if (showDebugPanelRef.current) {
+        void refreshSessionDebug(key);
+      }
+    }, Math.max(0, minInterval - elapsed));
+    debugRefreshRef.current[key] = entry;
+  };
+
   const handleOpenDebugCall = (messageId: number, iteration: number) => {
     if (!showDebugPanel) return;
     const call = llmCalls.find((item) => item.message_id === messageId && item.iteration === iteration);
@@ -1513,6 +1818,80 @@ function App() {
     if (!selected) return;
     const sessionKey = getCurrentSessionKey();
     await applyWorkPath(sessionKey, currentSessionIdRef.current, selected);
+  };
+
+  const parseAstPathList = (value: string) =>
+    value
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+  const pickAstFolder = async (target: 'ignore' | 'include' | 'force') => {
+    if (!astSettingsRoot) return;
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath: astSettingsRoot,
+      });
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      if (!path) return;
+      if (target === 'ignore') {
+        appendAstPath(path, astIgnorePaths, setAstIgnorePaths);
+      } else if (target === 'include') {
+        appendAstPath(path, astIncludeOnlyPaths, setAstIncludeOnlyPaths);
+      } else {
+        appendAstPath(path, astForceIncludePaths, setAstForceIncludePaths);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to pick folder.';
+      setAstSettingsError(message);
+    }
+  };
+
+  const normalizeAstLanguageList = (value: unknown) => {
+    if (!Array.isArray(value)) return [];
+    const allowed = new Set(AST_LANGUAGE_OPTIONS.map((option) => option.id));
+    const seen = new Set<string>();
+    const result: string[] = [];
+    value.forEach((item) => {
+      if (typeof item !== 'string') return;
+      const key = item.trim().toLowerCase();
+      if (!key || !allowed.has(key) || seen.has(key)) return;
+      seen.add(key);
+      result.push(key);
+    });
+    return result;
+  };
+
+  const toggleAstLanguage = (language: string) => {
+    if (!language) return;
+    setAstIncludeLanguages((prev) => {
+      if (prev.includes(language)) {
+        return prev.filter((item) => item !== language);
+      }
+      return [...prev, language];
+    });
+  };
+
+  const appendAstPath = (path: string, current: string, setter: (value: string) => void) => {
+    if (!path) return;
+    const list = parseAstPathList(current);
+    if (list.includes(path)) return;
+    setter([...list, path].join('\n'));
+  };
+
+  const openAstSettings = (root: string) => {
+    if (!root) return;
+    setAstSettingsRoot(root);
+    setAstSettingsError(null);
+    setShowAstSettings(true);
+  };
+
+  const closeAstSettings = () => {
+    if (astSettingsSaving) return;
+    setShowAstSettings(false);
+    setAstSettingsError(null);
   };
 
   const openWorkDirWindow = async (
@@ -1867,6 +2246,9 @@ function App() {
       const sessionWorkPath = session.work_path || '';
       workPathBySessionRef.current[session.id] = sessionWorkPath;
       setCurrentWorkPath(sessionWorkPath);
+      if (sessionWorkPath) {
+        scheduleAstNotify(sessionWorkPath, [sessionWorkPath]);
+      }
       setCurrentAgentProfileId(resolveAgentProfileId(agentConfig, session.agent_profile || null));
 
       if (!cached || (!isStreamingSession && !hasStreaming)) {
@@ -2044,9 +2426,10 @@ function App() {
         ? pendingContextEstimate.payload
         : null;
     const lastRequest = pendingRequest || getLatestRequestPayload(llmCalls, messages);
-    const usedTokens = estimateTokensFromRequest(lastRequest);
+    const breakdown = estimateTokensFromRequestBreakdown(lastRequest);
+    const usedTokens = breakdown.total;
     const ratio = maxTokens > 0 ? Math.min(1, usedTokens / maxTokens) : 0;
-    return { usedTokens, maxTokens, ratio };
+    return { usedTokens, maxTokens, ratio, breakdown };
   }, [currentConfig?.max_context_tokens, llmCalls, messages, pendingContextEstimate]);
   const contextRing = useMemo(() => {
     const circumference = 2 * Math.PI * CONTEXT_RING_RADIUS;
@@ -2485,40 +2868,56 @@ function App() {
                       {workPathDisplay}
                     </span>
                   </button>
-                  {workPathMenu && (
-                    <div
-                      className="work-path-menu"
-                      style={{
-                        top: Math.min(workPathMenu.y, window.innerHeight - 90),
-                        left: Math.min(workPathMenu.x, window.innerWidth - 220)
-                      }}
-                      onClick={(event) => event.stopPropagation()}
-                      onContextMenu={(event) => event.preventDefault()}
-                    >
-                      <button
-                        type="button"
-                        className="work-path-menu-item"
-                        onClick={async () => {
-                          setWorkPathMenu(null);
-                          await handleWorkPathPick();
+                  {workPathMenu &&
+                    typeof document !== 'undefined' &&
+                    createPortal(
+                      <div
+                        ref={workPathMenuRef}
+                        className="work-path-menu"
+                        style={{
+                          top: (workPathMenuPlacement || workPathMenu).y,
+                          left: (workPathMenuPlacement || workPathMenu).x
                         }}
+                        onClick={(event) => event.stopPropagation()}
+                        onContextMenu={(event) => event.preventDefault()}
                       >
-                        重新选择工作路径
-                      </button>
-                      <button
-                        type="button"
-                        className="work-path-menu-item"
-                        disabled={!currentWorkPath}
-                        onClick={async () => {
-                          if (!currentWorkPath) return;
-                          setWorkPathMenu(null);
-                          await openWorkPathInExplorer(currentWorkPath);
-                        }}
-                      >
-                        在资源管理器打开
-                      </button>
-                    </div>
-                  )}
+                        <button
+                          type="button"
+                          className="work-path-menu-item"
+                          disabled={!currentWorkPath}
+                          onClick={() => {
+                            if (!currentWorkPath) return;
+                            setWorkPathMenu(null);
+                            openAstSettings(currentWorkPath);
+                          }}
+                        >
+                          AST 分析设置
+                        </button>
+                        <button
+                          type="button"
+                          className="work-path-menu-item"
+                          onClick={async () => {
+                            setWorkPathMenu(null);
+                            await handleWorkPathPick();
+                          }}
+                        >
+                          重新选择工作路径
+                        </button>
+                        <button
+                          type="button"
+                          className="work-path-menu-item"
+                          disabled={!currentWorkPath}
+                          onClick={async () => {
+                            if (!currentWorkPath) return;
+                            setWorkPathMenu(null);
+                            await openWorkPathInExplorer(currentWorkPath);
+                          }}
+                        >
+                          在资源管理器打开
+                        </button>
+                      </div>,
+                      document.body
+                    )}
                 </div>
               )}
 
@@ -2526,7 +2925,7 @@ function App() {
                 {currentConfig && (
                 <div
                   className={`context-usage${contextUsage.ratio >= 0.8 ? ' warn' : contextUsage.ratio >= 0.6 ? ' mid' : ''}`}
-                  title={`Context ${Math.round(contextUsage.ratio * 100)}%`}
+                  title={`Context ${Math.round(contextUsage.ratio * 100)}%\n总用量: ${formatTokenCount(contextUsage.usedTokens)} / ${formatTokenCount(contextUsage.maxTokens)}\n系统提示词: ${formatTokenCount(contextUsage.breakdown.system)}\n历史对话(含压缩): ${formatTokenCount(contextUsage.breakdown.history)}\n工具声明: ${formatTokenCount(contextUsage.breakdown.tools)}\n其余: ${formatTokenCount(contextUsage.breakdown.other)}`}
                   aria-label={`Context usage ${Math.round(contextUsage.ratio * 100)}%`}
                 >
                     <svg viewBox="0 0 36 36" aria-hidden="true">
@@ -2549,6 +2948,29 @@ function App() {
                         strokeDashoffset={contextRing.dashOffset}
                       />
                     </svg>
+                    <div className="context-usage-details">
+                      <div className="context-usage-title">Context 预估</div>
+                      <div className="context-usage-row">
+                        <span>总用量</span>
+                        <span>{formatTokenCount(contextUsage.usedTokens)} / {formatTokenCount(contextUsage.maxTokens)}</span>
+                      </div>
+                      <div className="context-usage-row">
+                        <span>系统提示词</span>
+                        <span>{formatTokenCount(contextUsage.breakdown.system)}</span>
+                      </div>
+                      <div className="context-usage-row">
+                        <span>历史对话(含压缩)</span>
+                        <span>{formatTokenCount(contextUsage.breakdown.history)}</span>
+                      </div>
+                      <div className="context-usage-row">
+                        <span>工具声明</span>
+                        <span>{formatTokenCount(contextUsage.breakdown.tools)}</span>
+                      </div>
+                      <div className="context-usage-row">
+                        <span>其余</span>
+                        <span>{formatTokenCount(contextUsage.breakdown.other)}</span>
+                      </div>
+                    </div>
                   </div>
                 )}
                 <button
@@ -2620,6 +3042,129 @@ function App() {
             loadAgentConfig();
           }}
         />
+      )}
+
+      {showAstSettings && (
+        <div
+          className="ast-settings-backdrop"
+          onClick={() => {
+            if (!astSettingsSaving) closeAstSettings();
+          }}
+        >
+          <div className="ast-settings-dialog" onClick={(event) => event.stopPropagation()}>
+            <div className="ast-settings-title">AST 分析设置</div>
+            <div className="ast-settings-body">
+              <div className="ast-settings-row">
+                <label>工作路径</label>
+                <div className="ast-settings-path">{astSettingsRoot}</div>
+              </div>
+
+              <div className="ast-settings-label-row">
+                <label>忽略路径（每行一个）</label>
+                <button
+                  type="button"
+                  className="ast-settings-pick-btn"
+                  onClick={() => void pickAstFolder('ignore')}
+                  disabled={astSettingsLoading || astSettingsSaving}
+                >
+                  选择文件夹
+                </button>
+              </div>
+              <textarea
+                className="ast-settings-textarea"
+                value={astIgnorePaths}
+                onChange={(event) => setAstIgnorePaths(event.currentTarget.value)}
+                placeholder="例如：D:\\repo\\node_modules"
+                disabled={astSettingsLoading || astSettingsSaving}
+              />
+
+              <div className="ast-settings-label-row">
+                <label>仅包含路径（每行一个）</label>
+                <button
+                  type="button"
+                  className="ast-settings-pick-btn"
+                  onClick={() => void pickAstFolder('include')}
+                  disabled={astSettingsLoading || astSettingsSaving}
+                >
+                  选择文件夹
+                </button>
+              </div>
+              <textarea
+                className="ast-settings-textarea"
+                value={astIncludeOnlyPaths}
+                onChange={(event) => setAstIncludeOnlyPaths(event.currentTarget.value)}
+                placeholder="仅扫描这些路径及其子目录"
+                disabled={astSettingsLoading || astSettingsSaving}
+              />
+
+              <div className="ast-settings-label-row">
+                <label>必定包含路径（每行一个）</label>
+                <button
+                  type="button"
+                  className="ast-settings-pick-btn"
+                  onClick={() => void pickAstFolder('force')}
+                  disabled={astSettingsLoading || astSettingsSaving}
+                >
+                  选择文件夹
+                </button>
+              </div>
+              <textarea
+                className="ast-settings-textarea"
+                value={astForceIncludePaths}
+                onChange={(event) => setAstForceIncludePaths(event.currentTarget.value)}
+                placeholder="即使被 gitignore 或忽略规则命中也会扫描"
+                disabled={astSettingsLoading || astSettingsSaving}
+              />
+
+              <label>语言类型过滤（不选表示不过滤）</label>
+              <div className="ast-settings-language-grid">
+                {AST_LANGUAGE_OPTIONS.map((option) => (
+                  <label key={option.id} className="ast-settings-language-option">
+                    <input
+                      type="checkbox"
+                      checked={astIncludeLanguages.includes(option.id)}
+                      onChange={() => toggleAstLanguage(option.id)}
+                      disabled={astSettingsLoading || astSettingsSaving}
+                    />
+                    <span>{option.label}</span>
+                  </label>
+                ))}
+              </div>
+              <div className="ast-settings-hint">不选表示不过滤（全部语言）</div>
+
+              <label>最大分析文件数</label>
+              <input
+                className="ast-settings-input"
+                type="number"
+                min={1}
+                value={astMaxFiles}
+                onChange={(event) => setAstMaxFiles(event.currentTarget.value)}
+                disabled={astSettingsLoading || astSettingsSaving}
+              />
+              {astSettingsLoading && <div className="ast-settings-hint">正在加载设置...</div>}
+              <div className="ast-settings-hint">优先级：必定包含 &gt; 仅包含 &gt; 忽略 &gt; Git 忽略</div>
+              {astSettingsError && <div className="ast-settings-error">{astSettingsError}</div>}
+            </div>
+            <div className="ast-settings-actions">
+              <button
+                type="button"
+                className="ast-settings-btn ghost"
+                onClick={closeAstSettings}
+                disabled={astSettingsSaving}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="ast-settings-btn primary"
+                onClick={() => void handleSaveAstSettings()}
+                disabled={astSettingsSaving || astSettingsLoading}
+              >
+                {astSettingsSaving ? '保存中...' : '保存'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       <ConfirmDialog

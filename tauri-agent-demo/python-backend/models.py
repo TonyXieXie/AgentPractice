@@ -194,3 +194,17 @@ class AstRequest(BaseModel):
     work_path: Optional[str] = None
     extra_work_paths: Optional[List[str]] = None
     agent_mode: Optional[AgentMode] = None
+
+
+class AstNotifyRequest(BaseModel):
+    root: str
+    paths: Optional[List[str]] = None
+
+
+class AstSettingsRequest(BaseModel):
+    root: str
+    ignore_paths: Optional[List[str]] = None
+    include_only_paths: Optional[List[str]] = None
+    force_include_paths: Optional[List[str]] = None
+    include_languages: Optional[List[str]] = None
+    max_files: Optional[int] = None

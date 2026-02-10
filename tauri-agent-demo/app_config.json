@@ -1,0 +1,83 @@
+{
+  "llm": {
+    "timeout_sec": 180.0
+  },
+  "agent": {
+    "react_max_iterations": 200,
+    "base_system_prompt": "You are a helpful AI assistant.",
+    "abilities": [
+      {
+        "id": "tools_all",
+        "name": "All Tools",
+        "type": "tooling",
+        "tools": [
+          "*"
+        ],
+        "prompt": ""
+      },
+      {
+        "id": "rg_search",
+        "name": "RG Search",
+        "type": "tooling",
+        "tools": [
+          "rg"
+        ],
+        "prompt": "Prefer rg for searching file contents."
+      },
+      {
+        "id": "apply_patch",
+        "name": "Apply Patch",
+        "type": "tooling",
+        "tools": [
+          "apply_patch"
+        ],
+        "prompt": "Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.\napply_patch format (strict):\n  *** Begin Patch\n  *** Update File: path\n  @@\n  - old line\n  + new line\n  *** End Patch\n- Each change line must start with + or -, and context lines must be included under @@ hunks.\n- Do NOT wrap apply_patch content in code fences; send raw patch text only.\n- apply_patch matches by context; if the match is not unique, request more surrounding context.\n- If apply_patch fails due to context, ask for more context and retry."
+      },
+      {
+        "id": "code_map",
+        "name": "Code Map",
+        "type": "domain_knowledge",
+        "prompt": "{{code_map_prompt}}"
+      },
+      {
+        "id": "tool_json",
+        "name": "Tool Arguments JSON",
+        "type": "tool_policy",
+        "prompt": "If a tool is needed, call it with JSON arguments that match its schema."
+      },
+      {
+        "id": "output_concise",
+        "name": "Concise Output",
+        "type": "output_format",
+        "prompt": "Be concise and actionable."
+      }
+    ],
+    "profiles": [
+      {
+        "id": "default",
+        "name": "Default",
+        "abilities": [
+          "tools_all",
+          "rg_search",
+          "apply_patch",
+          "code_map",
+          "tool_json",
+          "output_concise"
+        ]
+      }
+    ],
+    "default_profile": "default"
+  },
+  "context": {
+    "compression_enabled": true,
+    "compress_start_pct": 75,
+    "compress_target_pct": 25,
+    "min_keep_messages": 12,
+    "keep_recent_calls": 10,
+    "step_calls": 5,
+    "truncate_long_data": false,
+    "long_data_threshold": 1000,
+    "long_data_head_chars": 600,
+    "long_data_tail_chars": 400
+  }
+}

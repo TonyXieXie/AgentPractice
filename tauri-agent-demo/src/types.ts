@@ -26,9 +26,20 @@ export interface AgentProfile {
     params?: Record<string, any>;
 }
 
+export interface CodeMapConfig {
+    enabled?: boolean;
+    max_symbols?: number;
+    max_files?: number;
+    max_lines?: number;
+    weight_refs?: number;
+    weight_mentions?: number;
+}
+
 export interface AgentConfig {
     base_system_prompt?: string;
     react_max_iterations?: number;
+    ast_enabled?: boolean;
+    code_map?: CodeMapConfig;
     abilities?: AgentAbility[];
     profiles?: AgentProfile[];
     default_profile?: string;
@@ -256,6 +267,41 @@ export interface AstRequest {
     work_path?: string | null;
     extra_work_paths?: string[] | null;
     agent_mode?: AgentMode;
+}
+
+export interface AstPathSettings {
+    root?: string;
+    ignore_paths?: string[];
+    include_only_paths?: string[];
+    force_include_paths?: string[];
+    include_languages?: string[];
+    max_files?: number;
+}
+
+export interface AstSettingsResponse {
+    ok?: boolean;
+    root?: string;
+    settings?: AstPathSettings;
+}
+
+export interface AstCacheFile {
+    path: string;
+    file_mtime?: number;
+    parsed_at?: number;
+    stale?: boolean;
+    include_text?: boolean;
+    payload?: AstPayload;
+}
+
+export interface AstCacheResponse {
+    ok?: boolean;
+    root?: string;
+    files?: AstCacheFile[];
+}
+
+export interface CodeMapResponse {
+    ok?: boolean;
+    prompt?: string;
 }
 
 export interface ChatRequest {

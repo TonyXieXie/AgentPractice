@@ -10,6 +10,7 @@ import base64
 from io import BytesIO
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
+from pathlib import Path
 import traceback
 
 from PIL import Image
@@ -20,7 +21,7 @@ from models import (
     ChatSession, ChatSessionCreate, ChatSessionUpdate,
     ChatRequest, ChatResponse, ExportRequest,
     ToolPermissionRequest, ToolPermissionRequestUpdate,
-    ChatStopRequest, RollbackRequest, PatchRevertRequest, AstRequest
+    ChatStopRequest, RollbackRequest, PatchRevertRequest, AstRequest, AstNotifyRequest, AstSettingsRequest
 )
 from database import db
 from llm_client import create_llm_client
@@ -37,6 +38,9 @@ from tools.builtin.system_tools import ApplyPatchTool, CodeAstTool
 from stream_control import stream_stop_registry
 from app_config import get_app_config, update_app_config, get_app_config_path
 from ghost_snapshot import restore_snapshot
+from code_map import build_code_map_prompt
+from ast_index import get_ast_index
+from ast_settings import get_ast_settings, update_ast_settings
 
 app = FastAPI(title="Tauri Agent Chat Backend")
 
@@ -49,6 +53,17 @@ app.add_middleware(
 )
 
 register_builtin_tools()
+
+# ==================== AST Cache ====================
+
+def _schedule_ast_scan(work_path: Optional[str]) -> None:
+    if not work_path:
+        return
+    try:
+        get_ast_index().ensure_root(work_path)
+    except Exception:
+        # Avoid breaking requests if AST cache fails.
+        pass
 
 # ==================== Local File Read ====================
 
@@ -748,7 +763,9 @@ def create_session(session: ChatSessionCreate):
     config = db.get_config(session.config_id)
     if not config:
         raise HTTPException(status_code=404, detail="Config not found")
-    return db.create_session(session)
+    created = db.create_session(session)
+    _schedule_ast_scan(created.work_path)
+    return created
 
 @app.put("/sessions/{session_id}", response_model=ChatSession)
 def update_session(session_id: str, update: ChatSessionUpdate):
@@ -759,6 +776,8 @@ def update_session(session_id: str, update: ChatSessionUpdate):
     session = db.update_session(session_id, update)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    if update.work_path is not None:
+        _schedule_ast_scan(session.work_path)
     return session
 
 @app.delete("/sessions/{session_id}")
@@ -874,6 +893,7 @@ async def chat(request: ChatRequest):
                 agent_profile=request.agent_profile
             ))
             new_session_created = True
+            _schedule_ast_scan(session.work_path)
         is_first_turn = (session.message_count or 0) == 0
 
         config = db.get_config(session.config_id)
@@ -986,6 +1006,7 @@ async def chat_stream(request: ChatRequest):
                 agent_profile=request.agent_profile
             ))
             new_session_created = True
+            _schedule_ast_scan(session.work_path)
         is_first_turn = (session.message_count or 0) == 0
 
         config = db.get_config(session.config_id)
@@ -1249,10 +1270,11 @@ async def chat_agent_stream(request: ChatRequest):
         agent_type = request.agent_type_override if hasattr(request, 'agent_type_override') else getattr(session, 'agent_type', 'react')
         profile_id = request.agent_profile or getattr(session, "agent_profile", None)
         include_tools = agent_type != "simple"
-        system_prompt, tools, resolved_profile_id = build_agent_prompt_and_tools(
+        system_prompt, tools, resolved_profile_id, ability_ids = build_agent_prompt_and_tools(
             profile_id,
             ToolRegistry.get_all(),
-            include_tools=include_tools
+            include_tools=include_tools,
+            exclude_ability_ids=["code_map"]
         )
         if resolved_profile_id and resolved_profile_id != getattr(session, "agent_profile", None):
             db.update_session(session.id, ChatSessionUpdate(agent_profile=resolved_profile_id))
@@ -1261,6 +1283,15 @@ async def chat_agent_stream(request: ChatRequest):
         app_config = get_app_config()
         agent_config = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
         context_config = app_config.get("context", {}) if isinstance(app_config, dict) else {}
+        ast_enabled = bool(agent_config.get("ast_enabled", True))
+        code_map_cfg = agent_config.get("code_map", {}) if isinstance(agent_config, dict) else {}
+        code_map_enabled = bool(code_map_cfg.get("enabled", True))
+        code_map_prompt = None
+        if "code_map" in ability_ids and ast_enabled and code_map_enabled:
+            code_map_prompt = build_code_map_prompt(
+                session.id,
+                request.work_path or getattr(session, "work_path", None)
+            )
         react_max_iterations = agent_config.get("react_max_iterations", 50)
         try:
             react_max_iterations = int(react_max_iterations)
@@ -1278,12 +1309,19 @@ async def chat_agent_stream(request: ChatRequest):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        def build_history_for_llm(summary: str, after_message_id: Optional[int]) -> List[Dict[str, str]]:
+        def build_history_for_llm(
+            summary: str,
+            after_message_id: Optional[int],
+            code_map: Optional[str]
+        ) -> List[Dict[str, str]]:
             messages = db.get_dialogue_messages_after(session.id, after_message_id)
             filtered = [msg for msg in messages if msg.get("id") != user_msg.id]
             history = [{"role": msg.get("role"), "content": msg.get("content")} for msg in filtered]
             if summary:
                 history.insert(0, {"role": "assistant", "content": f"{CONTEXT_SUMMARY_MARKER}\n{summary}"})
+            if code_map:
+                insert_index = 1 if summary else 0
+                history.insert(insert_index, {"role": "assistant", "content": code_map})
             return history
 
         def stream_text_chunks(text: str, chunk_size: int = 1):
@@ -1365,7 +1403,7 @@ async def chat_agent_stream(request: ChatRequest):
                     yield f"data: {json.dumps(compress_step.to_dict())}\n\n"
                     sequence += 1
 
-                history_for_llm = build_history_for_llm(context_summary, last_compressed_message_id)
+                history_for_llm = build_history_for_llm(context_summary, last_compressed_message_id, code_map_prompt)
 
                 async for step in executor.run(
                     user_input=processed_message,
@@ -1616,6 +1654,83 @@ async def run_ast(request: AstRequest):
         return json.loads(result_text)
     except Exception:
         return {"ok": False, "error": result_text}
+
+@app.post("/ast/notify")
+def notify_ast(request: AstNotifyRequest):
+    if not request.root:
+        raise HTTPException(status_code=400, detail="Missing root")
+    paths = request.paths or []
+    try:
+        updated = get_ast_index().notify_paths(request.root, paths)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AST notify failed: {exc}")
+    return {"ok": True, "updated": updated}
+
+@app.get("/ast/settings")
+def get_ast_settings_route(root: str = Query(...)):
+    if not root:
+        raise HTTPException(status_code=400, detail="Missing root")
+    if not Path(root).expanduser().exists():
+        raise HTTPException(status_code=404, detail="Root path not found")
+    try:
+        settings = get_ast_settings(root)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AST settings error: {exc}")
+    return {"ok": True, "root": settings.get("root"), "settings": settings}
+
+@app.put("/ast/settings")
+def update_ast_settings_route(request: AstSettingsRequest):
+    if not request.root:
+        raise HTTPException(status_code=400, detail="Missing root")
+    if not Path(request.root).expanduser().exists():
+        raise HTTPException(status_code=404, detail="Root path not found")
+    patch = request.dict(exclude={"root"}, exclude_none=True)
+    try:
+        settings = update_ast_settings(request.root, patch)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AST settings update failed: {exc}")
+    try:
+        get_ast_index().ensure_root(request.root)
+    except Exception:
+        pass
+    return {"ok": True, "root": settings.get("root"), "settings": settings}
+
+@app.get("/ast/cache")
+def get_ast_cache(root: str = Query(...), path: Optional[str] = None, include_payload: bool = False):
+    if not root:
+        raise HTTPException(status_code=400, detail="Missing root")
+    if not Path(root).expanduser().exists():
+        raise HTTPException(status_code=404, detail="Root path not found")
+    try:
+        app_config = get_app_config()
+        agent_cfg = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
+        ast_enabled = bool(agent_cfg.get("ast_enabled", True))
+        if path:
+            payload = get_ast_index().get_file_payload(root, path)
+            if isinstance(payload, dict) and not ast_enabled:
+                payload.setdefault("disabled", True)
+            return payload
+        entries = get_ast_index().get_root_entries(root, include_payload=include_payload)
+        return {"ok": True, "root": root, "files": entries, "disabled": not ast_enabled}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AST cache error: {exc}")
+
+@app.get("/ast/code-map")
+def get_code_map(session_id: str = Query(...), root: str = Query(...)):
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Missing session_id")
+    if not root:
+        raise HTTPException(status_code=400, detail="Missing root")
+    if not Path(root).expanduser().exists():
+        raise HTTPException(status_code=404, detail="Root path not found")
+    session = db.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        prompt = build_code_map_prompt(session_id, root)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Code map error: {exc}")
+    return {"ok": True, "prompt": prompt or ""}
 
 @app.post("/chat/stop")
 def stop_chat(request: ChatStopRequest):

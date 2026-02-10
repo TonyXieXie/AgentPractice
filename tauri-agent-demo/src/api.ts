@@ -14,7 +14,9 @@
     ToolPermissionRequest,
     PatchRevertResponse,
     ToolDefinition,
-    AstRequest
+    AstRequest,
+    AstPathSettings,
+    AstSettingsResponse
 } from './types';
 
 export const API_BASE_URL = 'http://127.0.0.1:8000';
@@ -137,6 +139,63 @@ export async function runAstTool(payload: AstRequest): Promise<any> {
     });
     if (!response.ok) {
         throw await buildApiError(response, 'Failed to run AST tool');
+    }
+    return response.json();
+}
+
+export async function notifyAstChanges(root: string, paths?: string[]): Promise<void> {
+    const response = await fetch(`${API_BASE_URL}/ast/notify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ root, paths: paths || [] }),
+    });
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to notify AST changes');
+    }
+}
+
+export async function getAstCache(root: string): Promise<any> {
+    const response = await fetch(`${API_BASE_URL}/ast/cache?root=${encodeURIComponent(root)}`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to fetch AST cache');
+    }
+    return response.json();
+}
+
+export async function getAstCacheFile(root: string, path: string): Promise<any> {
+    const query = `root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}`;
+    const response = await fetch(`${API_BASE_URL}/ast/cache?${query}`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to fetch AST cache file');
+    }
+    return response.json();
+}
+
+export async function getAstSettings(root: string): Promise<AstSettingsResponse> {
+    const response = await fetch(`${API_BASE_URL}/ast/settings?root=${encodeURIComponent(root)}`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to fetch AST settings');
+    }
+    return response.json();
+}
+
+export async function updateAstSettings(payload: AstPathSettings & { root: string }): Promise<AstSettingsResponse> {
+    const response = await fetch(`${API_BASE_URL}/ast/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to update AST settings');
+    }
+    return response.json();
+}
+
+export async function getCodeMap(sessionId: string, root: string): Promise<any> {
+    const query = `session_id=${encodeURIComponent(sessionId)}&root=${encodeURIComponent(root)}`;
+    const response = await fetch(`${API_BASE_URL}/ast/code-map?${query}`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to fetch code map');
     }
     return response.json();
 }

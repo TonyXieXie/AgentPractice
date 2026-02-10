@@ -791,25 +791,26 @@ body[data-platform="mac"] .app-titlebar {
 
 .work-path-menu {
   position: fixed;
-  z-index: 1200;
+  z-index: 1600;
   background: #1b222b;
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 10px;
-  padding: 6px;
-  min-width: 200px;
+  border-radius: 8px;
+  padding: 4px;
+  min-width: 180px;
   box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
 }
 
 .work-path-menu-item {
   width: 100%;
   text-align: left;
-  padding: 8px 10px;
+  padding: 6px 8px;
   border: none;
   background: transparent;
   color: #e5e7eb;
   border-radius: 8px;
   cursor: pointer;
-  font-size: 0.85rem;
+  font-size: 0.78rem;
+  line-height: 1.2;
   transition: background 0.15s ease, color 0.15s ease;
 }
 
@@ -819,6 +820,187 @@ body[data-platform="mac"] .app-titlebar {
 
 .work-path-menu-item:disabled {
   opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ast-settings-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1300;
+  animation: astSettingsFade 0.15s ease-out;
+}
+
+@keyframes astSettingsFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.ast-settings-dialog {
+  width: min(520px, 92vw);
+  background: #1b1d20;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 18px 18px 16px;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.45);
+  color: #e5e7eb;
+}
+
+.ast-settings-title {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.ast-settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ast-settings-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ast-settings-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ast-settings-pick-btn {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.05);
+  color: #e5e7eb;
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.ast-settings-pick-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+}
+
+.ast-settings-pick-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.ast-settings-path {
+  font-size: 0.8rem;
+  color: #94a3b8;
+  word-break: break-all;
+}
+
+.ast-settings-textarea {
+  min-height: 78px;
+  resize: vertical;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: #111318;
+  color: #e5e7eb;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.ast-settings-textarea:focus {
+  outline: none;
+  border-color: rgba(255, 255, 255, 0.28);
+  background: #151a20;
+}
+
+.ast-settings-input {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: #111318;
+  color: #e5e7eb;
+  font-size: 0.9rem;
+}
+
+.ast-settings-input:focus {
+  outline: none;
+  border-color: rgba(255, 255, 255, 0.28);
+  background: #151a20;
+}
+
+.ast-settings-language-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px 10px;
+  padding: 4px 0;
+}
+
+.ast-settings-language-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+  color: #e5e7eb;
+}
+
+.ast-settings-language-option input {
+  accent-color: #60a5fa;
+}
+
+.ast-settings-hint {
+  font-size: 0.75rem;
+  color: #9ca3af;
+}
+
+.ast-settings-error {
+  font-size: 0.78rem;
+  color: #fca5a5;
+}
+
+.ast-settings-actions {
+  margin-top: 12px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.ast-settings-btn {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 6px 14px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.ast-settings-btn.ghost {
+  background: transparent;
+  color: #cbd5e1;
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+.ast-settings-btn.ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: #e2e8f0;
+}
+
+.ast-settings-btn.primary {
+  background: rgba(59, 130, 246, 0.85);
+  color: #0b1120;
+}
+
+.ast-settings-btn.primary:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 1);
+}
+
+.ast-settings-btn:disabled {
+  opacity: 0.6;
   cursor: not-allowed;
 }
 
@@ -1015,6 +1197,52 @@ body[data-platform="mac"] .app-titlebar {
   align-items: center;
   justify-content: center;
   color: #cbd5e1;
+}
+
+.context-usage-details {
+  position: absolute;
+  right: 0;
+  bottom: 32px;
+  width: 260px;
+  background: #0f1216;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: #e2e8f0;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  z-index: 8;
+}
+
+.context-usage-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: #f8fafc;
+}
+
+.context-usage-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: #cbd5e1;
+}
+
+.context-usage-row span:last-child {
+  color: #f8fafc;
+  font-variant-numeric: tabular-nums;
+}
+
+.context-usage:hover .context-usage-details,
+.context-usage:focus-within .context-usage-details {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
 }
 
 .context-usage svg {
