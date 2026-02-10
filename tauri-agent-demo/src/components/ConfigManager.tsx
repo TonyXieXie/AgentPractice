@@ -1,4 +1,6 @@
 ﻿import { useState, useEffect } from 'react';
+import { save as saveDialog } from '@tauri-apps/plugin-dialog';
+import { writeTextFile } from '@tauri-apps/plugin-fs';
 import {
     LLMConfig,
     LLMConfigCreate,
@@ -83,6 +85,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const [activeTab, setActiveTab] = useState<ConfigTab>('models');
     const [globalTimeoutSec, setGlobalTimeoutSec] = useState('180');
     const [globalReactMaxIterations, setGlobalReactMaxIterations] = useState('50');
+    const [globalAstEnabled, setGlobalAstEnabled] = useState(true);
+    const [globalCodeMapEnabled, setGlobalCodeMapEnabled] = useState(true);
     const [globalContextCompressionEnabled, setGlobalContextCompressionEnabled] = useState(false);
     const [globalContextCompressStartPct, setGlobalContextCompressStartPct] = useState(
         String(DEFAULT_CONTEXT_START_PCT)
@@ -194,6 +198,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             if (reactMax !== undefined && reactMax !== null) {
                 setGlobalReactMaxIterations(String(reactMax));
             }
+            setGlobalAstEnabled(Boolean(data?.agent?.ast_enabled ?? true));
+            setGlobalCodeMapEnabled(Boolean(data?.agent?.code_map?.enabled ?? true));
             const contextConfig = data?.context || {};
             setGlobalContextCompressionEnabled(Boolean(contextConfig?.compression_enabled));
             const startPct = Number.parseInt(
@@ -388,7 +394,13 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         try {
             const updated = await updateAppConfig({
                 llm: { timeout_sec: timeoutValue },
-                agent: { react_max_iterations: reactMaxValue },
+                agent: {
+                    react_max_iterations: reactMaxValue,
+                    ast_enabled: globalAstEnabled,
+                    code_map: {
+                        enabled: globalCodeMapEnabled
+                    }
+                },
                 context: {
                     compression_enabled: globalContextCompressionEnabled,
                     compress_start_pct: startPct,
@@ -407,6 +419,12 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             }
             if (updated?.agent?.react_max_iterations !== undefined && updated?.agent?.react_max_iterations !== null) {
                 setGlobalReactMaxIterations(String(updated.agent.react_max_iterations));
+            }
+            if (updated?.agent?.ast_enabled !== undefined && updated?.agent?.ast_enabled !== null) {
+                setGlobalAstEnabled(Boolean(updated.agent.ast_enabled));
+            }
+            if (updated?.agent?.code_map?.enabled !== undefined && updated?.agent?.code_map?.enabled !== null) {
+                setGlobalCodeMapEnabled(Boolean(updated.agent.code_map.enabled));
             }
             if (updated?.context) {
                 setGlobalContextCompressionEnabled(Boolean(updated.context.compression_enabled));
@@ -648,6 +666,68 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         }));
         setAgentSaved(false);
         setShowProfileForm(false);
+    };
+
+    const handleExportAgentPrompt = async () => {
+        if (!agentConfig) return;
+        const basePrompt = (agentConfig.base_system_prompt || '').trim();
+        const profiles = Array.isArray(agentConfig.profiles) ? agentConfig.profiles : [];
+        const profileId = agentConfig.default_profile || profiles[0]?.id || '';
+        const profile = profiles.find((item) => item.id === profileId) || null;
+        const abilityMap = new Map(
+            (agentConfig.abilities || []).map((ability) => [ability.id, ability])
+        );
+        const abilityIds = profile?.abilities?.length
+            ? profile.abilities
+            : (agentConfig.abilities || []).map((ability) => ability.id);
+        const promptAbilities = abilityIds
+            .map((id) => abilityMap.get(id))
+            .filter((ability): ability is AgentAbility => Boolean(ability))
+            .filter((ability) => ability.id !== 'code_map' && ability.prompt && ability.prompt.trim());
+
+        const lines: string[] = [];
+        lines.push('# Agent Prompt');
+        lines.push('');
+        lines.push(`Exported: ${new Date().toLocaleString()}`);
+        if (profile) {
+            lines.push(`Profile: ${profile.name || profile.id}`);
+        }
+        lines.push('');
+        lines.push('## Base System Prompt');
+        lines.push('');
+        lines.push('```');
+        lines.push(basePrompt);
+        lines.push('```');
+
+        if (promptAbilities.length > 0) {
+            lines.push('');
+            lines.push('## Abilities');
+            for (const ability of promptAbilities) {
+                lines.push('');
+                lines.push(`### ${ability.name || ability.id}`);
+                lines.push('');
+                lines.push('```');
+                lines.push((ability.prompt || '').trim());
+                lines.push('```');
+            }
+        }
+
+        const defaultName = profile?.name
+            ? `agent-prompt-${profile.name.replace(/[^a-z0-9-_]+/gi, '_')}.md`
+            : 'agent-prompt.md';
+        try {
+            const target = await saveDialog({
+                title: '导出提示词',
+                defaultPath: defaultName,
+                filters: [{ name: 'Markdown', extensions: ['md'] }]
+            });
+            if (!target) return;
+            await writeTextFile(target, lines.join('\n'));
+            alert('提示词已导出。');
+        } catch (error: any) {
+            console.error('Failed to export prompt:', error);
+            alert(`导出失败: ${error?.message || 'Unknown error'}`);
+        }
     };
 
     const handleDeleteProfile = (profileId: string) => {
@@ -942,6 +1022,43 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
 
                             <div className="config-subsection">
                                 <div className="config-subsection-header">
+                                    <h4>代码分析</h4>
+                                    <span>控制 AST 与 Code Map 生成。</span>
+                                </div>
+
+                                <div className="form-group checkbox-group">
+                                    <label>
+                                        <input
+                                            type="checkbox"
+                                            checked={globalAstEnabled}
+                                            onChange={(e) => {
+                                                setGlobalAstEnabled(e.target.checked);
+                                                setGlobalSaved(false);
+                                            }}
+                                            disabled={globalLoading || globalSaving}
+                                        />
+                                        启用 AST 解析
+                                    </label>
+                                </div>
+
+                                <div className="form-group checkbox-group">
+                                    <label>
+                                        <input
+                                            type="checkbox"
+                                            checked={globalCodeMapEnabled}
+                                            onChange={(e) => {
+                                                setGlobalCodeMapEnabled(e.target.checked);
+                                                setGlobalSaved(false);
+                                            }}
+                                            disabled={globalLoading || globalSaving}
+                                        />
+                                        启用 Code Map
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div className="config-subsection">
+                                <div className="config-subsection-header">
                                     <h4>Context 管理</h4>
                                     <span>仅保存参数，压缩逻辑稍后接入。</span>
                                 </div>
@@ -1160,135 +1277,6 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                         + Add Ability
                                     </button>
                                 </div>
-                                {showAbilityForm && (
-                                    <div className="inline-modal">
-                                        <div className="modal-header">
-                                            <h2>{editingAbilityId ? 'Edit Ability' : 'Create Ability'}</h2>
-                                            <button
-                                                type="button"
-                                                className="close-btn"
-                                                onClick={() => setShowAbilityForm(false)}
-                                            >
-                                                X
-                                            </button>
-                                        </div>
-                                        <div className="modal-body">
-                                            <div className="config-form">
-                                                <div className="form-group">
-                                                    <label>Name *</label>
-                                                    <input
-                                                        type="text"
-                                                        value={abilityForm.name}
-                                                        onChange={(e) =>
-                                                            setAbilityForm({ ...abilityForm, name: e.target.value })
-                                                        }
-                                                        placeholder="Ability name"
-                                                        required
-                                                    />
-                                                </div>
-
-                                                <div className="form-group">
-                                                    <label>Type *</label>
-                                                    <select
-                                                        value={abilityForm.type}
-                                                        onChange={(e) =>
-                                                            setAbilityForm({ ...abilityForm, type: e.target.value })
-                                                        }
-                                                    >
-                                                        {ABILITY_TYPE_OPTIONS.map((option) => (
-                                                            <option key={option.value} value={option.value}>
-                                                                {option.label}
-                                                            </option>
-                                                        ))}
-                                                    </select>
-                                                </div>
-
-                                                <div className="form-group">
-                                                    <label>Tools</label>
-                                                    <div className="checkbox-grid">
-                                                        <label className="checkbox-inline">
-                                                            <input
-                                                                type="checkbox"
-                                                                checked={allToolsSelected}
-                                                                onChange={(e) => {
-                                                                    if (e.target.checked) {
-                                                                        setAbilityForm({ ...abilityForm, tools: ['*'] });
-                                                                    } else {
-                                                                        setAbilityForm({ ...abilityForm, tools: [] });
-                                                                    }
-                                                                }}
-                                                            />
-                                                            All tools
-                                                        </label>
-                                                        {availableTools.map((tool) => {
-                                                            const checked = abilityForm.tools.includes(tool.name);
-                                                            return (
-                                                                <label key={tool.name} className="checkbox-inline">
-                                                                    <input
-                                                                        type="checkbox"
-                                                                        checked={checked}
-                                                                        disabled={allToolsSelected}
-                                                                        onChange={(e) => {
-                                                                            const next = new Set(
-                                                                                abilityForm.tools.filter((name) => name !== '*')
-                                                                            );
-                                                                            if (e.target.checked) {
-                                                                                next.add(tool.name);
-                                                                            } else {
-                                                                                next.delete(tool.name);
-                                                                            }
-                                                                            setAbilityForm({
-                                                                                ...abilityForm,
-                                                                                tools: Array.from(next)
-                                                                            });
-                                                                        }}
-                                                                    />
-                                                                    {tool.name}
-                                                                </label>
-                                                            );
-                                                        })}
-                                                    </div>
-                                                </div>
-
-                                                <div className="form-group">
-                                                    <label>Prompt</label>
-                                                    <textarea
-                                                        rows={6}
-                                                        value={abilityForm.prompt}
-                                                        onChange={(e) =>
-                                                            setAbilityForm({ ...abilityForm, prompt: e.target.value })
-                                                        }
-                                                        placeholder="Prompt text (optional)"
-                                                    />
-                                                </div>
-
-                                                <div className="form-group">
-                                                    <label>Params (JSON)</label>
-                                                    <textarea
-                                                        rows={4}
-                                                        value={abilityForm.paramsText}
-                                                        onChange={(e) =>
-                                                            setAbilityForm({ ...abilityForm, paramsText: e.target.value })
-                                                        }
-                                                        placeholder='{"key": "value"}'
-                                                    />
-                                                    <small>可选。支持 {'{{param}}'} 占位符。</small>
-                                                </div>
-
-                                                {abilityFormError && <div className="form-error">{abilityFormError}</div>}
-
-                                                <div className="form-actions">
-                                                    <button type="button" onClick={() => setShowAbilityForm(false)}>
-                                                        Cancel
-                                                    </button>
-                                                    <button type="button" onClick={handleSaveAbility}>
-                                                        Save
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                )}
                                 <div className="agent-list">
                                     {(agentConfig.abilities || []).length === 0 ? (
                                         <p className="empty-message">No abilities yet.</p>
@@ -1340,9 +1328,14 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                             <div className="agent-section">
                                 <div className="agent-section-header">
                                     <h4>Profiles</h4>
-                                    <button type="button" className="add-btn add-inline" onClick={openNewProfileForm}>
-                                        + Add Profile
-                                    </button>
+                                    <div className="agent-section-actions">
+                                        <button type="button" className="add-btn add-inline" onClick={handleExportAgentPrompt}>
+                                            导出提示词
+                                        </button>
+                                        <button type="button" className="add-btn add-inline" onClick={openNewProfileForm}>
+                                            + Add Profile
+                                        </button>
+                                    </div>
                                 </div>
                                 {showProfileForm && (
                                     <div className="inline-modal">
@@ -1666,6 +1659,138 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     </button>
                                 </div>
                             </form>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {showAbilityForm && activeTab === 'agents' && (
+                <div className="modal-overlay modal-overlay-nested" onClick={() => setShowAbilityForm(false)}>
+                    <div className="modal-content modal-content-nested" onClick={(e) => e.stopPropagation()}>
+                        <div className="modal-header">
+                            <h2>{editingAbilityId ? 'Edit Ability' : 'Create Ability'}</h2>
+                            <button
+                                type="button"
+                                className="close-btn"
+                                onClick={() => setShowAbilityForm(false)}
+                            >
+                                X
+                            </button>
+                        </div>
+                        <div className="modal-body">
+                            <div className="config-form">
+                                <div className="form-group">
+                                    <label>Name *</label>
+                                    <input
+                                        type="text"
+                                        value={abilityForm.name}
+                                        onChange={(e) =>
+                                            setAbilityForm({ ...abilityForm, name: e.target.value })
+                                        }
+                                        placeholder="Ability name"
+                                        required
+                                    />
+                                </div>
+
+                                <div className="form-group">
+                                    <label>Type *</label>
+                                    <select
+                                        value={abilityForm.type}
+                                        onChange={(e) =>
+                                            setAbilityForm({ ...abilityForm, type: e.target.value })
+                                        }
+                                    >
+                                        {ABILITY_TYPE_OPTIONS.map((option) => (
+                                            <option key={option.value} value={option.value}>
+                                                {option.label}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                <div className="form-group">
+                                    <label>Tools</label>
+                                    <div className="checkbox-grid">
+                                        <label className="checkbox-inline">
+                                            <input
+                                                type="checkbox"
+                                                checked={allToolsSelected}
+                                                onChange={(e) => {
+                                                    if (e.target.checked) {
+                                                        setAbilityForm({ ...abilityForm, tools: ['*'] });
+                                                    } else {
+                                                        setAbilityForm({ ...abilityForm, tools: [] });
+                                                    }
+                                                }}
+                                            />
+                                            All tools
+                                        </label>
+                                        {availableTools.map((tool) => {
+                                            const checked = abilityForm.tools.includes(tool.name);
+                                            return (
+                                                <label key={tool.name} className="checkbox-inline">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={checked}
+                                                        disabled={allToolsSelected}
+                                                        onChange={(e) => {
+                                                            const next = new Set(
+                                                                abilityForm.tools.filter((name) => name !== '*')
+                                                            );
+                                                            if (e.target.checked) {
+                                                                next.add(tool.name);
+                                                            } else {
+                                                                next.delete(tool.name);
+                                                            }
+                                                            setAbilityForm({
+                                                                ...abilityForm,
+                                                                tools: Array.from(next)
+                                                            });
+                                                        }}
+                                                    />
+                                                    {tool.name}
+                                                </label>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+
+                                <div className="form-group">
+                                    <label>Prompt</label>
+                                    <textarea
+                                        rows={6}
+                                        value={abilityForm.prompt}
+                                        onChange={(e) =>
+                                            setAbilityForm({ ...abilityForm, prompt: e.target.value })
+                                        }
+                                        placeholder="Prompt text (optional)"
+                                    />
+                                </div>
+
+                                <div className="form-group">
+                                    <label>Params (JSON)</label>
+                                    <textarea
+                                        rows={4}
+                                        value={abilityForm.paramsText}
+                                        onChange={(e) =>
+                                            setAbilityForm({ ...abilityForm, paramsText: e.target.value })
+                                        }
+                                        placeholder='{"key": "value"}'
+                                    />
+                                    <small>可选。支持 {'{{param}}'} 占位符。</small>
+                                </div>
+
+                                {abilityFormError && <div className="form-error">{abilityFormError}</div>}
+
+                                <div className="form-actions">
+                                    <button type="button" onClick={() => setShowAbilityForm(false)}>
+                                        Cancel
+                                    </button>
+                                    <button type="button" onClick={handleSaveAbility}>
+                                        Save
+                                    </button>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>

@@ -171,6 +171,12 @@
   gap: 12px;
 }
 
+.agent-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .agent-section-header h4 {
   margin: 0;
   color: #f1f5f9;
@@ -182,6 +188,21 @@
   flex-direction: column;
   gap: 10px;
   margin-top: 10px;
+}
+
+.agent-list .config-actions {
+  gap: 4px;
+}
+
+.agent-list .config-actions .icon-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+}
+
+.agent-list .config-actions .icon-btn svg {
+  width: 14px;
+  height: 14px;
 }
 
 .agent-item {
