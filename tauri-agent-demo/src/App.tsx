@@ -1,4 +1,5 @@
-import { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
+import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { readDir, watchImmediate, type UnwatchFn } from '@tauri-apps/plugin-fs';
@@ -14,7 +15,8 @@ import {
   ToolPermissionRequest,
   ReasoningEffort,
   AgentMode,
-  AgentConfig
+  AgentConfig,
+  ContextEstimate
 } from './types';
 import {
   sendMessageAgentStream,
@@ -86,6 +88,11 @@ const AST_LANGUAGE_OPTIONS = [
   { id: 'rust', label: 'Rust (.rs)' },
   { id: 'json', label: 'JSON (.json)' },
 ];
+const SESSION_SWITCH_PROFILE = true;
+const MESSAGE_PAGE_SIZE = 80;
+const MESSAGE_LOAD_THRESHOLD_PX = 240;
+const MESSAGE_OVERSCAN_PX = 600;
+const MESSAGE_ESTIMATED_HEIGHT = 220;
 
 type WorkdirBounds = {
   x?: number;
@@ -386,6 +393,16 @@ const formatTokenCount = (value: number) => {
   return String(Math.max(0, Math.round(value)));
 };
 
+const normalizeContextEstimate = (estimate: any, fallbackTime?: string | null): ContextEstimate => ({
+  total: Number(estimate?.total) || 0,
+  system: Number(estimate?.system) || 0,
+  history: Number(estimate?.history) || 0,
+  tools: Number(estimate?.tools) || 0,
+  other: Number(estimate?.other) || 0,
+  max_tokens: Number.isFinite(Number(estimate?.max_tokens)) ? Number(estimate?.max_tokens) : undefined,
+  updated_at: typeof estimate?.updated_at === 'string' ? estimate.updated_at : (fallbackTime || undefined),
+});
+
 const collectTextFromContent = (content: any, bucket: string[]) => {
   if (!content) return;
   if (typeof content === 'string') {
@@ -518,6 +535,49 @@ const buildEstimatedRequestPayload = (
   return { messages };
 };
 
+const findItemIndexByOffset = (offsets: number[], value: number) => {
+  if (offsets.length <= 1) return 0;
+  let low = 0;
+  let high = offsets.length - 1;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (offsets[mid] <= value) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return Math.max(0, low - 1);
+};
+
+type MeasuredMessageProps = {
+  rowKey: string;
+  className: string;
+  onHeight: (key: string, height: number) => void;
+  children: ReactNode;
+};
+
+const MeasuredMessage = ({ rowKey, className, onHeight, children }: MeasuredMessageProps) => {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const measure = () => onHeight(rowKey, el.offsetHeight);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => measure());
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [rowKey, onHeight]);
+
+  return (
+    <div ref={ref} className={className}>
+      {children}
+    </div>
+  );
+};
+
 type PendingAttachment = {
   id: string;
   name: string;
@@ -577,6 +637,10 @@ function App() {
   const [debugFocus, setDebugFocus] = useState<{ key: string; messageId: number; iteration: number; callId?: number } | null>(null);
   const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
   const [pendingContextEstimate, setPendingContextEstimate] = useState<PendingContextEstimate | null>(null);
+  const [contextEstimateBySession, setContextEstimateBySession] = useState<Record<string, ContextEstimate>>({});
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [heightTick, setHeightTick] = useState(0);
+  const [virtualRange, setVirtualRange] = useState({ start: 0, end: 0 });
   const debugRefreshRef = useRef<Record<string, { last: number; timer: number | null }>>({});
   const [agentMode, setAgentMode] = useState<AgentMode>('default');
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null);
@@ -605,12 +669,19 @@ function App() {
   const [astIncludeLanguages, setAstIncludeLanguages] = useState<string[]>([]);
   const [astMaxFiles, setAstMaxFiles] = useState(String(AST_DEFAULT_MAX_FILES));
   const [isMaximized, setIsMaximized] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
+  const streamingRef = useRef(false);
+  const scrollRafRef = useRef<number | null>(null);
+  const forceAutoScrollRef = useRef(false);
   const lastScrollTopRef = useRef(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const messagesCacheRef = useRef<Record<string, Message[]>>({});
+  const messagePagingRef = useRef<Record<string, { loading: boolean; hasMore: boolean; oldestId: number | null }>>({});
+  const pendingPrependRef = useRef<{ anchorKey: string; anchorOffset: number } | null>(null);
+  const heightUpdateRef = useRef<number | null>(null);
+  const rowHeightsRef = useRef<Map<string, number>>(new Map());
+  const containerPaddingRef = useRef<{ top: number; bottom: number }>({ top: 0, bottom: 0 });
   const workPathBySessionRef = useRef<Record<string, string>>({});
   const currentSessionIdRef = useRef<string | null>(null);
   const queueBySessionRef = useRef<Record<string, QueueItem[]>>({});
@@ -848,16 +919,114 @@ function App() {
     handleTitlebarMaximize();
   };
 
+  const getMessageKey = useCallback((msg: Message, index: number) => {
+    if ((msg as any).metadata?.streaming_placeholder) return 'streaming';
+    if (typeof msg.id === 'number') return `id:${msg.id}`;
+    return `idx:${index}`;
+  }, []);
+
+  const scheduleHeightRecalc = useCallback(() => {
+    if (heightUpdateRef.current != null) return;
+    heightUpdateRef.current = window.requestAnimationFrame(() => {
+      heightUpdateRef.current = null;
+      setHeightTick((tick) => tick + 1);
+    });
+  }, []);
+
+  const updateRowHeight = useCallback(
+    (key: string, height: number) => {
+      const rounded = Math.max(1, Math.ceil(height));
+      const prev = rowHeightsRef.current.get(key);
+      if (prev === rounded) return;
+      rowHeightsRef.current.set(key, rounded);
+      scheduleHeightRecalc();
+    },
+    [scheduleHeightRecalc]
+  );
+
+  const updateContainerPadding = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const style = window.getComputedStyle(container);
+    containerPaddingRef.current = {
+      top: parseFloat(style.paddingTop || '0') || 0,
+      bottom: parseFloat(style.paddingBottom || '0') || 0,
+    };
+  }, []);
+
+  const getPagingState = useCallback((sessionKey: string) => {
+    if (!messagePagingRef.current[sessionKey]) {
+      messagePagingRef.current[sessionKey] = { loading: false, hasMore: true, oldestId: null };
+    }
+    return messagePagingRef.current[sessionKey];
+  }, []);
+
+  const updateScrollToBottomVisibility = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const scrollable = container.scrollHeight - container.clientHeight;
+    if (scrollable <= 0) {
+      setShowScrollToBottom(false);
+      return;
+    }
+    const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    const ratio = distanceToBottom / scrollable;
+    const shouldShow = !autoScrollRef.current && ratio >= 0.05;
+    setShowScrollToBottom((prev) => (prev === shouldShow ? prev : shouldShow));
+  }, []);
+
+  const scheduleScrollToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
+    if (!autoScrollRef.current) return;
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const distanceToBottom = Math.abs(container.scrollHeight - container.scrollTop - container.clientHeight);
+    const forced = forceAutoScrollRef.current;
+    const requested: ScrollBehavior = forced ? 'auto' : behavior;
+    const useBehavior: ScrollBehavior = requested === 'smooth' && distanceToBottom > 800 ? 'auto' : requested;
+    forceAutoScrollRef.current = false;
+    if (scrollRafRef.current !== null) {
+      window.cancelAnimationFrame(scrollRafRef.current);
+    }
+    scrollRafRef.current = window.requestAnimationFrame(() => {
+      container.scrollTo({ top: container.scrollHeight, behavior: useBehavior });
+      scrollRafRef.current = null;
+    });
+  }, []);
+
+  const handleScrollToBottomClick = () => {
+    autoScrollRef.current = true;
+    scheduleScrollToBottom('smooth');
+    updateScrollToBottomVisibility();
+  };
+
   useEffect(() => {
     if (!autoScrollRef.current) return;
     const container = messagesContainerRef.current;
     if (!container) return;
-    const behavior: ScrollBehavior = container.scrollHeight > container.clientHeight ? 'smooth' : 'auto';
-    const scrollToBottom = () => {
-      container.scrollTo({ top: container.scrollHeight, behavior });
-    };
-    requestAnimationFrame(scrollToBottom);
-  }, [messages]);
+    const hasStreaming = messages.some((msg) => msg.metadata?.agent_streaming);
+    streamingRef.current = hasStreaming;
+    const behavior: ScrollBehavior = hasStreaming
+      ? 'auto'
+      : container.scrollHeight > container.clientHeight
+        ? 'smooth'
+        : 'auto';
+    scheduleScrollToBottom(behavior);
+  }, [messages, scheduleScrollToBottom]);
+
+  useEffect(() => {
+    updateScrollToBottomVisibility();
+  }, [messages, updateScrollToBottomVisibility]);
+
+  useEffect(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const observer = new MutationObserver(() => {
+      if (!autoScrollRef.current) return;
+      scheduleScrollToBottom(streamingRef.current ? 'auto' : 'smooth');
+    });
+    observer.observe(container, { childList: true, subtree: true, characterData: true });
+    return () => observer.disconnect();
+  }, [scheduleScrollToBottom]);
 
   useEffect(() => {
     if (!showConfigSelector && !showReasoningSelector && !showAgentModeSelector && !showProfileSelector) return;
@@ -1256,6 +1425,32 @@ function App() {
     });
   };
 
+  const applyContextEstimate = (sessionKey: string, estimate?: ContextEstimate | null) => {
+    if (!sessionKey) return;
+    setContextEstimateBySession((prev) => {
+      if (!estimate) {
+        if (!prev[sessionKey]) return prev;
+        const next = { ...prev };
+        delete next[sessionKey];
+        return next;
+      }
+      const current = prev[sessionKey];
+      if (
+        current &&
+        current.total === estimate.total &&
+        current.system === estimate.system &&
+        current.history === estimate.history &&
+        current.tools === estimate.tools &&
+        current.other === estimate.other &&
+        current.max_tokens === estimate.max_tokens &&
+        current.updated_at === estimate.updated_at
+      ) {
+        return prev;
+      }
+      return { ...prev, [sessionKey]: estimate };
+    });
+  };
+
   const getInFlightCount = () => Object.keys(inFlightBySessionRef.current).length;
 
   const getSessionQueue = (sessionKey: string) => queueBySessionRef.current[sessionKey] || [];
@@ -1313,6 +1508,12 @@ function App() {
         messagesCacheRef.current[toKey] = [...messagesCacheRef.current[toKey], ...cached];
       }
       delete messagesCacheRef.current[fromKey];
+    }
+
+    const paging = messagePagingRef.current[fromKey];
+    if (paging) {
+      messagePagingRef.current[toKey] = { ...paging };
+      delete messagePagingRef.current[fromKey];
     }
 
     const queued = queueBySessionRef.current[fromKey];
@@ -1434,7 +1635,8 @@ function App() {
             if (currentState) {
               currentState.activeAssistantId = incomingAssistantId;
               if (currentState.stopRequested) {
-                stopAgentStream(incomingAssistantId).catch(() => undefined);
+                stopAgentStream({ messageId: incomingAssistantId }).catch(() => undefined);
+                currentState.abortController.abort();
               }
             }
           }
@@ -1488,6 +1690,11 @@ function App() {
         }
 
         const step = chunk as AgentStep;
+        if (step.step_type === 'context_estimate') {
+          const sessionKeyForEstimate = newSessionId || activeSessionKey;
+          applyContextEstimate(sessionKeyForEstimate, normalizeContextEstimate(step.metadata));
+          continue;
+        }
 
         updateSessionMessages(activeSessionKey, (prev) =>
           prev.map((msg) => {
@@ -2181,11 +2388,18 @@ function App() {
     const inflight = inFlightBySessionRef.current[sessionKey];
     if (!inflight) return;
     inflight.stopRequested = true;
+    inflight.abortController.abort();
     const activeAssistantId = inflight.activeAssistantId;
     let assistantId: number | null = activeAssistantId ?? inflight.tempAssistantId;
     if (activeAssistantId) {
       try {
-        await stopAgentStream(activeAssistantId);
+        await stopAgentStream({ messageId: activeAssistantId });
+      } catch (error) {
+        console.error('Failed to stop stream:', error);
+      }
+    } else if (currentSessionIdRef.current) {
+      try {
+        await stopAgentStream({ sessionId: currentSessionIdRef.current });
       } catch (error) {
         console.error('Failed to stop stream:', error);
       }
@@ -2221,66 +2435,161 @@ function App() {
   };
 
   const handleSelectSession = async (sessionId: string) => {
+    const perfEnabled = SESSION_SWITCH_PROFILE && typeof performance !== 'undefined';
+    const perfStart = perfEnabled ? performance.now() : 0;
+    const perfMarks: Array<{ label: string; t: number }> = [];
+    const perfMeta: Record<string, any> = perfEnabled ? { sessionId } : {};
+    const mark = (label: string) => {
+      if (!perfEnabled) return;
+      perfMarks.push({ label, t: performance.now() });
+    };
+    const schedulePerfLog = (status: 'ok' | 'error', error?: unknown) => {
+      if (!perfEnabled) return;
+      const logNow = () => {
+        const end = performance.now();
+        const rows: Array<{ stage: string; deltaMs: string; totalMs: string }> = [];
+        let prev = perfStart;
+        perfMarks.forEach((entry) => {
+          rows.push({
+            stage: entry.label,
+            deltaMs: (entry.t - prev).toFixed(1),
+            totalMs: (entry.t - perfStart).toFixed(1),
+          });
+          prev = entry.t;
+        });
+        perfMeta.status = status;
+        perfMeta.totalMs = (end - perfStart).toFixed(1);
+        if (error) {
+          perfMeta.error = String((error as Error)?.message || error);
+        }
+        console.groupCollapsed(
+          `[Session Switch] ${sessionId} ${status} ${perfMeta.totalMs}ms`
+        );
+        console.info(perfMeta);
+        if (rows.length > 0) {
+          console.table(rows);
+        }
+        console.groupEnd();
+      };
+      requestAnimationFrame(() => requestAnimationFrame(logNow));
+    };
     try {
       autoScrollRef.current = true;
+      forceAutoScrollRef.current = true;
       stashCurrentMessages();
       currentSessionIdRef.current = sessionId;
       setCurrentSessionId(sessionId);
       setShowConfigSelector(false);
       setShowReasoningSelector(false);
+      mark('setup');
 
       const sessionKey = getSessionKey(sessionId);
       const cached = messagesCacheRef.current[sessionKey];
       const isStreamingSession = Boolean(inFlightBySessionRef.current[sessionKey]);
       const hasStreaming = Boolean(cached?.some((msg) => msg.metadata?.agent_streaming));
-      if (cached && (isStreamingSession || hasStreaming)) {
+      if (cached) {
         setSessionMessages(sessionKey, cached);
+      } else {
+        setSessionMessages(sessionKey, []);
       }
+      if (perfEnabled) {
+        perfMeta.cachedMessages = cached?.length || 0;
+        perfMeta.cachedStreaming = isStreamingSession || hasStreaming;
+      }
+      mark('cache-check');
 
-      const [session, calls] = await Promise.all([
-        getSession(sessionId),
-        getSessionLLMCalls(sessionId),
-      ]);
-
-      setLlmCalls(calls);
+      setLlmCalls([]);
+      const sessionFetchStart = perfEnabled ? performance.now() : 0;
+      const session = await getSession(sessionId, { includeCount: false });
+      if (perfEnabled) {
+        perfMeta.sessionFetchMs = (performance.now() - sessionFetchStart).toFixed(1);
+      }
+      mark('session');
       const sessionWorkPath = session.work_path || '';
       workPathBySessionRef.current[session.id] = sessionWorkPath;
       setCurrentWorkPath(sessionWorkPath);
+      if (session.context_estimate) {
+        applyContextEstimate(session.id, normalizeContextEstimate(session.context_estimate, session.context_estimate_at || null));
+      } else {
+        applyContextEstimate(session.id, null);
+      }
       if (sessionWorkPath) {
         scheduleAstNotify(sessionWorkPath, [sessionWorkPath]);
       }
       setCurrentAgentProfileId(resolveAgentProfileId(agentConfig, session.agent_profile || null));
+      mark('session-apply');
 
-      if (!cached || (!isStreamingSession && !hasStreaming)) {
-        const [msgs, steps] = await Promise.all([
-          getSessionMessages(sessionId),
-          getSessionAgentSteps(sessionId),
-        ]);
-
-        const stepMap = new Map<number, AgentStep[]>();
-        (steps as AgentStepWithMessage[]).forEach((step) => {
-          const list = stepMap.get(step.message_id) || [];
-          list.push({ step_type: step.step_type as AgentStep['step_type'], content: step.content, metadata: step.metadata });
-          stepMap.set(step.message_id, list);
+      if (!cached || cached.length === 0) {
+        const messagesFetchStart = perfEnabled ? performance.now() : 0;
+        const stepsFetchStart = perfEnabled ? performance.now() : 0;
+        const messagesPromise = getSessionMessages(sessionId, { limit: MESSAGE_PAGE_SIZE }).then((result) => {
+          if (perfEnabled) {
+            perfMeta.messagesFetchMs = (performance.now() - messagesFetchStart).toFixed(1);
+            perfMeta.messagesCount = result?.length || 0;
+          }
+          return result;
         });
+        const msgs = await messagesPromise;
+        const stepIds = msgs.map((msg) => msg.id).filter((id) => typeof id === 'number');
+        const stepsPromise = stepIds.length
+          ? getSessionAgentSteps(sessionId, stepIds).then((result) => {
+              if (perfEnabled) {
+                perfMeta.stepsFetchMs = (performance.now() - stepsFetchStart).toFixed(1);
+                perfMeta.stepsCount = result?.length || 0;
+              }
+              return result;
+            })
+          : Promise.resolve([]);
+        const steps = await stepsPromise;
+        mark('messages+steps');
 
-        const hydratedMessages = msgs.map((msg) => {
-          const agentSteps = stepMap.get(msg.id) || [];
-          if (!agentSteps.length) return msg;
-          return {
-            ...msg,
-            metadata: { ...(msg.metadata || {}), agent_steps: agentSteps, agent_streaming: false }
-          };
-        });
+        const hydrateStart = perfEnabled ? performance.now() : 0;
+        const hydratedMessages = hydrateMessagesWithSteps(msgs, steps);
+        if (perfEnabled) {
+          perfMeta.hydrateMs = (performance.now() - hydrateStart).toFixed(1);
+        }
+        mark('hydrate');
 
         setSessionMessages(sessionKey, hydratedMessages);
+        const paging = getPagingState(sessionKey);
+        paging.oldestId = hydratedMessages[0]?.id ?? null;
+        paging.hasMore = hydratedMessages.length >= MESSAGE_PAGE_SIZE;
+        mark('set-messages');
+        forceAutoScrollRef.current = true;
+      } else {
+        const paging = getPagingState(sessionKey);
+        if (!paging.oldestId && cached && cached.length > 0) {
+          paging.oldestId = cached[0].id;
+        }
+        if (paging.hasMore && cached && cached.length < MESSAGE_PAGE_SIZE) {
+          paging.hasMore = false;
+        }
       }
 
-      const config = await getConfig(session.config_id);
-      setCurrentConfig(config);
+      const cachedConfig =
+        (currentConfig && currentConfig.id === session.config_id ? currentConfig : null) ||
+        allConfigs.find((item) => item.id === session.config_id) ||
+        null;
+      if (cachedConfig) {
+        if (perfEnabled) {
+          perfMeta.configCache = true;
+        }
+        setCurrentConfig(cachedConfig);
+      } else {
+        const configFetchStart = perfEnabled ? performance.now() : 0;
+        const config = await getConfig(session.config_id);
+        if (perfEnabled) {
+          perfMeta.configFetchMs = (performance.now() - configFetchStart).toFixed(1);
+          perfMeta.configCache = false;
+        }
+        setCurrentConfig(config);
+      }
+      mark('config');
+      schedulePerfLog('ok');
     } catch (error) {
       console.error('Failed to load session:', error);
       alert('Failed to load session.');
+      schedulePerfLog('error', error);
     }
   };
 
@@ -2294,6 +2603,7 @@ function App() {
     setCurrentSessionId(null);
     setSessionMessages(DRAFT_SESSION_KEY, []);
     setLlmCalls([]);
+    messagePagingRef.current[DRAFT_SESSION_KEY] = { loading: false, hasMore: true, oldestId: null };
     autoScrollRef.current = true;
 
     if (sourcePath) {
@@ -2376,6 +2686,158 @@ function App() {
     }
   };
 
+  const currentSessionKey = getSessionKey(currentSessionId);
+  const isStreamingCurrent = useMemo(
+    () => Boolean(inFlightBySessionRef.current[currentSessionKey]),
+    [currentSessionKey, inFlightTick]
+  );
+  const renderMessages = useMemo(() => {
+    if (!isStreamingCurrent) return messages;
+    return [
+      ...messages,
+      {
+        id: -1,
+        session_id: currentSessionId || '',
+        role: 'assistant',
+        content: '',
+        timestamp: new Date().toISOString(),
+        metadata: { streaming_placeholder: true }
+      } as Message
+    ];
+  }, [messages, isStreamingCurrent, currentSessionId]);
+
+  const offsets = useMemo(() => {
+    const list = renderMessages;
+    const nextOffsets = new Array(list.length + 1);
+    nextOffsets[0] = 0;
+    for (let i = 0; i < list.length; i += 1) {
+      const key = getMessageKey(list[i], i);
+      const height = rowHeightsRef.current.get(key) ?? MESSAGE_ESTIMATED_HEIGHT;
+      nextOffsets[i + 1] = nextOffsets[i] + height;
+    }
+    return nextOffsets;
+  }, [renderMessages, heightTick, getMessageKey]);
+
+  const totalHeight = offsets[offsets.length - 1] || 0;
+
+  const updateVirtualRange = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const { top: paddingTop, bottom: paddingBottom } = containerPaddingRef.current;
+    const viewHeight = Math.max(0, container.clientHeight - paddingTop - paddingBottom);
+    const scrollTop = Math.max(0, (container.scrollTop || 0) - paddingTop);
+    const start = Math.max(0, findItemIndexByOffset(offsets, Math.max(0, scrollTop - MESSAGE_OVERSCAN_PX)));
+    const end = Math.min(
+      renderMessages.length - 1,
+      findItemIndexByOffset(offsets, scrollTop + viewHeight + MESSAGE_OVERSCAN_PX)
+    );
+    setVirtualRange((prev) => {
+      if (prev.start === start && prev.end === end) return prev;
+      return { start, end };
+    });
+  }, [offsets, renderMessages.length]);
+
+  useLayoutEffect(() => {
+    updateContainerPadding();
+    updateVirtualRange();
+  }, [updateContainerPadding, updateVirtualRange]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      updateContainerPadding();
+      updateVirtualRange();
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [updateContainerPadding, updateVirtualRange]);
+
+  useLayoutEffect(() => {
+    const pending = pendingPrependRef.current;
+    const container = messagesContainerRef.current;
+    if (!pending || !container) return;
+    const anchorIndex = renderMessages.findIndex((msg, idx) => getMessageKey(msg, idx) === pending.anchorKey);
+    if (anchorIndex >= 0) {
+      const newTopSpacer = offsets[anchorIndex] || 0;
+      const { top: paddingTop } = containerPaddingRef.current;
+      container.scrollTop = newTopSpacer + pending.anchorOffset + paddingTop;
+    }
+    pendingPrependRef.current = null;
+  }, [offsets, renderMessages, getMessageKey]);
+
+  const hydrateMessagesWithSteps = useCallback((msgs: Message[], steps: AgentStepWithMessage[]) => {
+    const stepMap = new Map<number, AgentStep[]>();
+    (steps as AgentStepWithMessage[]).forEach((step) => {
+      const list = stepMap.get(step.message_id) || [];
+      list.push({ step_type: step.step_type as AgentStep['step_type'], content: step.content, metadata: step.metadata });
+      stepMap.set(step.message_id, list);
+    });
+    return msgs.map((msg) => {
+      const agentSteps = stepMap.get(msg.id) || [];
+      if (!agentSteps.length) return msg;
+      return {
+        ...msg,
+        metadata: { ...(msg.metadata || {}), agent_steps: agentSteps, agent_streaming: false }
+      };
+    });
+  }, []);
+
+  const loadOlderMessages = useCallback(async (anchor?: { key: string; offset: number }) => {
+    const sessionId = currentSessionIdRef.current;
+    if (!sessionId) return;
+    const sessionKey = getSessionKey(sessionId);
+    const paging = getPagingState(sessionKey);
+    if (paging.loading || !paging.hasMore) return;
+    const cached = messagesCacheRef.current[sessionKey] || [];
+    const oldestId = paging.oldestId ?? cached[0]?.id ?? null;
+    if (!oldestId) {
+      paging.hasMore = false;
+      return;
+    }
+    paging.loading = true;
+    const container = messagesContainerRef.current;
+    let anchorKey = anchor?.key || '';
+    let anchorOffset = anchor?.offset || 0;
+    if (!anchorKey) {
+      const anchorIndex = virtualRange.start;
+      anchorKey = renderMessages[anchorIndex] ? getMessageKey(renderMessages[anchorIndex], anchorIndex) : '';
+      const prevTopSpacer = offsets[anchorIndex] || 0;
+      if (container) {
+        const { top: paddingTop } = containerPaddingRef.current;
+        anchorOffset = container.scrollTop - paddingTop - prevTopSpacer;
+      }
+    }
+    try {
+      const older = await getSessionMessages(sessionId, { limit: MESSAGE_PAGE_SIZE, beforeId: oldestId });
+      if (!older.length) {
+        paging.hasMore = false;
+        return;
+      }
+      const stepIds = older.map((msg) => msg.id).filter((id) => typeof id === 'number');
+      const steps = stepIds.length ? await getSessionAgentSteps(sessionId, stepIds) : [];
+      const hydrated = hydrateMessagesWithSteps(older, steps);
+      updateSessionMessages(sessionKey, (prev) => [...hydrated, ...prev]);
+      paging.oldestId = hydrated[0]?.id ?? paging.oldestId;
+      if (older.length < MESSAGE_PAGE_SIZE) {
+        paging.hasMore = false;
+      }
+      if (container && anchorKey) {
+        pendingPrependRef.current = { anchorKey, anchorOffset };
+      }
+    } catch (error) {
+      console.error('Failed to load older messages:', error);
+    } finally {
+      paging.loading = false;
+    }
+  }, [
+    getPagingState,
+    getMessageKey,
+    hydrateMessagesWithSteps,
+    offsets,
+    renderMessages,
+    updateSessionMessages,
+    virtualRange.start,
+  ]);
+
   const handleMessagesScroll = () => {
     const container = messagesContainerRef.current;
     if (!container) return;
@@ -2389,18 +2851,24 @@ function App() {
       autoScrollRef.current = true;
     }
     lastScrollTopRef.current = currentScrollTop;
+    updateScrollToBottomVisibility();
+    updateVirtualRange();
+    if (currentScrollTop <= MESSAGE_LOAD_THRESHOLD_PX) {
+      const { top: paddingTop } = containerPaddingRef.current;
+      const logicalScrollTop = Math.max(0, currentScrollTop - paddingTop);
+      const anchorIndex = Math.max(0, findItemIndexByOffset(offsets, logicalScrollTop));
+      const anchorKey = renderMessages[anchorIndex] ? getMessageKey(renderMessages[anchorIndex], anchorIndex) : '';
+      const prevTopSpacer = offsets[anchorIndex] || 0;
+      const anchorOffset = currentScrollTop - paddingTop - prevTopSpacer;
+      void loadOlderMessages(anchorKey ? { key: anchorKey, offset: anchorOffset } : undefined);
+    }
   };
 
   const latestAssistantId =
     [...messages].reverse().find((msg) => msg.role === 'assistant')?.id ?? null;
-  const currentSessionKey = getSessionKey(currentSessionId);
   const debugExtraWorkPaths = useMemo(
     () => loadExtraWorkPaths(currentSessionKey, currentWorkPath),
     [currentSessionKey, currentWorkPath]
-  );
-  const isStreamingCurrent = useMemo(
-    () => Boolean(inFlightBySessionRef.current[currentSessionKey]),
-    [currentSessionKey, inFlightTick]
   );
   const currentSessionQueue = useMemo(
     () => getSessionQueue(currentSessionKey),
@@ -2419,18 +2887,59 @@ function App() {
   const currentAgentProfile = agentProfiles.find((profile) => profile.id === resolvedAgentProfileId) || null;
   const currentReasoning = (currentConfig?.reasoning_effort || 'medium') as ReasoningEffort;
   const workPathDisplay = useMemo(() => formatWorkPath(currentWorkPath), [currentWorkPath]);
+  const visibleMessages = useMemo(() => {
+    if (renderMessages.length === 0) return [];
+    const start = Math.max(0, Math.min(virtualRange.start, renderMessages.length - 1));
+    const end = Math.max(start, Math.min(virtualRange.end, renderMessages.length - 1));
+    return renderMessages.slice(start, end + 1).map((msg, offset) => ({
+      msg,
+      index: start + offset
+    }));
+  }, [renderMessages, virtualRange]);
+  const topSpacerHeight = renderMessages.length > 0 ? offsets[Math.min(virtualRange.start, offsets.length - 1)] || 0 : 0;
+  const bottomSpacerHeight =
+    renderMessages.length > 0
+      ? Math.max(
+          0,
+          totalHeight - (offsets[Math.min(virtualRange.end + 1, offsets.length - 1)] || 0)
+        )
+      : 0;
   const contextUsage = useMemo(() => {
-    const maxTokens = currentConfig?.max_context_tokens || DEFAULT_MAX_CONTEXT_TOKENS;
     const pendingRequest =
       pendingContextEstimate && pendingContextEstimate.sessionKey === getCurrentSessionKey()
         ? pendingContextEstimate.payload
         : null;
-    const lastRequest = pendingRequest || getLatestRequestPayload(llmCalls, messages);
+    const cachedEstimate = contextEstimateBySession[currentSessionKey];
+    if (pendingRequest) {
+      const maxTokens = currentConfig?.max_context_tokens || DEFAULT_MAX_CONTEXT_TOKENS;
+      const breakdown = estimateTokensFromRequestBreakdown(pendingRequest);
+      const usedTokens = breakdown.total;
+      const ratio = maxTokens > 0 ? Math.min(1, usedTokens / maxTokens) : 0;
+      return { usedTokens, maxTokens, ratio, breakdown };
+    }
+    if (cachedEstimate) {
+      const maxTokens = cachedEstimate.max_tokens || currentConfig?.max_context_tokens || DEFAULT_MAX_CONTEXT_TOKENS;
+      const breakdown = {
+        total: cachedEstimate.total || 0,
+        system: cachedEstimate.system || 0,
+        history: cachedEstimate.history || 0,
+        tools: cachedEstimate.tools || 0,
+        other: cachedEstimate.other || 0,
+      };
+      if (!breakdown.total) {
+        breakdown.total = breakdown.system + breakdown.history + breakdown.tools + breakdown.other;
+      }
+      const usedTokens = breakdown.total;
+      const ratio = maxTokens > 0 ? Math.min(1, usedTokens / maxTokens) : 0;
+      return { usedTokens, maxTokens, ratio, breakdown };
+    }
+    const maxTokens = currentConfig?.max_context_tokens || DEFAULT_MAX_CONTEXT_TOKENS;
+    const lastRequest = getLatestRequestPayload(llmCalls, messages);
     const breakdown = estimateTokensFromRequestBreakdown(lastRequest);
     const usedTokens = breakdown.total;
     const ratio = maxTokens > 0 ? Math.min(1, usedTokens / maxTokens) : 0;
     return { usedTokens, maxTokens, ratio, breakdown };
-  }, [currentConfig?.max_context_tokens, llmCalls, messages, pendingContextEstimate]);
+  }, [currentConfig?.max_context_tokens, llmCalls, messages, pendingContextEstimate, contextEstimateBySession, currentSessionKey]);
   const contextRing = useMemo(() => {
     const circumference = 2 * Math.PI * CONTEXT_RING_RADIUS;
     const dashOffset = circumference * (1 - contextUsage.ratio);
@@ -2523,113 +3032,155 @@ function App() {
 
       <div className="main-content">
         <div className="chat-container">
-          <div className="messages" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
-            {messages.length === 0 ? (
-              <div className="welcome-message">
-                <h2>Welcome to Agent Chat</h2>
-                <p>Type a message to get started.</p>
-                {!currentConfig && <p className="warning">Please configure an LLM.</p>}
-              </div>
-            ) : (
-              messages.map((msg, index) => {
-                const steps = (msg.metadata?.agent_steps || []) as AgentStep[];
-                const streaming = Boolean(msg.metadata?.agent_streaming);
-                const showPermission = Boolean(currentPendingPermission && msg.id === latestAssistantId);
-                const previousUser = (() => {
-                  for (let i = index - 1; i >= 0; i -= 1) {
-                    if (messages[i].role === 'user') return messages[i];
-                  }
-                  return null;
-                })();
-
-                return (
-                  <div key={msg.id} className={`message ${msg.role}`}>
-                    <div className="message-content">
-                      {msg.role === 'assistant' && (steps.length > 0 || showPermission) ? (
-                        <AgentStepView
-                          steps={steps}
-                          messageId={msg.id}
-                          streaming={streaming}
-                          pendingPermission={showPermission ? currentPendingPermission : null}
-                          onPermissionDecision={handlePermissionDecision}
-                          permissionBusy={currentPermissionBusy}
-                          onRollbackMessage={
-                            previousUser?.id ? () => handleRollback(previousUser.id) : undefined
-                          }
-                          onRetryMessage={
-                            previousUser?.content
-                              ? () => handleRetryMessage(previousUser.id, previousUser.content)
-                              : undefined
-                          }
-                          onRevertPatch={handleRevertPatch}
-                          patchRevertBusy={patchRevertBusy}
-                          onOpenWorkFile={openWorkdirForFile}
-                          currentWorkPath={currentWorkPath}
-                          debugActive={showDebugPanel}
-                          onOpenDebugCall={(iteration) => handleOpenDebugCall(msg.id, iteration)}
-                        />
-                      ) : msg.role === 'user' ? (
-                        <>
-                          {msg.content && <div className="message-text">{msg.content}</div>}
-                          {msg.attachments && msg.attachments.length > 0 && (
-                            <div className="message-attachments">
-                              {msg.attachments.map((attachment, idx) => {
-                                const src = getAttachmentPreviewSrc(attachment);
-                                if (!src) return null;
-                                return (
-                                  <button
-                                    key={`${attachment.id || attachment.local_id || 'att'}-${idx}`}
-                                    type="button"
-                                    className="attachment-thumb"
-                                    onClick={() => handleAttachmentPreview(attachment)}
-                                    title={attachment.name || 'image'}
-                                    aria-label={attachment.name || 'image'}
-                                  >
-                                    <img src={src} alt={attachment.name || 'attachment'} loading="lazy" />
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          )}
-                          <button
-                            className="message-action-btn icon inline"
-                            onClick={() => handleRollback(msg.id)}
-                            title={'\u56de\u64a4\u5230\u6b64\u6d88\u606f'}
-                            aria-label={'\u56de\u64a4\u5230\u6b64\u6d88\u606f'}
-                          >
-                            <svg className="icon-undo" viewBox="0 0 24 24" aria-hidden="true">
-                              <path
-                                d="M7 8L3 12l4 4M3 12h11a5 5 0 0 1 0 10h-4"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="2"
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                              />
-                            </svg>
-                          </button>
-                        </>
-                      ) : (
-                        msg.content
-                      )}
-                    </div>
-                    <div className="message-time">{new Date(msg.timestamp).toLocaleTimeString()}</div>
-                  </div>
-                );
-              })
-            )}
-            {isStreamingCurrent && (
-              <div className="message assistant loading">
-                <div className="message-content">
-                  <span className="typing-indicator">
-                    <span></span>
-                    <span></span>
-                    <span></span>
-                  </span>
+          <div className="messages-wrapper">
+            <div className="messages" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
+              {renderMessages.length === 0 ? (
+                <div className="welcome-message">
+                  <h2>Welcome to Agent Chat</h2>
+                  <p>Type a message to get started.</p>
+                  {!currentConfig && <p className="warning">Please configure an LLM.</p>}
                 </div>
-              </div>
+              ) : (
+                <>
+                  {topSpacerHeight > 0 && (
+                    <div className="message-spacer" style={{ height: topSpacerHeight }} />
+                  )}
+                  {visibleMessages.map(({ msg, index }) => {
+                    const rowKey = getMessageKey(msg, index);
+                    if ((msg as any).metadata?.streaming_placeholder) {
+                      return (
+                      <MeasuredMessage
+                        key={rowKey}
+                        rowKey={rowKey}
+                        onHeight={updateRowHeight}
+                        className="message assistant loading"
+                      >
+                          <div className="message-content">
+                            <span className="typing-indicator">
+                              <span></span>
+                              <span></span>
+                              <span></span>
+                            </span>
+                          </div>
+                        </MeasuredMessage>
+                      );
+                    }
+                    const steps = (msg.metadata?.agent_steps || []) as AgentStep[];
+                    const streaming = Boolean(msg.metadata?.agent_streaming);
+                    const showPermission = Boolean(currentPendingPermission && msg.id === latestAssistantId);
+                    const previousUser = (() => {
+                      for (let i = index - 1; i >= 0; i -= 1) {
+                        if (messages[i]?.role === 'user') return messages[i];
+                      }
+                      return null;
+                    })();
+
+                    return (
+                      <MeasuredMessage
+                        key={rowKey}
+                        rowKey={rowKey}
+                        onHeight={updateRowHeight}
+                        className={`message ${msg.role}`}
+                      >
+                        <div className="message-content">
+                          {msg.role === 'assistant' && (steps.length > 0 || showPermission) ? (
+                            <AgentStepView
+                              steps={steps}
+                              messageId={msg.id}
+                              streaming={streaming}
+                              pendingPermission={showPermission ? currentPendingPermission : null}
+                              onPermissionDecision={handlePermissionDecision}
+                              permissionBusy={currentPermissionBusy}
+                              onRollbackMessage={
+                                previousUser?.id ? () => handleRollback(previousUser.id) : undefined
+                              }
+                              onRetryMessage={
+                                previousUser?.content
+                                  ? () => handleRetryMessage(previousUser.id, previousUser.content)
+                                  : undefined
+                              }
+                              onRevertPatch={handleRevertPatch}
+                              patchRevertBusy={patchRevertBusy}
+                              onOpenWorkFile={openWorkdirForFile}
+                              currentWorkPath={currentWorkPath}
+                              debugActive={showDebugPanel}
+                              onOpenDebugCall={(iteration) => handleOpenDebugCall(msg.id, iteration)}
+                            />
+                          ) : msg.role === 'user' ? (
+                            <>
+                              {msg.content && <div className="message-text">{msg.content}</div>}
+                              {msg.attachments && msg.attachments.length > 0 && (
+                                <div className="message-attachments">
+                                  {msg.attachments.map((attachment, idx) => {
+                                    const src = getAttachmentPreviewSrc(attachment);
+                                    if (!src) return null;
+                                    return (
+                                      <button
+                                        key={`${attachment.id || attachment.local_id || 'att'}-${idx}`}
+                                        type="button"
+                                        className="attachment-thumb"
+                                        onClick={() => handleAttachmentPreview(attachment)}
+                                        title={attachment.name || 'image'}
+                                        aria-label={attachment.name || 'image'}
+                                      >
+                                        <img src={src} alt={attachment.name || 'attachment'} loading="lazy" />
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                              <button
+                                className="message-action-btn icon inline"
+                                onClick={() => handleRollback(msg.id)}
+                                title={'\u56de\u64a4\u5230\u6b64\u6d88\u606f'}
+                                aria-label={'\u56de\u64a4\u5230\u6b64\u6d88\u606f'}
+                              >
+                                <svg className="icon-undo" viewBox="0 0 24 24" aria-hidden="true">
+                                  <path
+                                    d="M7 8L3 12l4 4M3 12h11a5 5 0 0 1 0 10h-4"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                </svg>
+                              </button>
+                            </>
+                          ) : (
+                            msg.content
+                          )}
+                        </div>
+                        <div className="message-time">{new Date(msg.timestamp).toLocaleTimeString()}</div>
+                      </MeasuredMessage>
+                    );
+                  })}
+                  {bottomSpacerHeight > 0 && (
+                    <div className="message-spacer" style={{ height: bottomSpacerHeight }} />
+                  )}
+                </>
+              )}
+            </div>
+            {showScrollToBottom && (
+              <button
+                type="button"
+                className="scroll-to-bottom-btn"
+                onClick={handleScrollToBottomClick}
+                aria-label="Scroll to bottom"
+                title="Scroll to bottom"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M6 9l6 6 6-6"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
             )}
-            <div ref={messagesEndRef} />
           </div>
 
           <div

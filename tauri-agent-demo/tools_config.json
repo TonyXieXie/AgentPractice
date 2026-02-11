@@ -41,7 +41,8 @@
       "ren",
       "rm",
       "del",
-      "find"
+      "find",
+      "grep"
     ],
     "timeout_sec": 30,
     "max_output": 20000

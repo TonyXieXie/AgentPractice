@@ -131,6 +131,8 @@ class Database:
                 agent_profile TEXT,
                 context_summary TEXT,
                 last_compressed_llm_call_id INTEGER,
+                context_estimate TEXT,
+                context_estimate_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (config_id) REFERENCES llm_configs(id)
@@ -159,6 +161,16 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN last_compressed_llm_call_id INTEGER')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN context_estimate TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN context_estimate_at TEXT')
         except sqlite3.OperationalError:
             pass
         
@@ -494,22 +506,32 @@ class Database:
         
         return self.get_session(session_id)
     
-    def get_session(self, session_id: str) -> Optional[ChatSession]:
+    def get_session(self, session_id: str, include_count: bool = True) -> Optional[ChatSession]:
         """Get session"""
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT s.*, COUNT(m.id) as message_count
-            FROM chat_sessions s
-            LEFT JOIN chat_messages m ON s.id = m.session_id
-            WHERE s.id = ?
-            GROUP BY s.id
-        ''', (session_id,))
+        if include_count:
+            cursor.execute('''
+                SELECT s.*, COUNT(m.id) as message_count
+                FROM chat_sessions s
+                LEFT JOIN chat_messages m ON s.id = m.session_id
+                WHERE s.id = ?
+                GROUP BY s.id
+            ''', (session_id,))
+        else:
+            cursor.execute('SELECT * FROM chat_sessions WHERE id = ?', (session_id,))
         row = cursor.fetchone()
         conn.close()
         
         if row:
-            return ChatSession(**dict(row))
+            data = dict(row)
+            estimate_raw = data.get("context_estimate")
+            if estimate_raw:
+                try:
+                    data["context_estimate"] = json.loads(estimate_raw)
+                except Exception:
+                    data["context_estimate"] = None
+            return ChatSession(**data)
         return None
     
     def get_all_sessions(self) -> List[ChatSession]:
@@ -525,8 +547,17 @@ class Database:
         ''')
         rows = cursor.fetchall()
         conn.close()
-        
-        return [ChatSession(**dict(row)) for row in rows]
+        sessions: List[ChatSession] = []
+        for row in rows:
+            data = dict(row)
+            estimate_raw = data.get("context_estimate")
+            if estimate_raw:
+                try:
+                    data["context_estimate"] = json.loads(estimate_raw)
+                except Exception:
+                    data["context_estimate"] = None
+            sessions.append(ChatSession(**data))
+        return sessions
     
     def update_session(self, session_id: str, update: ChatSessionUpdate) -> Optional[ChatSession]:
         """Update session"""
@@ -575,6 +606,24 @@ class Database:
             SET context_summary = ?, last_compressed_llm_call_id = ?, updated_at = ?
             WHERE id = ?
         ''', (summary, last_call_id, datetime.now().isoformat(), session_id))
+        conn.commit()
+        conn.close()
+        return self.get_session(session_id)
+
+    def update_session_context_estimate(
+        self,
+        session_id: str,
+        estimate: Optional[Dict[str, Any]]
+    ) -> Optional[ChatSession]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        payload = json.dumps(estimate) if estimate else None
+        now = datetime.now().isoformat()
+        cursor.execute('''
+            UPDATE chat_sessions
+            SET context_estimate = ?, context_estimate_at = ?, updated_at = ?
+            WHERE id = ?
+        ''', (payload, now if estimate else None, now, session_id))
         conn.commit()
         conn.close()
         return self.get_session(session_id)
@@ -696,6 +745,62 @@ class Database:
         if limit:
             messages.reverse()
 
+        return messages
+
+    def get_session_messages_before(self, session_id: str, before_id: int, limit: int) -> List[ChatMessage]:
+        """Get session messages before a message id (latest first, then reversed)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT * FROM chat_messages
+            WHERE session_id = ? AND id < ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        ''', (session_id, before_id, limit))
+
+        rows = cursor.fetchall()
+        message_ids = [row['id'] for row in rows]
+        attachments_by_message: Dict[int, List[Dict[str, Any]]] = {}
+        if message_ids:
+            placeholders = ",".join(["?"] * len(message_ids))
+            cursor.execute(
+                f'''
+                SELECT id, message_id, name, mime, width, height, size, created_at
+                FROM message_attachments
+                WHERE message_id IN ({placeholders})
+                ORDER BY created_at ASC
+                ''',
+                message_ids
+            )
+            for attach_row in cursor.fetchall():
+                data = dict(attach_row)
+                msg_id = data.get("message_id")
+                if msg_id is None:
+                    continue
+                attachments_by_message.setdefault(msg_id, []).append(data)
+
+        conn.close()
+
+        messages = []
+        for row in rows:
+            metadata = json.loads(row['metadata']) if row['metadata'] else None
+            raw_request = json.loads(row['raw_request']) if row['raw_request'] else None
+            raw_response = json.loads(row['raw_response']) if row['raw_response'] else None
+            attachments = attachments_by_message.get(row['id'])
+            messages.append(ChatMessage(
+                id=row['id'],
+                session_id=row['session_id'],
+                role=row['role'],
+                content=row['content'],
+                timestamp=row['timestamp'],
+                metadata=metadata,
+                raw_request=raw_request,
+                raw_response=raw_response,
+                attachments=attachments
+            ))
+
+        messages.reverse()
         return messages
 
     def get_message(self, session_id: str, message_id: int) -> Optional[Dict[str, Any]]:
@@ -922,6 +1027,37 @@ class Database:
         rows = cursor.fetchall()
         conn.close()
 
+        return [
+            {
+                "message_id": row["message_id"],
+                "step_type": row["step_type"],
+                "content": row["content"],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                "sequence": row["sequence"],
+                "timestamp": row["timestamp"]
+            }
+            for row in rows
+        ]
+
+    def get_session_agent_steps_for_messages(self, session_id: str, message_ids: List[int]) -> List[Dict[str, Any]]:
+        """Get agent steps for specific messages in a session."""
+        if not message_ids:
+            return []
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        placeholders = ",".join(["?"] * len(message_ids))
+        cursor.execute(
+            f'''
+            SELECT s.message_id, s.step_type, s.content, s.metadata, s.sequence, s.timestamp
+            FROM agent_steps s
+            JOIN chat_messages m ON s.message_id = m.id
+            WHERE m.session_id = ? AND s.message_id IN ({placeholders})
+            ORDER BY s.message_id ASC, s.sequence ASC
+            ''',
+            [session_id, *message_ids]
+        )
+        rows = cursor.fetchall()
+        conn.close()
         return [
             {
                 "message_id": row["message_id"],

@@ -97,6 +97,8 @@ class ChatSession(BaseModel):
     agent_profile: Optional[str] = None
     context_summary: Optional[str] = None
     last_compressed_llm_call_id: Optional[int] = None
+    context_estimate: Optional[Dict[str, Any]] = None
+    context_estimate_at: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     message_count: Optional[int] = 0
@@ -165,7 +167,8 @@ class ToolPermissionRequestUpdate(BaseModel):
 
 
 class ChatStopRequest(BaseModel):
-    message_id: int
+    message_id: Optional[int] = None
+    session_id: Optional[str] = None
 
 
 class RollbackRequest(BaseModel):

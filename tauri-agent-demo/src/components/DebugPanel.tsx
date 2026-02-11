@@ -32,6 +32,7 @@ function DebugPanel({
     const [rawStreamVisible, setRawStreamVisible] = useState<Record<string, boolean>>({});
     const [panelWidth, setPanelWidth] = useState(400);
     const [focusedCallId, setFocusedCallId] = useState<number | null>(null);
+    const [suppressedFocusKey, setSuppressedFocusKey] = useState<string | null>(null);
     const [activeTab, setActiveTab] = useState<'llm' | 'ast' | 'cache'>('llm');
     const [astForm, setAstForm] = useState({
         path: '',
@@ -275,6 +276,7 @@ function DebugPanel({
 
     useEffect(() => {
         if (!focusTarget) return;
+        if (suppressedFocusKey && focusTarget.key === suppressedFocusKey) return;
         const { callId, messageId, iteration } = focusTarget;
         let targetCall: LLMCall | undefined;
         if (typeof callId === 'number') {
@@ -308,7 +310,7 @@ function DebugPanel({
                 attemptScroll();
             }, 60);
         }
-    }, [focusTarget, llmCalls]);
+    }, [focusTarget, llmCalls, suppressedFocusKey]);
 
     useEffect(() => {
         if (focusTarget) {
@@ -406,7 +408,16 @@ function DebugPanel({
         const isFocused = focusedCallId === call.id;
         return (
             <div key={call.id} className={`debug-message${isFocused ? ' focused' : ''}`} data-call-id={call.id}>
-                <div className="debug-message-header" onClick={() => toggleExpandCall(callKey)}>
+                <div
+                    className="debug-message-header"
+                    onClick={() => {
+                        toggleExpandCall(callKey);
+                        setFocusedCallId(call.id);
+                        if (focusTarget?.key) {
+                            setSuppressedFocusKey(focusTarget.key);
+                        }
+                    }}
+                >
                     <div className="message-title">
                         <span className="role-badge call">LLM</span>
                         <span className="message-id">Call {call.id}</span>

@@ -58,6 +58,16 @@ export interface ContextConfig {
     long_data_tail_chars?: number;
 }
 
+export interface ContextEstimate {
+    total: number;
+    system: number;
+    history: number;
+    tools: number;
+    other: number;
+    max_tokens?: number;
+    updated_at?: string;
+}
+
 export interface AppConfig {
     llm?: {
         timeout_sec?: number;
@@ -148,6 +158,8 @@ export interface ChatSession {
     agent_profile?: string | null;
     context_summary?: string | null;
     last_compressed_llm_call_id?: number | null;
+    context_estimate?: ContextEstimate | null;
+    context_estimate_at?: string | null;
     created_at: string;
     updated_at: string;
     message_count?: number;

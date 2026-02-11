@@ -7,6 +7,7 @@ import os
 import argparse
 import shlex
 import base64
+import time
 from io import BytesIO
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
@@ -752,10 +753,16 @@ def get_sessions():
     return db.get_all_sessions()
 
 @app.get("/sessions/{session_id}", response_model=ChatSession)
-def get_session(session_id: str):
-    session = db.get_session(session_id)
+def get_session(session_id: str, include_count: bool = Query(True)):
+    t0 = time.perf_counter()
+    session = db.get_session(session_id, include_count=include_count)
+    t1 = time.perf_counter()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    print(
+        "[Session Fetch] session=%s include_count=%s db=%.1fms"
+        % (session_id, include_count, (t1 - t0) * 1000)
+    )
     return session
 
 @app.post("/sessions", response_model=ChatSession)
@@ -787,25 +794,78 @@ def delete_session(session_id: str):
     raise HTTPException(status_code=404, detail="Session not found")
 
 @app.get("/sessions/{session_id}/messages", response_model=List[ChatMessage])
-def get_session_messages(session_id: str, limit: Optional[int] = None):
-    session = db.get_session(session_id)
+def get_session_messages(session_id: str, limit: Optional[int] = None, before_id: Optional[int] = None):
+    t0 = time.perf_counter()
+    session = db.get_session(session_id, include_count=False)
+    t1 = time.perf_counter()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    return db.get_session_messages(session_id, limit)
+    if before_id is not None:
+        fetch_limit = limit or 50
+        messages = db.get_session_messages_before(session_id, before_id, fetch_limit)
+    else:
+        messages = db.get_session_messages(session_id, limit)
+    t2 = time.perf_counter()
+    print(
+        "[Session Fetch] messages session=%s lookup=%.1fms db=%.1fms total=%.1fms count=%s limit=%s before_id=%s"
+        % (
+            session_id,
+            (t1 - t0) * 1000,
+            (t2 - t1) * 1000,
+            (t2 - t0) * 1000,
+            len(messages),
+            limit if limit is not None else "none",
+            before_id if before_id is not None else "none",
+        )
+    )
+    return messages
 
 @app.get("/sessions/{session_id}/llm_calls")
 def get_session_llm_calls(session_id: str):
+    t0 = time.perf_counter()
     session = db.get_session(session_id)
+    t1 = time.perf_counter()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    return db.get_session_llm_calls(session_id)
+    calls = db.get_session_llm_calls(session_id)
+    t2 = time.perf_counter()
+    print(
+        "[Session Fetch] llm_calls session=%s lookup=%.1fms db=%.1fms total=%.1fms count=%s"
+        % (
+            session_id,
+            (t1 - t0) * 1000,
+            (t2 - t1) * 1000,
+            (t2 - t0) * 1000,
+            len(calls),
+        )
+    )
+    return calls
 
 @app.get("/sessions/{session_id}/agent_steps")
-def get_session_agent_steps(session_id: str):
+def get_session_agent_steps(session_id: str, message_ids: Optional[str] = None):
+    t0 = time.perf_counter()
     session = db.get_session(session_id)
+    t1 = time.perf_counter()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    return db.get_session_agent_steps(session_id)
+    if message_ids:
+        ids = [int(item) for item in message_ids.split(",") if item.strip().isdigit()]
+        steps = db.get_session_agent_steps_for_messages(session_id, ids)
+    else:
+        steps = db.get_session_agent_steps(session_id)
+    t2 = time.perf_counter()
+    print(
+        "[Session Fetch] agent_steps session=%s lookup=%.1fms db=%.1fms total=%.1fms count=%s filter=%s"
+        % (
+            session_id,
+            (t1 - t0) * 1000,
+            (t2 - t1) * 1000,
+            (t2 - t0) * 1000,
+            len(steps),
+            "message_ids" if message_ids else "all",
+        )
+    )
+    return steps
 
 @app.post("/sessions/{session_id}/rollback")
 def rollback_session(session_id: str, request: RollbackRequest):
@@ -1411,6 +1471,14 @@ async def chat_agent_stream(request: ChatRequest):
                     session_id=session.id,
                     request_overrides=request_overrides if request_overrides else None
                 ):
+                    if step.step_type == "context_estimate":
+                        try:
+                            db.update_session_context_estimate(session.id, step.metadata)
+                        except Exception as exc:
+                            print(f"[Context Estimate] Failed to update session: {exc}")
+                        yield f"data: {json.dumps(step.to_dict())}\n\n"
+                        continue
+
                     if step.step_type.endswith("_delta"):
                         saw_delta = True
                         yield f"data: {json.dumps(step.to_dict())}\n\n"
@@ -1734,8 +1802,13 @@ def get_code_map(session_id: str = Query(...), root: str = Query(...)):
 
 @app.post("/chat/stop")
 def stop_chat(request: ChatStopRequest):
-    stopped = stream_stop_registry.stop(request.message_id)
-    return {"stopped": stopped}
+    message_id = request.message_id
+    if message_id is None and request.session_id:
+        message_id = db.get_latest_assistant_message_id(request.session_id)
+    if message_id is None:
+        raise HTTPException(status_code=400, detail="Missing message_id or session_id")
+    stopped = stream_stop_registry.stop(int(message_id))
+    return {"stopped": stopped, "message_id": message_id}
 
 @app.get("/tools/config")
 def get_tools_config():

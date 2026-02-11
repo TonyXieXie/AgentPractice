@@ -8,9 +8,11 @@ This agent maintains simple conversational behavior:
 """
 
 from typing import List, Dict, Any, AsyncGenerator, Optional
+from datetime import datetime
 import traceback
 from .base import AgentStrategy, AgentStep
 from message_processor import message_processor
+from context_estimate import build_context_estimate
 
 
 class SimpleAgent(AgentStrategy):
@@ -95,6 +97,15 @@ class SimpleAgent(AgentStrategy):
             debug_ctx = self._merge_debug_context(session_id, request_overrides, "simple", 0)
             if debug_ctx:
                 llm_overrides["_debug"] = debug_ctx
+
+            max_tokens = getattr(llm_client.config, "max_context_tokens", 0) or 0
+            estimate = build_context_estimate(
+                messages,
+                tools_payload=None,
+                max_tokens=max_tokens,
+                updated_at=datetime.now().isoformat()
+            )
+            yield AgentStep(step_type="context_estimate", content="", metadata=estimate)
 
             response = await llm_client.chat(messages, llm_overrides if llm_overrides else None)
             content = response.get("content", "")

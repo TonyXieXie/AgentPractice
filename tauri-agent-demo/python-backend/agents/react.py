@@ -9,11 +9,13 @@ Implements a ReAct-style loop with tool calling.
 import json
 import re
 import traceback
+from datetime import datetime
 from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
 
 import httpx
 from .base import AgentStrategy, AgentStep
 from tools.base import Tool, tool_to_openai_function, tool_to_openai_responses_tool
+from context_estimate import build_context_estimate
 
 
 TRUNCATION_MARKER_START = "[TRUNCATED_START]"
@@ -241,6 +243,7 @@ class ReActAgent(AgentStrategy):
             no_answer_attempts = 0
             while True:
                 current_call_seq = call_seq
+                estimate_emitted = False
                 llm_overrides = dict(request_overrides) if request_overrides else {}
                 if openai_tools:
                     llm_overrides.setdefault("tools", openai_tools)
@@ -285,6 +288,16 @@ class ReActAgent(AgentStrategy):
 
                         try:
                             sanitized_messages = _sanitize_messages_for_prompt(messages, current_call_seq, trunc_cfg)
+                            if not estimate_emitted:
+                                estimate_emitted = True
+                                max_tokens = getattr(llm_client.config, "max_context_tokens", 0) or 0
+                                estimate = build_context_estimate(
+                                    sanitized_messages,
+                                    tools_payload=openai_tools,
+                                    max_tokens=max_tokens,
+                                    updated_at=datetime.now().isoformat()
+                                )
+                                yield AgentStep(step_type="context_estimate", content="", metadata=estimate)
                             async for event in llm_client.chat_stream_events(sanitized_messages, llm_overrides if llm_overrides else None):
                                 received_any = True
                                 event_type = event.get("type")
@@ -519,6 +532,16 @@ class ReActAgent(AgentStrategy):
 
                     try:
                         sanitized_messages = _sanitize_messages_for_prompt(messages, current_call_seq, trunc_cfg)
+                        if not estimate_emitted:
+                            estimate_emitted = True
+                            max_tokens = getattr(llm_client.config, "max_context_tokens", 0) or 0
+                            estimate = build_context_estimate(
+                                sanitized_messages,
+                                tools_payload=openai_tools,
+                                max_tokens=max_tokens,
+                                updated_at=datetime.now().isoformat()
+                            )
+                            yield AgentStep(step_type="context_estimate", content="", metadata=estimate)
                         async for event in llm_client.chat_stream_events(sanitized_messages, llm_overrides if llm_overrides else None):
                             received_any = True
                             event_type = event.get("type")
@@ -758,6 +781,15 @@ class ReActAgent(AgentStrategy):
                 debug_ctx = self._merge_debug_context(session_id, request_overrides, "react", iteration)
                 if debug_ctx:
                     llm_overrides["_debug"] = debug_ctx
+
+                max_tokens = getattr(llm_client.config, "max_context_tokens", 0) or 0
+                estimate = build_context_estimate(
+                    messages,
+                    tools_payload=None,
+                    max_tokens=max_tokens,
+                    updated_at=datetime.now().isoformat()
+                )
+                yield AgentStep(step_type="context_estimate", content="", metadata=estimate)
 
                 response = await llm_client.chat(messages, llm_overrides if llm_overrides else None)
                 llm_output = response.get("content", "")

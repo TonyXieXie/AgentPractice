@@ -66,13 +66,17 @@
         ]
       }
     ],
-    "default_profile": "default"
+    "default_profile": "default",
+    "ast_enabled": true,
+    "code_map": {
+      "enabled": true
+    }
   },
   "context": {
-    "compression_enabled": true,
+    "compression_enabled": false,
     "compress_start_pct": 75,
     "compress_target_pct": 25,
-    "min_keep_messages": 12,
+    "min_keep_messages": 1,
     "keep_recent_calls": 10,
     "step_calls": 5,
     "truncate_long_data": false,

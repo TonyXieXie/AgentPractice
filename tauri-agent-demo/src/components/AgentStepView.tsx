@@ -55,7 +55,8 @@ const STEP_CATEGORY: Record<AgentStep['step_type'], Category> = {
     observation: 'tool',
     answer: 'final',
     answer_delta: 'final',
-    error: 'error'
+    error: 'error',
+    context_estimate: 'other'
 };
 
 const IS_MAC = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent);
@@ -590,6 +591,8 @@ function AgentStepView({
         };
     }, [fileMenu]);
 
+
+
     const ensureMermaid = () => {
         if (mermaidInitializedRef.current) return;
         mermaid.initialize({
@@ -827,46 +830,46 @@ function AgentStepView({
                 }
                 return out;
             };
+            const escapeLabelBrackets = (label: string) => {
+                const replace = (text: string) => text.replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
+                if (label.startsWith('[') && label.endsWith(']') && label.length > 1) {
+                    const inner = label.slice(1, -1);
+                    const escapedInner = replace(inner);
+                    const next = `[${escapedInner}]`;
+                    if (next !== label) changed = true;
+                    return next;
+                }
+                const escapedLabel = replace(label);
+                if (escapedLabel !== label) changed = true;
+                return escapedLabel;
+            };
+            const normalizeLabel = (label: string) => {
+                const bracketEscaped = escapeLabelBrackets(label);
+                if (!/[()]/.test(bracketEscaped)) return bracketEscaped;
+                const trimmed = bracketEscaped.trim();
+                const isQuoted =
+                    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+                    (trimmed.startsWith("'") && trimmed.endsWith("'"));
+                if (!isQuoted) {
+                    let quote = '"';
+                    if (bracketEscaped.includes('"') && !bracketEscaped.includes("'")) {
+                        quote = "'";
+                    } else if (bracketEscaped.includes('"') && bracketEscaped.includes("'")) {
+                        const encoded = bracketEscaped.replace(/\(/g, '&#40;').replace(/\)/g, '&#41;');
+                        if (encoded !== bracketEscaped) changed = true;
+                        return encoded;
+                    }
+                    changed = true;
+                    return `${quote}${bracketEscaped}${quote}`;
+                }
+                return bracketEscaped;
+            };
             const normalizeSquareLabels = (input: string) => {
                 let out = '';
                 let inSquare = false;
                 let nestedSquare = 0;
                 let escaped = false;
                 let buffer = '';
-                const escapeLabelBrackets = (label: string) => {
-                    const replace = (text: string) => text.replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
-                    if (label.startsWith('[') && label.endsWith(']') && label.length > 1) {
-                        const inner = label.slice(1, -1);
-                        const escapedInner = replace(inner);
-                        const next = `[${escapedInner}]`;
-                        if (next !== label) changed = true;
-                        return next;
-                    }
-                    const escapedLabel = replace(label);
-                    if (escapedLabel !== label) changed = true;
-                    return escapedLabel;
-                };
-                const normalizeLabel = (label: string) => {
-                    const bracketEscaped = escapeLabelBrackets(label);
-                    if (!/[()]/.test(bracketEscaped)) return bracketEscaped;
-                    const trimmed = bracketEscaped.trim();
-                    const isQuoted =
-                        (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-                        (trimmed.startsWith("'") && trimmed.endsWith("'"));
-                    if (!isQuoted) {
-                        let quote = '"';
-                        if (bracketEscaped.includes('"') && !bracketEscaped.includes("'")) {
-                            quote = "'";
-                        } else if (bracketEscaped.includes('"') && bracketEscaped.includes("'")) {
-                            const encoded = bracketEscaped.replace(/\(/g, '&#40;').replace(/\)/g, '&#41;');
-                            if (encoded !== bracketEscaped) changed = true;
-                            return encoded;
-                        }
-                        changed = true;
-                        return `${quote}${bracketEscaped}${quote}`;
-                    }
-                    return bracketEscaped;
-                };
                 for (let i = 0; i < input.length; i += 1) {
                     const ch = input[i];
                     if (escaped) {
@@ -921,14 +924,140 @@ function AgentStepView({
                 }
                 return out;
             };
+            const normalizeCurlyLabels = (input: string) => {
+                let out = '';
+                let inCurly = false;
+                let nestedCurly = 0;
+                let escaped = false;
+                let buffer = '';
+                for (let i = 0; i < input.length; i += 1) {
+                    const ch = input[i];
+                    if (escaped) {
+                        if (inCurly) {
+                            buffer += ch;
+                        } else {
+                            out += ch;
+                        }
+                        escaped = false;
+                        continue;
+                    }
+                    if (ch === '\\') {
+                        if (inCurly) {
+                            buffer += ch;
+                        } else {
+                            out += ch;
+                        }
+                        escaped = true;
+                        continue;
+                    }
+                    if (ch === '{' && !inCurly) {
+                        inCurly = true;
+                        nestedCurly = 0;
+                        buffer = '';
+                        out += ch;
+                        continue;
+                    }
+                    if (ch === '{' && inCurly) {
+                        nestedCurly += 1;
+                        buffer += ch;
+                        continue;
+                    }
+                    if (ch === '}' && inCurly) {
+                        if (nestedCurly > 0) {
+                            nestedCurly -= 1;
+                            buffer += ch;
+                            continue;
+                        }
+                        inCurly = false;
+                        out += normalizeLabel(buffer);
+                        out += ch;
+                        continue;
+                    }
+                    if (inCurly) {
+                        buffer += ch;
+                    } else {
+                        out += ch;
+                    }
+                }
+                if (inCurly && buffer) {
+                    out += buffer;
+                }
+                return out;
+            };
+            const stripTrailingEscapedNewlines = (line: string) => {
+                const isOutsideIndex = (text: string, index: number) => {
+                    let depthSquare = 0;
+                    let depthRound = 0;
+                    let depthCurly = 0;
+                    let inSingle = false;
+                    let inDouble = false;
+                    let escapedChar = false;
+                    for (let i = 0; i < text.length; i += 1) {
+                        if (i === index) {
+                            return (
+                                !inSingle &&
+                                !inDouble &&
+                                depthSquare === 0 &&
+                                depthRound === 0 &&
+                                depthCurly === 0
+                            );
+                        }
+                        const ch = text[i];
+                        if (escapedChar) {
+                            escapedChar = false;
+                            continue;
+                        }
+                        if (ch === '\\') {
+                            escapedChar = true;
+                            continue;
+                        }
+                        if (!inDouble && ch === "'") {
+                            inSingle = !inSingle;
+                            continue;
+                        }
+                        if (!inSingle && ch === '"') {
+                            inDouble = !inDouble;
+                            continue;
+                        }
+                        if (!inSingle && !inDouble) {
+                            if (ch === '[') depthSquare += 1;
+                            else if (ch === ']') depthSquare = Math.max(0, depthSquare - 1);
+                            else if (ch === '(') depthRound += 1;
+                            else if (ch === ')') depthRound = Math.max(0, depthRound - 1);
+                            else if (ch === '{') depthCurly += 1;
+                            else if (ch === '}') depthCurly = Math.max(0, depthCurly - 1);
+                        }
+                    }
+                    return false;
+                };
+                let next = line;
+                let updated = false;
+                while (true) {
+                    const trimmed = next.replace(/[ \t]+$/, '');
+                    if (!trimmed.endsWith('n')) break;
+                    let backslashCount = 0;
+                    let cursor = trimmed.length - 2;
+                    while (cursor >= 0 && trimmed[cursor] === '\\') {
+                        backslashCount += 1;
+                        cursor -= 1;
+                    }
+                    if (backslashCount === 0) break;
+                    const start = trimmed.length - 1 - backslashCount;
+                    if (!isOutsideIndex(trimmed, start)) break;
+                    next = trimmed.slice(0, start);
+                    updated = true;
+                }
+                if (updated) changed = true;
+                return next;
+            };
             const normalized = value
                 .replace(/\r\n/g, '\n')
                 .replace(/\r/g, '\n')
                 .replace(/[\u2028\u2029]/g, '\n')
                 .split('\n')
-                .map(splitConcatenatedEdges)
+                .map((line) => stripTrailingEscapedNewlines(splitConcatenatedEdges(line)))
                 .join('\n');
-            const escaped = normalizeSquareLabels(normalized);
+            const escaped = normalizeCurlyLabels(normalizeSquareLabels(normalized));
             if (changed) logMermaid('debug', 'normalized mermaid source');
             return escaped;
         };

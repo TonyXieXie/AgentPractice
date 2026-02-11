@@ -330,6 +330,14 @@ body[data-platform="mac"] .app-titlebar {
 }
 
 /* Messages */
+.messages-wrapper {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
 .messages {
   flex: 1;
   overflow-y: auto;
@@ -339,13 +347,48 @@ body[data-platform="mac"] .app-titlebar {
   background: #121417;
   border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.06);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
   min-height: 0;
   /* 关键：允许flex子项缩小 */
-  scroll-behavior: smooth;
-  /* 平滑滚动 */
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.message-spacer {
+  width: 100%;
+  pointer-events: none;
+  flex-shrink: 0;
+}
+
+.scroll-to-bottom-btn {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.92);
+  color: #e2e8f0;
+  border-radius: 999px;
+  width: 34px;
+  height: 34px;
+  cursor: pointer;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.45);
+  transition: transform 0.15s ease, background 0.2s ease, border-color 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.scroll-to-bottom-btn:hover {
+  background: rgba(30, 41, 59, 0.95);
+  border-color: rgba(148, 163, 184, 0.55);
+  transform: translateX(-50%) translateY(-1px);
+}
+
+.scroll-to-bottom-btn svg {
+  width: 18px;
+  height: 18px;
 }
 
 .welcome-message {
@@ -370,7 +413,9 @@ body[data-platform="mac"] .app-titlebar {
   display: flex;
   flex-direction: column;
   max-width: 95%;
-  animation: slideIn 0.3s ease-out;
+  padding-bottom: 12px;
+  box-sizing: border-box;
+  flex-shrink: 0;
 }
 
 @keyframes slideIn {

@@ -141,38 +141,95 @@ const injectMermaidFences = (content: string) => {
 
 const normalizeMermaidSource = (value: string) => {
   if (!value) return value;
+  const stripTrailingEscapedNewlines = (line: string) => {
+    const isOutsideIndex = (text: string, index: number) => {
+      let depthSquare = 0;
+      let depthRound = 0;
+      let depthCurly = 0;
+      let inSingle = false;
+      let inDouble = false;
+      let escapedChar = false;
+      for (let i = 0; i < text.length; i += 1) {
+        if (i === index) {
+          return !inSingle && !inDouble && depthSquare === 0 && depthRound === 0 && depthCurly === 0;
+        }
+        const ch = text[i];
+        if (escapedChar) {
+          escapedChar = false;
+          continue;
+        }
+        if (ch === '\\') {
+          escapedChar = true;
+          continue;
+        }
+        if (!inDouble && ch === "'") {
+          inSingle = !inSingle;
+          continue;
+        }
+        if (!inSingle && ch === '"') {
+          inDouble = !inDouble;
+          continue;
+        }
+        if (!inSingle && !inDouble) {
+          if (ch === '[') depthSquare += 1;
+          else if (ch === ']') depthSquare = Math.max(0, depthSquare - 1);
+          else if (ch === '(') depthRound += 1;
+          else if (ch === ')') depthRound = Math.max(0, depthRound - 1);
+          else if (ch === '{') depthCurly += 1;
+          else if (ch === '}') depthCurly = Math.max(0, depthCurly - 1);
+        }
+      }
+      return false;
+    };
+    let next = line;
+    while (true) {
+      const trimmed = next.replace(/[ \t]+$/, '');
+      if (!trimmed.endsWith('n')) break;
+      let backslashCount = 0;
+      let cursor = trimmed.length - 2;
+      while (cursor >= 0 && trimmed[cursor] === '\\') {
+        backslashCount += 1;
+        cursor -= 1;
+      }
+      if (backslashCount === 0) break;
+      const start = trimmed.length - 1 - backslashCount;
+      if (!isOutsideIndex(trimmed, start)) break;
+      next = trimmed.slice(0, start);
+    }
+    return next;
+  };
+  const escapeLabelBrackets = (label: string) => {
+    const replace = (text: string) => text.replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
+    if (label.startsWith('[') && label.endsWith(']') && label.length > 1) {
+      const inner = label.slice(1, -1);
+      return `[${replace(inner)}]`;
+    }
+    return replace(label);
+  };
+  const normalizeLabel = (label: string) => {
+    const bracketEscaped = escapeLabelBrackets(label);
+    if (!/[()]/.test(bracketEscaped)) return bracketEscaped;
+    const trimmed = bracketEscaped.trim();
+    const isQuoted =
+      (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'"));
+    if (!isQuoted) {
+      let quote = '"';
+      if (bracketEscaped.includes('"') && !bracketEscaped.includes("'")) {
+        quote = "'";
+      } else if (bracketEscaped.includes('"') && bracketEscaped.includes("'")) {
+        return bracketEscaped.replace(/\(/g, '&#40;').replace(/\)/g, '&#41;');
+      }
+      return `${quote}${bracketEscaped}${quote}`;
+    }
+    return bracketEscaped;
+  };
   const normalizeSquareLabels = (input: string) => {
     let out = '';
     let inSquare = false;
     let nestedSquare = 0;
     let escaped = false;
     let buffer = '';
-    const escapeLabelBrackets = (label: string) => {
-      const replace = (text: string) => text.replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
-      if (label.startsWith('[') && label.endsWith(']') && label.length > 1) {
-        const inner = label.slice(1, -1);
-        return `[${replace(inner)}]`;
-      }
-      return replace(label);
-    };
-    const normalizeLabel = (label: string) => {
-      const bracketEscaped = escapeLabelBrackets(label);
-      if (!/[()]/.test(bracketEscaped)) return bracketEscaped;
-      const trimmed = bracketEscaped.trim();
-      const isQuoted =
-        (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-        (trimmed.startsWith("'") && trimmed.endsWith("'"));
-      if (!isQuoted) {
-        let quote = '"';
-        if (bracketEscaped.includes('"') && !bracketEscaped.includes("'")) {
-          quote = "'";
-        } else if (bracketEscaped.includes('"') && bracketEscaped.includes("'")) {
-          return bracketEscaped.replace(/\(/g, '&#40;').replace(/\)/g, '&#41;');
-        }
-        return `${quote}${bracketEscaped}${quote}`;
-      }
-      return bracketEscaped;
-    };
     for (let i = 0; i < input.length; i += 1) {
       const ch = input[i];
       if (escaped) {
@@ -227,11 +284,74 @@ const normalizeMermaidSource = (value: string) => {
     }
     return out;
   };
+  const normalizeCurlyLabels = (input: string) => {
+    let out = '';
+    let inCurly = false;
+    let nestedCurly = 0;
+    let escaped = false;
+    let buffer = '';
+    for (let i = 0; i < input.length; i += 1) {
+      const ch = input[i];
+      if (escaped) {
+        if (inCurly) {
+          buffer += ch;
+        } else {
+          out += ch;
+        }
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        if (inCurly) {
+          buffer += ch;
+        } else {
+          out += ch;
+        }
+        escaped = true;
+        continue;
+      }
+      if (ch === '{' && !inCurly) {
+        inCurly = true;
+        nestedCurly = 0;
+        buffer = '';
+        out += ch;
+        continue;
+      }
+      if (ch === '{' && inCurly) {
+        nestedCurly += 1;
+        buffer += ch;
+        continue;
+      }
+      if (ch === '}' && inCurly) {
+        if (nestedCurly > 0) {
+          nestedCurly -= 1;
+          buffer += ch;
+          continue;
+        }
+        inCurly = false;
+        out += normalizeLabel(buffer);
+        out += ch;
+        continue;
+      }
+      if (inCurly) {
+        buffer += ch;
+      } else {
+        out += ch;
+      }
+    }
+    if (inCurly && buffer) {
+      out += buffer;
+    }
+    return out;
+  };
   const normalized = value
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
-    .replace(/[\u2028\u2029]/g, '\n');
-  return normalizeSquareLabels(normalized);
+    .replace(/[\u2028\u2029]/g, '\n')
+    .split('\n')
+    .map(stripTrailingEscapedNewlines)
+    .join('\n');
+  return normalizeCurlyLabels(normalizeSquareLabels(normalized));
 };
 
 const renderMarkdownHtml = (content: string) => markdown.render(injectMermaidFences(content || ''));
@@ -976,7 +1096,28 @@ function WorkDirBrowser({
       setupMermaidInteractions();
       return;
     }
-    pendingNodes.forEach((node) => {
+    const mermaidParser = (
+      mermaid as unknown as {
+        parse?: (text: string, parseOptions?: { suppressErrors?: boolean }) => Promise<boolean | void>;
+      }
+    ).parse;
+    const getLineContext = (source: string, error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      const match = message.match(/line\s+(\d+)/i);
+      if (!match) return null;
+      const lineNumber = Number.parseInt(match[1], 10);
+      if (!Number.isFinite(lineNumber) || lineNumber <= 0) return null;
+      const lines = source.split('\n');
+      const line = lines[lineNumber - 1] ?? '';
+      const prev = lines[lineNumber - 2] ?? '';
+      const next = lines[lineNumber] ?? '';
+      return { lineNumber, prev, line, next };
+    };
+    const logMermaid = (message: string, detail?: unknown) => {
+      const payload = detail === undefined ? ['[mermaid]', message] : ['[mermaid]', message, detail];
+      console.warn(...payload);
+    };
+    pendingNodes.forEach((node, idx) => {
       node.removeAttribute('data-processed');
       const raw = node.dataset.raw;
       let source = '';
@@ -995,6 +1136,22 @@ function WorkDirBrowser({
         node.dataset.raw = encodeURIComponent(source);
       }
       node.textContent = source;
+      if (source.trim() && typeof mermaidParser === 'function') {
+        try {
+          void mermaidParser(source, { suppressErrors: false }).catch((error) => {
+            logMermaid('parse failed', {
+              index: idx,
+              error,
+              context: getLineContext(source, error),
+              preview: source.slice(0, 320),
+            });
+            node.dataset.mermaidParseError = 'true';
+          });
+        } catch (error) {
+          logMermaid('parse threw', { index: idx, error, context: getLineContext(source, error), preview: source.slice(0, 320) });
+          node.dataset.mermaidParseError = 'true';
+        }
+      }
     });
     mermaid.run({ nodes: pendingNodes }).then(
       () => {
