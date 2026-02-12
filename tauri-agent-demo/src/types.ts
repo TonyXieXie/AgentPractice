@@ -2,7 +2,7 @@
 export type LLMProfile = 'openai' | 'openai_compatible' | 'deepseek' | 'zhipu';
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 export type ReasoningSummary = 'auto' | 'concise' | 'detailed';
-export type AgentMode = 'default' | 'shell_safe' | 'super';
+export type AgentMode = 'default' | 'super';
 
 export interface ToolDefinition {
     name: string;

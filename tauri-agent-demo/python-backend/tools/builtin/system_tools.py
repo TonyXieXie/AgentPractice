@@ -5,6 +5,8 @@ import json
 import os
 import shlex
 import subprocess
+import sys
+import locale
 import time
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional, List, Set
@@ -100,7 +102,10 @@ def _log_permission_request(tool_name: str, action: str, path: Path, reason: str
 def _get_agent_mode() -> str:
     tool_ctx = get_tool_context()
     mode = tool_ctx.get("agent_mode") or "default"
-    return str(mode).lower()
+    mode = str(mode).lower()
+    if mode not in ("default", "super"):
+        mode = "default"
+    return mode
 
 
 def _resolve_path(raw_path: str, tool_name: str, action: str) -> Path:
@@ -113,8 +118,6 @@ def _resolve_path(raw_path: str, tool_name: str, action: str) -> Path:
     if not any(_is_within_root(path, allowed_root) for allowed_root in roots):
         mode = _get_agent_mode()
         if mode == "super":
-            return path
-        if mode == "shell_safe" and action == "read":
             return path
         request_id = _log_permission_request(
             tool_name=tool_name,
@@ -520,6 +523,456 @@ def _command_targets_outside_root(command: str, root: Path) -> bool:
     return False
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def _escape_seatbelt_path(path: Path) -> str:
+    raw = str(path)
+    return raw.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _build_macos_sandbox_profile(roots: List[Path]) -> str:
+    allowed_paths = [_escape_seatbelt_path(root) for root in roots if root]
+    allow_blocks = [
+        '(allow file-read* (subpath "/usr") (subpath "/bin") (subpath "/System") (subpath "/Library"))',
+        '(allow file-read* file-write* (subpath "/tmp") (subpath "/private/tmp") (subpath "/var/tmp"))',
+        "(allow network*)",
+        "(allow process-exec)",
+        "(allow process-fork)",
+        "(allow process-signal)",
+        "(allow sysctl-read)"
+    ]
+    if allowed_paths:
+        roots_clause = " ".join([f'(subpath "{path}")' for path in allowed_paths])
+        allow_blocks.append(f"(allow file-read* file-write* {roots_clause})")
+    profile_lines = ["(version 1)", "(deny default)"]
+    profile_lines.extend(allow_blocks)
+    return "\n".join(profile_lines)
+
+
+def _run_macos_sandboxed(command: str, workdir: Path, timeout_sec: float) -> Tuple[int, str]:
+    sandbox_exec = "/usr/bin/sandbox-exec"
+    if not Path(sandbox_exec).exists():
+        raise RuntimeError("sandbox-exec not available on this system.")
+    roots = _get_allowed_roots()
+    profile = _build_macos_sandbox_profile(roots)
+    print(f"[Shell Sandbox] macos sandbox-exec={sandbox_exec} shell=/bin/sh workdir={workdir}")
+    proc = subprocess.run(
+        [sandbox_exec, "-p", profile, "/bin/sh", "-c", command],
+        cwd=str(workdir),
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec
+    )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, output
+
+
+def _run_windows_restricted(command: str, workdir: Path, timeout_sec: float) -> Tuple[int, str]:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcessId.restype = wintypes.DWORD
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+
+    comspec = os.environ.get("COMSPEC") or "cmd.exe"
+    print(f"[Shell Sandbox] windows comspec={comspec} workdir={workdir}")
+
+    TOKEN_ASSIGN_PRIMARY = 0x0001
+    TOKEN_DUPLICATE = 0x0002
+    TOKEN_QUERY = 0x0008
+    TOKEN_ADJUST_PRIVILEGES = 0x0020
+    TOKEN_ADJUST_DEFAULT = 0x0080
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    DISABLE_MAX_PRIVILEGE = 0x00000001
+
+    CREATE_NO_WINDOW = 0x08000000
+    CREATE_UNICODE_ENVIRONMENT = 0x00000400
+    STARTF_USESTDHANDLES = 0x00000100
+    HANDLE_FLAG_INHERIT = 0x00000001
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    JobObjectExtendedLimitInformation = 9
+
+    SE_GROUP_INTEGRITY = 0x00000020
+    SE_PRIVILEGE_ENABLED = 0x00000002
+    ERROR_NOT_ALL_ASSIGNED = 1300
+    TokenIntegrityLevel = 25
+    class SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", wintypes.LPVOID),
+            ("bInheritHandle", wintypes.BOOL)
+        ]
+
+    class STARTUPINFO(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR),
+            ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD),
+            ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD),
+            ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE)
+        ]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wintypes.HANDLE),
+            ("hThread", wintypes.HANDLE),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD)
+        ]
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD)
+        ]
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong)
+        ]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t)
+        ]
+
+    class SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_MANDATORY_LABEL(ctypes.Structure):
+        _fields_ = [("Label", SID_AND_ATTRIBUTES)]
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", LUID_AND_ATTRIBUTES)]
+
+    advapi32.CreateProcessAsUserW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        ctypes.POINTER(SECURITY_ATTRIBUTES),
+        ctypes.POINTER(SECURITY_ATTRIBUTES),
+        wintypes.BOOL,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPCWSTR,
+        ctypes.POINTER(STARTUPINFO),
+        ctypes.POINTER(PROCESS_INFORMATION),
+    ]
+    advapi32.CreateProcessAsUserW.restype = wintypes.BOOL
+
+    def _raise_last_error(message: str) -> None:
+        err = ctypes.get_last_error()
+        print(f"[Shell Sandbox] {message} (winerr={err})")
+        raise RuntimeError(f"{message} (winerr={err})")
+
+    h_process = None
+    h_process_opened = False
+    try:
+        pid = kernel32.GetCurrentProcessId()
+        h_process = kernel32.OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+            False,
+            pid
+        )
+        if h_process:
+            h_process_opened = True
+            print(f"[Shell Sandbox] OpenProcess handle acquired pid={pid}")
+    except Exception:
+        h_process = None
+
+    if not h_process:
+        h_process = kernel32.GetCurrentProcess()
+    h_token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        h_process,
+        TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_PRIVILEGES,
+        ctypes.byref(h_token)
+    ):
+        if h_process_opened:
+            kernel32.CloseHandle(h_process)
+        _raise_last_error("OpenProcessToken failed")
+
+    def _enable_privilege(token_handle: wintypes.HANDLE, name: str) -> None:
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+            print(f"[Shell Sandbox] LookupPrivilegeValue failed for {name} (winerr={ctypes.get_last_error()})")
+            return
+        tp = TOKEN_PRIVILEGES()
+        tp.PrivilegeCount = 1
+        tp.Privileges = LUID_AND_ATTRIBUTES(luid, SE_PRIVILEGE_ENABLED)
+        if not advapi32.AdjustTokenPrivileges(token_handle, False, ctypes.byref(tp), 0, None, None):
+            print(f"[Shell Sandbox] AdjustTokenPrivileges failed for {name} (winerr={ctypes.get_last_error()})")
+            return
+        last_err = ctypes.get_last_error()
+        if last_err == ERROR_NOT_ALL_ASSIGNED:
+            print(f"[Shell Sandbox] Privilege not assigned: {name}")
+
+    _enable_privilege(h_token, "SeChangeNotifyPrivilege")
+
+    restricted_token = wintypes.HANDLE()
+    if not advapi32.CreateRestrictedToken(
+        h_token,
+        DISABLE_MAX_PRIVILEGE,
+        0,
+        None,
+        0,
+        None,
+        0,
+        None,
+        ctypes.byref(restricted_token)
+    ):
+        kernel32.CloseHandle(h_token)
+        if h_process_opened:
+            kernel32.CloseHandle(h_process)
+        _raise_last_error("CreateRestrictedToken failed")
+
+    sid = wintypes.LPVOID()
+    if advapi32.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)):
+        tml = TOKEN_MANDATORY_LABEL()
+        tml.Label.Sid = sid
+        tml.Label.Attributes = SE_GROUP_INTEGRITY
+        if not advapi32.SetTokenInformation(
+            restricted_token,
+            TokenIntegrityLevel,
+            ctypes.byref(tml),
+            ctypes.sizeof(tml)
+        ):
+            print(f"[Shell Sandbox] SetTokenInformation failed (winerr={ctypes.get_last_error()})")
+        kernel32.LocalFree(sid)
+
+    sa = SECURITY_ATTRIBUTES()
+    sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
+    sa.lpSecurityDescriptor = None
+    sa.bInheritHandle = True
+
+    stdout_read = wintypes.HANDLE()
+    stdout_write = wintypes.HANDLE()
+    if not kernel32.CreatePipe(ctypes.byref(stdout_read), ctypes.byref(stdout_write), ctypes.byref(sa), 0):
+        kernel32.CloseHandle(restricted_token)
+        kernel32.CloseHandle(h_token)
+        if h_process_opened:
+            kernel32.CloseHandle(h_process)
+        _raise_last_error("CreatePipe failed")
+    if not kernel32.SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0):
+        kernel32.CloseHandle(stdout_read)
+        kernel32.CloseHandle(stdout_write)
+        kernel32.CloseHandle(restricted_token)
+        kernel32.CloseHandle(h_token)
+        if h_process_opened:
+            kernel32.CloseHandle(h_process)
+        _raise_last_error("SetHandleInformation failed")
+
+    startup = STARTUPINFO()
+    startup.cb = ctypes.sizeof(STARTUPINFO)
+    startup.dwFlags = STARTF_USESTDHANDLES
+    startup.hStdOutput = stdout_write
+    startup.hStdError = stdout_write
+    startup.hStdInput = kernel32.GetStdHandle(-10)
+
+    proc_info = PROCESS_INFORMATION()
+    command_line = ctypes.create_unicode_buffer(f'"{comspec}" /c {command}')
+
+    created = advapi32.CreateProcessAsUserW(
+        restricted_token,
+        None,
+        command_line,
+        None,
+        None,
+        True,
+        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        None,
+        str(workdir),
+        ctypes.byref(startup),
+        ctypes.byref(proc_info)
+    )
+
+    kernel32.CloseHandle(stdout_write)
+    kernel32.CloseHandle(restricted_token)
+    kernel32.CloseHandle(h_token)
+    if h_process_opened:
+        kernel32.CloseHandle(h_process)
+
+    if not created:
+        kernel32.CloseHandle(stdout_read)
+        _raise_last_error("CreateProcessAsUserW failed")
+
+    job_handle = kernel32.CreateJobObjectW(None, None)
+    if job_handle:
+        job_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        kernel32.SetInformationJobObject(
+            job_handle,
+            JobObjectExtendedLimitInformation,
+            ctypes.byref(job_info),
+            ctypes.sizeof(job_info)
+        )
+        if not kernel32.AssignProcessToJobObject(job_handle, proc_info.hProcess):
+            err = ctypes.get_last_error()
+            print(f"[Shell Sandbox] AssignProcessToJobObject failed (winerr={err})")
+
+    output_chunks: List[bytes] = []
+    start_time = time.monotonic()
+    buffer = ctypes.create_string_buffer(4096)
+    bytes_read = wintypes.DWORD()
+
+    while True:
+        if timeout_sec is not None and timeout_sec > 0:
+            remaining = max(0.0, timeout_sec - (time.monotonic() - start_time))
+            wait_ms = int(min(50.0, remaining) * 1000)
+            if remaining <= 0:
+                kernel32.TerminateProcess(proc_info.hProcess, 1)
+                kernel32.CloseHandle(proc_info.hThread)
+                kernel32.CloseHandle(proc_info.hProcess)
+                kernel32.CloseHandle(stdout_read)
+                if job_handle:
+                    kernel32.CloseHandle(job_handle)
+                raise subprocess.TimeoutExpired(command, timeout_sec)
+        else:
+            wait_ms = 50
+
+        wait_result = kernel32.WaitForSingleObject(proc_info.hProcess, wait_ms)
+
+        while True:
+            available = wintypes.DWORD()
+            if not kernel32.PeekNamedPipe(stdout_read, None, 0, None, ctypes.byref(available), None):
+                break
+            if available.value == 0:
+                break
+            to_read = min(len(buffer), available.value)
+            if kernel32.ReadFile(stdout_read, buffer, to_read, ctypes.byref(bytes_read), None):
+                if bytes_read.value > 0:
+                    output_chunks.append(buffer.raw[:bytes_read.value])
+
+        if wait_result == WAIT_OBJECT_0:
+            break
+        if wait_result not in (WAIT_OBJECT_0, WAIT_TIMEOUT):
+            break
+
+    while True:
+        available = wintypes.DWORD()
+        if not kernel32.PeekNamedPipe(stdout_read, None, 0, None, ctypes.byref(available), None):
+            break
+        if available.value == 0:
+            break
+        to_read = min(len(buffer), available.value)
+        if kernel32.ReadFile(stdout_read, buffer, to_read, ctypes.byref(bytes_read), None):
+            if bytes_read.value > 0:
+                output_chunks.append(buffer.raw[:bytes_read.value])
+
+    exit_code = wintypes.DWORD()
+    kernel32.GetExitCodeProcess(proc_info.hProcess, ctypes.byref(exit_code))
+    kernel32.CloseHandle(proc_info.hThread)
+    kernel32.CloseHandle(proc_info.hProcess)
+    kernel32.CloseHandle(stdout_read)
+    if job_handle:
+        kernel32.CloseHandle(job_handle)
+
+    raw_output = b"".join(output_chunks)
+
+    def _decode_output_bytes(data: bytes) -> str:
+        if not data:
+            return ""
+        if data.startswith(b"\xef\xbb\xbf"):
+            return data.decode("utf-8-sig", errors="replace")
+        if data.startswith(b"\xff\xfe"):
+            return data.decode("utf-16le", errors="replace")
+        if data.startswith(b"\xfe\xff"):
+            return data.decode("utf-16be", errors="replace")
+        probe_len = min(len(data), 2000)
+        if probe_len >= 4:
+            zero_odd = sum(1 for i in range(1, probe_len, 2) if data[i] == 0)
+            zero_even = sum(1 for i in range(0, probe_len, 2) if data[i] == 0)
+            if zero_odd > max(10, zero_even * 2):
+                return data.decode("utf-16le", errors="replace")
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        encoding = locale.getpreferredencoding(False) or "utf-8"
+        return data.decode(encoding, errors="replace")
+
+    output = _decode_output_bytes(raw_output)
+    return int(exit_code.value), output
+
+
+def _run_sandboxed_command(command: str, workdir: Path, timeout_sec: float) -> Tuple[int, str]:
+    if _is_windows():
+        try:
+            return _run_windows_restricted(command, workdir, timeout_sec)
+        except Exception as exc:
+            print(f"[Shell Sandbox] windows restricted failed: {exc}")
+            raise
+    if _is_macos():
+        try:
+            return _run_macos_sandboxed(command, workdir, timeout_sec)
+        except Exception as exc:
+            print(f"[Shell Sandbox] macos sandbox-exec failed: {exc}")
+            raise
+    print("[Shell Sandbox] unsupported platform, falling back to shell execution")
+    proc = subprocess.run(
+        command,
+        cwd=str(workdir),
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec
+    )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, output
+
+
 def _ensure_shell_allowlist_entry(command_name: str) -> None:
     if not command_name:
         return
@@ -533,6 +986,43 @@ def _ensure_shell_allowlist_entry(command_name: str) -> None:
         update_tool_config({"shell": {"allowlist": allowlist}})
     except Exception:
         pass
+
+
+def _ensure_shell_unrestricted_allowlist_entry(command_name: str) -> None:
+    if not command_name:
+        return
+    config = get_tool_config()
+    allowlist = list(config.get("shell", {}).get("unrestricted_allowlist", []) or [])
+    allowset = {str(item).lower() for item in allowlist}
+    if command_name.lower() in allowset:
+        return
+    allowlist.append(command_name)
+    try:
+        update_tool_config({"shell": {"unrestricted_allowlist": allowlist}})
+    except Exception:
+        pass
+
+
+def _looks_like_permission_denied(message: str) -> bool:
+    if not message:
+        return False
+    text = str(message)
+    lower = text.lower()
+    patterns = [
+        "access is denied",
+        "permission denied",
+        "permissiondenied",
+        "unauthorizedaccessexception",
+        "not authorized",
+        "accessdenied",
+        "eacces",
+        "eperm",
+        "\u6743\u9650\u4e0d\u8db3",
+        "\u62d2\u7edd\u8bbf\u95ee",
+        "\u6ca1\u6709\u6743\u9650",
+        "\u65e0\u6743\u9650"
+    ]
+    return any(pattern in lower for pattern in patterns)
 
 
 async def _wait_for_permission(request_id: Optional[int], timeout_sec: float) -> str:
@@ -710,29 +1200,16 @@ class RunShellTool(Tool):
         cmd_name = _extract_command_name(command)
         root = _get_root_path()
         tool_ctx = get_tool_context()
-        agent_mode = str(tool_ctx.get("agent_mode") or "default").lower()
+        agent_mode = _get_agent_mode()
         shell_unrestricted = bool(tool_ctx.get("shell_unrestricted"))
         allowlist = get_tool_config().get("shell", {}).get("allowlist", [])
         allowset = {str(item).lower() for item in allowlist}
+        unrestricted_allowlist = get_tool_config().get("shell", {}).get("unrestricted_allowlist", [])
+        unrestricted_allowset = {str(item).lower() for item in unrestricted_allowlist}
         reasons = []
         if agent_mode != "super":
-            if agent_mode == "default":
-                if _contains_shell_operators(command):
-                    reasons.append("Shell operators detected.")
-                if not shell_unrestricted and cmd_name not in allowset:
-                    reasons.append("Command not in allowlist.")
-                if _command_targets_outside_root(command, root):
-                    reasons.append("Command may access paths outside work path.")
-            elif agent_mode == "shell_safe":
-                if _command_targets_outside_root(command, root):
-                    reasons.append("Command may access paths outside work path.")
-            else:
-                if _contains_shell_operators(command):
-                    reasons.append("Shell operators detected.")
-                if not shell_unrestricted and cmd_name not in allowset:
-                    reasons.append("Command not in allowlist.")
-                if _command_targets_outside_root(command, root):
-                    reasons.append("Command may access paths outside work path.")
+            if not shell_unrestricted and cmd_name not in allowset:
+                reasons.append("Command not in allowlist.")
         if reasons:
             request_id = None
             try:
@@ -749,14 +1226,14 @@ class RunShellTool(Tool):
 
             timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
             status = await _wait_for_permission(request_id, timeout_sec)
-            if status != "approved":
+            if status not in ("approved", "approved_once"):
                 if status == "denied":
                     return "Permission denied."
                 if status == "timeout":
                     return "Permission request timed out."
                 return "Permission required."
 
-            if agent_mode == "default" and not shell_unrestricted and cmd_name not in allowset:
+            if status == "approved" and agent_mode == "default" and not shell_unrestricted and cmd_name not in allowset:
                 _ensure_shell_allowlist_entry(cmd_name)
 
         cwd = data.get("cwd")
@@ -767,7 +1244,7 @@ class RunShellTool(Tool):
         max_output = data.get("max_output")
         max_output = int(max_output) if max_output is not None else int(get_tool_config().get("shell", {}).get("max_output", 20000))
 
-        def _run() -> Tuple[int, str]:
+        def _run_unsandboxed() -> Tuple[int, str]:
             completed = subprocess.run(
                 command,
                 cwd=str(workdir),
@@ -779,10 +1256,81 @@ class RunShellTool(Tool):
             output = (completed.stdout or "") + (completed.stderr or "")
             return completed.returncode, output
 
+        def _run_sandboxed() -> Tuple[int, str]:
+            return _run_sandboxed_command(command, workdir, timeout_sec)
+
+        ran_sandbox = False
         try:
-            returncode, output = await asyncio.to_thread(_run)
+            if agent_mode == "super":
+                returncode, output = await asyncio.to_thread(_run_unsandboxed)
+            elif cmd_name in unrestricted_allowset:
+                returncode, output = await asyncio.to_thread(_run_unsandboxed)
+            else:
+                ran_sandbox = True
+                returncode, output = await asyncio.to_thread(_run_sandboxed)
         except subprocess.TimeoutExpired:
             return "Command timed out."
+        except Exception as exc:
+            request_id = None
+            try:
+                from database import db
+                request_id = db.create_permission_request(
+                    tool_name=self.name,
+                    action="execute_unrestricted",
+                    path=str(command),
+                    reason=f"Sandbox execution failed: {str(exc)}",
+                    session_id=tool_ctx.get("session_id")
+                )
+            except Exception:
+                request_id = None
+
+            timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
+            status = await _wait_for_permission(request_id, timeout_sec)
+            if status not in ("approved", "approved_once"):
+                if status == "denied":
+                    return "Permission denied."
+                if status == "timeout":
+                    return "Permission request timed out."
+                return "Permission required."
+
+            if status == "approved" and agent_mode == "default" and not shell_unrestricted and cmd_name not in unrestricted_allowset:
+                _ensure_shell_unrestricted_allowlist_entry(cmd_name)
+
+            try:
+                returncode, output = await asyncio.to_thread(_run_unsandboxed)
+            except subprocess.TimeoutExpired:
+                return "Command timed out."
+
+        if ran_sandbox and returncode != 0 and _looks_like_permission_denied(output):
+            request_id = None
+            try:
+                from database import db
+                request_id = db.create_permission_request(
+                    tool_name=self.name,
+                    action="execute_unrestricted",
+                    path=str(command),
+                    reason="Sandbox permission denied. Allow unrestricted execution?",
+                    session_id=tool_ctx.get("session_id")
+                )
+            except Exception:
+                request_id = None
+
+            timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
+            status = await _wait_for_permission(request_id, timeout_sec)
+            if status not in ("approved", "approved_once"):
+                if status == "denied":
+                    return f"[exit_code={returncode}]\n{output}"
+                if status == "timeout":
+                    return "Permission request timed out."
+                return "Permission required."
+
+            if status == "approved" and agent_mode == "default" and not shell_unrestricted and cmd_name not in unrestricted_allowset:
+                _ensure_shell_unrestricted_allowlist_entry(cmd_name)
+
+            try:
+                returncode, output = await asyncio.to_thread(_run_unsandboxed)
+            except subprocess.TimeoutExpired:
+                return "Command timed out."
 
         if not output:
             output = "(no output)"

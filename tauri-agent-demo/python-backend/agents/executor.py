@@ -74,6 +74,8 @@ class AgentExecutor:
             agent_mode = None
             if request_overrides and request_overrides.get("agent_mode") is not None:
                 agent_mode = str(request_overrides.get("agent_mode") or "default").lower()
+                if agent_mode not in ("default", "super"):
+                    agent_mode = "default"
             work_path = None
             if request_overrides and request_overrides.get("work_path"):
                 work_path = request_overrides.get("work_path")

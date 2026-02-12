@@ -965,17 +965,45 @@
 }
 
 .workdir-markdown pre {
-  background: #1b1b1b;
-  border: 1px solid #2d2d2d;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
   padding: 12px;
   border-radius: 6px;
   overflow-x: auto;
 }
 
 .workdir-markdown code {
-  background: #2d2d2d;
-  padding: 2px 4px;
+  background: transparent;
+  padding: 2px 5px;
   border-radius: 4px;
+}
+
+.workdir-markdown table {
+  border-collapse: collapse;
+  border-spacing: 0;
+  display: inline-table;
+  width: auto;
+  max-width: 100%;
+  table-layout: auto;
+  margin: 0.4rem 0 0.6rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.workdir-markdown thead th {
+  text-align: left;
+  font-weight: 600;
+  color: #e2e8f0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.28);
+  padding: 4px 8px;
+}
+
+.workdir-markdown tbody td {
+  padding: 4px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.workdir-markdown tbody tr:last-child td {
+  border-bottom: none;
 }
 
 .workdir-markdown .katex {

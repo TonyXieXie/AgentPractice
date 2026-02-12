@@ -27,7 +27,7 @@ interface AgentStepViewProps {
     messageId?: number;
     streaming?: boolean;
     pendingPermission?: ToolPermissionRequest | null;
-    onPermissionDecision?: (status: 'approved' | 'denied') => void;
+    onPermissionDecision?: (status: 'approved' | 'approved_once' | 'denied') => void;
     permissionBusy?: boolean;
     onRetryMessage?: () => void;
     onRollbackMessage?: () => void;
@@ -173,6 +173,14 @@ function RichContent({ content, onClick }: { content: string; onClick?: MouseEve
 
 function looksLikeDiff(content: string) {
     return /^diff --git /m.test(content) || /^@@\s+-\d+/m.test(content);
+}
+
+function parseExitCode(content: string) {
+    if (!content) return null;
+    const match = content.match(/\[exit_code\s*=\s*(-?\d+)\]/i);
+    if (!match) return null;
+    const value = Number(match[1]);
+    return Number.isFinite(value) ? value : null;
 }
 
 type ApplyPatchResult = {
@@ -1628,11 +1636,12 @@ function AgentStepView({
             <div className="agent-step-content">
                 <div className="permission-card">
                     <div className="permission-title">Shell 权限请求</div>
-                    <div className="permission-subtitle">该命令不在 allowlist 中，是否允许执行？</div>
+                    <div className="permission-subtitle">该操作需要权限确认，是否允许执行？</div>
                     <div className="permission-command">{pendingPermission.path}</div>
                     {pendingPermission.reason && (
                         <div className="permission-reason">{pendingPermission.reason}</div>
                     )}
+                    <div className="permission-note">仅此一次：只放行本次；始终允许：加入全局允许列表。</div>
                     <div className="permission-actions">
                         <button
                             type="button"
@@ -1645,10 +1654,20 @@ function AgentStepView({
                         <button
                             type="button"
                             className="permission-btn allow"
+                            onClick={() => onPermissionDecision && onPermissionDecision('approved_once')}
+                            disabled={permissionBusy || !onPermissionDecision}
+                            title="仅本次允许，不会加入全局允许列表"
+                        >
+                            仅此一次
+                        </button>
+                        <button
+                            type="button"
+                            className="permission-btn allow"
                             onClick={() => onPermissionDecision && onPermissionDecision('approved')}
                             disabled={permissionBusy || !onPermissionDecision}
+                            title="加入全局允许列表，后续不再询问"
                         >
-                            允许
+                            始终允许
                         </button>
                     </div>
                 </div>
@@ -1687,11 +1706,16 @@ function AgentStepView({
                 let observationPreview = '';
                 let observationHasMore = false;
                 let observationIsDiff = false;
+                let observationFailed = false;
                 let applyPatchResult: ApplyPatchResult | null = null;
                 let isApplyPatch = false;
                 let astPayload: AstPayload | null = null;
                 if (isObservation) {
                     observationText = rawContent.replace(/\r\n/g, '\n');
+                    const exitCode = parseExitCode(observationText);
+                    if (exitCode !== null && exitCode !== 0) {
+                        observationFailed = true;
+                    }
                     const lines = observationText.split('\n');
                     observationHasMore = lines.length > 1;
                     observationPreview = observationHasMore ? `${lines[0]} ...` : lines[0] || '';
@@ -1699,6 +1723,9 @@ function AgentStepView({
                     isApplyPatch = toolName === 'apply_patch';
                     if (isApplyPatch) {
                         applyPatchResult = parseApplyPatchResult(observationText);
+                        if (applyPatchResult && applyPatchResult.ok === false) {
+                            observationFailed = true;
+                        }
                     } else if (isAstObservation) {
                         astPayload = parseAstPayload(observationText);
                     }
@@ -1716,6 +1743,9 @@ function AgentStepView({
                             <div className="agent-step-header">
                                     <span className="agent-step-category">{CATEGORY_LABELS[category]}</span>
                                     <div className="agent-step-header-actions">
+                                        {isObservation && observationFailed && (
+                                            <span className="agent-step-failure-icon" title="Failed">X</span>
+                                        )}
                                         <span className="agent-step-type">{step.step_type}</span>
                                         {showObservationToggle && (
                                             <button

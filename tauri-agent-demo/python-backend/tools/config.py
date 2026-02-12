@@ -31,6 +31,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
             "git",
             "rg"
         ],
+        "unrestricted_allowlist": [],
         "timeout_sec": 30,
         "max_output": 20000,
         "permission_timeout_sec": 300

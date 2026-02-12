@@ -4,7 +4,7 @@ from typing import Optional, Dict, Any, Literal, List
 # LLM API format and profile
 LLMApiFormat = Literal["openai_chat_completions", "openai_responses"]
 LLMProfile = Literal["openai", "openai_compatible", "deepseek", "zhipu"]
-AgentMode = Literal["default", "shell_safe", "super"]
+AgentMode = Literal["default", "super"]
 class LLMConfig(BaseModel):
     id: Optional[str] = None
     name: str

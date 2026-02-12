@@ -62,7 +62,6 @@ const REASONING_OPTIONS: { value: ReasoningEffort; label: string }[] = [
 
 const AGENT_MODE_OPTIONS: { value: AgentMode; label: string; description: string }[] = [
   { value: 'default', label: '默认', description: '使用默认安全策略' },
-  { value: 'shell_safe', label: 'Shell安全', description: '允许部分操作（基于允许列表）' },
   { value: 'super', label: '超级', description: '允许所有操作' },
 ];
 
@@ -2389,10 +2388,38 @@ function App() {
     };
   };
 
+  const resolvePendingPermission = async (
+    sessionKey: string,
+    status: 'approved' | 'approved_once' | 'denied',
+    options?: { silent?: boolean }
+  ) => {
+    const pending = pendingPermissionBySessionRef.current[sessionKey];
+    if (!pending || permissionBusyBySessionRef.current[sessionKey]) return;
+    permissionBusyBySessionRef.current[sessionKey] = true;
+    bumpPermissions();
+    try {
+      await updateToolPermission(pending.id, status);
+      if (pendingPermissionBySessionRef.current[sessionKey]?.id === pending.id) {
+        delete pendingPermissionBySessionRef.current[sessionKey];
+      }
+    } catch (error) {
+      console.error('Failed to update permission:', error);
+      if (!options?.silent) {
+        alert('权限更新失败');
+      }
+    } finally {
+      permissionBusyBySessionRef.current[sessionKey] = false;
+      bumpPermissions();
+    }
+  };
+
   const handleStop = async () => {
     const sessionKey = getCurrentSessionKey();
     const inflight = inFlightBySessionRef.current[sessionKey];
     if (!inflight) return;
+    if (pendingPermissionBySessionRef.current[sessionKey]) {
+      await resolvePendingPermission(sessionKey, 'denied', { silent: true });
+    }
     inflight.stopRequested = true;
     inflight.abortController.abort();
     const activeAssistantId = inflight.activeAssistantId;
@@ -2420,24 +2447,9 @@ function App() {
     });
   };
 
-  const handlePermissionDecision = async (status: 'approved' | 'denied') => {
+  const handlePermissionDecision = async (status: 'approved' | 'approved_once' | 'denied') => {
     const sessionKey = getCurrentSessionKey();
-    const pending = pendingPermissionBySessionRef.current[sessionKey];
-    if (!pending || permissionBusyBySessionRef.current[sessionKey]) return;
-    permissionBusyBySessionRef.current[sessionKey] = true;
-    bumpPermissions();
-    try {
-      await updateToolPermission(pending.id, status);
-      if (pendingPermissionBySessionRef.current[sessionKey]?.id === pending.id) {
-        delete pendingPermissionBySessionRef.current[sessionKey];
-      }
-    } catch (error) {
-      console.error('Failed to update permission:', error);
-      alert('权限更新失败');
-    } finally {
-      permissionBusyBySessionRef.current[sessionKey] = false;
-      bumpPermissions();
-    }
+    await resolvePendingPermission(sessionKey, status);
   };
 
   const handleSelectSession = async (
