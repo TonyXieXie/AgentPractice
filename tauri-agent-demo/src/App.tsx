@@ -989,6 +989,7 @@ function App() {
     }
     scrollRafRef.current = window.requestAnimationFrame(() => {
       container.scrollTo({ top: container.scrollHeight, behavior: useBehavior });
+      lastScrollTopRef.current = container.scrollTop;
       scrollRafRef.current = null;
     });
   }, []);
@@ -1495,6 +1496,11 @@ function App() {
   const stashCurrentMessages = () => {
     const key = getCurrentSessionKey();
     messagesCacheRef.current[key] = messages;
+  };
+
+  const clearSessionCache = (sessionKey: string) => {
+    delete messagesCacheRef.current[sessionKey];
+    delete messagePagingRef.current[sessionKey];
   };
 
   const migrateSessionKey = (fromKey: string, toKey: string) => {
@@ -2434,7 +2440,10 @@ function App() {
     }
   };
 
-  const handleSelectSession = async (sessionId: string) => {
+  const handleSelectSession = async (
+    sessionId: string,
+    options?: { forceReload?: boolean; skipStash?: boolean }
+  ) => {
     const perfEnabled = SESSION_SWITCH_PROFILE && typeof performance !== 'undefined';
     const perfStart = perfEnabled ? performance.now() : 0;
     const perfMarks: Array<{ label: string; t: number }> = [];
@@ -2476,7 +2485,9 @@ function App() {
     try {
       autoScrollRef.current = true;
       forceAutoScrollRef.current = true;
-      stashCurrentMessages();
+      if (!options?.skipStash) {
+        stashCurrentMessages();
+      }
       currentSessionIdRef.current = sessionId;
       setCurrentSessionId(sessionId);
       setShowConfigSelector(false);
@@ -2484,6 +2495,9 @@ function App() {
       mark('setup');
 
       const sessionKey = getSessionKey(sessionId);
+      if (options?.forceReload) {
+        clearSessionCache(sessionKey);
+      }
       const cached = messagesCacheRef.current[sessionKey];
       const isStreamingSession = Boolean(inFlightBySessionRef.current[sessionKey]);
       const hasStreaming = Boolean(cached?.some((msg) => msg.metadata?.agent_streaming));
@@ -2637,7 +2651,14 @@ function App() {
 
     try {
       const result = await rollbackSession(currentSessionId, messageId);
-      await handleSelectSession(currentSessionId);
+      await handleSelectSession(currentSessionId, { forceReload: true, skipStash: true });
+      autoScrollRef.current = true;
+      forceAutoScrollRef.current = true;
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          scheduleScrollToBottom('auto');
+        });
+      });
       if (options?.keepInput) {
         setInputMsg(result.input_message || '');
         inputRef.current?.focus();

@@ -10,9 +10,11 @@ Provides:
 
 from typing import List, Dict, Optional, AsyncGenerator, Any
 import traceback
+import httpx
 from .base import AgentStep, AgentStrategy
 from .simple import SimpleAgent
 from .react import ReActAgent
+from llm_client import LLMTransientError
 from tools.base import Tool, ToolRegistry
 from tools.context import set_tool_context, reset_tool_context
 
@@ -118,10 +120,25 @@ class AgentExecutor:
         except Exception as e:
             # Catch any unhandled errors
             tb = traceback.format_exc()
+            suppress_prompt = isinstance(e, LLMTransientError)
+            if not suppress_prompt:
+                if isinstance(e, httpx.RequestError):
+                    suppress_prompt = True
+                elif isinstance(e, httpx.HTTPStatusError):
+                    status_code = getattr(e.response, "status_code", None)
+                    if status_code == 429:
+                        suppress_prompt = True
+            metadata = {"error": str(e), "error_type": type(e).__name__, "traceback": tb}
+            if suppress_prompt:
+                metadata["suppress_prompt"] = True
+                metadata["transient_error"] = True
+                status_code = getattr(e, "status_code", None)
+                if status_code is not None:
+                    metadata["status_code"] = status_code
             yield AgentStep(
                 step_type="error",
                 content=f"Agent execution failed: {str(e)}",
-                metadata={"error": str(e), "error_type": type(e).__name__, "traceback": tb}
+                metadata=metadata
             )
         finally:
             if token is not None:

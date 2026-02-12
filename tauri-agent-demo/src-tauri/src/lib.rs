@@ -4,7 +4,7 @@ use std::{
     sync::Mutex,
 };
 
-use tauri::{Manager, RunEvent};
+use tauri::{Manager, RunEvent, WindowEvent};
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -92,6 +92,14 @@ pub fn run() {
                 }
             }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    window.app_handle().exit(0);
+                }
+            }
         })
         .build(context)
         .expect("error while building tauri application");

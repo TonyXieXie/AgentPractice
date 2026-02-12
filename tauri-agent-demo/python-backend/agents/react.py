@@ -16,6 +16,7 @@ import httpx
 from .base import AgentStrategy, AgentStep
 from tools.base import Tool, tool_to_openai_function, tool_to_openai_responses_tool
 from context_estimate import build_context_estimate
+from llm_client import LLMTransientError
 
 
 TRUNCATION_MARKER_START = "[TRUNCATED_START]"
@@ -352,17 +353,39 @@ class ReActAgent(AgentStrategy):
                                 yield AgentStep(
                                     step_type="error",
                                     content="网络错误：连接中断，请重试。",
-                                    metadata={"error": str(e), "error_type": "ConnectError"}
+                                    metadata={
+                                        "error": str(e),
+                                        "error_type": "ConnectError",
+                                        "suppress_prompt": True,
+                                        "transient_error": True
+                                    }
                                 )
                                 return
                             if connect_attempt >= max_connect_retries:
                                 yield AgentStep(
                                     step_type="error",
                                     content=f"网络错误：连接失败（已重试{max_connect_retries}次）",
-                                    metadata={"error": str(e), "error_type": "ConnectError"}
+                                    metadata={
+                                        "error": str(e),
+                                        "error_type": "ConnectError",
+                                        "suppress_prompt": True,
+                                        "transient_error": True
+                                    }
                                 )
                                 return
                             continue
+                        except LLMTransientError as e:
+                            yield AgentStep(
+                                step_type="error",
+                                content=str(e),
+                                metadata={
+                                    "error": str(e),
+                                    "error_type": type(e).__name__,
+                                    "suppress_prompt": True,
+                                    "transient_error": True
+                                }
+                            )
+                            return
 
                     if not connect_ok:
                         return
@@ -593,17 +616,39 @@ class ReActAgent(AgentStrategy):
                             yield AgentStep(
                                 step_type="error",
                                 content="网络错误：连接中断，请重试。",
-                                metadata={"error": str(e), "error_type": "ConnectError"}
+                                metadata={
+                                    "error": str(e),
+                                    "error_type": "ConnectError",
+                                    "suppress_prompt": True,
+                                    "transient_error": True
+                                }
                             )
                             return
                         if connect_attempt >= max_connect_retries:
                             yield AgentStep(
                                 step_type="error",
                                 content=f"网络错误：连接失败（已重试{max_connect_retries}次）",
-                                metadata={"error": str(e), "error_type": "ConnectError"}
+                                metadata={
+                                    "error": str(e),
+                                    "error_type": "ConnectError",
+                                    "suppress_prompt": True,
+                                    "transient_error": True
+                                }
                             )
                             return
                         continue
+                    except LLMTransientError as e:
+                        yield AgentStep(
+                            step_type="error",
+                            content=str(e),
+                            metadata={
+                                "error": str(e),
+                                "error_type": type(e).__name__,
+                                "suppress_prompt": True,
+                                "transient_error": True
+                            }
+                        )
+                        return
 
                 if not connect_ok:
                     return
@@ -795,10 +840,16 @@ class ReActAgent(AgentStrategy):
                 llm_output = response.get("content", "")
 
             except Exception as e:
+                suppress_prompt = isinstance(e, LLMTransientError)
+                metadata = {"iteration": iteration, "error": str(e), "traceback": traceback.format_exc()}
+                if suppress_prompt:
+                    metadata["suppress_prompt"] = True
+                    metadata["transient_error"] = True
+                    metadata["error_type"] = type(e).__name__
                 yield AgentStep(
                     step_type="error",
                     content=f"LLM call failed: {str(e)}",
-                    metadata={"iteration": iteration, "error": str(e), "traceback": traceback.format_exc()}
+                    metadata=metadata
                 )
                 return
 

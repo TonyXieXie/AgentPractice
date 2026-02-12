@@ -500,7 +500,16 @@ async def _maybe_compress_context(
 
     def build_uncompressed_messages(after_id: Optional[int]) -> List[Dict[str, Any]]:
         messages = db.get_dialogue_messages_after(session_id, after_id)
-        return [msg for msg in messages if msg.get("id") != current_user_message_id]
+        filtered = []
+        for msg in messages:
+            if msg.get("id") == current_user_message_id:
+                continue
+            if msg.get("role") == "assistant":
+                content_text = str(msg.get("content") or "")
+                if not content_text.strip():
+                    continue
+            filtered.append(msg)
+        return filtered
 
     uncompressed = build_uncompressed_messages(last_message_id)
     initial_tokens = _estimate_tokens_for_text(summary) + _estimate_tokens_for_messages(uncompressed)
@@ -1375,7 +1384,15 @@ async def chat_agent_stream(request: ChatRequest):
             code_map: Optional[str]
         ) -> List[Dict[str, str]]:
             messages = db.get_dialogue_messages_after(session.id, after_message_id)
-            filtered = [msg for msg in messages if msg.get("id") != user_msg.id]
+            filtered = []
+            for msg in messages:
+                if msg.get("id") == user_msg.id:
+                    continue
+                if msg.get("role") == "assistant":
+                    content_text = str(msg.get("content") or "")
+                    if not content_text.strip():
+                        continue
+                filtered.append(msg)
             history = [{"role": msg.get("role"), "content": msg.get("content")} for msg in filtered]
             if summary:
                 history.insert(0, {"role": "assistant", "content": f"{CONTEXT_SUMMARY_MARKER}\n{summary}"})
@@ -1481,6 +1498,13 @@ async def chat_agent_stream(request: ChatRequest):
 
                     if step.step_type.endswith("_delta"):
                         saw_delta = True
+                        yield f"data: {json.dumps(step.to_dict())}\n\n"
+                        continue
+                    suppress_prompt = False
+                    if step.step_type == "error":
+                        suppress_prompt = bool(step.metadata.get("suppress_prompt")) if isinstance(step.metadata, dict) else False
+
+                    if suppress_prompt:
                         yield f"data: {json.dumps(step.to_dict())}\n\n"
                         continue
 

@@ -50,6 +50,15 @@
         "name": "Concise Output",
         "type": "output_format",
         "prompt": "Be concise and actionable."
+      },
+      {
+        "id": "websear",
+        "name": "WebSear",
+        "type": "tooling",
+        "prompt": "Prefer web search for more information.",
+        "tools": [
+          "search"
+        ]
       }
     ],
     "profiles": [
@@ -60,9 +69,15 @@
           "tools_all",
           "rg_search",
           "apply_patch",
-          "code_map",
           "tool_json",
           "output_concise"
+        ]
+      },
+      {
+        "id": "search",
+        "name": "Search",
+        "abilities": [
+          "websear"
         ]
       }
     ],
@@ -73,7 +88,7 @@
     }
   },
   "context": {
-    "compression_enabled": false,
+    "compression_enabled": true,
     "compress_start_pct": 75,
     "compress_target_pct": 25,
     "min_keep_messages": 1,

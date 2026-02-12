@@ -13,6 +13,7 @@ import traceback
 from .base import AgentStrategy, AgentStep
 from message_processor import message_processor
 from context_estimate import build_context_estimate
+from llm_client import LLMTransientError
 
 
 class SimpleAgent(AgentStrategy):
@@ -126,10 +127,16 @@ class SimpleAgent(AgentStrategy):
                 }
             )
         except Exception as e:
+            suppress_prompt = isinstance(e, LLMTransientError)
+            metadata = {"error": str(e), "traceback": traceback.format_exc()}
+            if suppress_prompt:
+                metadata["suppress_prompt"] = True
+                metadata["transient_error"] = True
+                metadata["error_type"] = type(e).__name__
             yield AgentStep(
                 step_type="error",
                 content=f"LLM call failed: {str(e)}",
-                metadata={"error": str(e), "traceback": traceback.format_exc()}
+                metadata=metadata
             )
 
     def build_prompt(
