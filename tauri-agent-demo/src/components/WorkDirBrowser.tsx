@@ -141,6 +141,20 @@ const injectMermaidFences = (content: string) => {
 
 const normalizeMermaidSource = (value: string) => {
   if (!value) return value;
+  const detectMermaidDiagramType = (input: string) => {
+    const lines = input.split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (trimmed.startsWith('%%')) continue;
+      const match = trimmed.match(
+        /^(graph|flowchart|sequenceDiagram|classDiagram|stateDiagram(?:-v2)?|erDiagram|gantt|journey|pie|gitGraph|mindmap|timeline|quadrantChart|sankey-beta)\b/i
+      );
+      if (match) return match[1].toLowerCase();
+      break;
+    }
+    return '';
+  };
   const stripTrailingEscapedNewlines = (line: string) => {
     const isOutsideIndex = (text: string, index: number) => {
       let depthSquare = 0;
@@ -351,7 +365,9 @@ const normalizeMermaidSource = (value: string) => {
     .split('\n')
     .map(stripTrailingEscapedNewlines)
     .join('\n');
-  return normalizeCurlyLabels(normalizeSquareLabels(normalized));
+  const diagramType = detectMermaidDiagramType(normalized);
+  const shouldNormalizeLabels = !['classdiagram', 'erdiagram'].includes(diagramType);
+  return shouldNormalizeLabels ? normalizeCurlyLabels(normalizeSquareLabels(normalized)) : normalized;
 };
 
 const renderMarkdownHtml = (content: string) => markdown.render(injectMermaidFences(content || ''));

@@ -764,6 +764,20 @@ function AgentStepView({
         const normalizeMermaidSource = (value: string) => {
             if (!value) return value;
             let changed = false;
+            const detectMermaidDiagramType = (input: string) => {
+                const lines = input.split('\n');
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed) continue;
+                    if (trimmed.startsWith('%%')) continue;
+                    const match = trimmed.match(
+                        /^(graph|flowchart|sequenceDiagram|classDiagram|stateDiagram(?:-v2)?|erDiagram|gantt|journey|pie|gitGraph|mindmap|timeline|quadrantChart|sankey-beta)\b/i
+                    );
+                    if (match) return match[1].toLowerCase();
+                    break;
+                }
+                return '';
+            };
             const arrowTokens = ['-->', '==>', '-.->', '<-->', '<--', '<=='];
             const matchArrow = (text: string, index: number) => {
                 for (const arrow of arrowTokens) {
@@ -1065,7 +1079,11 @@ function AgentStepView({
                 .split('\n')
                 .map((line) => stripTrailingEscapedNewlines(splitConcatenatedEdges(line)))
                 .join('\n');
-            const escaped = normalizeCurlyLabels(normalizeSquareLabels(normalized));
+            const diagramType = detectMermaidDiagramType(normalized);
+            const shouldNormalizeLabels = !['classdiagram', 'erdiagram'].includes(diagramType);
+            const escaped = shouldNormalizeLabels
+                ? normalizeCurlyLabels(normalizeSquareLabels(normalized))
+                : normalized;
             if (changed) logMermaid('debug', 'normalized mermaid source');
             return escaped;
         };

@@ -50,7 +50,20 @@ fn spawn_backend<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Child, 
     std::fs::create_dir_all(&app_data_dir)
         .map_err(|err| format!("Failed to create app data directory: {err}"))?;
 
-    let db_path = app_data_dir.join("chat_app.db");
+    let db_path = std::env::var("TAURI_AGENT_DB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            if tauri::is_dev() {
+                let dev_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("python-backend")
+                    .join("chat_app.db");
+                if dev_candidate.exists() {
+                    return dev_candidate;
+                }
+            }
+            app_data_dir.join("chat_app.db")
+        });
     let app_config_path = app_data_dir.join("app_config.json");
     let tools_config_path = app_data_dir.join("tools_config.json");
     let backend_path = resolve_backend_path(app)?;
