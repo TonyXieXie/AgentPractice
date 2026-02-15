@@ -1,0 +1,34 @@
+#!/bin/bash
+set -euo pipefail
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rg"
+
+if [ -n "${RG_EXE:-}" ] && [ -x "${RG_EXE}" ]; then
+  exec "${RG_EXE}" "$@"
+fi
+if [ -n "${RIPGREP_EXE:-}" ] && [ -x "${RIPGREP_EXE}" ]; then
+  exec "${RIPGREP_EXE}" "$@"
+fi
+
+CANDIDATES=(
+  "/Applications/Codex.app/Contents/Resources/rg"
+  "/opt/homebrew/bin/rg"
+  "/usr/local/bin/rg"
+  "/usr/bin/rg"
+)
+
+for c in "${CANDIDATES[@]}"; do
+  if [ -x "$c" ] && [ "$c" != "$SELF" ]; then
+    exec "$c" "$@"
+  fi
+done
+
+if command -v rg >/dev/null 2>&1; then
+  RG_PATH="$(command -v rg)"
+  if [ "$RG_PATH" != "$SELF" ]; then
+    exec "$RG_PATH" "$@"
+  fi
+fi
+
+echo "rg not found. Install ripgrep (brew install ripgrep) or set RG_EXE." >&2
+exit 127
