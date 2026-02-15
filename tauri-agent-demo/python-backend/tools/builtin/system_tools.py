@@ -538,19 +538,17 @@ def _escape_seatbelt_path(path: Path) -> str:
 
 def _build_macos_sandbox_profile(roots: List[Path]) -> str:
     allowed_paths = [_escape_seatbelt_path(root) for root in roots if root]
+    profile_lines = [
+        "(version 1)",
+        "(allow default)",
+        '(deny file-write* (subpath "/"))'
+    ]
     allow_blocks = [
-        '(allow file-read* (subpath "/usr") (subpath "/bin") (subpath "/System") (subpath "/Library"))',
-        '(allow file-read* file-write* (subpath "/tmp") (subpath "/private/tmp") (subpath "/var/tmp"))',
-        "(allow network*)",
-        "(allow process-exec)",
-        "(allow process-fork)",
-        "(allow process-signal)",
-        "(allow sysctl-read)"
+        '(allow file-write* (subpath "/tmp") (subpath "/private/tmp") (subpath "/var/tmp") (subpath "/dev"))'
     ]
     if allowed_paths:
         roots_clause = " ".join([f'(subpath "{path}")' for path in allowed_paths])
-        allow_blocks.append(f"(allow file-read* file-write* {roots_clause})")
-    profile_lines = ["(version 1)", "(deny default)"]
+        allow_blocks.append(f"(allow file-write* {roots_clause})")
     profile_lines.extend(allow_blocks)
     return "\n".join(profile_lines)
 

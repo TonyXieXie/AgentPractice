@@ -14,6 +14,20 @@ fn greet(name: &str) -> String {
 
 struct BackendChild(Mutex<Option<Child>>);
 
+fn log_sandbox_status() {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let home_in_container = home.contains("/Library/Containers/");
+        let sandbox_id = std::env::var("APP_SANDBOX_CONTAINER_ID").unwrap_or_default();
+        let sandbox_label = if sandbox_id.is_empty() { "(none)" } else { &sandbox_id };
+        eprintln!(
+            "[Sandbox] macos home_in_container={} app_sandbox_id={}",
+            home_in_container, sandbox_label
+        );
+    }
+}
+
 fn resolve_backend_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
     let resource_dir = app
         .path()
@@ -43,6 +57,14 @@ fn resolve_backend_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<
 }
 
 fn spawn_backend<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Child, String> {
+    if std::env::var("TAURI_AGENT_EXTERNAL_BACKEND")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        eprintln!("[Backend] External backend enabled; skipping sidecar spawn.");
+        return Err("External backend enabled; skipping sidecar spawn.".to_string());
+    }
+    eprintln!("[Backend] Spawning sidecar backend.");
     let app_data_dir = app
         .path()
         .app_data_dir()
@@ -93,13 +115,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![greet])
         .setup(|app| {
+            log_sandbox_status();
             match spawn_backend(&app.handle()) {
                 Ok(child) => {
                     app.manage(BackendChild(Mutex::new(Some(child))));
                 }
                 Err(err) => {
                     eprintln!("{err}");
-                    if !tauri::is_dev() {
+                    if !tauri::is_dev()
+                        && !err.contains("External backend enabled")
+                    {
                         return Err(err.into());
                     }
                 }
