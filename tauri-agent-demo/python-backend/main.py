@@ -9,6 +9,8 @@ import argparse
 import shlex
 import base64
 import time
+import atexit
+import signal
 from io import BytesIO
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
@@ -37,6 +39,7 @@ from tools.base import ToolRegistry
 from tools.config import get_tool_config, update_tool_config, get_tool_config_path
 from tools.context import set_tool_context, reset_tool_context
 from tools.builtin.system_tools import ApplyPatchTool, CodeAstTool
+from tools.pty_manager import get_pty_manager
 from stream_control import stream_stop_registry
 from app_config import get_app_config, update_app_config, get_app_config_path
 from ghost_snapshot import restore_snapshot
@@ -56,6 +59,30 @@ app.add_middleware(
 )
 
 register_builtin_tools()
+
+def _close_all_ptys() -> None:
+    try:
+        count = get_pty_manager().close_all()
+        if count:
+            print(f"[PTY] closed {count} sessions")
+    except Exception:
+        pass
+
+atexit.register(_close_all_ptys)
+try:
+    signal.signal(signal.SIGTERM, lambda *_: _close_all_ptys())
+    signal.signal(signal.SIGINT, lambda *_: _close_all_ptys())
+except Exception:
+    pass
+
+@app.on_event("shutdown")
+def _shutdown_cleanup():
+    try:
+        count = get_pty_manager().close_all()
+        if count:
+            print(f"[PTY] closed {count} sessions on shutdown")
+    except Exception:
+        pass
 
 # ==================== AST Cache ====================
 
@@ -557,6 +584,10 @@ def update_session(session_id: str, update: ChatSessionUpdate):
 @app.delete("/sessions/{session_id}")
 def delete_session(session_id: str):
     if db.delete_session(session_id):
+        try:
+            get_pty_manager().close_session(session_id)
+        except Exception:
+            pass
         return {"success": True}
     raise HTTPException(status_code=404, detail="Session not found")
 

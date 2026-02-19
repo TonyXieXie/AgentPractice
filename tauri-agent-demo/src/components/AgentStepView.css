@@ -461,6 +461,110 @@
     gap: 6px;
 }
 
+.shell-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: #0f131a;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    padding: 10px 12px;
+}
+
+.shell-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.shell-card-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #cbd5e1;
+}
+
+.shell-card-badges {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.shell-badge {
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    background: rgba(148, 163, 184, 0.12);
+    color: #cbd5e1;
+    padding: 2px 8px;
+    font-size: 0.68rem;
+    text-transform: lowercase;
+}
+
+.shell-badge.ok {
+    border-color: rgba(74, 222, 128, 0.35);
+    background: rgba(74, 222, 128, 0.12);
+    color: #bbf7d0;
+}
+
+.shell-badge.err {
+    border-color: rgba(248, 113, 113, 0.4);
+    background: rgba(248, 113, 113, 0.12);
+    color: #fecaca;
+}
+
+.shell-badge.warn {
+    border-color: rgba(251, 191, 36, 0.4);
+    background: rgba(251, 191, 36, 0.12);
+    color: #fde68a;
+}
+
+.shell-card-meta {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 6px 12px;
+}
+
+.shell-meta-item {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    color: #94a3b8;
+    font-size: 0.72rem;
+}
+
+.shell-meta-label {
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #64748b;
+    font-size: 0.64rem;
+}
+
+.shell-meta-value {
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    color: #e2e8f0;
+}
+
+.shell-card-output {
+    background: #0b0f14;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: #e2e8f0;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.shell-card-output.expanded {
+    max-height: 360px;
+    overflow: auto;
+}
+
 .ast-view {
     display: flex;
     flex-direction: column;

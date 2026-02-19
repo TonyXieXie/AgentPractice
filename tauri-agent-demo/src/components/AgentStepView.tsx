@@ -183,6 +183,98 @@ function parseExitCode(content: string) {
     return Number.isFinite(value) ? value : null;
 }
 
+type ShellHeader = {
+    pty_id?: string;
+    status?: string;
+    pty?: boolean;
+    exit_code?: number;
+    idle_timeout?: number;
+    buffer_size?: number;
+    cursor?: number;
+    reset?: boolean;
+    pty_fallback?: boolean;
+};
+
+function parseShellHeaderLine(line: string) {
+    const match = line.match(/^\[([^\]]+)\](.*)$/);
+    if (!match) return { header: null as ShellHeader | null, extraText: '' };
+    const header: ShellHeader = {};
+    const parseToken = (token: string) => {
+        if (!token.includes('=')) return false;
+        const [rawKey, rawValue] = token.split('=');
+        if (!rawKey || rawValue === undefined) return false;
+        const key = rawKey.trim().toLowerCase();
+        const value = rawValue.trim();
+        const lower = value.toLowerCase();
+        switch (key) {
+            case 'pty_id':
+                header.pty_id = value;
+                return true;
+            case 'status':
+                header.status = value;
+                return true;
+            case 'pty':
+                header.pty = lower === 'true';
+                return true;
+            case 'exit_code': {
+                const num = Number(value);
+                if (Number.isFinite(num)) header.exit_code = num;
+                return true;
+            }
+            case 'idle_timeout': {
+                const num = Number(value);
+                if (Number.isFinite(num)) header.idle_timeout = num;
+                return true;
+            }
+            case 'buffer_size': {
+                const num = Number(value);
+                if (Number.isFinite(num)) header.buffer_size = num;
+                return true;
+            }
+            case 'cursor': {
+                const num = Number(value);
+                if (Number.isFinite(num)) header.cursor = num;
+                return true;
+            }
+            case 'reset':
+                header.reset = lower === 'true';
+                return true;
+            case 'pty_fallback':
+                header.pty_fallback = lower === 'true';
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    match[1].trim().split(/\s+/).forEach(parseToken);
+    const extraTokens = (match[2] || '').trim().split(/\s+/).filter(Boolean);
+    const extras: string[] = [];
+    extraTokens.forEach((token) => {
+        if (!parseToken(token)) {
+            extras.push(token);
+        }
+    });
+    return { header, extraText: extras.join(' ') };
+}
+
+function parseShellOutput(raw: string) {
+    if (!raw) return null;
+    const normalized = raw.replace(/\r\n/g, '\n');
+    const lines = normalized.split('\n');
+    if (!lines.length) return null;
+    const { header, extraText } = parseShellHeaderLine(lines[0].trim());
+    if (!header) return null;
+    const rest = lines.slice(1);
+    if (extraText) {
+        rest.unshift(extraText);
+    }
+    return {
+        header,
+        body: rest.join('\n')
+    };
+}
+
 type ApplyPatchResult = {
     ok: boolean;
     summary?: { path: string; added: number; removed: number }[];
@@ -1711,6 +1803,7 @@ function AgentStepView({
                 const lowerContent = trimmedContent.toLowerCase();
                 const toolName = String(step.metadata?.tool || '').toLowerCase();
                 const isAstObservation = isObservation && toolName === 'code_ast';
+                const isRunShell = isObservation && toolName === 'run_shell';
                 const looksLikeSearchCall =
                     /\bsearch\s*\[/i.test(rawContent) || /\bsearch\s*\(/i.test(rawContent) || lowerContent.startsWith('search');
                 const canTranslateSearch = isAction && (toolName === 'search' || looksLikeSearchCall) && hasUnicodeEscapes(rawContent);
@@ -1729,6 +1822,9 @@ function AgentStepView({
                 let applyPatchResult: ApplyPatchResult | null = null;
                 let isApplyPatch = false;
                 let astPayload: AstPayload | null = null;
+                let shellPayload: ReturnType<typeof parseShellOutput> | null = null;
+                let shellBody = '';
+                let shellPreview = '';
                 if (isObservation) {
                     observationText = rawContent.replace(/\r\n/g, '\n');
                     const exitCode = parseExitCode(observationText);
@@ -1747,6 +1843,19 @@ function AgentStepView({
                         }
                     } else if (isAstObservation) {
                         astPayload = parseAstPayload(observationText);
+                    } else if (isRunShell) {
+                        shellPayload = parseShellOutput(observationText);
+                        if (shellPayload) {
+                            shellBody = shellPayload.body || '';
+                            const bodyLines = shellBody.split('\n');
+                            observationHasMore = bodyLines.length > 1;
+                            shellPreview = observationHasMore ? `${bodyLines[0]} ...` : bodyLines[0] || '';
+                            observationPreview = shellPreview;
+                            observationIsDiff = false;
+                            if (typeof shellPayload.header.exit_code === 'number' && shellPayload.header.exit_code !== 0) {
+                                observationFailed = true;
+                            }
+                        }
                     }
                 }
                 const patchExpandedDefault = patchAggregate.patchCount > 1;
@@ -1804,7 +1913,68 @@ function AgentStepView({
                             </div>
                             {isObservation ? (
                                 <div className={`agent-step-content observation${isContextCompress ? ' compression' : ''}`}>
-                                    {isApplyPatch && applyPatchResult ? (
+                                    {shellPayload && isRunShell ? (
+                                        <div className="shell-card">
+                                            <div className="shell-card-header">
+                                                <span className="shell-card-title">Shell</span>
+                                                <div className="shell-card-badges">
+                                                    <span className={`shell-badge ${shellPayload.header.pty ? 'ok' : ''}`}>
+                                                        {shellPayload.header.pty ? 'PTY' : 'PIPE'}
+                                                    </span>
+                                                    {shellPayload.header.status && (
+                                                        <span className="shell-badge">status: {shellPayload.header.status}</span>
+                                                    )}
+                                                    {typeof shellPayload.header.exit_code === 'number' && (
+                                                        <span
+                                                            className={`shell-badge ${shellPayload.header.exit_code === 0 ? 'ok' : 'err'}`}
+                                                        >
+                                                            exit {shellPayload.header.exit_code}
+                                                        </span>
+                                                    )}
+                                                    {shellPayload.header.pty_fallback && (
+                                                        <span className="shell-badge warn">pty fallback</span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            <div className="shell-card-meta">
+                                                {shellPayload.header.pty_id && (
+                                                    <div className="shell-meta-item">
+                                                        <span className="shell-meta-label">pty_id</span>
+                                                        <span className="shell-meta-value">{shellPayload.header.pty_id}</span>
+                                                    </div>
+                                                )}
+                                                {typeof shellPayload.header.cursor === 'number' && (
+                                                    <div className="shell-meta-item">
+                                                        <span className="shell-meta-label">cursor</span>
+                                                        <span className="shell-meta-value">{shellPayload.header.cursor}</span>
+                                                    </div>
+                                                )}
+                                                {typeof shellPayload.header.idle_timeout === 'number' && (
+                                                    <div className="shell-meta-item">
+                                                        <span className="shell-meta-label">idle_timeout</span>
+                                                        <span className="shell-meta-value">{shellPayload.header.idle_timeout}ms</span>
+                                                    </div>
+                                                )}
+                                                {typeof shellPayload.header.buffer_size === 'number' && (
+                                                    <div className="shell-meta-item">
+                                                        <span className="shell-meta-label">buffer</span>
+                                                        <span className="shell-meta-value">{shellPayload.header.buffer_size}</span>
+                                                    </div>
+                                                )}
+                                                {typeof shellPayload.header.reset === 'boolean' && (
+                                                    <div className="shell-meta-item">
+                                                        <span className="shell-meta-label">reset</span>
+                                                        <span className="shell-meta-value">{String(shellPayload.header.reset)}</span>
+                                                    </div>
+                                                )}
+                                            </div>
+                                            <div className={`shell-card-output${isObservationExpanded ? ' expanded' : ''}`}>
+                                                {renderLinkedText(
+                                                    (isObservationExpanded ? shellBody : shellPreview) || '(no output)'
+                                                )}
+                                            </div>
+                                        </div>
+                                    ) : isApplyPatch && applyPatchResult ? (
                                         applyPatchResult.ok ? (
                                             <div className="patch-result">
                                                 <div className="patch-summary-header">
