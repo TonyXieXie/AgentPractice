@@ -84,7 +84,12 @@
     "default_profile": "default",
     "ast_enabled": true,
     "code_map": {
-      "enabled": true
+      "enabled": true,
+      "max_symbols": 40,
+      "max_files": 20,
+      "max_lines": 30,
+      "weight_refs": 1.0,
+      "weight_mentions": 2.0
     }
   },
   "context": {

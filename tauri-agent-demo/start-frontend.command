@@ -20,4 +20,4 @@ echo ""
 echo "========================================"
 echo ""
 
-npm run tauri dev
+npm run tauri dev -- --config "$ROOT/src-tauri/tauri.conf.dev.json"

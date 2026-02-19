@@ -2334,7 +2334,7 @@ class RunShellTool(Tool):
             "Run a shell command within the work path. "
             "Supports mode=oneshot|persistent. "
             "Persistent mode returns a pty_id and supports action=send|read|close|list. "
-            "Optional args: pty, stdin, timeout (ms), timeout_sec (s), idle_timeout (ms), "
+            "Optional args: stdin, timeout_sec (s), idle_timeout (ms), "
             "max_output (chars), buffer_size (bytes)."
         )
         self.parameters = [
@@ -2363,12 +2363,6 @@ class RunShellTool(Tool):
                 required=False
             ),
             ToolParameter(
-                name="pty",
-                type="boolean",
-                description="Whether to use a PTY if supported (default auto).",
-                required=False
-            ),
-            ToolParameter(
                 name="stdin",
                 type="string",
                 description="Stdin content to write (one-shot or send).",
@@ -2383,13 +2377,7 @@ class RunShellTool(Tool):
             ToolParameter(
                 name="timeout_sec",
                 type="number",
-                description="Timeout in seconds (ignored if timeout is provided).",
-                required=False
-            ),
-            ToolParameter(
-                name="timeout",
-                type="number",
-                description="Timeout in milliseconds (overrides timeout_sec if provided).",
+                description="Timeout in seconds.",
                 required=False
             ),
             ToolParameter(
@@ -2472,7 +2460,7 @@ class RunShellTool(Tool):
                 header = f"[pty_id={proc.id} status={proc.status} cursor={new_cursor} reset={str(reset).lower()}]"
                 if proc.status == "exited":
                     header = f"{header} exit_code={proc.exit_code}"
-                return f"{header}\n{chunk if chunk else '(no output)'}"
+                return f"{header}\n{chunk or ''}"
             if action == "close":
                 manager.close(session_id, str(pty_id))
                 return f"[pty_id={pty_id} status=closed]"
@@ -2532,9 +2520,15 @@ class RunShellTool(Tool):
         cwd = data.get("cwd")
         workdir = _resolve_path(cwd, self.name, "execute") if cwd else root
 
+        timeout_sec = None
         timeout_ms = data.get("timeout")
         if timeout_ms is not None:
-            timeout_sec = float(timeout_ms) / 1000.0
+            try:
+                timeout_ms = float(timeout_ms)
+            except (TypeError, ValueError):
+                timeout_ms = None
+        if timeout_ms is not None and timeout_ms > 0:
+            timeout_sec = timeout_ms / 1000.0
         else:
             timeout_value = data.get("timeout_sec")
             timeout_sec = float(timeout_value) if timeout_value is not None else float(get_tool_config().get("shell", {}).get("timeout_sec", 30))
@@ -2608,7 +2602,7 @@ class RunShellTool(Tool):
                 )
                 if pty_fallback:
                     header = f"{header} pty_fallback=true"
-                return f"{header}\n{chunk if chunk else '(no output)'}"
+                return f"{header}\n{chunk or ''}"
 
             if agent_mode == "super":
                 returncode, output = await asyncio.to_thread(_run_oneshot, False)
@@ -2656,7 +2650,7 @@ class RunShellTool(Tool):
                 )
                 if pty_fallback:
                     header = f"{header} pty_fallback=true"
-                return f"{header}\n{chunk if chunk else '(no output)'}"
+                return f"{header}\n{chunk or ''}"
 
             returncode, output = await asyncio.to_thread(_run_oneshot, False)
 

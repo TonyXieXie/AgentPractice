@@ -6,8 +6,10 @@ Implements a ReAct-style loop with tool calling.
 - Other providers: uses text-based Action/Action Input parsing
 """
 
+import asyncio
 import json
 import re
+import time
 import traceback
 from datetime import datetime
 from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
@@ -15,6 +17,7 @@ from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
 import httpx
 from .base import AgentStrategy, AgentStep
 from tools.base import Tool, tool_to_openai_function, tool_to_openai_responses_tool
+from tools.config import get_tool_config
 from context_estimate import build_context_estimate
 from llm_client import LLMTransientError
 from app_config import get_app_config
@@ -838,12 +841,42 @@ class ReActAgent(AgentStrategy):
                                 content=f"{tool_name}[{tool_input}]",
                                 metadata={"tool": tool_name, "input": tool_input, "iteration": iteration, "stream_key": call_key}
                             )
-                            tool_output = error_msg if error_msg else await self._execute_tool(tool, tool_input) if tool else f"Tool not found: '{tool_name}'"
-                            yield AgentStep(
-                                step_type="observation",
-                                content=tool_output,
-                                metadata={"tool": tool_name, "iteration": iteration}
-                            )
+
+                            tool_output = ""
+                            if error_msg:
+                                tool_output = error_msg
+                                yield AgentStep(
+                                    step_type="observation",
+                                    content=tool_output,
+                                    metadata={"tool": tool_name, "iteration": iteration}
+                                )
+                            elif tool is None:
+                                tool_output = f"Tool not found: '{tool_name}'"
+                                yield AgentStep(
+                                    step_type="observation",
+                                    content=tool_output,
+                                    metadata={"tool": tool_name, "iteration": iteration}
+                                )
+                            elif str(tool_name or "").lower() == "run_shell":
+                                output_holder: Dict[str, str] = {}
+                                stream_key = f"{call_key}-obs"
+                                async for obs_step in self._stream_run_shell_tool(
+                                    tool=tool,
+                                    tool_input=tool_input,
+                                    tool_name=tool_name,
+                                    iteration=iteration,
+                                    stream_key=stream_key,
+                                    output_holder=output_holder
+                                ):
+                                    yield obs_step
+                                tool_output = output_holder.get("output", "")
+                            else:
+                                tool_output = await self._execute_tool(tool, tool_input)
+                                yield AgentStep(
+                                    step_type="observation",
+                                    content=tool_output,
+                                    metadata={"tool": tool_name, "iteration": iteration}
+                                )
 
                             dynamic_response_items.append({
                                 "type": "function_call_output",
@@ -1086,12 +1119,41 @@ class ReActAgent(AgentStrategy):
                             content=f"{tool_name}[{tool_input}]",
                             metadata={"tool": tool_name, "input": tool_input, "iteration": iteration, "stream_key": call_key}
                         )
-                        tool_output = error_msg if error_msg else await self._execute_tool(tool, tool_input) if tool else f"Tool not found: '{tool_name}'"
-                        yield AgentStep(
-                            step_type="observation",
-                            content=tool_output,
-                            metadata={"tool": tool_name, "iteration": iteration}
-                        )
+                        tool_output = ""
+                        if error_msg:
+                            tool_output = error_msg
+                            yield AgentStep(
+                                step_type="observation",
+                                content=tool_output,
+                                metadata={"tool": tool_name, "iteration": iteration}
+                            )
+                        elif tool is None:
+                            tool_output = f"Tool not found: '{tool_name}'"
+                            yield AgentStep(
+                                step_type="observation",
+                                content=tool_output,
+                                metadata={"tool": tool_name, "iteration": iteration}
+                            )
+                        elif str(tool_name or "").lower() == "run_shell":
+                            output_holder: Dict[str, str] = {}
+                            stream_key = f"{call_key}-obs"
+                            async for obs_step in self._stream_run_shell_tool(
+                                tool=tool,
+                                tool_input=tool_input,
+                                tool_name=tool_name,
+                                iteration=iteration,
+                                stream_key=stream_key,
+                                output_holder=output_holder
+                            ):
+                                yield obs_step
+                            tool_output = output_holder.get("output", "")
+                        else:
+                            tool_output = await self._execute_tool(tool, tool_input)
+                            yield AgentStep(
+                                step_type="observation",
+                                content=tool_output,
+                                metadata={"tool": tool_name, "iteration": iteration}
+                            )
 
                     dynamic_messages.append({
                         "role": "tool",
@@ -1344,12 +1406,27 @@ class ReActAgent(AgentStrategy):
                 tool = self._get_tool(tools, action)
                 if tool:
                     try:
-                        observation = await tool.execute(action_input)
-                        yield AgentStep(
-                            step_type="observation",
-                            content=observation,
-                            metadata={"tool": action, "iteration": iteration}
-                        )
+                        observation = ""
+                        if str(action or "").lower() == "run_shell":
+                            output_holder: Dict[str, str] = {}
+                            stream_key = f"text-tool-{iteration}-{call_seq}"
+                            async for obs_step in self._stream_run_shell_tool(
+                                tool=tool,
+                                tool_input=action_input,
+                                tool_name=action,
+                                iteration=iteration,
+                                stream_key=stream_key,
+                                output_holder=output_holder
+                            ):
+                                yield obs_step
+                            observation = output_holder.get("output", "")
+                        else:
+                            observation = await tool.execute(action_input)
+                            yield AgentStep(
+                                step_type="observation",
+                                content=observation,
+                                metadata={"tool": action, "iteration": iteration}
+                            )
                         scratchpad.append({"text": f"Observation: {observation}", "origin_call_seq": current_call_seq})
                     except Exception as e:
                         error_msg = f"Tool execution failed: {str(e)}"
@@ -1495,6 +1572,45 @@ class ReActAgent(AgentStrategy):
         except json.JSONDecodeError as e:
             return None, f"Invalid JSON arguments: {e}"
 
+    def _split_shell_output(self, output: str) -> Tuple[str, str]:
+        if not output:
+            return "", ""
+        normalized = output.replace("\r\n", "\n")
+        if "\n" in normalized:
+            header, body = normalized.split("\n", 1)
+        else:
+            header, body = normalized, ""
+        return header.strip(), body
+
+    def _parse_shell_header(self, header_line: str) -> Dict[str, str]:
+        header_line = (header_line or "").strip()
+        if not header_line:
+            return {}
+        tokens: List[str] = []
+        if "]" in header_line:
+            prefix, rest = header_line.split("]", 1)
+            if prefix.startswith("["):
+                tokens.extend(prefix[1:].strip().split())
+            else:
+                tokens.extend(prefix.strip().split())
+            if rest:
+                tokens.extend(rest.strip().split())
+        else:
+            trimmed = header_line
+            if trimmed.startswith("[") and trimmed.endswith("]"):
+                trimmed = trimmed[1:-1]
+            tokens.extend(trimmed.strip().split())
+        parsed: Dict[str, str] = {}
+        for token in tokens:
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if key:
+                parsed[key] = value
+        return parsed
+
     def _extract_tool_input(self, tool: Tool, args: Dict[str, Any]) -> str:
         if not tool.parameters:
             return json.dumps(args) if args else ""
@@ -1522,6 +1638,229 @@ class ReActAgent(AgentStrategy):
             return await tool.execute(tool_input)
         except Exception as e:
             return f"Tool execution failed: {str(e)}"
+
+    async def _stream_run_shell_tool(
+        self,
+        tool: Tool,
+        tool_input: str,
+        tool_name: str,
+        iteration: int,
+        stream_key: str,
+        output_holder: Dict[str, str]
+    ) -> AsyncGenerator[AgentStep, None]:
+        args, parse_error = self._safe_json_loads(tool_input)
+        if parse_error or not isinstance(args, dict):
+            tool_output = parse_error or "Tool arguments must be a JSON object."
+            output_holder["output"] = tool_output
+            yield AgentStep(
+                step_type="observation",
+                content=tool_output,
+                metadata={"tool": tool_name, "iteration": iteration}
+            )
+            return
+
+        action = str(args.get("action") or "").strip().lower()
+        mode = str(args.get("mode") or "").strip().lower()
+        if action or mode == "persistent" or args.get("pty_id"):
+            tool_output = await self._execute_tool(tool, tool_input)
+            output_holder["output"] = tool_output
+            yield AgentStep(
+                step_type="observation",
+                content=tool_output,
+                metadata={"tool": tool_name, "iteration": iteration}
+            )
+            return
+
+        command = args.get("command")
+        if not command:
+            tool_output = await self._execute_tool(tool, tool_input)
+            output_holder["output"] = tool_output
+            yield AgentStep(
+                step_type="observation",
+                content=tool_output,
+                metadata={"tool": tool_name, "iteration": iteration}
+            )
+            return
+
+        start_args = dict(args)
+        start_args["mode"] = "persistent"
+        start_args.pop("action", None)
+        start_args.pop("pty_id", None)
+        start_args.pop("cursor", None)
+        if "idle_timeout" not in start_args:
+            start_args["idle_timeout"] = 120000
+
+        start_output = await self._execute_tool(tool, json.dumps(start_args))
+        header_line, body = self._split_shell_output(start_output)
+        header_data = self._parse_shell_header(header_line)
+        pty_id = header_data.get("pty_id")
+        status = header_data.get("status")
+        if not header_line or not pty_id:
+            output_holder["output"] = start_output
+            yield AgentStep(
+                step_type="observation",
+                content=start_output,
+                metadata={"tool": tool_name, "iteration": iteration}
+            )
+            return
+
+        if body.strip() == "(no output)" and status != "exited":
+            body = ""
+
+        command_text = str(command)
+        command_prefix = f"$ {command_text}" if command_text else ""
+        body_buffer = body
+        if command_prefix:
+            if body_buffer:
+                if not body_buffer.startswith(command_prefix):
+                    body_buffer = f"{command_prefix}\n{body_buffer}"
+            else:
+                body_buffer = command_prefix
+        initial_content = f"{header_line}\n{body_buffer}"
+        yield AgentStep(
+            step_type="observation",
+            content=initial_content,
+            metadata={
+                "tool": tool_name,
+                "iteration": iteration,
+                "stream_key": stream_key,
+                "streaming": True,
+                "command": str(command)
+            }
+        )
+
+        try:
+            max_output = args.get("max_output")
+            if max_output is None:
+                max_output = int(get_tool_config().get("shell", {}).get("max_output", 20000))
+            else:
+                max_output = int(max_output)
+        except (TypeError, ValueError):
+            max_output = int(get_tool_config().get("shell", {}).get("max_output", 20000))
+
+        timeout_sec = None
+        try:
+            timeout_ms = args.get("timeout")
+            timeout_ms = float(timeout_ms) if timeout_ms is not None else None
+        except (TypeError, ValueError):
+            timeout_ms = None
+        if timeout_ms is not None and timeout_ms > 0:
+            timeout_sec = timeout_ms / 1000.0
+        if timeout_sec is None:
+            try:
+                timeout_value = args.get("timeout_sec")
+                timeout_sec = float(timeout_value) if timeout_value is not None else None
+            except (TypeError, ValueError):
+                timeout_sec = None
+        if timeout_sec is None:
+            try:
+                timeout_sec = float(get_tool_config().get("shell", {}).get("timeout_sec", 30))
+            except (TypeError, ValueError):
+                timeout_sec = None
+
+        cursor = None
+        start_time = time.monotonic()
+        timed_out = False
+        error_output: Optional[str] = None
+        last_header_line = header_line
+
+        while True:
+            if timeout_sec is not None and timeout_sec > 0:
+                if (time.monotonic() - start_time) >= timeout_sec:
+                    timed_out = True
+                    break
+
+            read_args: Dict[str, Any] = {"action": "read", "pty_id": pty_id}
+            if cursor is not None:
+                read_args["cursor"] = cursor
+            if max_output is not None:
+                read_args["max_output"] = max_output
+
+            read_output = await self._execute_tool(tool, json.dumps(read_args))
+            read_header, chunk = self._split_shell_output(read_output)
+            if read_header and not read_header.startswith("["):
+                error_output = read_output
+                break
+            if read_header:
+                header_data = self._parse_shell_header(read_header)
+                last_header_line = read_header
+                status = header_data.get("status")
+                if header_data.get("cursor") is not None:
+                    try:
+                        cursor = int(header_data.get("cursor"))
+                    except (TypeError, ValueError):
+                        cursor = cursor
+                reset = header_data.get("reset") == "true"
+            else:
+                reset = False
+                status = None
+
+            if chunk.strip() == "(no output)":
+                chunk = ""
+
+            if chunk:
+                if reset:
+                    body_buffer = chunk
+                    if command_prefix:
+                        if body_buffer:
+                            if not body_buffer.startswith(command_prefix):
+                                body_buffer = f"{command_prefix}\n{body_buffer}"
+                        else:
+                            body_buffer = command_prefix
+                else:
+                    if command_prefix and body_buffer.startswith(command_prefix) and not body_buffer.endswith("\n") and not chunk.startswith("\n"):
+                        body_buffer += "\n"
+                    body_buffer += chunk
+                yield AgentStep(
+                    step_type="observation_delta",
+                    content=chunk,
+                    metadata={
+                        "tool": tool_name,
+                        "iteration": iteration,
+                        "stream_key": stream_key,
+                        "reset": bool(reset),
+                        "command": str(command)
+                    }
+                )
+
+            if status == "exited":
+                if not chunk:
+                    break
+                continue
+
+            if not chunk:
+                await asyncio.sleep(0.05)
+
+        if error_output:
+            await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+            output_holder["output"] = error_output
+            yield AgentStep(
+                step_type="observation",
+                content=error_output,
+                metadata={"tool": tool_name, "iteration": iteration, "stream_key": stream_key}
+            )
+            return
+
+        if timed_out:
+            await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+            final_output = "[exit_code=124]\nCommand timed out."
+            output_holder["output"] = final_output
+            yield AgentStep(
+                step_type="observation",
+                content=final_output,
+                metadata={"tool": tool_name, "iteration": iteration, "stream_key": stream_key, "command": str(command)}
+            )
+            return
+
+        await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+        final_body = body_buffer if body_buffer else "(no output)"
+        final_output = f"{last_header_line}\n{final_body}"
+        output_holder["output"] = final_output
+        yield AgentStep(
+            step_type="observation",
+            content=final_output,
+            metadata={"tool": tool_name, "iteration": iteration, "stream_key": stream_key, "command": str(command)}
+        )
 
     async def _execute_tool_call(self, tools: List[Tool], tool_name: Optional[str], args_text: str) -> Tuple[str, str]:
         tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)
