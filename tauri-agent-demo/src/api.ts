@@ -258,6 +258,14 @@ export async function deleteSession(sessionId: string): Promise<void> {
     if (!response.ok) throw new Error('Failed to delete session');
 }
 
+export async function copySession(sessionId: string): Promise<ChatSession> {
+    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/copy`, {
+        method: 'POST',
+    });
+    if (!response.ok) throw new Error('Failed to copy session');
+    return response.json();
+}
+
 export async function getSessionMessages(
     sessionId: string,
     options?: { limit?: number; beforeId?: number }

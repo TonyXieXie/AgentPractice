@@ -683,6 +683,7 @@ function App() {
   const [queueTick, setQueueTick] = useState(0);
   const [inFlightTick, setInFlightTick] = useState(0);
   const [permissionTick, setPermissionTick] = useState(0);
+  const [unreadBySession, setUnreadBySession] = useState<Record<string, boolean>>({});
   const [patchRevertBusy, setPatchRevertBusy] = useState(false);
   const [rollbackTarget, setRollbackTarget] = useState<{ messageId: number; keepInput?: boolean } | null>(null);
   const [workPathMenu, setWorkPathMenu] = useState<{ x: number; y: number } | null>(null);
@@ -1456,6 +1457,32 @@ function App() {
   const bumpInFlight = () => setInFlightTick((prev) => prev + 1);
   const bumpPermissions = () => setPermissionTick((prev) => prev + 1);
 
+  const markSessionUnread = (sessionKey: string) => {
+    if (!sessionKey || sessionKey === DRAFT_SESSION_KEY) return;
+    if (sessionKey === getCurrentSessionKey()) return;
+    setUnreadBySession((prev) => (prev[sessionKey] ? prev : { ...prev, [sessionKey]: true }));
+  };
+
+  const clearSessionUnread = (sessionKey: string) => {
+    if (!sessionKey) return;
+    setUnreadBySession((prev) => {
+      if (!prev[sessionKey]) return prev;
+      const next = { ...prev };
+      delete next[sessionKey];
+      return next;
+    });
+  };
+
+  const inFlightBySession = useMemo(() => {
+    const next: Record<string, boolean> = {};
+    Object.keys(inFlightBySessionRef.current).forEach((key) => {
+      if (key !== DRAFT_SESSION_KEY) {
+        next[key] = true;
+      }
+    });
+    return next;
+  }, [inFlightTick]);
+
   const clearPendingContextForItem = (queueId: string) => {
     setPendingContextEstimate((prev) => {
       if (!prev || prev.queueId !== queueId) return prev;
@@ -2000,6 +2027,8 @@ function App() {
         setSessionRefreshTrigger((prev) => prev + 1);
         await refreshSessionDebug(newSessionId);
       }
+
+      markSessionUnread(activeSessionKey);
     } catch (error: any) {
       const stopped = inFlightBySessionRef.current[activeSessionKey]?.stopRequested;
       if (error?.name === 'AbortError' || stopped) {
@@ -2014,6 +2043,7 @@ function App() {
           timestamp: new Date().toISOString(),
         };
         updateSessionMessages(activeSessionKey, (prev) => [...prev.filter((m) => m.id !== currentAssistantId), errorMsg]);
+        markSessionUnread(activeSessionKey);
       }
     } finally {
       delete inFlightBySessionRef.current[activeSessionKey];
@@ -2763,6 +2793,7 @@ function App() {
       mark('setup');
 
       const sessionKey = getSessionKey(sessionId);
+      clearSessionUnread(sessionKey);
       if (options?.forceReload) {
         clearSessionCache(sessionKey);
       }
@@ -3374,6 +3405,8 @@ function App() {
           onToggleDebug={() => setShowDebugPanel((prev) => !prev)}
           debugActive={showDebugPanel}
           refreshTrigger={sessionRefreshTrigger}
+          inFlightBySession={inFlightBySession}
+          unreadBySession={unreadBySession}
         />
       )}
 

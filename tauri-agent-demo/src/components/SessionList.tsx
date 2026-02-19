@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useMemo, useState, useEffect, useRef } from 'react';
 import { ChatSession } from '../types';
-import { getSessions, deleteSession, updateSession } from '../api';
+import { getSessions, deleteSession, updateSession, copySession } from '../api';
 import ConfirmDialog from './ConfirmDialog';
 import './SessionList.css';
 
@@ -12,6 +12,8 @@ interface SessionListProps {
     onToggleDebug: () => void;
     debugActive: boolean;
     refreshTrigger?: number;
+    inFlightBySession?: Record<string, boolean>;
+    unreadBySession?: Record<string, boolean>;
 }
 
 export default function SessionList({
@@ -21,12 +23,21 @@ export default function SessionList({
     onOpenConfig,
     onToggleDebug,
     debugActive,
-    refreshTrigger
+    refreshTrigger,
+    inFlightBySession,
+    unreadBySession
 }: SessionListProps) {
     const [sessions, setSessions] = useState<ChatSession[]>([]);
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editTitle, setEditTitle] = useState('');
     const [deleteTarget, setDeleteTarget] = useState<ChatSession | null>(null);
+    const [contextMenu, setContextMenu] = useState<{
+        session: ChatSession;
+        x: number;
+        y: number;
+    } | null>(null);
+    const contextMenuRef = useRef<HTMLDivElement | null>(null);
+    const NO_WORK_PATH_KEY = '__no_work_path__';
 
     useEffect(() => {
         loadSessions();
@@ -62,8 +73,17 @@ export default function SessionList({
         }
     };
 
-    const handleRename = async (id: string, e: React.MouseEvent) => {
-        e.stopPropagation();
+    const handleCopyConversation = async (session: ChatSession) => {
+        try {
+            await copySession(session.id);
+            await loadSessions();
+        } catch (error) {
+            console.error('Failed to copy session:', error);
+            alert('拷贝对话失败');
+        }
+    };
+
+    const startRename = (id: string) => {
         setEditingId(id);
         const session = sessions.find(s => s.id === id);
         setEditTitle(session?.title || '');
@@ -82,21 +102,115 @@ export default function SessionList({
         }
     };
 
+    const openContextMenu = (session: ChatSession, event: React.MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const menuWidth = 176;
+        const menuHeight = 88;
+        const padding = 8;
+        const maxX = window.innerWidth - menuWidth - padding;
+        const maxY = window.innerHeight - menuHeight - padding;
+        const x = Math.min(event.clientX, Math.max(padding, maxX));
+        const y = Math.min(event.clientY, Math.max(padding, maxY));
+        setContextMenu({ session, x, y });
+    };
+
+    useEffect(() => {
+        if (!contextMenu) return;
+        const handlePointer = (event: MouseEvent) => {
+            if (contextMenuRef.current && contextMenuRef.current.contains(event.target as Node)) {
+                return;
+            }
+            setContextMenu(null);
+        };
+        const handleKey = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') setContextMenu(null);
+        };
+        const handleScroll = () => setContextMenu(null);
+        window.addEventListener('mousedown', handlePointer);
+        window.addEventListener('keydown', handleKey);
+        window.addEventListener('scroll', handleScroll, true);
+        return () => {
+            window.removeEventListener('mousedown', handlePointer);
+            window.removeEventListener('keydown', handleKey);
+            window.removeEventListener('scroll', handleScroll, true);
+        };
+    }, [contextMenu]);
+
     const formatDate = (dateStr: string) => {
         const date = new Date(dateStr);
         const now = new Date();
         if (Number.isNaN(date.getTime())) return dateStr;
         const diff = now.getTime() - date.getTime();
-        if (diff < 60 * 1000) return '刚刚';
+        if (diff < 60 * 1000) return '0m';
         const minutes = Math.floor(diff / (1000 * 60));
-        if (minutes < 60) return `${minutes}分钟前`;
+        if (minutes < 60) return `${minutes}m`;
         const hours = Math.floor(diff / (1000 * 60 * 60));
-        if (hours < 24) return `${hours}小时前`;
+        if (hours < 24) return `${hours}h`;
         const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-        if (days === 1) return '昨天';
-        if (days < 7) return `${days}天前`;
+        if (days < 7) return `${days}d`;
         return date.toLocaleDateString('zh-CN');
     };
+
+    const normalizeWorkPath = (path?: string | null) => {
+        if (!path) return '';
+        let normalized = path.trim();
+        if (!normalized) return '';
+        normalized = normalized.replace(/\\/g, '/');
+        if (normalized.length > 1 && normalized.endsWith('/')) {
+            normalized = normalized.slice(0, -1);
+        }
+        return normalized;
+    };
+
+    const getFolderLabel = (normalizedPath: string) => {
+        if (!normalizedPath) return '未设置路径';
+        const parts = normalizedPath.split('/').filter(Boolean);
+        if (parts.length === 0) return normalizedPath;
+        return parts[parts.length - 1];
+    };
+
+    const groupedSessions = useMemo(() => {
+        const groups = new Map<
+            string,
+            { key: string; label: string; fullPath: string; sessions: ChatSession[] }
+        >();
+
+        for (const session of sessions) {
+            const normalizedPath = normalizeWorkPath(session.work_path || null);
+            if (!normalizedPath) {
+                if (!groups.has(NO_WORK_PATH_KEY)) {
+                    groups.set(NO_WORK_PATH_KEY, {
+                        key: NO_WORK_PATH_KEY,
+                        label: '未设置路径',
+                        fullPath: '',
+                        sessions: []
+                    });
+                }
+                groups.get(NO_WORK_PATH_KEY)!.sessions.push(session);
+                continue;
+            }
+
+            const key = normalizedPath;
+            if (!groups.has(key)) {
+                groups.set(key, {
+                    key,
+                    label: getFolderLabel(normalizedPath),
+                    fullPath: normalizedPath,
+                    sessions: []
+                });
+            }
+            groups.get(key)!.sessions.push(session);
+        }
+
+        const result = Array.from(groups.values());
+        const noPathIndex = result.findIndex((group) => group.key === NO_WORK_PATH_KEY);
+        if (noPathIndex !== -1 && noPathIndex !== result.length - 1) {
+            const [noPathGroup] = result.splice(noPathIndex, 1);
+            result.push(noPathGroup);
+        }
+        return result;
+    }, [sessions]);
 
     return (
         <div className="session-list">
@@ -169,91 +283,135 @@ export default function SessionList({
             </div>
 
             <div className="sessions-container">
-                {sessions.length === 0 ? (
+                {groupedSessions.length === 0 ? (
                     <p className="empty-sessions">暂无对话历史</p>
                 ) : (
-                    sessions.map((session) => (
-                        <div
-                            key={session.id}
-                            className={`session-item ${currentSessionId === session.id ? 'active' : ''}`}
-                            onClick={() => onSelectSession(session.id)}
-                        >
-                            {editingId === session.id ? (
-                                <input
-                                    type="text"
-                                    className="session-rename-input"
-                                    value={editTitle}
-                                    onChange={(e) => setEditTitle(e.target.value)}
-                                    onBlur={() => handleSaveRename(session.id)}
-                                    onKeyDown={(e) => {
-                                        if (e.key === 'Enter') handleSaveRename(session.id);
-                                        if (e.key === 'Escape') setEditingId(null);
-                                    }}
-                                    onClick={(e) => e.stopPropagation()}
-                                    autoFocus
-                                />
-                            ) : (
-                                <>
-                                    <div className="session-info">
-                                        <div className="session-title">{session.title}</div>
-                                        <div className="session-meta">
-                                            <span>{formatDate(session.updated_at || session.created_at)}</span>
-                                            <span className="session-meta-sep">{'\u00b7'}</span>
-                                            <span
-                                                className={`session-work-path${session.work_path ? '' : ' empty'}`}
-                                                title={session.work_path || '\u672a\u8bbe\u7f6e\u5de5\u4f5c\u8def\u5f84'}
-                                            >
-                                                {session.work_path || '\u672a\u8bbe\u7f6e\u5de5\u4f5c\u8def\u5f84'}
-                                            </span>
+                    groupedSessions.map((group) => (
+                        <div key={group.key} className="session-group">
+                            <div
+                                className="session-group-header"
+                                title={group.fullPath || '未设置路径'}
+                            >
+                                <svg
+                                    className="session-group-icon"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="1.6"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    aria-hidden="true"
+                                >
+                                    <path d="M3 7.5h6l2 2H21v7.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7.5Z" />
+                                    <path d="M3 7.5a2 2 0 0 1 2-2h4l2 2" />
+                                </svg>
+                                <span className="session-group-title">{group.label}</span>
+                            </div>
+                            <div className="session-group-items">
+                                {group.sessions.map((session) => {
+                                    const isStreaming = Boolean(inFlightBySession?.[session.id]);
+                                    const isUnread = !isStreaming && Boolean(unreadBySession?.[session.id]) && currentSessionId !== session.id;
+                                    const showStatus = isStreaming || isUnread;
+                                    const statusClass = isStreaming ? 'streaming' : 'unread';
+
+                                    return (
+                                        <div
+                                            key={session.id}
+                                            className={`session-item ${currentSessionId === session.id ? 'active' : ''}`}
+                                            onClick={() => onSelectSession(session.id)}
+                                            onContextMenu={(e) => openContextMenu(session, e)}
+                                        >
+                                            {editingId === session.id ? (
+                                                <input
+                                                    type="text"
+                                                    className="session-rename-input"
+                                                    value={editTitle}
+                                                    onChange={(e) => setEditTitle(e.target.value)}
+                                                    onBlur={() => handleSaveRename(session.id)}
+                                                onKeyDown={(e) => {
+                                                    if (e.key === 'Enter') handleSaveRename(session.id);
+                                                    if (e.key === 'Escape') setEditingId(null);
+                                                }}
+                                                onClick={(e) => e.stopPropagation()}
+                                                onContextMenu={(e) => e.stopPropagation()}
+                                                autoFocus
+                                            />
+                                            ) : (
+                                                <>
+                                                    <div className="session-info">
+                                                        <div className="session-row">
+                                                            <span
+                                                                className={`session-status ${showStatus ? statusClass : 'idle'}`}
+                                                                aria-hidden="true"
+                                                            >
+                                                                {showStatus && <span className="session-status-indicator" />}
+                                                            </span>
+                                                            <div className="session-title">{session.title}</div>
+                                                            <div className="session-right">
+                                                                <span className="session-time">
+                                                                    {formatDate(session.updated_at || session.created_at)}
+                                                                </span>
+                                                                <button
+                                                                    className="session-action-btn delete session-delete-btn"
+                                                                    onClick={(e) => handleDelete(session, e)}
+                                                                    title="删除"
+                                                                >
+                                                                    <svg
+                                                                        className="session-action-icon"
+                                                                        viewBox="0 0 24 24"
+                                                                        fill="none"
+                                                                        stroke="currentColor"
+                                                                        strokeWidth="1.8"
+                                                                        strokeLinecap="round"
+                                                                        strokeLinejoin="round"
+                                                                        aria-hidden="true"
+                                                                    >
+                                                                        <path d="M3 6h18" />
+                                                                        <path d="M8 6V4h8v2" />
+                                                                        <path d="M6 6l1 14h10l1-14" />
+                                                                    </svg>
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </>
+                                            )}
                                         </div>
-                                    </div>
-                                    <div className="session-actions">
-                                        <button
-                                            className="session-action-btn"
-                                            onClick={(e) => handleRename(session.id, e)}
-                                            title="重命名"
-                                        >
-                                            <svg
-                                                className="session-action-icon"
-                                                viewBox="0 0 24 24"
-                                                fill="none"
-                                                stroke="currentColor"
-                                                strokeWidth="1.8"
-                                                strokeLinecap="round"
-                                                strokeLinejoin="round"
-                                                aria-hidden="true"
-                                            >
-                                                <path d="M12 20h9" />
-                                                <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z" />
-                                            </svg>
-                                        </button>
-                                        <button
-                                            className="session-action-btn delete"
-                                            onClick={(e) => handleDelete(session, e)}
-                                            title="删除"
-                                        >
-                                            <svg
-                                                className="session-action-icon"
-                                                viewBox="0 0 24 24"
-                                                fill="none"
-                                                stroke="currentColor"
-                                                strokeWidth="1.8"
-                                                strokeLinecap="round"
-                                                strokeLinejoin="round"
-                                                aria-hidden="true"
-                                            >
-                                                <path d="M3 6h18" />
-                                                <path d="M8 6V4h8v2" />
-                                                <path d="M6 6l1 14h10l1-14" />
-                                            </svg>
-                                        </button>
-                                    </div>
-                                </>
-                            )}
+                                    );
+                                })}
+                            </div>
                         </div>
                     ))
                 )}
             </div>
+            {contextMenu && (
+                <div
+                    ref={contextMenuRef}
+                    className="session-context-menu"
+                    style={{ left: contextMenu.x, top: contextMenu.y }}
+                >
+                    <button
+                        type="button"
+                        className="session-context-item"
+                        onClick={() => {
+                            startRename(contextMenu.session.id);
+                            setContextMenu(null);
+                        }}
+                    >
+                        重命名
+                    </button>
+                    <button
+                        type="button"
+                        className="session-context-item"
+                        onClick={() => {
+                            handleCopyConversation(contextMenu.session);
+                            setContextMenu(null);
+                        }}
+                    >
+                        拷贝对话
+                    </button>
+                </div>
+            )}
             <ConfirmDialog
                 open={Boolean(deleteTarget)}
                 title="删除会话"

@@ -171,6 +171,17 @@ def _clean_title(raw_title: str) -> str:
     return title
 
 
+def _build_copy_title(base_title: str, sessions: List[ChatSession]) -> str:
+    existing = {session.title for session in sessions if session.title}
+    candidate = f"{base_title} (copy)"
+    if candidate not in existing:
+        return candidate
+    index = 2
+    while f"{base_title} (copy {index})" in existing:
+        index += 1
+    return f"{base_title} (copy {index})"
+
+
 def _strip_json_fence(text: str) -> str:
     if not text:
         return ""
@@ -580,6 +591,18 @@ def update_session(session_id: str, update: ChatSessionUpdate):
     if update.work_path is not None:
         _schedule_ast_scan(session.work_path)
     return session
+
+@app.post("/sessions/{session_id}/copy", response_model=ChatSession)
+def copy_session(session_id: str):
+    source = db.get_session(session_id, include_count=False)
+    if not source:
+        raise HTTPException(status_code=404, detail="Session not found")
+    title = _build_copy_title(source.title, db.get_all_sessions())
+    created = db.copy_session(session_id, title)
+    if not created:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _schedule_ast_scan(created.work_path)
+    return created
 
 @app.delete("/sessions/{session_id}")
 def delete_session(session_id: str):
