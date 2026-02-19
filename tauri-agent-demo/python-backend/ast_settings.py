@@ -207,3 +207,32 @@ def update_ast_settings(root: str, patch: Dict[str, Any]) -> Dict[str, Any]:
         _save_settings_file(store)
         _SETTINGS_CACHE = store
     return normalized
+
+
+def get_all_ast_settings() -> Dict[str, Any]:
+    with _SETTINGS_LOCK:
+        store = _get_store()
+        paths = store.get("paths", {}) if isinstance(store, dict) else {}
+
+    entries: List[Dict[str, Any]] = []
+    if isinstance(paths, dict):
+        for key, entry in paths.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                root_path = normalize_path(str(key))
+            except Exception:
+                root_path = Path(str(key))
+            normalized = _normalize_settings(root_path, entry)
+            entries.append({
+                "root": normalized.get("root", str(root_path)),
+                "settings": {
+                    "ignore_paths": normalized.get("ignore_paths", []),
+                    "include_only_paths": normalized.get("include_only_paths", []),
+                    "force_include_paths": normalized.get("force_include_paths", []),
+                    "include_languages": normalized.get("include_languages", []),
+                    "max_files": normalized.get("max_files", DEFAULT_MAX_FILES)
+                }
+            })
+
+    return {"paths": entries}

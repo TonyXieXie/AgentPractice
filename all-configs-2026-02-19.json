@@ -1,0 +1,278 @@
+{
+  "kind": "all",
+  "version": 1,
+  "exported_at": "2026-02-19T03:59:31.416Z",
+  "data": {
+    "models": {
+      "configs": [
+        {
+          "id": "5d84929e-2e13-4935-baac-7a24551e3539",
+          "name": "GPT",
+          "api_format": "openai_chat_completions",
+          "api_profile": "openai",
+          "api_key": "sk-003570a8270f47e78d97dd748df28707",
+          "base_url": "https://right.codes/codex/v1",
+          "model": "gpt-5.2",
+          "temperature": 0.7,
+          "max_tokens": 20000,
+          "max_context_tokens": 200000,
+          "is_default": true,
+          "created_at": "2026-01-27T12:22:42.897741",
+          "reasoning_effort": "xhigh",
+          "reasoning_summary": "detailed"
+        },
+        {
+          "id": "872dff08-401a-437a-8aa1-e8062f3cb02f",
+          "name": "GPT -5.3",
+          "api_format": "openai_chat_completions",
+          "api_profile": "openai",
+          "api_key": "sk-003570a8270f47e78d97dd748df28707",
+          "base_url": "https://right.codes/codex/v1",
+          "model": "gpt-5.3-codex",
+          "temperature": 0.7,
+          "max_tokens": 20000,
+          "max_context_tokens": 200000,
+          "is_default": false,
+          "created_at": "2026-02-16T11:27:46.521710",
+          "reasoning_effort": "xhigh",
+          "reasoning_summary": "detailed"
+        },
+        {
+          "id": "46267610-5c82-453a-9d61-0577c8029bd9",
+          "name": "Minimax_seasun",
+          "api_format": "openai_chat_completions",
+          "api_profile": "openai",
+          "api_key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjbGllbnRfaXAiOiIxODIuMTM5LjEzMy4xMzUiLCJleHAiOjE3NzI4NzQ5ODIsIm1hY19hZGRyZXNzIjoiIiwidXNlcklkIjoieGllamloYW8ifQ.FVPPmmwgH6wu6rf_NzqftyGbFgzhu8KOlIV7mhVzFoo",
+          "base_url": "https://tech.seasungame.com//ai_in_one/v2",
+          "model": "minimax-m2.1",
+          "temperature": 0.7,
+          "max_tokens": 20000,
+          "max_context_tokens": 200000,
+          "is_default": false,
+          "created_at": "2026-02-06T11:44:39.029166",
+          "reasoning_effort": "high",
+          "reasoning_summary": "detailed"
+        },
+        {
+          "id": "4bc487f4-742e-46fb-8c5e-7283173f6384",
+          "name": "claude_seasun",
+          "api_format": "openai_chat_completions",
+          "api_profile": "openai",
+          "api_key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjbGllbnRfaXAiOiIxODIuMTM5LjEzMy4xMzUiLCJleHAiOjE3NzI4NzQ5ODIsIm1hY19hZGRyZXNzIjoiIiwidXNlcklkIjoieGllamloYW8ifQ.FVPPmmwgH6wu6rf_NzqftyGbFgzhu8KOlIV7mhVzFoo",
+          "base_url": "https://tech.seasungame.com//ai_in_one/v2",
+          "model": "claude4.5",
+          "temperature": 0.7,
+          "max_tokens": 20000,
+          "max_context_tokens": 200000,
+          "is_default": false,
+          "created_at": "2026-02-06T11:41:50.837158",
+          "reasoning_effort": "high",
+          "reasoning_summary": "detailed"
+        },
+        {
+          "id": "a5c99ab8-ecc1-41e7-b7f0-fcb87d8a32ed",
+          "name": "GPT_seasun",
+          "api_format": "openai_chat_completions",
+          "api_profile": "openai",
+          "api_key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjbGllbnRfaXAiOiIxODIuMTM5LjEzMy4xMzUiLCJleHAiOjE3NzI4NzQ5ODIsIm1hY19hZGRyZXNzIjoiIiwidXNlcklkIjoieGllamloYW8ifQ.FVPPmmwgH6wu6rf_NzqftyGbFgzhu8KOlIV7mhVzFoo",
+          "base_url": "https://tech.seasungame.com//ai_in_one/v2",
+          "model": "gpt-5.2",
+          "temperature": 0.7,
+          "max_tokens": 20000,
+          "max_context_tokens": 200000,
+          "is_default": false,
+          "created_at": "2026-02-06T11:31:49.022844",
+          "reasoning_effort": "high",
+          "reasoning_summary": "detailed"
+        },
+        {
+          "id": "057d9eec-4afe-48e7-9fa6-a28709779047",
+          "name": "kimi-k2-thinking-turbo",
+          "api_format": "openai_chat_completions",
+          "api_profile": "deepseek",
+          "api_key": "cc53d023-d5e5-43ab-8537-9a329fd7f40d",
+          "base_url": "https://kspmas.ksyun.com/v1",
+          "model": "kimi-k2-thinking-turbo",
+          "temperature": 0.7,
+          "max_tokens": 20000,
+          "max_context_tokens": 200000,
+          "is_default": false,
+          "created_at": "2026-02-06T09:17:00.058725",
+          "reasoning_effort": "high",
+          "reasoning_summary": "detailed"
+        },
+        {
+          "id": "ee8357bb-4e81-4a3f-8ba6-3e1d14ec15f6",
+          "name": "deepseek",
+          "api_format": "openai_chat_completions",
+          "api_profile": "deepseek",
+          "api_key": "cc53d023-d5e5-43ab-8537-9a329fd7f40d",
+          "base_url": "https://kspmas.ksyun.com/v1",
+          "model": "deepseek-v3.2",
+          "temperature": 0.7,
+          "max_tokens": 20000,
+          "max_context_tokens": 200000,
+          "is_default": false,
+          "created_at": "2026-02-06T09:07:13.733548",
+          "reasoning_effort": "high",
+          "reasoning_summary": "detailed"
+        },
+        {
+          "id": "2a356ff8-e61e-4b0e-81b6-28967044d260",
+          "name": "GLM-4.7",
+          "api_format": "openai_chat_completions",
+          "api_profile": "deepseek",
+          "api_key": "cc53d023-d5e5-43ab-8537-9a329fd7f40d",
+          "base_url": "https://kspmas.ksyun.com/v1",
+          "model": "glm-4.7",
+          "temperature": 0.7,
+          "max_tokens": 20000,
+          "max_context_tokens": 80000,
+          "is_default": false,
+          "created_at": "2026-01-27T12:30:51.039914",
+          "reasoning_effort": "high",
+          "reasoning_summary": "detailed"
+        }
+      ]
+    },
+    "global": {
+      "llm": {
+        "timeout_sec": 180
+      },
+      "context": {
+        "compression_enabled": true,
+        "compress_start_pct": 75,
+        "compress_target_pct": 25,
+        "min_keep_messages": 1,
+        "keep_recent_calls": 10,
+        "step_calls": 5,
+        "truncate_long_data": false,
+        "long_data_threshold": 1000,
+        "long_data_head_chars": 600,
+        "long_data_tail_chars": 400
+      },
+      "agent": {
+        "react_max_iterations": 200,
+        "ast_enabled": true,
+        "code_map": {
+          "enabled": true,
+          "max_symbols": 40,
+          "max_files": 20,
+          "max_lines": 30,
+          "weight_refs": 1,
+          "weight_mentions": 2
+        }
+      }
+    },
+    "agent": {
+      "base_system_prompt": "You are a helpful AI assistant.",
+      "abilities": [
+        {
+          "id": "tools_all",
+          "name": "All Tools",
+          "type": "tooling",
+          "tools": [
+            "*"
+          ],
+          "prompt": ""
+        },
+        {
+          "id": "rg_search",
+          "name": "RG Search",
+          "type": "tooling",
+          "tools": [
+            "rg"
+          ],
+          "prompt": "Prefer rg for searching file contents."
+        },
+        {
+          "id": "apply_patch",
+          "name": "Apply Patch",
+          "type": "tooling",
+          "tools": [
+            "apply_patch"
+          ],
+          "prompt": "Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.\napply_patch format (strict):\n  *** Begin Patch\n  *** Update File: path\n  @@\n  - old line\n  + new line\n  *** End Patch\n- Each change line must start with + or -, and context lines must be included under @@ hunks.\n- Do NOT wrap apply_patch content in code fences; send raw patch text only.\n- apply_patch matches by context; if the match is not unique, request more surrounding context.\n- If apply_patch fails due to context, ask for more context and retry."
+        },
+        {
+          "id": "code_map",
+          "name": "Code Map",
+          "type": "domain_knowledge",
+          "prompt": "{{code_map_prompt}}"
+        },
+        {
+          "id": "tool_json",
+          "name": "Tool Arguments JSON",
+          "type": "tool_policy",
+          "prompt": "If a tool is needed, call it with JSON arguments that match its schema."
+        },
+        {
+          "id": "output_concise",
+          "name": "Concise Output",
+          "type": "output_format",
+          "prompt": "Be concise and actionable."
+        },
+        {
+          "id": "websear",
+          "name": "WebSear",
+          "type": "tooling",
+          "prompt": "Prefer web search for more information.",
+          "tools": [
+            "search"
+          ]
+        }
+      ],
+      "profiles": [
+        {
+          "id": "default",
+          "name": "Default",
+          "abilities": [
+            "tools_all",
+            "rg_search",
+            "apply_patch",
+            "tool_json",
+            "output_concise"
+          ]
+        },
+        {
+          "id": "search",
+          "name": "Search",
+          "abilities": [
+            "websear"
+          ]
+        }
+      ],
+      "default_profile": "default"
+    },
+    "ast": {
+      "paths": [
+        {
+          "root": "/Users/jeffery/Documents/UGit/AgentPractice/tauri-agent-demo/python-backend/e:\\physx\\physx\\physx\\source\\physxvehicle",
+          "settings": {
+            "ignore_paths": [],
+            "include_only_paths": [],
+            "force_include_paths": [],
+            "include_languages": [
+              "cpp"
+            ],
+            "max_files": 500
+          }
+        },
+        {
+          "root": "/Users/jeffery/Documents/UGit/AgentPractice/tauri-agent-demo/python-backend/d:\\gpusimulation\\plugins\\gpuphysics",
+          "settings": {
+            "ignore_paths": [],
+            "include_only_paths": [
+              "/Users/jeffery/Documents/UGit/AgentPractice/tauri-agent-demo/python-backend/d:\\gpusimulation\\plugins\\gpuphysics/D:\\GPUSimulation\\Plugins\\GPUPhysics\\Source\\GPUPhysics"
+            ],
+            "force_include_paths": [],
+            "include_languages": [
+              "cpp"
+            ],
+            "max_files": 500
+          }
+        }
+      ]
+    }
+  }
+}

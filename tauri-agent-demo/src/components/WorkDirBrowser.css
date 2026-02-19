@@ -702,6 +702,13 @@
   gap: 10px;
 }
 
+.workdir-dialog-io {
+  margin-top: 8px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .workdir-dialog-btn {
   border-radius: 8px;
   border: 1px solid transparent;

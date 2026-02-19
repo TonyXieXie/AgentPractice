@@ -73,6 +73,19 @@
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.modal-header-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.config-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .modal-header h2 {
   margin: 0;
   font-size: 1.2rem;
@@ -156,6 +169,38 @@
   padding: 6px 10px;
   margin-bottom: 0;
   font-size: 0.85rem;
+}
+
+.config-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.config-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.config-form-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.config-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.config-form-header h3 {
+  margin: 0;
 }
 
 .agent-section {

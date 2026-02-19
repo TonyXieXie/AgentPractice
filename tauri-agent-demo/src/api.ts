@@ -16,7 +16,8 @@
     ToolDefinition,
     AstRequest,
     AstPathSettings,
-    AstSettingsResponse
+    AstSettingsResponse,
+    AstSettingsAllResponse
 } from './types';
 
 export const API_BASE_URL = 'http://127.0.0.1:8000';
@@ -187,6 +188,14 @@ export async function updateAstSettings(payload: AstPathSettings & { root: strin
     });
     if (!response.ok) {
         throw await buildApiError(response, 'Failed to update AST settings');
+    }
+    return response.json();
+}
+
+export async function getAstSettingsAll(): Promise<AstSettingsAllResponse> {
+    const response = await fetch(`${API_BASE_URL}/ast/settings/all`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to fetch AST settings');
     }
     return response.json();
 }

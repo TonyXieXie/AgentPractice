@@ -1015,6 +1015,13 @@ body[data-platform="mac"] .app-titlebar {
   gap: 10px;
 }
 
+.ast-settings-io {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 6px;
+}
+
 .ast-settings-btn {
   border-radius: 8px;
   border: 1px solid transparent;

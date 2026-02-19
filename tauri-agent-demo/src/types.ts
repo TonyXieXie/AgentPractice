@@ -296,6 +296,16 @@ export interface AstSettingsResponse {
     settings?: AstPathSettings;
 }
 
+export interface AstSettingsBundleEntry {
+    root: string;
+    settings: AstPathSettings;
+}
+
+export interface AstSettingsAllResponse {
+    ok?: boolean;
+    paths?: AstSettingsBundleEntry[];
+}
+
 export interface AstCacheFile {
     path: string;
     file_mtime?: number;

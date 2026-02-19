@@ -7,6 +7,7 @@ import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import './App.css';
+import { exportConfigFile, importConfigFile } from './configExchange';
 import {
   Message,
   MessageAttachment,
@@ -1222,10 +1223,43 @@ function App() {
     }
   }, [showDebugPanel, debugFocus]);
 
-  const handleSaveAstSettings = async () => {
-    if (!astSettingsRoot) return;
+  const applyAstSettingsPayload = async (
+    payload: { root: string } & Record<string, any>,
+    options?: { close?: boolean }
+  ) => {
+    if (!payload.root) return false;
     setAstSettingsSaving(true);
     setAstSettingsError(null);
+    try {
+      const result = await updateAstSettings(payload);
+      const settings = result?.settings || payload;
+      const ignoreList = Array.isArray(settings.ignore_paths) ? settings.ignore_paths : [];
+      const includeList = Array.isArray(settings.include_only_paths) ? settings.include_only_paths : [];
+      const forceList = Array.isArray(settings.force_include_paths) ? settings.force_include_paths : [];
+      setAstIgnorePaths(ignoreList.join('\n'));
+      setAstIncludeOnlyPaths(includeList.join('\n'));
+      setAstForceIncludePaths(forceList.join('\n'));
+      const languageList = normalizeAstLanguageList(settings.include_languages);
+      setAstIncludeLanguages(languageList);
+      if (settings.max_files !== undefined && settings.max_files !== null) {
+        setAstMaxFiles(String(settings.max_files));
+      }
+      scheduleAstNotify(payload.root, [payload.root]);
+      if (options?.close !== false) {
+        closeAstSettings();
+      }
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to save AST settings.';
+      setAstSettingsError(message);
+      return false;
+    } finally {
+      setAstSettingsSaving(false);
+    }
+  };
+
+  const handleSaveAstSettings = async () => {
+    if (!astSettingsRoot) return;
     const parsedMax = Number.parseInt(astMaxFiles, 10);
     const maxFiles = Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : AST_DEFAULT_MAX_FILES;
     const includeLanguages = AST_LANGUAGE_OPTIONS
@@ -1239,26 +1273,7 @@ function App() {
       include_languages: includeLanguages,
       max_files: maxFiles,
     };
-    try {
-      const result = await updateAstSettings(payload);
-      const settings = result?.settings || payload;
-      const ignoreList = Array.isArray(settings.ignore_paths) ? settings.ignore_paths : payload.ignore_paths;
-      const includeList = Array.isArray(settings.include_only_paths) ? settings.include_only_paths : payload.include_only_paths;
-      const forceList = Array.isArray(settings.force_include_paths) ? settings.force_include_paths : payload.force_include_paths;
-      setAstIgnorePaths(ignoreList.join('\n'));
-      setAstIncludeOnlyPaths(includeList.join('\n'));
-      setAstForceIncludePaths(forceList.join('\n'));
-      const languageList = normalizeAstLanguageList(settings.include_languages ?? includeLanguages);
-      setAstIncludeLanguages(languageList);
-      setAstMaxFiles(String(settings.max_files ?? maxFiles));
-      scheduleAstNotify(astSettingsRoot, [astSettingsRoot]);
-      closeAstSettings();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to save AST settings.';
-      setAstSettingsError(message);
-    } finally {
-      setAstSettingsSaving(false);
-    }
+    await applyAstSettingsPayload(payload, { close: true });
   };
 
   useEffect(() => {
@@ -2049,6 +2064,137 @@ function App() {
       .split(/\r?\n/)
       .map((item) => item.trim())
       .filter(Boolean);
+
+  const normalizeAstImportList = (value: unknown) => {
+    if (Array.isArray(value)) {
+      return value
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+    if (typeof value === 'string') {
+      return parseAstPathList(value);
+    }
+    return [];
+  };
+
+  const normalizeAstImportLanguages = (value: unknown) => {
+    if (Array.isArray(value)) {
+      return normalizeAstLanguageList(value);
+    }
+    if (typeof value === 'string') {
+      const list = value
+        .split(/[,\r\n]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+      return normalizeAstLanguageList(list);
+    }
+    return [];
+  };
+
+  const handleExportAstSettings = async () => {
+    if (!astSettingsRoot) return;
+    const parsedMax = Number.parseInt(astMaxFiles, 10);
+    const maxFiles = Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : AST_DEFAULT_MAX_FILES;
+    const includeLanguages = AST_LANGUAGE_OPTIONS
+      .map((option) => option.id)
+      .filter((id) => astIncludeLanguages.includes(id));
+    const payload = {
+      root: astSettingsRoot,
+      settings: {
+        ignore_paths: parseAstPathList(astIgnorePaths),
+        include_only_paths: parseAstPathList(astIncludeOnlyPaths),
+        force_include_paths: parseAstPathList(astForceIncludePaths),
+        include_languages: includeLanguages,
+        max_files: maxFiles,
+      },
+    };
+    try {
+      const ok = await exportConfigFile('ast_settings', payload, {
+        title: '导出 AST 设置',
+        defaultName: `ast-settings-${new Date().toISOString().slice(0, 10)}.json`,
+      });
+      if (ok) alert('AST 设置已导出。');
+    } catch (error: any) {
+      console.error('Failed to export AST settings:', error);
+      alert(`导出失败: ${error?.message || 'Unknown error'}`);
+    }
+  };
+
+  const handleImportAstSettings = async () => {
+    if (!astSettingsRoot) return;
+    let result;
+    try {
+      result = await importConfigFile({ title: '导入 AST 设置' });
+    } catch (error: any) {
+      console.error('Failed to import AST settings:', error);
+      alert(`导入失败: ${error?.message || 'Unknown error'}`);
+      return;
+    }
+    if (!result) return;
+    if (result.kind && !['ast_settings', 'ast', 'ast_config'].includes(result.kind)) {
+      alert(`导入失败: 文件类型为 "${result.kind}"，不是 AST 设置。`);
+      return;
+    }
+
+    const raw = result.data;
+    let settings: Record<string, any> | null = null;
+    let importRoot = '';
+    if (raw && typeof raw === 'object') {
+      const record = raw as Record<string, any>;
+      if (record.settings && typeof record.settings === 'object') {
+        settings = record.settings as Record<string, any>;
+        if (typeof record.root === 'string') {
+          importRoot = record.root;
+        }
+      } else {
+        settings = record;
+        if (typeof record.root === 'string') {
+          importRoot = record.root;
+        }
+      }
+    }
+
+    if (!settings) {
+      alert('未识别到有效的 AST 设置。');
+      return;
+    }
+
+    if (importRoot && importRoot !== astSettingsRoot) {
+      const proceed = window.confirm(
+        `导入配置来自路径：\n${importRoot}\n\n将应用到当前路径：\n${astSettingsRoot}\n\n是否继续？`
+      );
+      if (!proceed) return;
+    }
+
+    const payload: Record<string, any> = { root: astSettingsRoot };
+    if ('ignore_paths' in settings) {
+      payload.ignore_paths = normalizeAstImportList(settings.ignore_paths);
+    }
+    if ('include_only_paths' in settings) {
+      payload.include_only_paths = normalizeAstImportList(settings.include_only_paths);
+    }
+    if ('force_include_paths' in settings) {
+      payload.force_include_paths = normalizeAstImportList(settings.force_include_paths);
+    }
+    if ('include_languages' in settings) {
+      payload.include_languages = normalizeAstImportLanguages(settings.include_languages);
+    }
+    if ('max_files' in settings) {
+      const parsedMax = Number.parseInt(String(settings.max_files), 10);
+      if (Number.isFinite(parsedMax) && parsedMax > 0) {
+        payload.max_files = parsedMax;
+      }
+    }
+
+    if (Object.keys(payload).length <= 1) {
+      alert('导入文件中没有可用的 AST 设置字段。');
+      return;
+    }
+
+    const ok = await applyAstSettingsPayload(payload, { close: true });
+    if (ok) alert('AST 设置已导入。');
+  };
 
   const pickAstFolder = async (target: 'ignore' | 'include' | 'force') => {
     if (!astSettingsRoot) return;
@@ -3798,6 +3944,24 @@ function App() {
               {astSettingsLoading && <div className="ast-settings-hint">正在加载设置...</div>}
               <div className="ast-settings-hint">优先级：必定包含 &gt; 仅包含 &gt; 忽略 &gt; Git 忽略</div>
               {astSettingsError && <div className="ast-settings-error">{astSettingsError}</div>}
+            </div>
+            <div className="ast-settings-io">
+              <button
+                type="button"
+                className="ast-settings-btn ghost"
+                onClick={handleImportAstSettings}
+                disabled={astSettingsSaving || astSettingsLoading}
+              >
+                导入
+              </button>
+              <button
+                type="button"
+                className="ast-settings-btn ghost"
+                onClick={handleExportAstSettings}
+                disabled={astSettingsSaving || astSettingsLoading}
+              >
+                导出
+              </button>
             </div>
             <div className="ast-settings-actions">
               <button

@@ -42,7 +42,7 @@ from app_config import get_app_config, update_app_config, get_app_config_path
 from ghost_snapshot import restore_snapshot
 from code_map import build_code_map_prompt
 from ast_index import get_ast_index
-from ast_settings import get_ast_settings, update_ast_settings
+from ast_settings import get_ast_settings, update_ast_settings, get_all_ast_settings
 from context_compress import build_history_for_llm, maybe_compress_context
 
 app = FastAPI(title="Tauri Agent Chat Backend")
@@ -1549,6 +1549,14 @@ def notify_ast(request: AstNotifyRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"AST notify failed: {exc}")
     return {"ok": True, "updated": updated}
+
+@app.get("/ast/settings/all")
+def get_ast_settings_all_route():
+    try:
+        data = get_all_ast_settings()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AST settings error: {exc}")
+    return {"ok": True, **data}
 
 @app.get("/ast/settings")
 def get_ast_settings_route(root: str = Query(...)):

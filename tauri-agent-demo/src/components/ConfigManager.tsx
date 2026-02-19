@@ -6,12 +6,25 @@ import {
     LLMConfigCreate,
     LLMApiFormat,
     LLMProfile,
+    AppConfig,
+    AppConfigUpdate,
     AgentConfig,
     AgentAbility,
     AgentProfile,
     ToolDefinition
 } from '../types';
-import { getConfigs, createConfig, updateConfig, deleteConfig, getAppConfig, updateAppConfig, getTools } from '../api';
+import {
+    getConfigs,
+    createConfig,
+    updateConfig,
+    deleteConfig,
+    getAppConfig,
+    updateAppConfig,
+    getTools,
+    getAstSettingsAll,
+    updateAstSettings
+} from '../api';
+import { exportConfigFile, importConfigFile } from '../configExchange';
 import ConfirmDialog from './ConfirmDialog';
 import './ConfigManager.css';
 
@@ -78,6 +91,70 @@ const normalizeTools = (tools: unknown): ToolDefinition[] => {
     return normalized;
 };
 
+const isRecord = (value: unknown): value is Record<string, any> =>
+    Boolean(value && typeof value === 'object' && !Array.isArray(value));
+
+const buildExportName = (prefix: string) => {
+    const stamp = new Date().toISOString().slice(0, 10);
+    return `${prefix}-${stamp}.json`;
+};
+
+const coerceNumber = (value: unknown, fallback: number) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const coerceInt = (value: unknown, fallback: number) => {
+    const parsed = Number.parseInt(String(value), 10);
+    return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const stripAgentGlobalFields = (agent: AgentConfig): AgentConfig => {
+    if (!agent || typeof agent !== 'object') return {};
+    const { react_max_iterations, ast_enabled, code_map, ...rest } = agent as Record<string, any>;
+    return rest as AgentConfig;
+};
+
+const MODEL_IMPORT_KINDS = new Set(['models', 'llm_configs', 'configs']);
+const GLOBAL_IMPORT_KINDS = new Set(['global', 'app', 'app_config']);
+const AGENT_IMPORT_KINDS = new Set(['agent', 'agent_config']);
+
+const isAllowedKind = (kind: string | undefined, allowed: Set<string>) =>
+    !kind || allowed.has(kind);
+
+const ALL_IMPORT_KINDS = new Set(['all', 'bundle', 'config_bundle', 'full']);
+
+const normalizeAstImportList = (value: unknown): string[] => {
+    if (Array.isArray(value)) {
+        return value
+            .filter((item): item is string => typeof item === 'string')
+            .map((item) => item.trim())
+            .filter(Boolean);
+    }
+    if (typeof value === 'string') {
+        return value
+            .split(/\r?\n/)
+            .map((item) => item.trim())
+            .filter(Boolean);
+    }
+    return [];
+};
+
+const normalizeAstImportLanguages = (value: unknown): string[] => {
+    if (Array.isArray(value)) {
+        return value
+            .filter((item): item is string => typeof item === 'string')
+            .map((item) => item.trim().toLowerCase())
+            .filter(Boolean);
+    }
+    if (typeof value === 'string') {
+        return value
+            .split(/[,\r\n]+/)
+            .map((item) => item.trim().toLowerCase())
+            .filter(Boolean);
+    }
+    return [];
+};
 
 export default function ConfigManager({ onClose, onConfigCreated }: ConfigManagerProps) {
     type ConfigTab = 'models' | 'global' | 'agents';
@@ -144,6 +221,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const [editingConfig, setEditingConfig] = useState<LLMConfig | null>(null);
     const [loading, setLoading] = useState(false);
     const [deleteTarget, setDeleteTarget] = useState<LLMConfig | null>(null);
+    const [bundleBusy, setBundleBusy] = useState(false);
 
     const [formData, setFormData] = useState<LLMConfigCreate>({
         name: '',
@@ -159,14 +237,16 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     });
 
     const normalizeAgentConfig = (data?: AgentConfig | null): AgentConfig => {
-        const parsedMax = Number.parseInt(String(data?.react_max_iterations ?? ''), 10);
+        const raw = isRecord(data) ? data : {};
+        const parsedMax = Number.parseInt(String(raw.react_max_iterations ?? ''), 10);
         const reactMaxIterations = Number.isFinite(parsedMax) ? Math.min(200, Math.max(1, parsedMax)) : 50;
         return {
-            base_system_prompt: data?.base_system_prompt ?? '',
+            ...raw,
+            base_system_prompt: raw.base_system_prompt ?? '',
             react_max_iterations: reactMaxIterations,
-            abilities: Array.isArray(data?.abilities) ? data!.abilities : [],
-            profiles: Array.isArray(data?.profiles) ? data!.profiles : [],
-            default_profile: data?.default_profile ?? '',
+            abilities: Array.isArray(raw.abilities) ? raw.abilities : [],
+            profiles: Array.isArray(raw.profiles) ? raw.profiles : [],
+            default_profile: raw.default_profile ?? '',
         };
     };
 
@@ -186,80 +266,84 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         }
     };
 
+    const applyAppConfigState = (data?: AppConfig | null) => {
+        const timeoutValue = data?.llm?.timeout_sec;
+        if (timeoutValue !== undefined && timeoutValue !== null) {
+            setGlobalTimeoutSec(String(timeoutValue));
+        }
+        const reactMax = data?.agent?.react_max_iterations;
+        if (reactMax !== undefined && reactMax !== null) {
+            setGlobalReactMaxIterations(String(reactMax));
+        }
+        setGlobalAstEnabled(Boolean(data?.agent?.ast_enabled ?? true));
+        setGlobalCodeMapEnabled(Boolean(data?.agent?.code_map?.enabled ?? true));
+        const contextConfig = data?.context || {};
+        setGlobalContextCompressionEnabled(Boolean(contextConfig?.compression_enabled));
+        const startPct = Number.parseInt(
+            String(contextConfig?.compress_start_pct ?? DEFAULT_CONTEXT_START_PCT),
+            10
+        );
+        if (Number.isFinite(startPct)) {
+            setGlobalContextCompressStartPct(String(startPct));
+        }
+        const targetPct = Number.parseInt(
+            String(contextConfig?.compress_target_pct ?? DEFAULT_CONTEXT_TARGET_PCT),
+            10
+        );
+        if (Number.isFinite(targetPct)) {
+            setGlobalContextCompressTargetPct(String(targetPct));
+        }
+        const minKeep = Number.parseInt(
+            String(contextConfig?.min_keep_messages ?? DEFAULT_CONTEXT_MIN_KEEP_MESSAGES),
+            10
+        );
+        if (Number.isFinite(minKeep)) {
+            setGlobalContextMinKeepMessages(String(minKeep));
+        }
+        const keepCalls = Number.parseInt(
+            String(contextConfig?.keep_recent_calls ?? DEFAULT_CONTEXT_KEEP_RECENT_CALLS),
+            10
+        );
+        if (Number.isFinite(keepCalls)) {
+            setGlobalContextKeepRecentCalls(String(keepCalls));
+        }
+        const stepCalls = Number.parseInt(
+            String(contextConfig?.step_calls ?? DEFAULT_CONTEXT_STEP_CALLS),
+            10
+        );
+        if (Number.isFinite(stepCalls)) {
+            setGlobalContextStepCalls(String(stepCalls));
+        }
+        setGlobalContextTruncateLongData(Boolean(contextConfig?.truncate_long_data ?? true));
+        const longThreshold = Number.parseInt(
+            String(contextConfig?.long_data_threshold ?? DEFAULT_CONTEXT_LONG_THRESHOLD),
+            10
+        );
+        if (Number.isFinite(longThreshold)) {
+            setGlobalContextLongThreshold(String(longThreshold));
+        }
+        const longHead = Number.parseInt(
+            String(contextConfig?.long_data_head_chars ?? DEFAULT_CONTEXT_LONG_HEAD_CHARS),
+            10
+        );
+        if (Number.isFinite(longHead)) {
+            setGlobalContextLongHeadChars(String(longHead));
+        }
+        const longTail = Number.parseInt(
+            String(contextConfig?.long_data_tail_chars ?? DEFAULT_CONTEXT_LONG_TAIL_CHARS),
+            10
+        );
+        if (Number.isFinite(longTail)) {
+            setGlobalContextLongTailChars(String(longTail));
+        }
+        setAgentConfig(normalizeAgentConfig(data?.agent));
+    };
+
     const loadAppConfig = async () => {
         setGlobalLoading(true);
         try {
             const data = await getAppConfig();
-            const timeoutValue = data?.llm?.timeout_sec;
-            if (timeoutValue !== undefined && timeoutValue !== null) {
-                setGlobalTimeoutSec(String(timeoutValue));
-            }
-            const reactMax = data?.agent?.react_max_iterations;
-            if (reactMax !== undefined && reactMax !== null) {
-                setGlobalReactMaxIterations(String(reactMax));
-            }
-            setGlobalAstEnabled(Boolean(data?.agent?.ast_enabled ?? true));
-            setGlobalCodeMapEnabled(Boolean(data?.agent?.code_map?.enabled ?? true));
-            const contextConfig = data?.context || {};
-            setGlobalContextCompressionEnabled(Boolean(contextConfig?.compression_enabled));
-            const startPct = Number.parseInt(
-                String(contextConfig?.compress_start_pct ?? DEFAULT_CONTEXT_START_PCT),
-                10
-            );
-            if (Number.isFinite(startPct)) {
-                setGlobalContextCompressStartPct(String(startPct));
-            }
-            const targetPct = Number.parseInt(
-                String(contextConfig?.compress_target_pct ?? DEFAULT_CONTEXT_TARGET_PCT),
-                10
-            );
-            if (Number.isFinite(targetPct)) {
-                setGlobalContextCompressTargetPct(String(targetPct));
-            }
-            const minKeep = Number.parseInt(
-                String(contextConfig?.min_keep_messages ?? DEFAULT_CONTEXT_MIN_KEEP_MESSAGES),
-                10
-            );
-            if (Number.isFinite(minKeep)) {
-                setGlobalContextMinKeepMessages(String(minKeep));
-            }
-            const keepCalls = Number.parseInt(
-                String(contextConfig?.keep_recent_calls ?? DEFAULT_CONTEXT_KEEP_RECENT_CALLS),
-                10
-            );
-            if (Number.isFinite(keepCalls)) {
-                setGlobalContextKeepRecentCalls(String(keepCalls));
-            }
-            const stepCalls = Number.parseInt(
-                String(contextConfig?.step_calls ?? DEFAULT_CONTEXT_STEP_CALLS),
-                10
-            );
-            if (Number.isFinite(stepCalls)) {
-                setGlobalContextStepCalls(String(stepCalls));
-            }
-            setGlobalContextTruncateLongData(Boolean(contextConfig?.truncate_long_data ?? true));
-            const longThreshold = Number.parseInt(
-                String(contextConfig?.long_data_threshold ?? DEFAULT_CONTEXT_LONG_THRESHOLD),
-                10
-            );
-            if (Number.isFinite(longThreshold)) {
-                setGlobalContextLongThreshold(String(longThreshold));
-            }
-            const longHead = Number.parseInt(
-                String(contextConfig?.long_data_head_chars ?? DEFAULT_CONTEXT_LONG_HEAD_CHARS),
-                10
-            );
-            if (Number.isFinite(longHead)) {
-                setGlobalContextLongHeadChars(String(longHead));
-            }
-            const longTail = Number.parseInt(
-                String(contextConfig?.long_data_tail_chars ?? DEFAULT_CONTEXT_LONG_TAIL_CHARS),
-                10
-            );
-            if (Number.isFinite(longTail)) {
-                setGlobalContextLongTailChars(String(longTail));
-            }
-            setAgentConfig(normalizeAgentConfig(data?.agent));
+            applyAppConfigState(data);
         } catch (error: any) {
             console.error('Failed to load app config:', error);
             let errorMessage = 'Failed to load global config';
@@ -281,6 +365,599 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             setAvailableTools(normalizeTools(tools));
         } catch (error) {
             console.error('Failed to load tools:', error);
+        }
+    };
+
+    const extractConfigImportItems = (data: unknown): unknown[] => {
+        if (Array.isArray(data)) return data;
+        if (isRecord(data)) {
+            if (Array.isArray(data.configs)) return data.configs;
+            if (Array.isArray(data.models)) return data.models;
+            if (Array.isArray(data.items)) return data.items;
+        }
+        return [];
+    };
+
+    const makeUniqueName = (base: string, used: Set<string>) => {
+        let candidate = base;
+        let index = 2;
+        while (used.has(candidate)) {
+            candidate = `${base} (import ${index})`;
+            index += 1;
+        }
+        used.add(candidate);
+        return candidate;
+    };
+
+    const buildImportedConfigPayload = (
+        raw: unknown,
+        index: number,
+        usedNames: Set<string>
+    ): { payload?: Record<string, any>; error?: string } => {
+        if (!isRecord(raw)) {
+            return { error: '配置格式不正确' };
+        }
+        const model = typeof raw.model === 'string' ? raw.model.trim() : '';
+        if (!model) {
+            const fallbackName = typeof raw.name === 'string' && raw.name.trim()
+                ? raw.name.trim()
+                : `Imported Config ${index + 1}`;
+            return { error: `配置 "${fallbackName}" 缺少 model` };
+        }
+        const baseName = typeof raw.name === 'string' && raw.name.trim()
+            ? raw.name.trim()
+            : `Imported Config ${index + 1}`;
+        const name = makeUniqueName(baseName, usedNames);
+
+        const payload: Record<string, any> = { ...raw };
+        payload.name = name;
+        payload.api_format = typeof raw.api_format === 'string' && raw.api_format.trim()
+            ? raw.api_format
+            : 'openai_chat_completions';
+        const profile = typeof raw.api_profile === 'string' && raw.api_profile.trim()
+            ? raw.api_profile
+            : (typeof raw.api_type === 'string' && raw.api_type.trim() ? raw.api_type : '');
+        payload.api_profile = profile || 'openai';
+        payload.api_key = typeof raw.api_key === 'string' ? raw.api_key : '';
+        if (typeof raw.base_url === 'string') {
+            payload.base_url = raw.base_url;
+        } else {
+            delete payload.base_url;
+        }
+        payload.model = model;
+        payload.temperature = coerceNumber(raw.temperature, 0.7);
+        payload.max_tokens = Math.round(coerceNumber(raw.max_tokens, 2000));
+        payload.max_context_tokens = Math.round(coerceNumber(raw.max_context_tokens, 200000));
+        payload.is_default = Boolean(raw.is_default);
+        if (typeof raw.reasoning_effort === 'string') {
+            payload.reasoning_effort = raw.reasoning_effort;
+        }
+        if (typeof raw.reasoning_summary === 'string') {
+            payload.reasoning_summary = raw.reasoning_summary;
+        }
+
+        delete payload.id;
+        delete payload.created_at;
+        return { payload };
+    };
+
+    const handleExportConfigs = async () => {
+        try {
+            const ok = await exportConfigFile('models', { configs }, {
+                title: '导出模型配置',
+                defaultName: buildExportName('model-configs'),
+            });
+            if (ok) alert('模型配置已导出。');
+        } catch (error: any) {
+            console.error('Failed to export configs:', error);
+            alert(`导出失败: ${error?.message || 'Unknown error'}`);
+        }
+    };
+
+    const handleImportConfigs = async () => {
+        let result;
+        try {
+            result = await importConfigFile({ title: '导入模型配置' });
+        } catch (error: any) {
+            console.error('Failed to import configs:', error);
+            alert(`导入失败: ${error?.message || 'Unknown error'}`);
+            return;
+        }
+        if (!result) return;
+        if (!isAllowedKind(result.kind, MODEL_IMPORT_KINDS)) {
+            alert(`导入失败: 文件类型为 "${result.kind}"，不是模型配置。`);
+            return;
+        }
+
+        const items = extractConfigImportItems(result.data);
+        if (items.length === 0) {
+            alert('未找到可导入的模型配置。');
+            return;
+        }
+        const resultSummary = await importModelConfigsFromItems(items, configs);
+        if (resultSummary.cancelled) return;
+        await loadConfigs();
+        onConfigCreated?.();
+
+        const summary = `导入完成：成功 ${resultSummary.success}，失败 ${resultSummary.failed.length}，跳过 ${resultSummary.skipped.length}`;
+        const details = [
+            ...resultSummary.failed.map((item) => `失败: ${item}`),
+            ...resultSummary.skipped.map((item) => `跳过: ${item}`)
+        ];
+        const detailText = details.length ? `\n${details.slice(0, 4).join('\n')}` : '';
+        alert(`${summary}${detailText}`);
+    };
+
+    const buildGlobalExportPayload = (): AppConfigUpdate => ({
+        llm: {
+            timeout_sec: coerceNumber(globalTimeoutSec, 180),
+        },
+        agent: {
+            react_max_iterations: coerceInt(globalReactMaxIterations, 50),
+            ast_enabled: globalAstEnabled,
+            code_map: {
+                enabled: globalCodeMapEnabled,
+            },
+        },
+        context: {
+            compression_enabled: globalContextCompressionEnabled,
+            compress_start_pct: coerceInt(globalContextCompressStartPct, DEFAULT_CONTEXT_START_PCT),
+            compress_target_pct: coerceInt(globalContextCompressTargetPct, DEFAULT_CONTEXT_TARGET_PCT),
+            min_keep_messages: coerceInt(globalContextMinKeepMessages, DEFAULT_CONTEXT_MIN_KEEP_MESSAGES),
+            keep_recent_calls: coerceInt(globalContextKeepRecentCalls, DEFAULT_CONTEXT_KEEP_RECENT_CALLS),
+            step_calls: coerceInt(globalContextStepCalls, DEFAULT_CONTEXT_STEP_CALLS),
+            truncate_long_data: globalContextTruncateLongData,
+            long_data_threshold: coerceInt(globalContextLongThreshold, DEFAULT_CONTEXT_LONG_THRESHOLD),
+            long_data_head_chars: coerceInt(globalContextLongHeadChars, DEFAULT_CONTEXT_LONG_HEAD_CHARS),
+            long_data_tail_chars: coerceInt(globalContextLongTailChars, DEFAULT_CONTEXT_LONG_TAIL_CHARS),
+        },
+    });
+
+    const buildGlobalExportFromAppConfig = (appConfig: AppConfig | null | undefined): AppConfigUpdate => {
+        if (!appConfig) return {};
+        const payload: AppConfigUpdate = {};
+        if (appConfig.llm) {
+            payload.llm = { timeout_sec: appConfig.llm.timeout_sec };
+        }
+        if (appConfig.context) {
+            payload.context = appConfig.context;
+        }
+        if (appConfig.agent) {
+            const agent: Record<string, any> = { ...appConfig.agent };
+            delete agent.abilities;
+            delete agent.profiles;
+            delete agent.default_profile;
+            delete agent.base_system_prompt;
+            if (Object.keys(agent).length > 0) {
+                payload.agent = agent;
+            }
+        }
+        return payload;
+    };
+
+    const extractGlobalImportPayload = (data: unknown): AppConfigUpdate | null => {
+        if (!isRecord(data)) return null;
+        const candidate = isRecord(data.app_config)
+            ? data.app_config
+            : isRecord(data.appConfig)
+                ? data.appConfig
+                : isRecord(data.config)
+                    ? data.config
+                    : data;
+        if (!isRecord(candidate)) return null;
+
+        const payload: AppConfigUpdate = {};
+        if (isRecord(candidate.llm)) {
+            payload.llm = candidate.llm;
+        }
+        if (isRecord(candidate.context)) {
+            payload.context = candidate.context;
+        }
+        if (isRecord(candidate.agent)) {
+            const agent: Record<string, any> = { ...candidate.agent };
+            delete agent.abilities;
+            delete agent.profiles;
+            delete agent.default_profile;
+            delete agent.base_system_prompt;
+            if (Object.keys(agent).length > 0) {
+                payload.agent = agent;
+            }
+        }
+        return Object.keys(payload).length > 0 ? payload : null;
+    };
+
+    const handleExportGlobalConfig = async () => {
+        try {
+            const ok = await exportConfigFile('global', buildGlobalExportPayload(), {
+                title: '导出全局配置',
+                defaultName: buildExportName('global-config'),
+            });
+            if (ok) alert('全局配置已导出。');
+        } catch (error: any) {
+            console.error('Failed to export global config:', error);
+            alert(`导出失败: ${error?.message || 'Unknown error'}`);
+        }
+    };
+
+    const handleImportGlobalConfig = async () => {
+        let result;
+        try {
+            result = await importConfigFile({ title: '导入全局配置' });
+        } catch (error: any) {
+            console.error('Failed to import global config:', error);
+            alert(`导入失败: ${error?.message || 'Unknown error'}`);
+            return;
+        }
+        if (!result) return;
+        if (!isAllowedKind(result.kind, GLOBAL_IMPORT_KINDS)) {
+            alert(`导入失败: 文件类型为 "${result.kind}"，不是全局配置。`);
+            return;
+        }
+        const payload = extractGlobalImportPayload(result.data);
+        if (!payload) {
+            alert('未识别到有效的全局配置。');
+            return;
+        }
+        if (!globalSaved) {
+            const proceed = window.confirm('当前有未保存的全局配置修改，导入将覆盖它们。是否继续？');
+            if (!proceed) return;
+        }
+        setGlobalSaving(true);
+        setGlobalSaved(false);
+        try {
+            const updated = await updateAppConfig(payload);
+            applyAppConfigState(updated);
+            setGlobalSaved(true);
+            onConfigCreated?.();
+            alert('全局配置已导入。');
+        } catch (error: any) {
+            console.error('Failed to import global config:', error);
+            alert(`导入失败: ${error?.message || 'Unknown error'}`);
+        } finally {
+            setGlobalSaving(false);
+        }
+    };
+
+    const extractAgentImportPayload = (data: unknown): AgentConfig | null => {
+        if (!isRecord(data)) return null;
+        const candidate = isRecord(data.agent) ? data.agent : data;
+        if (!isRecord(candidate)) return null;
+        return stripAgentGlobalFields(candidate as AgentConfig);
+    };
+
+    const handleExportAgentConfig = async () => {
+        try {
+            const payload = stripAgentGlobalFields(normalizeAgentConfig(agentConfig));
+            const ok = await exportConfigFile('agent', payload, {
+                title: '导出 Agent 配置',
+                defaultName: buildExportName('agent-config'),
+            });
+            if (ok) alert('Agent 配置已导出。');
+        } catch (error: any) {
+            console.error('Failed to export agent config:', error);
+            alert(`导出失败: ${error?.message || 'Unknown error'}`);
+        }
+    };
+
+    const handleImportAgentConfig = async () => {
+        let result;
+        try {
+            result = await importConfigFile({ title: '导入 Agent 配置' });
+        } catch (error: any) {
+            console.error('Failed to import agent config:', error);
+            alert(`导入失败: ${error?.message || 'Unknown error'}`);
+            return;
+        }
+        if (!result) return;
+        if (!isAllowedKind(result.kind, AGENT_IMPORT_KINDS)) {
+            alert(`导入失败: 文件类型为 "${result.kind}"，不是 Agent 配置。`);
+            return;
+        }
+        const payload = extractAgentImportPayload(result.data);
+        if (!payload) {
+            alert('未识别到有效的 Agent 配置。');
+            return;
+        }
+        if (!agentSaved) {
+            const proceed = window.confirm('当前有未保存的 Agent 配置修改，导入将覆盖它们。是否继续？');
+            if (!proceed) return;
+        }
+        setAgentSaving(true);
+        setAgentSaved(false);
+        try {
+            const updated = await updateAppConfig({ agent: payload });
+            applyAppConfigState(updated);
+            setAgentSaved(true);
+            onConfigCreated?.();
+            alert('Agent 配置已导入。');
+        } catch (error: any) {
+            console.error('Failed to import agent config:', error);
+            alert(`导入失败: ${error?.message || 'Unknown error'}`);
+        } finally {
+            setAgentSaving(false);
+        }
+    };
+
+    const importModelConfigsFromItems = async (
+        items: unknown[],
+        existingConfigs: LLMConfig[],
+        options?: { confirmDefault?: boolean }
+    ) => {
+        const usedNames = new Set(existingConfigs.map((item) => item.name));
+        const payloads: Record<string, any>[] = [];
+        const skipped: string[] = [];
+
+        items.forEach((item, index) => {
+            const { payload, error } = buildImportedConfigPayload(item, index, usedNames);
+            if (payload) {
+                payloads.push(payload);
+            } else if (error) {
+                skipped.push(error);
+            }
+        });
+
+        if (payloads.length === 0) {
+            return { success: 0, failed: [] as string[], skipped, cancelled: false };
+        }
+
+        let defaultFound = false;
+        payloads.forEach((payload) => {
+            if (payload.is_default && !defaultFound) {
+                defaultFound = true;
+            } else if (payload.is_default) {
+                payload.is_default = false;
+            }
+        });
+
+        const confirmDefault = options?.confirmDefault !== false;
+        if (defaultFound && existingConfigs.length > 0 && confirmDefault) {
+            const proceed = window.confirm('导入的配置包含默认项，导入后会切换默认配置。是否继续？');
+            if (!proceed) {
+                return { success: 0, failed: [] as string[], skipped, cancelled: true };
+            }
+        }
+
+        let success = 0;
+        const failed: string[] = [];
+        for (const payload of payloads) {
+            try {
+                await createConfig(payload as LLMConfigCreate);
+                success += 1;
+            } catch (error: any) {
+                failed.push(`${payload.name || '未命名'}: ${error?.message || '导入失败'}`);
+            }
+        }
+
+        return { success, failed, skipped, cancelled: false };
+    };
+
+    const extractAstBundleEntries = (value: unknown) => {
+        const entries: { root: string; settings: Record<string, any> }[] = [];
+        if (!value) return entries;
+        if (Array.isArray(value)) {
+            value.forEach((item) => {
+                if (!isRecord(item)) return;
+                const root = typeof item.root === 'string' ? item.root : '';
+                const settings = isRecord(item.settings) ? item.settings : null;
+                if (root && settings) {
+                    entries.push({ root, settings });
+                }
+            });
+            return entries;
+        }
+        if (!isRecord(value)) return entries;
+        if (Array.isArray(value.paths)) {
+            value.paths.forEach((item: unknown) => {
+                if (!isRecord(item)) return;
+                const root = typeof item.root === 'string' ? item.root : '';
+                const settings = isRecord(item.settings) ? item.settings : null;
+                if (root && settings) {
+                    entries.push({ root, settings });
+                }
+            });
+            return entries;
+        }
+        if (isRecord(value.paths)) {
+            Object.entries(value.paths).forEach(([root, settings]) => {
+                if (!root || !isRecord(settings)) return;
+                entries.push({ root, settings });
+            });
+            return entries;
+        }
+        if (typeof value.root === 'string' && isRecord(value.settings)) {
+            entries.push({ root: value.root, settings: value.settings });
+        }
+        return entries;
+    };
+
+    const buildAstPayload = (root: string, settings: Record<string, any>) => {
+        const payload: Record<string, any> = { root };
+        if ('ignore_paths' in settings) {
+            payload.ignore_paths = normalizeAstImportList(settings.ignore_paths);
+        }
+        if ('include_only_paths' in settings) {
+            payload.include_only_paths = normalizeAstImportList(settings.include_only_paths);
+        }
+        if ('force_include_paths' in settings) {
+            payload.force_include_paths = normalizeAstImportList(settings.force_include_paths);
+        }
+        if ('include_languages' in settings) {
+            payload.include_languages = normalizeAstImportLanguages(settings.include_languages);
+        }
+        if ('max_files' in settings) {
+            const parsed = Number.parseInt(String(settings.max_files), 10);
+            if (Number.isFinite(parsed) && parsed > 0) {
+                payload.max_files = parsed;
+            }
+        }
+        return payload;
+    };
+
+    const handleExportAllConfigs = async () => {
+        setBundleBusy(true);
+        try {
+            const [latestConfigs, appConfig, astBundle] = await Promise.all([
+                getConfigs(),
+                getAppConfig(),
+                getAstSettingsAll()
+            ]);
+            const payload = {
+                models: { configs: latestConfigs },
+                global: buildGlobalExportFromAppConfig(appConfig),
+                agent: stripAgentGlobalFields(appConfig?.agent || {}),
+                ast: { paths: Array.isArray(astBundle?.paths) ? astBundle.paths : [] }
+            };
+            const ok = await exportConfigFile('all', payload, {
+                title: '导出全部配置',
+                defaultName: buildExportName('all-configs'),
+            });
+            if (ok) alert('全部配置已导出。');
+        } catch (error: any) {
+            console.error('Failed to export all configs:', error);
+            alert(`导出失败: ${error?.message || 'Unknown error'}`);
+        } finally {
+            setBundleBusy(false);
+        }
+    };
+
+    const handleImportAllConfigs = async () => {
+        let result;
+        try {
+            result = await importConfigFile({ title: '导入全部配置' });
+        } catch (error: any) {
+            console.error('Failed to import all configs:', error);
+            alert(`导入失败: ${error?.message || 'Unknown error'}`);
+            return;
+        }
+        if (!result) return;
+        if (!isAllowedKind(result.kind, ALL_IMPORT_KINDS)) {
+            alert(`导入失败: 文件类型为 "${result.kind}"，不是完整配置包。`);
+            return;
+        }
+        if (!isRecord(result.data)) {
+            alert('未识别到有效的配置包。');
+            return;
+        }
+
+        const data = result.data;
+        const modelSource = isRecord(data.models)
+            ? data.models
+            : isRecord(data.llm_configs)
+                ? data.llm_configs
+                : data;
+        const modelItems = extractConfigImportItems(modelSource);
+
+        const globalPayload = extractGlobalImportPayload(
+            isRecord(data.global)
+                ? data.global
+                : isRecord(data.app_config)
+                    ? data.app_config
+                    : isRecord(data.appConfig)
+                        ? data.appConfig
+                        : null
+        );
+        const agentPayload = extractAgentImportPayload(
+            isRecord(data.agent)
+                ? data.agent
+                : isRecord(data.agent_config)
+                    ? data.agent_config
+                    : null
+        );
+        const astEntries = extractAstBundleEntries(
+            isRecord(data.ast)
+                ? data.ast
+                : isRecord(data.ast_settings)
+                    ? data.ast_settings
+                    : isRecord(data.astSettings)
+                        ? data.astSettings
+                        : null
+        );
+
+        if (modelItems.length === 0 && !globalPayload && !agentPayload && astEntries.length === 0) {
+            alert('配置包中没有可导入的内容。');
+            return;
+        }
+
+        const summaryLines: string[] = [];
+        if (modelItems.length > 0) summaryLines.push(`模型配置：${modelItems.length} 项`);
+        if (globalPayload) summaryLines.push('全局配置');
+        if (agentPayload) summaryLines.push('Agent 配置');
+        if (astEntries.length > 0) summaryLines.push(`AST 设置：${astEntries.length} 个根路径`);
+
+        const proceed = window.confirm(`将导入以下内容：\n${summaryLines.join('\n')}\n\n是否继续？`);
+        if (!proceed) return;
+
+        setBundleBusy(true);
+        try {
+            const latestConfigs = await getConfigs();
+            let modelResult = { success: 0, failed: [] as string[], skipped: [] as string[], cancelled: false };
+            if (modelItems.length > 0) {
+                modelResult = await importModelConfigsFromItems(modelItems, latestConfigs, { confirmDefault: false });
+            }
+
+            const appPatch: AppConfigUpdate = {};
+            if (globalPayload?.llm) appPatch.llm = globalPayload.llm;
+            if (globalPayload?.context) appPatch.context = globalPayload.context;
+            if (globalPayload?.agent || agentPayload) {
+                appPatch.agent = {
+                    ...(globalPayload?.agent || {}),
+                    ...(agentPayload || {})
+                };
+            }
+
+            let appUpdated = false;
+            if (Object.keys(appPatch).length > 0) {
+                const updated = await updateAppConfig(appPatch);
+                applyAppConfigState(updated);
+                appUpdated = true;
+            }
+
+            let astSuccess = 0;
+            const astFailed: string[] = [];
+            if (astEntries.length > 0) {
+                for (const entry of astEntries) {
+                    const payload = buildAstPayload(entry.root, entry.settings);
+                    if (Object.keys(payload).length <= 1) {
+                        continue;
+                    }
+                    try {
+                        await updateAstSettings(payload as any);
+                        astSuccess += 1;
+                    } catch (error: any) {
+                        astFailed.push(`${entry.root}: ${error?.message || '导入失败'}`);
+                    }
+                }
+            }
+
+            if (modelItems.length > 0) {
+                await loadConfigs();
+            }
+            if (modelItems.length > 0 || appUpdated) {
+                onConfigCreated?.();
+            }
+
+            const resultLines: string[] = [];
+            if (modelItems.length > 0) {
+                resultLines.push(`模型配置：成功 ${modelResult.success}，失败 ${modelResult.failed.length}，跳过 ${modelResult.skipped.length}`);
+            }
+            if (globalPayload) resultLines.push('全局配置：已更新');
+            if (agentPayload) resultLines.push('Agent 配置：已更新');
+            if (astEntries.length > 0) {
+                resultLines.push(`AST 设置：成功 ${astSuccess}，失败 ${astFailed.length}`);
+            }
+
+            const detailLines = [
+                ...modelResult.failed.map((item) => `模型失败: ${item}`),
+                ...modelResult.skipped.map((item) => `模型跳过: ${item}`),
+                ...astFailed.map((item) => `AST 失败: ${item}`)
+            ];
+            const detailText = detailLines.length ? `\n${detailLines.slice(0, 4).join('\n')}` : '';
+            alert(`导入完成。\n${resultLines.join('\n')}${detailText}`);
+        } catch (error: any) {
+            console.error('Failed to import all configs:', error);
+            alert(`导入失败: ${error?.message || 'Unknown error'}`);
+        } finally {
+            setBundleBusy(false);
         }
     };
 
@@ -887,12 +1564,33 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     };
 
     const allToolsSelected = abilityForm.tools.includes('*');
+    const bundleDisabled = bundleBusy || globalLoading || globalSaving || agentLoading || agentSaving || loading;
 
     return (
         <div className="modal-overlay">
             <div className="modal-content" onClick={(e) => e.stopPropagation()}>
                 <div className="modal-header">
-                    <h2>配置管理</h2>
+                    <div className="modal-header-title">
+                        <h2>配置管理</h2>
+                        <div className="config-header-actions">
+                            <button
+                                type="button"
+                                className="add-btn add-inline"
+                                onClick={handleImportAllConfigs}
+                                disabled={bundleDisabled}
+                            >
+                                导入全部
+                            </button>
+                            <button
+                                type="button"
+                                className="add-btn add-inline"
+                                onClick={handleExportAllConfigs}
+                                disabled={bundleDisabled}
+                            >
+                                导出全部
+                            </button>
+                        </div>
+                    </div>
                     <button className="close-btn" onClick={onClose}>X</button>
                 </div>
 
@@ -929,9 +1627,27 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
 
                     {activeTab === 'models' ? (
                         <>
-                            <button className="add-btn" onClick={() => setShowForm(true)}>
-                                + Add Config
-                            </button>
+                            <div className="config-toolbar">
+                                <button className="add-btn add-inline" onClick={() => setShowForm(true)} type="button">
+                                    + Add Config
+                                </button>
+                                <div className="config-toolbar-actions">
+                                    <button
+                                        className="add-btn add-inline"
+                                        type="button"
+                                        onClick={handleImportConfigs}
+                                    >
+                                        导入
+                                    </button>
+                                    <button
+                                        className="add-btn add-inline"
+                                        type="button"
+                                        onClick={handleExportConfigs}
+                                    >
+                                        导出
+                                    </button>
+                                </div>
+                            </div>
 
                             <div className="configs-list">
                                 {configs.length === 0 ? (
@@ -984,7 +1700,27 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                         </>
                     ) : activeTab === 'global' ? (
                         <form onSubmit={handleGlobalSave} className="config-form">
-                            <h3>全局配置</h3>
+                            <div className="config-form-header">
+                                <h3>全局配置</h3>
+                                <div className="config-form-actions">
+                                    <button
+                                        type="button"
+                                        className="add-btn add-inline"
+                                        onClick={handleImportGlobalConfig}
+                                        disabled={globalLoading || globalSaving}
+                                    >
+                                        导入
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="add-btn add-inline"
+                                        onClick={handleExportGlobalConfig}
+                                        disabled={globalLoading || globalSaving}
+                                    >
+                                        导出
+                                    </button>
+                                </div>
+                            </div>
 
                             <div className="form-group">
                                 <label>LLM 超时（秒）</label>
@@ -1252,7 +1988,27 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                         </form>
                     ) : (
                         <form onSubmit={handleAgentSave} className="config-form">
-                            <h3>Agent配置</h3>
+                            <div className="config-form-header">
+                                <h3>Agent配置</h3>
+                                <div className="config-form-actions">
+                                    <button
+                                        type="button"
+                                        className="add-btn add-inline"
+                                        onClick={handleImportAgentConfig}
+                                        disabled={agentLoading || agentSaving}
+                                    >
+                                        导入
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="add-btn add-inline"
+                                        onClick={handleExportAgentConfig}
+                                        disabled={agentLoading || agentSaving}
+                                    >
+                                        导出
+                                    </button>
+                                </div>
+                            </div>
 
                             <div className="form-group">
                                 <label>基础系统提示词</label>
