@@ -491,6 +491,39 @@ def _contains_shell_operators(command: str) -> bool:
     return False
 
 
+def _join_command(parts: List[str]) -> str:
+    if not parts:
+        return ""
+    if _is_windows():
+        return subprocess.list2cmdline(parts)
+    joiner = getattr(shlex, "join", None)
+    if joiner:
+        return joiner(parts)
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def _rewrite_rg_command(command: str, root: Path) -> str:
+    if not command or _contains_shell_operators(command):
+        return command
+    try:
+        parts = shlex.split(command, posix=False)
+    except Exception:
+        return command
+    if not parts:
+        return command
+    head = parts[0].strip().strip('"').strip("'")
+    base = os.path.basename(head).lower()
+    if base.endswith(".exe") or base.endswith(".cmd") or base.endswith(".bat"):
+        base = os.path.splitext(base)[0]
+    if base != "rg":
+        return command
+    rg_exe = _resolve_rg_executable(root)
+    if not rg_exe or rg_exe == "rg":
+        return command
+    parts[0] = rg_exe
+    return _join_command(parts)
+
+
 def _extract_path_candidates(command: str) -> list:
     try:
         parts = shlex.split(command, posix=False)
@@ -2456,6 +2489,8 @@ class RunShellTool(Tool):
 
         cmd_name = _extract_command_name(command)
         root = _get_root_path()
+        if cmd_name == "rg":
+            command = _rewrite_rg_command(command, root)
         tool_ctx = get_tool_context()
         agent_mode = _get_agent_mode()
         shell_unrestricted = bool(tool_ctx.get("shell_unrestricted"))
