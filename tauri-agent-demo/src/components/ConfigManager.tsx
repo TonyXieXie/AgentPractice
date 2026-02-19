@@ -397,17 +397,18 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         if (!isRecord(raw)) {
             return { error: '配置格式不正确' };
         }
+        const rawName = typeof raw.name === 'string' && raw.name.trim()
+            ? raw.name.trim()
+            : '';
         const model = typeof raw.model === 'string' ? raw.model.trim() : '';
         if (!model) {
-            const fallbackName = typeof raw.name === 'string' && raw.name.trim()
-                ? raw.name.trim()
-                : `Imported Config ${index + 1}`;
+            const fallbackName = rawName || `Imported Config ${index + 1}`;
             return { error: `配置 "${fallbackName}" 缺少 model` };
         }
-        const baseName = typeof raw.name === 'string' && raw.name.trim()
-            ? raw.name.trim()
-            : `Imported Config ${index + 1}`;
-        const name = makeUniqueName(baseName, usedNames);
+        const name = rawName || makeUniqueName(`Imported Config ${index + 1}`, usedNames);
+        if (rawName) {
+            usedNames.add(rawName);
+        }
 
         const payload: Record<string, any> = { ...raw };
         payload.name = name;
@@ -418,7 +419,9 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             ? raw.api_profile
             : (typeof raw.api_type === 'string' && raw.api_type.trim() ? raw.api_type : '');
         payload.api_profile = profile || 'openai';
-        payload.api_key = typeof raw.api_key === 'string' ? raw.api_key : '';
+        if (typeof raw.api_key === 'string') {
+            payload.api_key = raw.api_key;
+        }
         if (typeof raw.base_url === 'string') {
             payload.base_url = raw.base_url;
         } else {
@@ -665,7 +668,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         setAgentSaving(true);
         setAgentSaved(false);
         try {
-            const updated = await updateAppConfig({ agent: payload });
+            const merged = mergeAgentConfigByName(agentConfig, payload);
+            const updated = await updateAppConfig({ agent: merged });
             applyAppConfigState(updated);
             setAgentSaved(true);
             onConfigCreated?.();
@@ -684,6 +688,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         options?: { confirmDefault?: boolean }
     ) => {
         const usedNames = new Set(existingConfigs.map((item) => item.name));
+        const existingByName = new Map(existingConfigs.map((item) => [item.name, item]));
         const payloads: Record<string, any>[] = [];
         const skipped: string[] = [];
 
@@ -720,11 +725,31 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         let success = 0;
         const failed: string[] = [];
         for (const payload of payloads) {
+            const name = String(payload.name || '').trim();
+            if (!name) {
+                failed.push('未命名: 缺少名称');
+                continue;
+            }
+            const existing = existingByName.get(name);
             try {
-                await createConfig(payload as LLMConfigCreate);
+                if (existing) {
+                    const updatePayload: Record<string, any> = { ...payload };
+                    if (!('api_key' in updatePayload)) {
+                        delete updatePayload.api_key;
+                    }
+                    const updated = await updateConfig(existing.id, updatePayload);
+                    existingByName.set(updated.name, updated);
+                } else {
+                    const createPayload: Record<string, any> = { ...payload };
+                    if (!('api_key' in createPayload)) {
+                        createPayload.api_key = '';
+                    }
+                    const created = await createConfig(createPayload as LLMConfigCreate);
+                    existingByName.set(created.name, created);
+                }
                 success += 1;
             } catch (error: any) {
-                failed.push(`${payload.name || '未命名'}: ${error?.message || '导入失败'}`);
+                failed.push(`${name}: ${error?.message || '导入失败'}`);
             }
         }
 
@@ -899,10 +924,18 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             if (globalPayload?.llm) appPatch.llm = globalPayload.llm;
             if (globalPayload?.context) appPatch.context = globalPayload.context;
             if (globalPayload?.agent || agentPayload) {
-                appPatch.agent = {
-                    ...(globalPayload?.agent || {}),
-                    ...(agentPayload || {})
-                };
+                const baseAgent = normalizeAgentConfig(agentConfig);
+                let mergedAgent = baseAgent;
+                if (agentPayload) {
+                    mergedAgent = mergeAgentConfigByName(baseAgent, agentPayload);
+                }
+                if (globalPayload?.agent) {
+                    mergedAgent = {
+                        ...mergedAgent,
+                        ...globalPayload.agent
+                    };
+                }
+                appPatch.agent = mergedAgent;
             }
 
             let appUpdated = false;
@@ -1162,6 +1195,202 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             counter += 1;
         }
         return id;
+    };
+
+    const mergeAbilitiesByName = (
+        current: AgentAbility[],
+        incoming: AgentAbility[]
+    ): { merged: AgentAbility[]; idMap: Map<string, string> } => {
+        const merged = current.map((ability) => ({ ...ability }));
+        const nameToIndex = new Map<string, number>();
+        const idToIndex = new Map<string, number>();
+        const existingIds: string[] = [];
+
+        merged.forEach((ability, index) => {
+            if (ability.id) {
+                existingIds.push(ability.id);
+                idToIndex.set(ability.id, index);
+            }
+            if (ability.name) {
+                nameToIndex.set(ability.name.trim(), index);
+            }
+        });
+
+        const idMap = new Map<string, string>();
+
+        incoming.forEach((rawAbility, index) => {
+            if (!rawAbility) return;
+            const incomingAbility = rawAbility as AgentAbility;
+            const rawName = typeof incomingAbility.name === 'string' ? incomingAbility.name.trim() : '';
+            const rawId = typeof incomingAbility.id === 'string' ? incomingAbility.id.trim() : '';
+            const nameKey = rawName || rawId || `ability-${index + 1}`;
+            const existingIndex =
+                (rawName && nameToIndex.has(rawName) ? nameToIndex.get(rawName) : undefined) ??
+                (rawId && idToIndex.has(rawId) ? idToIndex.get(rawId) : undefined);
+
+            if (existingIndex !== undefined) {
+                const existing = merged[existingIndex];
+                const finalId = existing.id || rawId || makeId(nameKey, existingIds, 'ability');
+                if (rawId && rawId !== finalId) {
+                    idMap.set(rawId, finalId);
+                }
+                if (!existing.id || existing.id !== finalId) {
+                    existingIds.push(finalId);
+                }
+                const next: AgentAbility = {
+                    ...existing,
+                    ...incomingAbility,
+                    id: finalId,
+                    name: rawName || existing.name || nameKey,
+                };
+                if (!Array.isArray(incomingAbility.tools) && Array.isArray(existing.tools)) {
+                    next.tools = existing.tools;
+                }
+                merged[existingIndex] = next;
+                nameToIndex.set(next.name || nameKey, existingIndex);
+                idToIndex.set(finalId, existingIndex);
+                return;
+            }
+
+            let finalId = rawId || makeId(nameKey, existingIds, 'ability');
+            if (existingIds.includes(finalId)) {
+                finalId = makeId(nameKey, existingIds, 'ability');
+            }
+            existingIds.push(finalId);
+            if (rawId && rawId !== finalId) {
+                idMap.set(rawId, finalId);
+            }
+
+            const created: AgentAbility = {
+                id: finalId,
+                name: rawName || nameKey || finalId,
+                type: incomingAbility.type || 'tooling',
+                prompt: incomingAbility.prompt,
+                tools: Array.isArray(incomingAbility.tools) ? incomingAbility.tools : [],
+                params: incomingAbility.params,
+            };
+            merged.push(created);
+            nameToIndex.set(created.name, merged.length - 1);
+            idToIndex.set(finalId, merged.length - 1);
+        });
+
+        return { merged, idMap };
+    };
+
+    const mergeProfilesByName = (
+        current: AgentProfile[],
+        incoming: AgentProfile[],
+        abilityIdMap: Map<string, string>
+    ): { merged: AgentProfile[]; idMap: Map<string, string> } => {
+        const merged = current.map((profile) => ({ ...profile }));
+        const nameToIndex = new Map<string, number>();
+        const idToIndex = new Map<string, number>();
+        const existingIds: string[] = [];
+
+        merged.forEach((profile, index) => {
+            if (profile.id) {
+                existingIds.push(profile.id);
+                idToIndex.set(profile.id, index);
+            }
+            if (profile.name) {
+                nameToIndex.set(profile.name.trim(), index);
+            }
+        });
+
+        const idMap = new Map<string, string>();
+
+        incoming.forEach((rawProfile, index) => {
+            if (!rawProfile) return;
+            const incomingProfile = rawProfile as AgentProfile;
+            const rawName = typeof incomingProfile.name === 'string' ? incomingProfile.name.trim() : '';
+            const rawId = typeof incomingProfile.id === 'string' ? incomingProfile.id.trim() : '';
+            const nameKey = rawName || rawId || `profile-${index + 1}`;
+            const existingIndex =
+                (rawName && nameToIndex.has(rawName) ? nameToIndex.get(rawName) : undefined) ??
+                (rawId && idToIndex.has(rawId) ? idToIndex.get(rawId) : undefined);
+            const nextAbilities = Array.isArray(incomingProfile.abilities)
+                ? incomingProfile.abilities.map((id) => abilityIdMap.get(id) || id)
+                : null;
+
+            if (existingIndex !== undefined) {
+                const existing = merged[existingIndex];
+                const finalId = existing.id || rawId || makeId(nameKey, existingIds, 'profile');
+                if (rawId && rawId !== finalId) {
+                    idMap.set(rawId, finalId);
+                }
+                if (!existing.id || existing.id !== finalId) {
+                    existingIds.push(finalId);
+                }
+                const next: AgentProfile = {
+                    ...existing,
+                    ...incomingProfile,
+                    id: finalId,
+                    name: rawName || existing.name || nameKey,
+                    abilities: nextAbilities ?? existing.abilities,
+                };
+                merged[existingIndex] = next;
+                nameToIndex.set(next.name || nameKey, existingIndex);
+                idToIndex.set(finalId, existingIndex);
+                return;
+            }
+
+            let finalId = rawId || makeId(nameKey, existingIds, 'profile');
+            if (existingIds.includes(finalId)) {
+                finalId = makeId(nameKey, existingIds, 'profile');
+            }
+            existingIds.push(finalId);
+            if (rawId && rawId !== finalId) {
+                idMap.set(rawId, finalId);
+            }
+            const created: AgentProfile = {
+                id: finalId,
+                name: rawName || nameKey || finalId,
+                abilities: nextAbilities ?? [],
+                params: incomingProfile.params,
+            };
+            merged.push(created);
+            nameToIndex.set(created.name, merged.length - 1);
+            idToIndex.set(finalId, merged.length - 1);
+        });
+
+        return { merged, idMap };
+    };
+
+    const mergeAgentConfigByName = (current: AgentConfig, incoming: AgentConfig): AgentConfig => {
+        const currentNormalized = normalizeAgentConfig(current);
+        const incomingRaw = isRecord(incoming) ? incoming : {};
+        const incomingAbilities = Array.isArray(incomingRaw.abilities) ? (incomingRaw.abilities as AgentAbility[]) : [];
+        const incomingProfiles = Array.isArray(incomingRaw.profiles) ? (incomingRaw.profiles as AgentProfile[]) : [];
+
+        const { merged: abilities, idMap: abilityIdMap } = mergeAbilitiesByName(
+            Array.isArray(currentNormalized.abilities) ? currentNormalized.abilities : [],
+            incomingAbilities
+        );
+        const { merged: profiles, idMap: profileIdMap } = mergeProfilesByName(
+            Array.isArray(currentNormalized.profiles) ? currentNormalized.profiles : [],
+            incomingProfiles,
+            abilityIdMap
+        );
+
+        let defaultProfile = currentNormalized.default_profile || '';
+        if (typeof incomingRaw.default_profile === 'string' && incomingRaw.default_profile.trim()) {
+            const incomingDefault = incomingRaw.default_profile.trim();
+            defaultProfile =
+                profileIdMap.get(incomingDefault) ||
+                profiles.find((profile) => profile.id === incomingDefault)?.id ||
+                profiles.find((profile) => profile.name === incomingDefault)?.id ||
+                defaultProfile;
+        }
+
+        return {
+            ...currentNormalized,
+            base_system_prompt: typeof incomingRaw.base_system_prompt === 'string'
+                ? incomingRaw.base_system_prompt
+                : currentNormalized.base_system_prompt,
+            abilities,
+            profiles,
+            default_profile: defaultProfile,
+        };
     };
 
     const handleAgentSave = async (e: React.FormEvent) => {
