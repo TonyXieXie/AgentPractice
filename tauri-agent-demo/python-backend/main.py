@@ -1,6 +1,7 @@
 ﻿from fastapi import FastAPI, HTTPException, Response, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
 import uvicorn
 import json
 import os
@@ -1237,62 +1238,98 @@ async def chat_agent_stream(request: ChatRequest):
                     request_overrides.get("prompt_truncation")
                 )
 
-                async for step in executor.run(
+                keepalive_sec = 15
+                try:
+                    keepalive_sec = int(os.getenv("AGENT_STREAM_KEEPALIVE_SEC", "15") or "15")
+                except (TypeError, ValueError):
+                    keepalive_sec = 15
+                if keepalive_sec < 5:
+                    keepalive_sec = 5
+
+                step_iter = executor.run(
                     user_input=processed_message,
                     history=history_for_llm,
                     session_id=session.id,
                     request_overrides=request_overrides if request_overrides else None
-                ):
-                    if step.step_type == "context_estimate":
+                )
+                step_queue: asyncio.Queue = asyncio.Queue()
+
+                async def _produce_steps():
+                    try:
+                        async for step in step_iter:
+                            await step_queue.put(step)
+                    finally:
+                        await step_queue.put(None)
+
+                producer_task = asyncio.create_task(_produce_steps())
+                try:
+                    while True:
                         try:
-                            db.update_session_context_estimate(session.id, step.metadata)
-                        except Exception as exc:
-                            print(f"[Context Estimate] Failed to update session: {exc}")
-                        yield f"data: {json.dumps(step.to_dict())}\n\n"
-                        continue
+                            step = await asyncio.wait_for(step_queue.get(), timeout=keepalive_sec)
+                        except asyncio.TimeoutError:
+                            # SSE keepalive comment to prevent client load timeouts.
+                            yield ":\n\n"
+                            continue
+                        if step is None:
+                            break
 
-                    if step.step_type.endswith("_delta"):
-                        saw_delta = True
-                        yield f"data: {json.dumps(step.to_dict())}\n\n"
-                        continue
-                    suppress_prompt = False
-                    if step.step_type == "error":
-                        suppress_prompt = bool(step.metadata.get("suppress_prompt")) if isinstance(step.metadata, dict) else False
+                        if step.step_type == "context_estimate":
+                            try:
+                                db.update_session_context_estimate(session.id, step.metadata)
+                            except Exception as exc:
+                                print(f"[Context Estimate] Failed to update session: {exc}")
+                            yield f"data: {json.dumps(step.to_dict())}\n\n"
+                            continue
 
-                    if suppress_prompt:
-                        yield f"data: {json.dumps(step.to_dict())}\n\n"
-                        continue
+                        if step.step_type.endswith("_delta"):
+                            saw_delta = True
+                            yield f"data: {json.dumps(step.to_dict())}\n\n"
+                            continue
+                        suppress_prompt = False
+                        if step.step_type == "error":
+                            suppress_prompt = bool(step.metadata.get("suppress_prompt")) if isinstance(step.metadata, dict) else False
 
-                    db.save_agent_step(
-                        message_id=assistant_msg_id,
-                        step_type=step.step_type,
-                        content=step.content,
-                        sequence=sequence,
-                        metadata=step.metadata
-                    )
+                        if suppress_prompt:
+                            yield f"data: {json.dumps(step.to_dict())}\n\n"
+                            continue
 
-                    if step.step_type == "action" and "tool" in step.metadata:
-                        db.save_tool_call(
+                        db.save_agent_step(
                             message_id=assistant_msg_id,
-                            tool_name=step.metadata["tool"],
-                            tool_input=step.metadata.get("input", ""),
-                            tool_output=""
+                            step_type=step.step_type,
+                            content=step.content,
+                            sequence=sequence,
+                            metadata=step.metadata
                         )
 
-                    if step.step_type == "answer":
-                        final_answer = step.content
-                        if not saw_delta:
-                            for chunk in stream_text_chunks(step.content, chunk_size=1):
-                                yield f"data: {json.dumps({'step_type': 'answer_delta', 'content': chunk, 'metadata': step.metadata})}\n\n"
+                        if step.step_type == "action" and "tool" in step.metadata:
+                            db.save_tool_call(
+                                message_id=assistant_msg_id,
+                                tool_name=step.metadata["tool"],
+                                tool_input=step.metadata.get("input", ""),
+                                tool_output=""
+                            )
+
+                        if step.step_type == "answer":
+                            final_answer = step.content
+                            if not saw_delta:
+                                for chunk in stream_text_chunks(step.content, chunk_size=1):
+                                    yield f"data: {json.dumps({'step_type': 'answer_delta', 'content': chunk, 'metadata': step.metadata})}\n\n"
+                            yield f"data: {json.dumps(step.to_dict())}\n\n"
+                            sequence += 1
+                            continue
+
+                        if step.step_type == "error":
+                            final_answer = step.content
+
                         yield f"data: {json.dumps(step.to_dict())}\n\n"
                         sequence += 1
-                        continue
-
-                    if step.step_type == "error":
-                        final_answer = step.content
-
-                    yield f"data: {json.dumps(step.to_dict())}\n\n"
-                    sequence += 1
+                finally:
+                    if producer_task and not producer_task.done():
+                        producer_task.cancel()
+                        try:
+                            await producer_task
+                        except Exception:
+                            pass
 
                 if final_answer and assistant_msg_id:
                     conn = db.get_connection()

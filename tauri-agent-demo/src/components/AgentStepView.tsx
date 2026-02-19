@@ -1701,6 +1701,7 @@ function AgentStepView({
                 const isObservation = step.step_type === 'observation';
                 const isAction = step.step_type === 'action' || step.step_type === 'action_delta';
                 const isError = step.step_type === 'error';
+                const isContextCompress = isObservation && Boolean(step.metadata?.context_compress);
                 const errorType = String(step.metadata?.error_type || '').toLowerCase();
                 const isTimeoutError =
                     isError && (errorType.includes('timeout') || /timeout/i.test(String(step.content || '')));
@@ -1757,10 +1758,15 @@ function AgentStepView({
                     iteration,
                     element: (
                         <Fragment key={`${step.step_type}-${index}`}>
-                        <div className={`agent-step ${category}${isAction ? ' action' : ''}`}>
+                        <div className={`agent-step ${category}${isAction ? ' action' : ''}${isContextCompress ? ' compression' : ''}`}>
                             <div className="agent-step-header">
                                     <span className="agent-step-category">{CATEGORY_LABELS[category]}</span>
                                     <div className="agent-step-header-actions">
+                                        {isContextCompress && (
+                                            <span className="context-compress-badge">
+                                                {step.metadata?.current_turn ? '本轮压缩' : '上下文压缩'}
+                                            </span>
+                                        )}
                                         {isObservation && observationFailed && (
                                             <span className="agent-step-failure-icon" title="Failed">X</span>
                                         )}
@@ -1797,7 +1803,7 @@ function AgentStepView({
                                 </div>
                             </div>
                             {isObservation ? (
-                                <div className="agent-step-content observation">
+                                <div className={`agent-step-content observation${isContextCompress ? ' compression' : ''}`}>
                                     {isApplyPatch && applyPatchResult ? (
                                         applyPatchResult.ok ? (
                                             <div className="patch-result">

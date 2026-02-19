@@ -346,8 +346,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             return;
         }
         const minKeep = Number.parseInt(globalContextMinKeepMessages, 10);
-        if (!Number.isFinite(minKeep) || minKeep < 1 || minKeep > 200) {
-            alert('最少保留消息数必须是 1 到 200 之间的整数。');
+        if (!Number.isFinite(minKeep) || minKeep < 0 || minKeep > 200) {
+            alert('最少保留消息数必须是 0 到 200 之间的整数。');
             setGlobalSaving(false);
             return;
         }
@@ -1117,7 +1117,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     <label>最少保留消息数</label>
                                     <input
                                         type="number"
-                                        min="1"
+                                        min="0"
                                         max="200"
                                         step="1"
                                         value={globalContextMinKeepMessages}

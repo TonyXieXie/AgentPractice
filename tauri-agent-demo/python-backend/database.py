@@ -1341,6 +1341,21 @@ class Database:
         value = row["message_id"]
         return int(value) if value is not None else None
 
+    def get_latest_llm_call_id(self, session_id: str) -> Optional[int]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT MAX(id) as id
+            FROM llm_calls
+            WHERE session_id = ?
+        ''', (session_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        value = row["id"]
+        return int(value) if value is not None else None
+
     def update_session_agent_type(self, session_id: str, agent_type: str):
         """Update session agent type"""
         conn = self.get_connection()

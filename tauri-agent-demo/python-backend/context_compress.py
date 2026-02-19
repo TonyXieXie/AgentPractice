@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional, Tuple
+import os
 
 from models import LLMConfig
 from database import db
@@ -17,6 +18,11 @@ CONTEXT_COMPRESS_KEEP_RECENT_CALLS = 10
 CONTEXT_COMPRESS_STEP_CALLS = 5
 TRUNCATION_MARKER_START = "[TRUNCATED_START]"
 TRUNCATION_MARKER_END = "[TRUNCATED_END]"
+
+
+def _debug_log(message: str) -> None:
+    if os.getenv("CONTEXT_COMPRESS_DEBUG"):
+        print(f"[Context Compress] {message}")
 
 
 def _estimate_tokens_for_text(text: str) -> int:
@@ -79,6 +85,15 @@ def _truncate_text_middle(text: str, cfg: Optional[Dict[str, Any]]) -> str:
     )
 
 
+def _build_trunc_cfg(context_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "enabled": bool(context_cfg.get("truncate_long_data", True)),
+        "threshold": int(context_cfg.get("long_data_threshold", 4000) or 4000),
+        "head_chars": int(context_cfg.get("long_data_head_chars", 1200) or 1200),
+        "tail_chars": int(context_cfg.get("long_data_tail_chars", 800) or 800)
+    }
+
+
 def _build_context_summary_request(summary: str, dialogue_text: str) -> List[Dict[str, str]]:
     parts = []
     if summary:
@@ -111,6 +126,14 @@ async def _run_context_summary(
         return None
     content = str(result.get("content") or "").strip()
     return content or None
+
+
+async def summarize_dialogue(
+    llm_client: Any,
+    summary: str,
+    dialogue_messages: List[Dict[str, Any]]
+) -> Optional[str]:
+    return await _run_context_summary(llm_client, summary, dialogue_messages)
 
 
 def build_history_for_llm(
@@ -184,13 +207,16 @@ async def maybe_compress_context(
     current_summary: str,
     last_compressed_call_id: Optional[int],
     current_user_message_id: Optional[int],
-    current_user_text: str
+    current_user_text: str,
+    current_total_tokens: Optional[int] = None
 ) -> Tuple[str, Optional[int], Optional[int], bool]:
     if not session_id or not current_user_message_id:
+        _debug_log("skip: missing session_id or current_user_message_id")
         return current_summary, last_compressed_call_id, None, False
 
     context_cfg = app_config.get("context", {}) if isinstance(app_config, dict) else {}
     if not context_cfg.get("compression_enabled"):
+        _debug_log("skip: compression disabled")
         return current_summary, last_compressed_call_id, None, False
 
     try:
@@ -221,11 +247,19 @@ async def maybe_compress_context(
 
     max_tokens = getattr(config, "max_context_tokens", 0) or 0
     if max_tokens <= 0:
+        _debug_log("skip: max_context_tokens <= 0")
         return current_summary, last_compressed_call_id, None, False
+
+    trunc_cfg = _build_trunc_cfg(context_cfg)
 
     summary = current_summary or ""
     last_call_id = int(last_compressed_call_id or 0)
     last_message_id = db.get_max_message_id_for_llm_call(session_id, last_call_id) if last_call_id else None
+    _debug_log(
+        f"start: max_tokens={max_tokens} start_pct={start_pct} target_pct={target_pct} "
+        f"keep_recent_calls={keep_recent_calls} step_calls={step_calls} last_call_id={last_call_id} "
+        f"last_message_id={last_message_id}"
+    )
 
     def build_uncompressed_messages(after_id: Optional[int]) -> List[Dict[str, Any]]:
         messages = db.get_dialogue_messages_after(session_id, after_id)
@@ -240,11 +274,23 @@ async def maybe_compress_context(
             filtered.append(msg)
         return filtered
 
-    uncompressed = build_uncompressed_messages(last_message_id)
-    initial_tokens = _estimate_tokens_for_text(summary) + _estimate_tokens_for_messages(uncompressed)
-    if current_user_text:
-        initial_tokens += _estimate_tokens_for_text(current_user_text)
+    history_for_llm = build_history_for_llm(
+        session_id,
+        last_message_id,
+        current_user_message_id,
+        summary,
+        None,
+        trunc_cfg
+    )
+    if current_total_tokens is not None:
+        initial_tokens = int(current_total_tokens)
+        _debug_log(f"using current_total_tokens={initial_tokens}")
+    else:
+        initial_tokens = _estimate_tokens_for_messages(history_for_llm)
+        if current_user_text:
+            initial_tokens += _estimate_tokens_for_text(current_user_text)
     if initial_tokens < (start_pct / 100.0) * max_tokens:
+        _debug_log(f"skip: initial_tokens={initial_tokens} below threshold")
         return summary, last_compressed_call_id, last_message_id, False
 
     keep_window = keep_recent_calls
@@ -253,6 +299,7 @@ async def maybe_compress_context(
     while True:
         calls_after = db.get_llm_call_metas_after(session_id, last_call_id)
         if len(calls_after) <= keep_window:
+            _debug_log(f"stop: calls_after={len(calls_after)} <= keep_window={keep_window}")
             break
 
         protected_calls = calls_after[-keep_window:] if keep_window > 0 else []
@@ -262,15 +309,28 @@ async def maybe_compress_context(
         boundary_call = None
         for call in reversed(compressible_calls):
             message_id = call.get("message_id")
-            if message_id and message_id not in protected_message_ids:
-                boundary_call = call
-                break
-        if not boundary_call:
+            if not message_id:
+                continue
+            if protected_message_ids and message_id in protected_message_ids:
+                continue
+            boundary_call = call
             break
+        if not boundary_call:
+            _debug_log(
+                f"no boundary: keep_window={keep_window} protected_ids={len(protected_message_ids)}"
+            )
+            if keep_window <= 0:
+                break
+            if keep_window > 1:
+                keep_window = max(1, keep_window - step_calls)
+            else:
+                keep_window = 0
+            continue
 
         boundary_call_id = int(boundary_call["id"])
         boundary_message_id = db.get_max_message_id_for_llm_call(session_id, boundary_call_id)
         if not boundary_message_id:
+            _debug_log(f"stop: no boundary_message_id for call {boundary_call_id}")
             break
 
         messages_between = db.get_dialogue_messages_between(
@@ -279,6 +339,7 @@ async def maybe_compress_context(
             boundary_message_id
         )
         if not messages_between:
+            _debug_log("stop: no messages_between to compress")
             break
 
         compressible_assistant_ids = {
@@ -287,6 +348,7 @@ async def maybe_compress_context(
             if call.get("message_id") and call["id"] <= boundary_call_id and call["message_id"] not in protected_message_ids
         }
         if not compressible_assistant_ids:
+            _debug_log("stop: no compressible_assistant_ids")
             break
 
         id_to_index = {msg["id"]: idx for idx, msg in enumerate(messages_between)}
@@ -303,20 +365,26 @@ async def maybe_compress_context(
 
         compressible_message_ids.discard(current_user_message_id)
         if not compressible_message_ids:
+            _debug_log("stop: no compressible_message_ids")
             break
 
         compress_messages = [
             msg for msg in messages_between if msg["id"] in compressible_message_ids
         ]
         if not compress_messages:
+            _debug_log("stop: compress_messages empty")
             break
 
         uncompressed_after = build_uncompressed_messages(boundary_message_id)
         if len(uncompressed_after) < min_keep_messages:
+            _debug_log(
+                f"stop: uncompressed_after={len(uncompressed_after)} < min_keep_messages={min_keep_messages}"
+            )
             break
 
         new_summary = await _run_context_summary(llm_client, summary, compress_messages)
         if not new_summary:
+            _debug_log("stop: summary generation returned empty")
             break
 
         summary = new_summary
@@ -324,8 +392,15 @@ async def maybe_compress_context(
         last_message_id = boundary_message_id
         did_compress = True
 
-        uncompressed_after = build_uncompressed_messages(last_message_id)
-        token_count = _estimate_tokens_for_text(summary) + _estimate_tokens_for_messages(uncompressed_after)
+        history_for_llm = build_history_for_llm(
+            session_id,
+            last_message_id,
+            current_user_message_id,
+            summary,
+            None,
+            trunc_cfg
+        )
+        token_count = _estimate_tokens_for_messages(history_for_llm)
         if current_user_text:
             token_count += _estimate_tokens_for_text(current_user_text)
         if token_count <= (target_pct / 100.0) * max_tokens:

@@ -78,6 +78,20 @@
     background: #161b22;
 }
 
+.agent-step.compression {
+    border-left-color: rgba(34, 211, 238, 0.8);
+    background: linear-gradient(135deg, rgba(14, 116, 144, 0.28), rgba(15, 23, 42, 0.92));
+    box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.18), 0 12px 24px rgba(34, 211, 238, 0.08);
+}
+
+.agent-step.compression .agent-step-header {
+    color: #7dd3fc;
+}
+
+.agent-step.compression .agent-step-type {
+    color: #bae6fd;
+}
+
 .agent-step.final {
     border-left-color: rgba(255, 255, 255, 0.12);
     background: #161b22;
@@ -115,6 +129,28 @@
     display: flex;
     align-items: center;
     gap: 6px;
+}
+
+.context-compress-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.62rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #e0f2fe;
+    border: 1px solid rgba(34, 211, 238, 0.5);
+    background: rgba(14, 116, 144, 0.35);
+    box-shadow: inset 0 0 0 1px rgba(34, 211, 238, 0.15);
+}
+
+.agent-step-content.observation.compression {
+    border-radius: 8px;
+    padding: 8px 10px;
+    background: rgba(14, 116, 144, 0.15);
+    border: 1px dashed rgba(34, 211, 238, 0.35);
 }
 
 .agent-step-failure-icon {

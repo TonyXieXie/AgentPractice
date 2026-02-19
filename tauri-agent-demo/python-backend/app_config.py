@@ -208,7 +208,7 @@ def _normalize_context_config(context: Dict[str, Any]) -> Dict[str, Any]:
         )
     if "min_keep_messages" in normalized:
         normalized["min_keep_messages"] = _coerce_int_range(
-            normalized["min_keep_messages"], "context.min_keep_messages", 1, 200
+            normalized["min_keep_messages"], "context.min_keep_messages", 0, 200
         )
     if "keep_recent_calls" in normalized:
         normalized["keep_recent_calls"] = _coerce_int_range(

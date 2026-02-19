@@ -19,7 +19,7 @@ from context_estimate import build_context_estimate
 from llm_client import LLMTransientError
 from app_config import get_app_config
 from database import db
-from context_compress import build_history_for_llm, maybe_compress_context
+from context_compress import build_history_for_llm, maybe_compress_context, summarize_dialogue
 
 
 TRUNCATION_MARKER_START = "[TRUNCATED_START]"
@@ -235,6 +235,7 @@ class ReActAgent(AgentStrategy):
         last_compressed_message_id = context_state.get("last_message_id")
         current_user_message_id = context_state.get("current_user_message_id")
         code_map_prompt = request_overrides.get("_code_map_prompt") if request_overrides else None
+        current_turn_compresses = 0
 
         def build_base_messages() -> List[Dict[str, Any]]:
             base_messages: List[Dict[str, Any]] = [{"role": prompt_role, "content": prompt}]
@@ -257,8 +258,133 @@ class ReActAgent(AgentStrategy):
         dynamic_messages: List[Dict[str, Any]] = []
         dynamic_response_items: List[Dict[str, Any]] = []
         response_input = self._build_responses_input(base_messages) + dynamic_response_items
+        current_turn_compresses = 0
 
-        async def refresh_history_if_needed() -> Tuple[bool, Optional[AgentStep]]:
+        async def compress_current_turn_if_needed(
+            current_total_tokens: Optional[int]
+        ) -> Optional[AgentStep]:
+            nonlocal history, context_summary, last_compressed_call_id, last_compressed_message_id
+            nonlocal dynamic_messages, dynamic_response_items, response_input, base_messages, messages
+            nonlocal current_turn_compresses
+
+            if not session_id or not current_user_message_id:
+                return None
+            if current_total_tokens is None:
+                return None
+            if not dynamic_messages:
+                return None
+            if current_turn_compresses >= 3:
+                return None
+
+            app_config = get_app_config()
+            context_cfg = app_config.get("context", {}) if isinstance(app_config, dict) else {}
+            if not context_cfg.get("compression_enabled"):
+                return None
+            try:
+                start_pct = int(context_cfg.get("compress_start_pct", 75))
+            except (TypeError, ValueError):
+                start_pct = 75
+
+            max_tokens = getattr(llm_client.config, "max_context_tokens", 0) or 0
+            if max_tokens <= 0:
+                return None
+            if current_total_tokens < (start_pct / 100.0) * max_tokens:
+                return None
+
+            summary_trunc_cfg = {
+                "enabled": True,
+                "threshold": int(context_cfg.get("long_data_threshold", 2000) or 2000),
+                "head_chars": int(context_cfg.get("long_data_head_chars", 600) or 600),
+                "tail_chars": int(context_cfg.get("long_data_tail_chars", 400) or 400)
+            }
+            summary_messages: List[Dict[str, Any]] = []
+            for msg in dynamic_messages:
+                role = msg.get("role")
+                if role == "assistant":
+                    content = str(msg.get("content") or "").strip()
+                    if content:
+                        summary_messages.append({
+                            "role": "assistant",
+                            "content": _truncate_text_middle(content, summary_trunc_cfg)
+                        })
+                    tool_calls = msg.get("tool_calls") if isinstance(msg.get("tool_calls"), list) else []
+                    for call in tool_calls:
+                        func = call.get("function") if isinstance(call, dict) else {}
+                        name = ""
+                        args = ""
+                        if isinstance(func, dict):
+                            name = func.get("name") or ""
+                            args = func.get("arguments") or ""
+                        if not name and isinstance(call, dict):
+                            name = call.get("name") or "tool"
+                        if args:
+                            summary_messages.append({
+                                "role": "assistant",
+                                "content": f"[Tool Call] {name}\n{_truncate_text_middle(args, summary_trunc_cfg)}"
+                            })
+                elif role == "tool":
+                    content = str(msg.get("content") or "").strip()
+                    if content:
+                        summary_messages.append({
+                            "role": "assistant",
+                            "content": f"[Tool Result]\n{_truncate_text_middle(content, summary_trunc_cfg)}"
+                        })
+
+            if not summary_messages:
+                return None
+
+            new_summary = await summarize_dialogue(llm_client, context_summary, summary_messages)
+            if not new_summary:
+                return None
+
+            context_summary = new_summary
+            latest_call_id = db.get_latest_llm_call_id(session_id)
+            if latest_call_id:
+                last_compressed_call_id = latest_call_id
+                last_compressed_message_id = db.get_max_message_id_for_llm_call(
+                    session_id,
+                    latest_call_id
+                )
+            try:
+                db.update_session_context(session_id, context_summary, last_compressed_call_id)
+            except Exception as exc:
+                print(f"[Context Compress] Failed to update session context: {exc}")
+
+            if request_overrides is not None:
+                request_overrides["_context_state"] = {
+                    "summary": context_summary,
+                    "last_call_id": last_compressed_call_id,
+                    "last_message_id": last_compressed_message_id,
+                    "current_user_message_id": current_user_message_id
+                }
+
+            dynamic_messages = []
+            dynamic_response_items = []
+            history = build_history_for_llm(
+                session_id,
+                last_compressed_message_id,
+                current_user_message_id,
+                context_summary,
+                code_map_prompt,
+                trunc_cfg
+            )
+            base_messages = build_base_messages()
+            if openai_format == "openai_responses":
+                messages = list(base_messages)
+                response_input = self._build_responses_input(base_messages) + dynamic_response_items
+            else:
+                messages = base_messages + dynamic_messages
+
+            current_turn_compresses += 1
+            return AgentStep(
+                step_type="observation",
+                content="正在进行上下文压缩...",
+                metadata={"context_compress": True, "current_turn": True}
+            )
+
+        async def refresh_history_if_needed(
+            current_total_tokens: Optional[int] = None
+        ) -> Tuple[bool, Optional[AgentStep]]:
             nonlocal history, context_summary, last_compressed_call_id, last_compressed_message_id
             if not session_id or not current_user_message_id:
                 return False, None
@@ -272,7 +398,8 @@ class ReActAgent(AgentStrategy):
                 current_summary=context_summary,
                 last_compressed_call_id=last_compressed_call_id,
                 current_user_message_id=current_user_message_id,
-                current_user_text=user_input
+                current_user_text=user_input,
+                current_total_tokens=current_total_tokens
             )
 
             if did_compress:
@@ -309,6 +436,125 @@ class ReActAgent(AgentStrategy):
                 return True, compress_step
 
             return False, None
+
+        async def compress_current_turn_if_needed(
+            current_total_tokens: Optional[int]
+        ) -> Optional[AgentStep]:
+            nonlocal history, context_summary, last_compressed_call_id, last_compressed_message_id
+            nonlocal dynamic_messages, dynamic_response_items, response_input, base_messages, messages
+            nonlocal current_turn_compresses
+            if not session_id or not current_user_message_id:
+                return None
+            if current_total_tokens is None:
+                return None
+            if not dynamic_messages:
+                return None
+            if current_turn_compresses >= 3:
+                return None
+
+            app_config = get_app_config()
+            context_cfg = app_config.get("context", {}) if isinstance(app_config, dict) else {}
+            if not context_cfg.get("compression_enabled"):
+                return None
+            try:
+                start_pct = int(context_cfg.get("compress_start_pct", 75))
+            except (TypeError, ValueError):
+                start_pct = 75
+
+            max_tokens = getattr(llm_client.config, "max_context_tokens", 0) or 0
+            if max_tokens <= 0:
+                return None
+            if current_total_tokens < (start_pct / 100.0) * max_tokens:
+                return None
+
+            summary_trunc_cfg = {
+                "enabled": True,
+                "threshold": int(context_cfg.get("long_data_threshold", 2000) or 2000),
+                "head_chars": int(context_cfg.get("long_data_head_chars", 600) or 600),
+                "tail_chars": int(context_cfg.get("long_data_tail_chars", 400) or 400)
+            }
+            summary_messages: List[Dict[str, Any]] = []
+            for msg in dynamic_messages:
+                role = msg.get("role")
+                if role == "assistant":
+                    content = str(msg.get("content") or "").strip()
+                    if content:
+                        summary_messages.append({
+                            "role": "assistant",
+                            "content": _truncate_text_middle(content, summary_trunc_cfg)
+                        })
+                    tool_calls = msg.get("tool_calls") if isinstance(msg.get("tool_calls"), list) else []
+                    for call in tool_calls:
+                        func = call.get("function") if isinstance(call, dict) else {}
+                        name = ""
+                        args = ""
+                        if isinstance(func, dict):
+                            name = func.get("name") or ""
+                            args = func.get("arguments") or ""
+                        if not name and isinstance(call, dict):
+                            name = call.get("name") or "tool"
+                        if args:
+                            summary_messages.append({
+                                "role": "assistant",
+                                "content": f"[Tool Call] {name}\n{_truncate_text_middle(args, summary_trunc_cfg)}"
+                            })
+                elif role == "tool":
+                    content = str(msg.get("content") or "").strip()
+                    if content:
+                        summary_messages.append({
+                            "role": "assistant",
+                            "content": f"[Tool Result]\n{_truncate_text_middle(content, summary_trunc_cfg)}"
+                        })
+
+            if not summary_messages:
+                return None
+            new_summary = await summarize_dialogue(llm_client, context_summary, summary_messages)
+            if not new_summary:
+                return None
+
+            context_summary = new_summary
+            latest_call_id = db.get_latest_llm_call_id(session_id)
+            if latest_call_id:
+                last_compressed_call_id = latest_call_id
+                last_compressed_message_id = db.get_max_message_id_for_llm_call(
+                    session_id,
+                    latest_call_id
+                )
+            try:
+                db.update_session_context(session_id, context_summary, last_compressed_call_id)
+            except Exception as exc:
+                print(f"[Context Compress] Failed to update session context: {exc}")
+
+            if request_overrides is not None:
+                request_overrides["_context_state"] = {
+                    "summary": context_summary,
+                    "last_call_id": last_compressed_call_id,
+                    "last_message_id": last_compressed_message_id,
+                    "current_user_message_id": current_user_message_id
+                }
+
+            dynamic_messages = []
+            dynamic_response_items = []
+            history = build_history_for_llm(
+                session_id,
+                last_compressed_message_id,
+                current_user_message_id,
+                context_summary,
+                code_map_prompt,
+                trunc_cfg
+            )
+            base_messages = build_base_messages()
+            if openai_format == "openai_responses":
+                messages = list(base_messages)
+                response_input = self._build_responses_input(base_messages) + dynamic_response_items
+            else:
+                messages = base_messages + dynamic_messages
+            current_turn_compresses += 1
+            return AgentStep(
+                step_type="observation",
+                content="正在进行上下文压缩...",
+                metadata={"context_compress": True, "current_turn": True}
+            )
         trunc_cfg = _get_prompt_truncation_config(request_overrides)
         call_seq = 0
         max_no_answer_attempts = 3
@@ -318,7 +564,19 @@ class ReActAgent(AgentStrategy):
             while True:
                 current_call_seq = call_seq
                 estimate_emitted = False
-                refreshed, compress_step = await refresh_history_if_needed()
+                current_total_tokens = None
+                try:
+                    sanitized_messages = _sanitize_messages_for_prompt(messages, current_call_seq, trunc_cfg)
+                    estimate = build_context_estimate(
+                        sanitized_messages,
+                        tools_payload=openai_tools,
+                        max_tokens=None,
+                        updated_at=None
+                    )
+                    current_total_tokens = estimate.get("total")
+                except Exception:
+                    current_total_tokens = None
+                refreshed, compress_step = await refresh_history_if_needed(current_total_tokens)
                 if compress_step:
                     yield compress_step
                 if refreshed:
@@ -328,6 +586,9 @@ class ReActAgent(AgentStrategy):
                         response_input = self._build_responses_input(base_messages) + dynamic_response_items
                     else:
                         messages = base_messages + dynamic_messages
+                current_turn_step = await compress_current_turn_if_needed(current_total_tokens)
+                if current_turn_step:
+                    yield current_turn_step
                 llm_overrides = dict(request_overrides) if request_overrides else {}
                 if openai_tools:
                     llm_overrides.setdefault("tools", openai_tools)
@@ -901,7 +1162,9 @@ class ReActAgent(AgentStrategy):
         current_user_message_id = context_state.get("current_user_message_id")
         code_map_prompt = request_overrides.get("_code_map_prompt") if request_overrides else None
 
-        async def refresh_history_if_needed() -> Tuple[bool, Optional[AgentStep]]:
+        async def refresh_history_if_needed(
+            current_total_tokens: Optional[int] = None
+        ) -> Tuple[bool, Optional[AgentStep]]:
             nonlocal history, context_summary, last_compressed_call_id, last_compressed_message_id
             if not session_id or not current_user_message_id:
                 return False, None
@@ -915,7 +1178,8 @@ class ReActAgent(AgentStrategy):
                 current_summary=context_summary,
                 last_compressed_call_id=last_compressed_call_id,
                 current_user_message_id=current_user_message_id,
-                current_user_text=user_input
+                current_user_text=user_input,
+                current_total_tokens=current_total_tokens
             )
 
             if did_compress:
@@ -954,9 +1218,6 @@ class ReActAgent(AgentStrategy):
             return False, None
 
         for iteration in range(self.max_iterations):
-            refreshed, compress_step = await refresh_history_if_needed()
-            if compress_step:
-                yield compress_step
             current_call_seq = call_seq
             prompt = self.build_prompt(user_input, history, tools, {
                 "scratchpad": scratchpad,
@@ -966,12 +1227,53 @@ class ReActAgent(AgentStrategy):
                 "prompt_truncation": trunc_cfg
             })
 
+            messages = [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_content if user_content is not None else user_input}
+            ]
+            current_total_tokens = None
             try:
+                estimate_preview = build_context_estimate(
+                    messages,
+                    tools_payload=None,
+                    max_tokens=None,
+                    updated_at=None
+                )
+                current_total_tokens = estimate_preview.get("total")
+            except Exception:
+                current_total_tokens = None
+
+            refreshed, compress_step = await refresh_history_if_needed(current_total_tokens)
+            if compress_step:
+                yield compress_step
+            current_turn_step = await compress_current_turn_if_needed(current_total_tokens)
+            if current_turn_step:
+                yield current_turn_step
+                prompt = self.build_prompt(user_input, history, tools, {
+                    "scratchpad": scratchpad,
+                    "iteration": iteration,
+                    "tool_calling": False,
+                    "call_seq": current_call_seq,
+                    "prompt_truncation": trunc_cfg
+                })
+                messages = [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_content if user_content is not None else user_input}
+                ]
+            if refreshed:
+                prompt = self.build_prompt(user_input, history, tools, {
+                    "scratchpad": scratchpad,
+                    "iteration": iteration,
+                    "tool_calling": False,
+                    "call_seq": current_call_seq,
+                    "prompt_truncation": trunc_cfg
+                })
                 messages = [
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": user_content if user_content is not None else user_input}
                 ]
 
+            try:
                 llm_overrides = dict(request_overrides) if request_overrides else {}
                 debug_ctx = self._merge_debug_context(session_id, request_overrides, "react", iteration)
                 if debug_ctx:

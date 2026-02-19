@@ -366,11 +366,15 @@ export interface AgentStepWithMessage extends AgentStep {
     timestamp?: string;
 }
 
+export interface AgentStreamKeepalive {
+    keepalive: true;
+}
+
 export async function* sendMessageAgentStream(
     request: ChatRequest,
     signal?: AbortSignal
 ): AsyncGenerator<
-    AgentStep | { session_id: string; user_message_id?: number; assistant_message_id?: number } | { done: true },
+    AgentStep | { session_id: string; user_message_id?: number; assistant_message_id?: number } | { done: true } | AgentStreamKeepalive,
     void,
     unknown
 > {
@@ -396,6 +400,11 @@ export async function* sendMessageAgentStream(
         buffer = lines.pop() || '';
 
         for (const line of lines) {
+            if (!line) continue;
+            if (line.startsWith(':')) {
+                yield { keepalive: true };
+                continue;
+            }
             if (line.startsWith('data: ')) {
                 const data = line.slice(6);
                 try {

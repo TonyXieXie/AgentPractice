@@ -77,6 +77,8 @@ const WORKDIR_DEFAULT_HEIGHT = 800;
 const DEFAULT_MAX_CONTEXT_TOKENS = 200000;
 const CONTEXT_RING_RADIUS = 10;
 const AST_DEFAULT_MAX_FILES = 500;
+const STREAM_STALL_MS = 90_000;
+const STREAM_STALL_CHECK_MS = 5_000;
 const AST_LANGUAGE_OPTIONS = [
   { id: 'python', label: 'Python (.py)' },
   { id: 'javascript', label: 'JavaScript (.js/.jsx/.mjs/.cjs)' },
@@ -609,6 +611,8 @@ type InFlightState = {
   activeAssistantId: number | null;
   tempAssistantId: number;
   sessionKey: string;
+  lastEventAt: number;
+  stalled?: boolean;
 };
 
 type PendingContextEstimate = {
@@ -1626,6 +1630,12 @@ function App() {
 
       for await (const chunk of streamGenerator) {
         const inflightState = inFlightBySessionRef.current[activeSessionKey];
+        if (inflightState) {
+          inflightState.lastEventAt = Date.now();
+        }
+        if ((chunk as any).keepalive) {
+          continue;
+        }
         if (inflightState?.stopRequested && !('session_id' in chunk)) {
           continue;
         }
@@ -1911,6 +1921,8 @@ function App() {
       activeAssistantId: null,
       tempAssistantId,
       sessionKey,
+      lastEventAt: Date.now(),
+      stalled: false,
     };
     bumpInFlight();
     void runStreamForItem(item, sessionKey, tempUserId, tempAssistantId, abortController);
@@ -2813,6 +2825,64 @@ function App() {
       };
     });
   }, []);
+
+  const refreshSessionMessages = useCallback(
+    async (sessionId: string) => {
+      const sessionKey = getSessionKey(sessionId);
+      const msgs = await getSessionMessages(sessionId, { limit: MESSAGE_PAGE_SIZE });
+      const stepIds = msgs.map((msg) => msg.id).filter((id) => typeof id === 'number');
+      const steps = stepIds.length ? await getSessionAgentSteps(sessionId, stepIds) : [];
+      const hydratedMessages = hydrateMessagesWithSteps(msgs, steps);
+      setSessionMessages(sessionKey, hydratedMessages);
+      const paging = getPagingState(sessionKey);
+      paging.oldestId = hydratedMessages[0]?.id ?? null;
+      paging.hasMore = hydratedMessages.length >= MESSAGE_PAGE_SIZE;
+    },
+    [hydrateMessagesWithSteps]
+  );
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      const entries = Object.entries(inFlightBySessionRef.current);
+      if (!entries.length) return;
+      entries.forEach(([sessionKey, inflight]) => {
+        if (inflight.stalled) return;
+        if (now - inflight.lastEventAt < STREAM_STALL_MS) return;
+        inflight.stalled = true;
+
+        const sessionId = sessionKey === DRAFT_SESSION_KEY ? null : sessionKey;
+        const assistantId = inflight.activeAssistantId ?? inflight.tempAssistantId ?? null;
+
+        if (assistantId) {
+          stopAgentStream({ messageId: assistantId }).catch(() => undefined);
+        } else if (sessionId) {
+          stopAgentStream({ sessionId }).catch(() => undefined);
+        }
+        inflight.abortController.abort();
+
+        updateSessionMessages(sessionKey, (prev) =>
+          prev.map((msg) => {
+            if (assistantId && msg.id !== assistantId) return msg;
+            if (!assistantId && msg.id !== inflight.tempAssistantId) return msg;
+            const nextSteps = [...((msg.metadata?.agent_steps as AgentStep[]) || [])];
+            nextSteps.push({ step_type: 'error', content: 'Streaming interrupted. Please retry.' });
+            return {
+              ...msg,
+              metadata: { ...(msg.metadata || {}), agent_steps: nextSteps, agent_streaming: false }
+            };
+          })
+        );
+
+        if (sessionId) {
+          refreshSessionMessages(sessionId).catch(() => undefined);
+        }
+        delete inFlightBySessionRef.current[sessionKey];
+        bumpInFlight();
+      });
+    }, STREAM_STALL_CHECK_MS);
+    return () => window.clearInterval(timer);
+  }, [refreshSessionMessages, updateSessionMessages]);
 
   const loadOlderMessages = useCallback(async (anchor?: { key: string; offset: number }) => {
     const sessionId = currentSessionIdRef.current;
