@@ -92,7 +92,6 @@ Desktop.ini
 .Trashes
 
 # Local helper scripts
-*.command
 
 # Local status/setup notes
 INSTALL-STATUS.md
