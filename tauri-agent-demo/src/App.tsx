@@ -96,6 +96,32 @@ const MESSAGE_LOAD_THRESHOLD_PX = 240;
 const MESSAGE_OVERSCAN_PX = 600;
 const MESSAGE_ESTIMATED_HEIGHT = 220;
 
+const extractRunShellCommand = (raw?: string): string => {
+  if (!raw) return '';
+  let text = String(raw).trim();
+  if (!text) return '';
+  const bracketStart = text.indexOf('[');
+  const bracketEnd = text.lastIndexOf(']');
+  if (text.startsWith('run_shell[') && bracketStart >= 0 && bracketEnd > bracketStart) {
+    text = text.slice(bracketStart + 1, bracketEnd).trim();
+  }
+  try {
+    const parsed = JSON.parse(text) as { command?: string } | null;
+    if (parsed && typeof parsed === 'object' && typeof parsed.command === 'string') {
+      return parsed.command;
+    }
+  } catch {
+    // fall through
+  }
+  const match = text.match(/"command"\s*:\s*"((?:\\.|[^"])*)"/);
+  if (!match) return '';
+  try {
+    return JSON.parse(`"${match[1].replace(/"/g, '\\"')}"`);
+  } catch {
+    return match[1];
+  }
+};
+
 type WorkdirBounds = {
   x?: number;
   y?: number;
@@ -1733,6 +1759,27 @@ function App() {
             const existingSteps = (msg.metadata?.agent_steps || []) as AgentStep[];
             let nextSteps = [...existingSteps];
             let nextMetadata = { ...(msg.metadata || {}) } as any;
+            const stepMeta = (step.metadata || {}) as any;
+            const toolName = String(stepMeta.tool || '').toLowerCase();
+            const isRunShellStep = toolName === 'run_shell';
+            if (step.step_type === 'action' && isRunShellStep) {
+              const command = extractRunShellCommand(stepMeta.input || step.content);
+              const streamKey = String(stepMeta.stream_key || '');
+              if (command && streamKey) {
+                const nextCommands = { ...(nextMetadata.agent_shell_commands || {}) } as Record<string, string>;
+                nextCommands[streamKey] = command;
+                nextMetadata.agent_shell_commands = nextCommands;
+              }
+            }
+            if ((step.step_type === 'observation' || step.step_type === 'observation_delta') && isRunShellStep) {
+              const streamKey = String(stepMeta.stream_key || '');
+              const lookupKey = streamKey.endsWith('-obs') ? streamKey.slice(0, -4) : streamKey;
+              const commandMap = (nextMetadata.agent_shell_commands || {}) as Record<string, string>;
+              const resolved = commandMap[lookupKey] || commandMap[streamKey] || '';
+              if (resolved && !stepMeta.command) {
+                stepMeta.command = resolved;
+              }
+            }
 
             if (step.step_type === 'answer_delta') {
               const streamKey = String(step.metadata?.stream_key || 'answer_default');
@@ -1833,6 +1880,52 @@ function App() {
               return { ...msg, metadata: nextMetadata };
             }
 
+            if (step.step_type === 'observation_delta') {
+              const streamKey = String(step.metadata?.stream_key || 'obs-0');
+              const toolName = String(step.metadata?.tool || '');
+              const reset = Boolean(step.metadata?.reset);
+              const buffers = { ...(nextMetadata.agent_observation_buffers || {}) } as Record<string, string>;
+              let baseBuffer = String(buffers[streamKey] || '');
+              if (!baseBuffer) {
+                const streamingIndex = nextSteps.findIndex(
+                  (s) => s.step_type === 'observation' && s.metadata?.streaming && s.metadata?.stream_key === streamKey
+                );
+                if (streamingIndex >= 0) {
+                  baseBuffer = String(nextSteps[streamingIndex].content || '');
+                }
+              }
+              let buffer = '';
+              if (reset) {
+                const headerLine = baseBuffer.split('\n')[0] || '';
+                buffer = headerLine ? `${headerLine}\n${step.content || ''}` : (step.content || '');
+              } else {
+                buffer = baseBuffer + (step.content || '');
+              }
+              buffers[streamKey] = buffer;
+              nextMetadata.agent_observation_buffers = buffers;
+              nextMetadata.agent_streaming = true;
+
+              const streamingIndex = nextSteps.findIndex(
+                (s) => s.step_type === 'observation' && s.metadata?.streaming && s.metadata?.stream_key === streamKey
+              );
+              if (streamingIndex >= 0) {
+                nextSteps[streamingIndex] = {
+                  ...nextSteps[streamingIndex],
+                  content: buffer,
+                  metadata: { ...(nextSteps[streamingIndex].metadata || {}), stream_key: streamKey, streaming: true, tool: toolName }
+                };
+              } else {
+                nextSteps.push({
+                  step_type: 'observation',
+                  content: buffer,
+                  metadata: { stream_key: streamKey, streaming: true, tool: toolName }
+                });
+              }
+
+              nextMetadata.agent_steps = nextSteps;
+              return { ...msg, metadata: nextMetadata };
+            }
+
             if (step.step_type === 'answer') {
               nextMetadata.agent_streaming = false;
               if (step.metadata?.stream_key && nextMetadata.agent_answer_buffers) {
@@ -1863,7 +1956,7 @@ function App() {
               return { ...msg, metadata: nextMetadata, content: step.content };
             }
 
-            if (step.step_type === 'thought' || step.step_type === 'action') {
+            if (step.step_type === 'thought' || step.step_type === 'action' || step.step_type === 'observation') {
               const streamKey = step.metadata?.stream_key;
               if (streamKey) {
                 const streamingIndex = nextSteps.findIndex(
@@ -1876,6 +1969,11 @@ function App() {
                 }
               } else {
                 nextSteps.push(step);
+              }
+              if (step.step_type === 'observation' && streamKey && nextMetadata.agent_observation_buffers) {
+                const nextBuffers = { ...(nextMetadata.agent_observation_buffers || {}) } as Record<string, string>;
+                delete nextBuffers[String(streamKey)];
+                nextMetadata.agent_observation_buffers = nextBuffers;
               }
             } else {
               nextSteps.push(step);
