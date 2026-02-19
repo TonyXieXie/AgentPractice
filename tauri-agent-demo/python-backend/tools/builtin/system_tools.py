@@ -7,6 +7,8 @@ import shlex
 import subprocess
 import sys
 import locale
+import select
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional, List, Set
@@ -16,9 +18,15 @@ import httpx
 from ..base import Tool, ToolParameter
 from ..config import get_tool_config, update_tool_config
 from ..context import get_tool_context
+from ..pty_manager import get_pty_manager, PtyProcess, DEFAULT_BUFFER_SIZE, _decode_output_bytes
 from app_config import get_app_config
 from ast_settings import get_ast_settings
 from ast_file_filter import collect_ast_files
+
+try:
+    import pty as posix_pty
+except Exception:
+    posix_pty = None
 
 
 def _get_root_path() -> Path:
@@ -106,6 +114,14 @@ def _get_agent_mode() -> str:
     if mode not in ("default", "super"):
         mode = "default"
     return mode
+
+
+def _get_session_id() -> str:
+    tool_ctx = get_tool_context()
+    session_id = tool_ctx.get("session_id")
+    if session_id is None or session_id == "":
+        return "global"
+    return str(session_id)
 
 
 def _resolve_path(raw_path: str, tool_name: str, action: str) -> Path:
@@ -531,6 +547,27 @@ def _is_macos() -> bool:
     return sys.platform == "darwin"
 
 
+_PTY_SUPPORT: Optional[bool] = None
+
+
+def _supports_pty() -> bool:
+    global _PTY_SUPPORT
+    if _PTY_SUPPORT is not None:
+        return _PTY_SUPPORT
+    if _is_windows():
+        try:
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            build = getattr(sys.getwindowsversion(), "build", 0)
+            _PTY_SUPPORT = bool(getattr(kernel32, "CreatePseudoConsole", None)) and build >= 17763
+            return _PTY_SUPPORT
+        except Exception:
+            _PTY_SUPPORT = False
+            return _PTY_SUPPORT
+    _PTY_SUPPORT = posix_pty is not None
+    return _PTY_SUPPORT
+
+
 def _escape_seatbelt_path(path: Path) -> str:
     raw = str(path)
     return raw.replace("\\", "\\\\").replace('"', '\\"')
@@ -918,29 +955,6 @@ def _run_windows_restricted(command: str, workdir: Path, timeout_sec: float) -> 
         kernel32.CloseHandle(job_handle)
 
     raw_output = b"".join(output_chunks)
-
-    def _decode_output_bytes(data: bytes) -> str:
-        if not data:
-            return ""
-        if data.startswith(b"\xef\xbb\xbf"):
-            return data.decode("utf-8-sig", errors="replace")
-        if data.startswith(b"\xff\xfe"):
-            return data.decode("utf-16le", errors="replace")
-        if data.startswith(b"\xfe\xff"):
-            return data.decode("utf-16be", errors="replace")
-        probe_len = min(len(data), 2000)
-        if probe_len >= 4:
-            zero_odd = sum(1 for i in range(1, probe_len, 2) if data[i] == 0)
-            zero_even = sum(1 for i in range(0, probe_len, 2) if data[i] == 0)
-            if zero_odd > max(10, zero_even * 2):
-                return data.decode("utf-16le", errors="replace")
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            pass
-        encoding = locale.getpreferredencoding(False) or "utf-8"
-        return data.decode(encoding, errors="replace")
-
     output = _decode_output_bytes(raw_output)
     return int(exit_code.value), output
 
@@ -969,6 +983,1127 @@ def _run_sandboxed_command(command: str, workdir: Path, timeout_sec: float) -> T
     )
     output = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, output
+
+
+def _apply_max_output(output: str, max_output: int) -> str:
+    if max_output > 0 and len(output) > max_output:
+        return output[:max_output] + "\n... (truncated)"
+    return output
+
+
+def _resolve_idle_timeout_ms(mode: str, idle_timeout_ms: Optional[int]) -> int:
+    if idle_timeout_ms is not None:
+        try:
+            return int(idle_timeout_ms)
+        except (TypeError, ValueError):
+            return 0
+    return 0 if mode == "persistent" else 120000
+
+
+def _resolve_buffer_size(raw_size: Optional[int]) -> int:
+    try:
+        config_default = int(get_tool_config().get("shell", {}).get("buffer_size", DEFAULT_BUFFER_SIZE))
+    except (TypeError, ValueError):
+        config_default = DEFAULT_BUFFER_SIZE
+    if raw_size is None:
+        return config_default
+    try:
+        size = int(raw_size)
+    except (TypeError, ValueError):
+        return config_default
+    if size <= 0:
+        return config_default
+    return size
+
+
+def _encode_stdin(stdin_text: Optional[str]) -> bytes:
+    if not stdin_text:
+        return b""
+    if isinstance(stdin_text, bytes):
+        return stdin_text
+    return str(stdin_text).encode("utf-8", errors="replace")
+
+
+def _build_posix_command(command: str, use_sandbox: bool = True) -> List[str]:
+    if _is_macos() and use_sandbox:
+        sandbox_exec = "/usr/bin/sandbox-exec"
+        if not Path(sandbox_exec).exists():
+            raise RuntimeError("sandbox-exec not available on this system.")
+        roots = _get_allowed_roots()
+        profile = _build_macos_sandbox_profile(roots)
+        return [sandbox_exec, "-p", profile, "/bin/sh", "-c", command]
+    return ["/bin/sh", "-c", command]
+
+
+def _terminate_posix_process(proc: subprocess.Popen) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, 15)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def _run_posix_pty_oneshot(
+    command: str,
+    workdir: Path,
+    timeout_sec: float,
+    idle_timeout_ms: int,
+    stdin_bytes: bytes,
+    use_sandbox: bool
+) -> Tuple[int, str]:
+    if posix_pty is None:
+        raise RuntimeError("PTY not available on this platform.")
+    master_fd, slave_fd = posix_pty.openpty()
+    cmd_list = _build_posix_command(command, use_sandbox=use_sandbox)
+    proc = subprocess.Popen(
+        cmd_list,
+        cwd=str(workdir),
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        preexec_fn=os.setsid
+    )
+    os.close(slave_fd)
+    try:
+        os.set_blocking(master_fd, False)
+    except Exception:
+        pass
+    if stdin_bytes:
+        try:
+            os.write(master_fd, stdin_bytes)
+        except Exception:
+            pass
+    output_chunks: List[bytes] = []
+    start_time = time.monotonic()
+    last_output = start_time
+    timed_out = False
+    exit_code: Optional[int] = None
+    timed_out = False
+    while True:
+        if timeout_sec is not None and timeout_sec > 0:
+            if (time.monotonic() - start_time) >= timeout_sec:
+                _terminate_posix_process(proc)
+                exit_code = proc.poll()
+                timed_out = True
+                break
+        if idle_timeout_ms and (time.monotonic() - last_output) * 1000.0 >= idle_timeout_ms:
+            _terminate_posix_process(proc)
+            exit_code = proc.poll()
+            output_chunks.append(b"\n[idle_timeout]\n")
+            break
+        rlist, _, _ = select.select([master_fd], [], [], 0.1)
+        if rlist:
+            try:
+                data = os.read(master_fd, 4096)
+            except Exception:
+                data = b""
+            if data:
+                output_chunks.append(data)
+                last_output = time.monotonic()
+            else:
+                if proc.poll() is not None:
+                    break
+        if proc.poll() is not None and not rlist:
+            break
+    try:
+        exit_code = proc.poll()
+    except Exception:
+        pass
+    try:
+        os.close(master_fd)
+    except Exception:
+        pass
+    if timed_out:
+        raise subprocess.TimeoutExpired(command, timeout_sec)
+    return int(exit_code or 0), _decode_output_bytes(b"".join(output_chunks))
+
+
+def _start_posix_pty_persistent(
+    command: str,
+    workdir: Path,
+    stdin_bytes: bytes,
+    idle_timeout_ms: int,
+    buffer_size: int,
+    use_sandbox: bool
+) -> PtyProcess:
+    if posix_pty is None:
+        raise RuntimeError("PTY not available on this platform.")
+    master_fd, slave_fd = posix_pty.openpty()
+    cmd_list = _build_posix_command(command, use_sandbox=use_sandbox)
+    proc = subprocess.Popen(
+        cmd_list,
+        cwd=str(workdir),
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        preexec_fn=os.setsid
+    )
+    os.close(slave_fd)
+    try:
+        os.set_blocking(master_fd, False)
+    except Exception:
+        pass
+
+    def _writer(data: bytes) -> int:
+        try:
+            return os.write(master_fd, data)
+        except Exception:
+            return 0
+
+    def _terminator() -> None:
+        _terminate_posix_process(proc)
+        try:
+            os.close(master_fd)
+        except Exception:
+            pass
+
+    pty_proc = PtyProcess(
+        session_id=_get_session_id(),
+        command=command,
+        pty_enabled=True,
+        buffer_size=buffer_size,
+        idle_timeout_ms=idle_timeout_ms,
+        writer=_writer,
+        terminator=_terminator
+    )
+
+    def _reader_loop() -> None:
+        last_output = time.monotonic()
+        while not pty_proc.stop_event.is_set():
+            rlist, _, _ = select.select([master_fd], [], [], 0.1)
+            if rlist:
+                try:
+                    data = os.read(master_fd, 4096)
+                except Exception:
+                    data = b""
+                if data:
+                    pty_proc.append_output(data)
+                    last_output = time.monotonic()
+                else:
+                    if proc.poll() is not None:
+                        break
+            if proc.poll() is not None and not rlist:
+                break
+            if idle_timeout_ms and (time.monotonic() - last_output) * 1000.0 >= idle_timeout_ms:
+                pty_proc.append_output(b"\n[idle_timeout]\n")
+                _terminate_posix_process(proc)
+                break
+        exit_code = proc.poll()
+        pty_proc.mark_exited(exit_code)
+        try:
+            os.close(master_fd)
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=_reader_loop, name=f"pty-reader-{pty_proc.id}", daemon=True)
+    pty_proc.reader_thread = thread
+    thread.start()
+    if stdin_bytes:
+        _writer(stdin_bytes)
+    return pty_proc
+
+
+def _start_posix_pipe_persistent(
+    command: str,
+    workdir: Path,
+    stdin_bytes: bytes,
+    idle_timeout_ms: int,
+    buffer_size: int,
+    use_sandbox: bool
+) -> PtyProcess:
+    cmd_list = _build_posix_command(command, use_sandbox=use_sandbox)
+    proc = subprocess.Popen(
+        cmd_list,
+        cwd=str(workdir),
+        shell=False,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid
+    )
+
+    def _writer(data: bytes) -> int:
+        if not proc.stdin:
+            return 0
+        try:
+            proc.stdin.write(data)
+            proc.stdin.flush()
+            return len(data)
+        except Exception:
+            return 0
+
+    def _terminator() -> None:
+        _terminate_posix_process(proc)
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+    pty_proc = PtyProcess(
+        session_id=_get_session_id(),
+        command=command,
+        pty_enabled=False,
+        buffer_size=buffer_size,
+        idle_timeout_ms=idle_timeout_ms,
+        writer=_writer,
+        terminator=_terminator
+    )
+
+    def _reader_loop() -> None:
+        last_output = time.monotonic()
+        stdout = proc.stdout
+        if stdout is None:
+            pty_proc.mark_exited(proc.poll())
+            return
+        fd = stdout.fileno()
+        try:
+            os.set_blocking(fd, False)
+        except Exception:
+            pass
+        while not pty_proc.stop_event.is_set():
+            rlist, _, _ = select.select([fd], [], [], 0.1)
+            if rlist:
+                try:
+                    data = os.read(fd, 4096)
+                except Exception:
+                    data = b""
+                if data:
+                    pty_proc.append_output(data)
+                    last_output = time.monotonic()
+                else:
+                    if proc.poll() is not None:
+                        break
+            if proc.poll() is not None and not rlist:
+                break
+            if idle_timeout_ms and (time.monotonic() - last_output) * 1000.0 >= idle_timeout_ms:
+                pty_proc.append_output(b"\n[idle_timeout]\n")
+                _terminate_posix_process(proc)
+                break
+        pty_proc.mark_exited(proc.poll())
+        try:
+            stdout.close()
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=_reader_loop, name=f"pipe-reader-{pty_proc.id}", daemon=True)
+    pty_proc.reader_thread = thread
+    thread.start()
+    if stdin_bytes:
+        _writer(stdin_bytes)
+    return pty_proc
+
+
+def _windows_create_restricted_token():
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcessId.restype = wintypes.DWORD
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+
+    TOKEN_ASSIGN_PRIMARY = 0x0001
+    TOKEN_DUPLICATE = 0x0002
+    TOKEN_QUERY = 0x0008
+    TOKEN_ADJUST_PRIVILEGES = 0x0020
+    TOKEN_ADJUST_DEFAULT = 0x0080
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    DISABLE_MAX_PRIVILEGE = 0x00000001
+
+    SE_GROUP_INTEGRITY = 0x00000020
+    SE_PRIVILEGE_ENABLED = 0x00000002
+    ERROR_NOT_ALL_ASSIGNED = 1300
+    TokenIntegrityLevel = 25
+
+    class SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_MANDATORY_LABEL(ctypes.Structure):
+        _fields_ = [("Label", SID_AND_ATTRIBUTES)]
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", LUID_AND_ATTRIBUTES)]
+
+    h_process = None
+    h_process_opened = False
+    try:
+        pid = kernel32.GetCurrentProcessId()
+        h_process = kernel32.OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+            False,
+            pid
+        )
+        if h_process:
+            h_process_opened = True
+    except Exception:
+        h_process = None
+
+    if not h_process:
+        h_process = kernel32.GetCurrentProcess()
+    h_token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        h_process,
+        TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_PRIVILEGES,
+        ctypes.byref(h_token)
+    ):
+        if h_process_opened:
+            kernel32.CloseHandle(h_process)
+        raise RuntimeError("OpenProcessToken failed")
+
+    def _enable_privilege(token_handle: wintypes.HANDLE, name: str) -> None:
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+            return
+        tp = TOKEN_PRIVILEGES()
+        tp.PrivilegeCount = 1
+        tp.Privileges = LUID_AND_ATTRIBUTES(luid, SE_PRIVILEGE_ENABLED)
+        if not advapi32.AdjustTokenPrivileges(token_handle, False, ctypes.byref(tp), 0, None, None):
+            return
+        last_err = ctypes.get_last_error()
+        if last_err == ERROR_NOT_ALL_ASSIGNED:
+            return
+
+    _enable_privilege(h_token, "SeChangeNotifyPrivilege")
+
+    restricted_token = wintypes.HANDLE()
+    if not advapi32.CreateRestrictedToken(
+        h_token,
+        DISABLE_MAX_PRIVILEGE,
+        0,
+        None,
+        0,
+        None,
+        0,
+        None,
+        ctypes.byref(restricted_token)
+    ):
+        kernel32.CloseHandle(h_token)
+        if h_process_opened:
+            kernel32.CloseHandle(h_process)
+        raise RuntimeError("CreateRestrictedToken failed")
+
+    sid = wintypes.LPVOID()
+    if advapi32.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)):
+        tml = TOKEN_MANDATORY_LABEL()
+        tml.Label.Sid = sid
+        tml.Label.Attributes = SE_GROUP_INTEGRITY
+        advapi32.SetTokenInformation(
+            restricted_token,
+            TokenIntegrityLevel,
+            ctypes.byref(tml),
+            ctypes.sizeof(tml)
+        )
+        kernel32.LocalFree(sid)
+
+    kernel32.CloseHandle(h_token)
+    if h_process_opened:
+        kernel32.CloseHandle(h_process)
+    return restricted_token, kernel32, advapi32
+
+
+def _windows_assign_job(kernel32, process_handle):
+    import ctypes
+    from ctypes import wintypes
+
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    JobObjectExtendedLimitInformation = 9
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD)
+        ]
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong)
+        ]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t)
+        ]
+
+    job_handle = kernel32.CreateJobObjectW(None, None)
+    if job_handle:
+        job_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        kernel32.SetInformationJobObject(
+            job_handle,
+            JobObjectExtendedLimitInformation,
+            ctypes.byref(job_info),
+            ctypes.sizeof(job_info)
+        )
+        kernel32.AssignProcessToJobObject(job_handle, process_handle)
+    return job_handle
+
+
+def _windows_start_conpty_process(command: str, workdir: Path, cols: int = 120, rows: int = 30):
+    import ctypes
+    from ctypes import wintypes
+
+    restricted_token, kernel32, advapi32 = _windows_create_restricted_token()
+
+    class SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", wintypes.LPVOID),
+            ("bInheritHandle", wintypes.BOOL)
+        ]
+
+    class COORD(ctypes.Structure):
+        _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+    class STARTUPINFO(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR),
+            ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD),
+            ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD),
+            ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE)
+        ]
+
+    class STARTUPINFOEXW(ctypes.Structure):
+        _fields_ = [("StartupInfo", STARTUPINFO), ("lpAttributeList", wintypes.LPVOID)]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wintypes.HANDLE),
+            ("hThread", wintypes.HANDLE),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD)
+        ]
+
+    CREATE_NO_WINDOW = 0x08000000
+    CREATE_UNICODE_ENVIRONMENT = 0x00000400
+    EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+    HANDLE_FLAG_INHERIT = 0x00000001
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
+
+    if not hasattr(kernel32, "CreatePseudoConsole"):
+        kernel32.CloseHandle(restricted_token)
+        raise RuntimeError("CreatePseudoConsole not available")
+
+    kernel32.CreatePseudoConsole.argtypes = [COORD, wintypes.HANDLE, wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    kernel32.CreatePseudoConsole.restype = ctypes.c_long
+    kernel32.InitializeProcThreadAttributeList.argtypes = [wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t)]
+    kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+    kernel32.UpdateProcThreadAttribute.argtypes = [
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.c_size_t,
+        wintypes.LPVOID,
+        ctypes.c_size_t,
+        wintypes.LPVOID,
+        wintypes.LPVOID
+    ]
+    kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
+    kernel32.DeleteProcThreadAttributeList.argtypes = [wintypes.LPVOID]
+    kernel32.DeleteProcThreadAttributeList.restype = None
+
+    advapi32.CreateProcessAsUserW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.BOOL,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPCWSTR,
+        ctypes.POINTER(STARTUPINFOEXW),
+        ctypes.POINTER(PROCESS_INFORMATION),
+    ]
+    advapi32.CreateProcessAsUserW.restype = wintypes.BOOL
+
+    sa = SECURITY_ATTRIBUTES()
+    sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
+    sa.lpSecurityDescriptor = None
+    sa.bInheritHandle = True
+
+    in_read = wintypes.HANDLE()
+    in_write = wintypes.HANDLE()
+    out_read = wintypes.HANDLE()
+    out_write = wintypes.HANDLE()
+    if not kernel32.CreatePipe(ctypes.byref(in_read), ctypes.byref(in_write), ctypes.byref(sa), 0):
+        kernel32.CloseHandle(restricted_token)
+        raise RuntimeError("CreatePipe failed (stdin)")
+    if not kernel32.CreatePipe(ctypes.byref(out_read), ctypes.byref(out_write), ctypes.byref(sa), 0):
+        kernel32.CloseHandle(in_read)
+        kernel32.CloseHandle(in_write)
+        kernel32.CloseHandle(restricted_token)
+        raise RuntimeError("CreatePipe failed (stdout)")
+    kernel32.SetHandleInformation(in_write, HANDLE_FLAG_INHERIT, 0)
+    kernel32.SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0)
+
+    h_pc = ctypes.c_void_p()
+    size = COORD(cols, rows)
+    if kernel32.CreatePseudoConsole(size, in_read, out_write, 0, ctypes.byref(h_pc)) != 0:
+        kernel32.CloseHandle(in_read)
+        kernel32.CloseHandle(in_write)
+        kernel32.CloseHandle(out_read)
+        kernel32.CloseHandle(out_write)
+        kernel32.CloseHandle(restricted_token)
+        raise RuntimeError("CreatePseudoConsole failed")
+    kernel32.CloseHandle(in_read)
+    kernel32.CloseHandle(out_write)
+
+    attr_list_size = ctypes.c_size_t()
+    kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attr_list_size))
+    attr_list = ctypes.create_string_buffer(attr_list_size.value)
+    attr_list_ptr = ctypes.cast(attr_list, wintypes.LPVOID)
+    if not kernel32.InitializeProcThreadAttributeList(attr_list_ptr, 1, 0, ctypes.byref(attr_list_size)):
+        kernel32.ClosePseudoConsole(h_pc)
+        kernel32.CloseHandle(in_write)
+        kernel32.CloseHandle(out_read)
+        kernel32.CloseHandle(restricted_token)
+        raise RuntimeError("InitializeProcThreadAttributeList failed")
+    if not kernel32.UpdateProcThreadAttribute(
+        attr_list_ptr,
+        0,
+        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+        ctypes.byref(h_pc),
+        ctypes.sizeof(h_pc),
+        None,
+        None
+    ):
+        kernel32.DeleteProcThreadAttributeList(attr_list_ptr)
+        kernel32.ClosePseudoConsole(h_pc)
+        kernel32.CloseHandle(in_write)
+        kernel32.CloseHandle(out_read)
+        kernel32.CloseHandle(restricted_token)
+        raise RuntimeError("UpdateProcThreadAttribute failed")
+
+    startup = STARTUPINFOEXW()
+    startup.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
+    startup.lpAttributeList = attr_list_ptr
+
+    comspec = os.environ.get("COMSPEC") or "cmd.exe"
+    command_line = ctypes.create_unicode_buffer(f'"{comspec}" /c {command}')
+
+    proc_info = PROCESS_INFORMATION()
+    created = advapi32.CreateProcessAsUserW(
+        restricted_token,
+        None,
+        command_line,
+        None,
+        None,
+        True,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        None,
+        str(workdir),
+        ctypes.byref(startup),
+        ctypes.byref(proc_info)
+    )
+
+    kernel32.DeleteProcThreadAttributeList(attr_list_ptr)
+    kernel32.CloseHandle(restricted_token)
+
+    if not created:
+        kernel32.ClosePseudoConsole(h_pc)
+        kernel32.CloseHandle(in_write)
+        kernel32.CloseHandle(out_read)
+        raise RuntimeError("CreateProcessAsUserW failed (ConPTY)")
+
+    job_handle = _windows_assign_job(kernel32, proc_info.hProcess)
+    return kernel32, proc_info, h_pc, in_write, out_read, job_handle
+
+
+def _run_windows_pty_oneshot(command: str, workdir: Path, timeout_sec: float, idle_timeout_ms: int, stdin_bytes: bytes) -> Tuple[int, str]:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32, proc_info, h_pc, in_write, out_read, job_handle = _windows_start_conpty_process(command, workdir)
+    output_chunks: List[bytes] = []
+    start_time = time.monotonic()
+    last_output = start_time
+    buffer = ctypes.create_string_buffer(4096)
+    bytes_read = wintypes.DWORD()
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+
+    if stdin_bytes:
+        written = wintypes.DWORD()
+        kernel32.WriteFile(in_write, stdin_bytes, len(stdin_bytes), ctypes.byref(written), None)
+
+    while True:
+        if timeout_sec is not None and timeout_sec > 0:
+            if (time.monotonic() - start_time) >= timeout_sec:
+                kernel32.TerminateProcess(proc_info.hProcess, 1)
+                timed_out = True
+                break
+        if idle_timeout_ms and (time.monotonic() - last_output) * 1000.0 >= idle_timeout_ms:
+            output_chunks.append(b"\n[idle_timeout]\n")
+            kernel32.TerminateProcess(proc_info.hProcess, 1)
+            break
+
+        wait_result = kernel32.WaitForSingleObject(proc_info.hProcess, 50)
+        while True:
+            available = wintypes.DWORD()
+            if not kernel32.PeekNamedPipe(out_read, None, 0, None, ctypes.byref(available), None):
+                break
+            if available.value == 0:
+                break
+            to_read = min(len(buffer), available.value)
+            if kernel32.ReadFile(out_read, buffer, to_read, ctypes.byref(bytes_read), None):
+                if bytes_read.value > 0:
+                    output_chunks.append(buffer.raw[:bytes_read.value])
+                    last_output = time.monotonic()
+        if wait_result == WAIT_OBJECT_0:
+            break
+        if wait_result not in (WAIT_OBJECT_0, WAIT_TIMEOUT):
+            break
+
+    exit_code = wintypes.DWORD()
+    kernel32.GetExitCodeProcess(proc_info.hProcess, ctypes.byref(exit_code))
+    kernel32.CloseHandle(proc_info.hThread)
+    kernel32.CloseHandle(proc_info.hProcess)
+    kernel32.CloseHandle(out_read)
+    kernel32.CloseHandle(in_write)
+    kernel32.ClosePseudoConsole(h_pc)
+    if job_handle:
+        kernel32.CloseHandle(job_handle)
+
+    output = _decode_output_bytes(b"".join(output_chunks))
+    if timed_out:
+        raise subprocess.TimeoutExpired(command, timeout_sec)
+    return int(exit_code.value), output
+
+
+def _start_windows_pty_persistent(
+    command: str,
+    workdir: Path,
+    stdin_bytes: bytes,
+    idle_timeout_ms: int,
+    buffer_size: int
+) -> PtyProcess:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32, proc_info, h_pc, in_write, out_read, job_handle = _windows_start_conpty_process(command, workdir)
+
+    def _writer(data: bytes) -> int:
+        written = wintypes.DWORD()
+        if kernel32.WriteFile(in_write, data, len(data), ctypes.byref(written), None):
+            return int(written.value)
+        return 0
+
+    def _terminator() -> None:
+        kernel32.TerminateProcess(proc_info.hProcess, 1)
+        kernel32.CloseHandle(out_read)
+        kernel32.CloseHandle(in_write)
+        kernel32.ClosePseudoConsole(h_pc)
+        if job_handle:
+            kernel32.CloseHandle(job_handle)
+        kernel32.CloseHandle(proc_info.hThread)
+        kernel32.CloseHandle(proc_info.hProcess)
+
+    pty_proc = PtyProcess(
+        session_id=_get_session_id(),
+        command=command,
+        pty_enabled=True,
+        buffer_size=buffer_size,
+        idle_timeout_ms=idle_timeout_ms,
+        writer=_writer,
+        terminator=_terminator
+    )
+
+    def _reader_loop() -> None:
+        buffer = ctypes.create_string_buffer(4096)
+        bytes_read = wintypes.DWORD()
+        last_output = time.monotonic()
+        WAIT_OBJECT_0 = 0x00000000
+        WAIT_TIMEOUT = 0x00000102
+        while not pty_proc.stop_event.is_set():
+            wait_result = kernel32.WaitForSingleObject(proc_info.hProcess, 50)
+            while True:
+                available = wintypes.DWORD()
+                if not kernel32.PeekNamedPipe(out_read, None, 0, None, ctypes.byref(available), None):
+                    break
+                if available.value == 0:
+                    break
+                to_read = min(len(buffer), available.value)
+                if kernel32.ReadFile(out_read, buffer, to_read, ctypes.byref(bytes_read), None):
+                    if bytes_read.value > 0:
+                        pty_proc.append_output(buffer.raw[:bytes_read.value])
+                        last_output = time.monotonic()
+            if wait_result == WAIT_OBJECT_0:
+                break
+            if wait_result not in (WAIT_OBJECT_0, WAIT_TIMEOUT):
+                break
+            if idle_timeout_ms and (time.monotonic() - last_output) * 1000.0 >= idle_timeout_ms:
+                pty_proc.append_output(b"\n[idle_timeout]\n")
+                kernel32.TerminateProcess(proc_info.hProcess, 1)
+                break
+        exit_code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(proc_info.hProcess, ctypes.byref(exit_code))
+        pty_proc.mark_exited(int(exit_code.value))
+        kernel32.CloseHandle(out_read)
+        kernel32.CloseHandle(in_write)
+        kernel32.ClosePseudoConsole(h_pc)
+        if job_handle:
+            kernel32.CloseHandle(job_handle)
+        kernel32.CloseHandle(proc_info.hThread)
+        kernel32.CloseHandle(proc_info.hProcess)
+
+    thread = threading.Thread(target=_reader_loop, name=f"conpty-reader-{pty_proc.id}", daemon=True)
+    pty_proc.reader_thread = thread
+    thread.start()
+    if stdin_bytes:
+        _writer(stdin_bytes)
+    return pty_proc
+
+
+def _start_windows_pipe_persistent(
+    command: str,
+    workdir: Path,
+    stdin_bytes: bytes,
+    idle_timeout_ms: int,
+    buffer_size: int
+) -> PtyProcess:
+    import ctypes
+    from ctypes import wintypes
+
+    class SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", wintypes.LPVOID),
+            ("bInheritHandle", wintypes.BOOL)
+        ]
+
+    class STARTUPINFO(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR),
+            ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD),
+            ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD),
+            ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE)
+        ]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wintypes.HANDLE),
+            ("hThread", wintypes.HANDLE),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD)
+        ]
+
+    CREATE_NO_WINDOW = 0x08000000
+    CREATE_UNICODE_ENVIRONMENT = 0x00000400
+    STARTF_USESTDHANDLES = 0x00000100
+    HANDLE_FLAG_INHERIT = 0x00000001
+
+    restricted_token, kernel32, advapi32 = _windows_create_restricted_token()
+    advapi32.CreateProcessAsUserW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.BOOL,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPCWSTR,
+        ctypes.POINTER(STARTUPINFO),
+        ctypes.POINTER(PROCESS_INFORMATION),
+    ]
+    advapi32.CreateProcessAsUserW.restype = wintypes.BOOL
+
+    sa = SECURITY_ATTRIBUTES()
+    sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
+    sa.lpSecurityDescriptor = None
+    sa.bInheritHandle = True
+
+    stdin_read = wintypes.HANDLE()
+    stdin_write = wintypes.HANDLE()
+    stdout_read = wintypes.HANDLE()
+    stdout_write = wintypes.HANDLE()
+    if not kernel32.CreatePipe(ctypes.byref(stdin_read), ctypes.byref(stdin_write), ctypes.byref(sa), 0):
+        kernel32.CloseHandle(restricted_token)
+        raise RuntimeError("CreatePipe failed (stdin)")
+    if not kernel32.CreatePipe(ctypes.byref(stdout_read), ctypes.byref(stdout_write), ctypes.byref(sa), 0):
+        kernel32.CloseHandle(stdin_read)
+        kernel32.CloseHandle(stdin_write)
+        kernel32.CloseHandle(restricted_token)
+        raise RuntimeError("CreatePipe failed (stdout)")
+    kernel32.SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0)
+    kernel32.SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0)
+
+    startup = STARTUPINFO()
+    startup.cb = ctypes.sizeof(STARTUPINFO)
+    startup.dwFlags = STARTF_USESTDHANDLES
+    startup.hStdInput = stdin_read
+    startup.hStdOutput = stdout_write
+    startup.hStdError = stdout_write
+
+    comspec = os.environ.get("COMSPEC") or "cmd.exe"
+    command_line = ctypes.create_unicode_buffer(f'"{comspec}" /c {command}')
+
+    proc_info = PROCESS_INFORMATION()
+    created = advapi32.CreateProcessAsUserW(
+        restricted_token,
+        None,
+        command_line,
+        None,
+        None,
+        True,
+        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        None,
+        str(workdir),
+        ctypes.byref(startup),
+        ctypes.byref(proc_info)
+    )
+
+    kernel32.CloseHandle(restricted_token)
+    kernel32.CloseHandle(stdin_read)
+    kernel32.CloseHandle(stdout_write)
+
+    if not created:
+        kernel32.CloseHandle(stdin_write)
+        kernel32.CloseHandle(stdout_read)
+        raise RuntimeError("CreateProcessAsUserW failed (pipe)")
+
+    job_handle = _windows_assign_job(kernel32, proc_info.hProcess)
+
+    def _writer(data: bytes) -> int:
+        written = wintypes.DWORD()
+        if kernel32.WriteFile(stdin_write, data, len(data), ctypes.byref(written), None):
+            return int(written.value)
+        return 0
+
+    def _terminator() -> None:
+        kernel32.TerminateProcess(proc_info.hProcess, 1)
+        kernel32.CloseHandle(stdout_read)
+        kernel32.CloseHandle(stdin_write)
+        if job_handle:
+            kernel32.CloseHandle(job_handle)
+        kernel32.CloseHandle(proc_info.hThread)
+        kernel32.CloseHandle(proc_info.hProcess)
+
+    pty_proc = PtyProcess(
+        session_id=_get_session_id(),
+        command=command,
+        pty_enabled=False,
+        buffer_size=buffer_size,
+        idle_timeout_ms=idle_timeout_ms,
+        writer=_writer,
+        terminator=_terminator
+    )
+
+    def _reader_loop() -> None:
+        buffer = ctypes.create_string_buffer(4096)
+        bytes_read = wintypes.DWORD()
+        last_output = time.monotonic()
+        WAIT_OBJECT_0 = 0x00000000
+        WAIT_TIMEOUT = 0x00000102
+        while not pty_proc.stop_event.is_set():
+            wait_result = kernel32.WaitForSingleObject(proc_info.hProcess, 50)
+            while True:
+                available = wintypes.DWORD()
+                if not kernel32.PeekNamedPipe(stdout_read, None, 0, None, ctypes.byref(available), None):
+                    break
+                if available.value == 0:
+                    break
+                to_read = min(len(buffer), available.value)
+                if kernel32.ReadFile(stdout_read, buffer, to_read, ctypes.byref(bytes_read), None):
+                    if bytes_read.value > 0:
+                        pty_proc.append_output(buffer.raw[:bytes_read.value])
+                        last_output = time.monotonic()
+            if wait_result == WAIT_OBJECT_0:
+                break
+            if wait_result not in (WAIT_OBJECT_0, WAIT_TIMEOUT):
+                break
+            if idle_timeout_ms and (time.monotonic() - last_output) * 1000.0 >= idle_timeout_ms:
+                pty_proc.append_output(b"\n[idle_timeout]\n")
+                kernel32.TerminateProcess(proc_info.hProcess, 1)
+                break
+        exit_code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(proc_info.hProcess, ctypes.byref(exit_code))
+        pty_proc.mark_exited(int(exit_code.value))
+        kernel32.CloseHandle(stdout_read)
+        kernel32.CloseHandle(stdin_write)
+        if job_handle:
+            kernel32.CloseHandle(job_handle)
+        kernel32.CloseHandle(proc_info.hThread)
+        kernel32.CloseHandle(proc_info.hProcess)
+
+    thread = threading.Thread(target=_reader_loop, name=f"pipe-reader-{pty_proc.id}", daemon=True)
+    pty_proc.reader_thread = thread
+    thread.start()
+    if stdin_bytes:
+        _writer(stdin_bytes)
+    return pty_proc
+
+
+def _start_windows_unrestricted_pipe_persistent(
+    command: str,
+    workdir: Path,
+    stdin_bytes: bytes,
+    idle_timeout_ms: int,
+    buffer_size: int
+) -> PtyProcess:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    proc = subprocess.Popen(
+        command,
+        cwd=str(workdir),
+        shell=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        creationflags=CREATE_NEW_PROCESS_GROUP
+    )
+
+    stdout_handle = None
+    if proc.stdout is not None:
+        try:
+            stdout_handle = msvcrt.get_osfhandle(proc.stdout.fileno())
+        except Exception:
+            stdout_handle = None
+
+    def _writer(data: bytes) -> int:
+        if not proc.stdin:
+            return 0
+        try:
+            proc.stdin.write(data)
+            proc.stdin.flush()
+            return len(data)
+        except Exception:
+            return 0
+
+    def _terminator() -> None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+    pty_proc = PtyProcess(
+        session_id=_get_session_id(),
+        command=command,
+        pty_enabled=False,
+        buffer_size=buffer_size,
+        idle_timeout_ms=idle_timeout_ms,
+        writer=_writer,
+        terminator=_terminator
+    )
+
+    def _reader_loop() -> None:
+        buffer = ctypes.create_string_buffer(4096)
+        bytes_read = wintypes.DWORD()
+        last_output = time.monotonic()
+        if stdout_handle is None:
+            pty_proc.mark_exited(proc.poll())
+            return
+        while not pty_proc.stop_event.is_set():
+            available = wintypes.DWORD()
+            if kernel32.PeekNamedPipe(stdout_handle, None, 0, None, ctypes.byref(available), None) and available.value:
+                to_read = min(len(buffer), available.value)
+                if kernel32.ReadFile(stdout_handle, buffer, to_read, ctypes.byref(bytes_read), None):
+                    if bytes_read.value > 0:
+                        pty_proc.append_output(buffer.raw[:bytes_read.value])
+                        last_output = time.monotonic()
+            if proc.poll() is not None:
+                break
+            if idle_timeout_ms and (time.monotonic() - last_output) * 1000.0 >= idle_timeout_ms:
+                pty_proc.append_output(b"\n[idle_timeout]\n")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+            time.sleep(0.05)
+        pty_proc.mark_exited(proc.poll())
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=_reader_loop, name=f"pipe-reader-{pty_proc.id}", daemon=True)
+    pty_proc.reader_thread = thread
+    thread.start()
+    if stdin_bytes:
+        _writer(stdin_bytes)
+    return pty_proc
 
 
 def _ensure_shell_allowlist_entry(command_name: str) -> None:
@@ -1162,13 +2297,49 @@ class RunShellTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "run_shell"
-        self.description = "Run a shell command within the work path."
+        self.description = (
+            "Run a shell command within the work path. "
+            "Supports mode=oneshot|persistent. "
+            "Persistent mode returns a pty_id and supports action=send|read|close|list. "
+            "Optional args: pty, stdin, timeout (ms), timeout_sec (s), idle_timeout (ms), "
+            "max_output (chars), buffer_size (bytes)."
+        )
         self.parameters = [
             ToolParameter(
                 name="command",
                 type="string",
                 description="Shell command to run.",
-                required=True
+                required=False
+            ),
+            ToolParameter(
+                name="mode",
+                type="string",
+                description="oneshot or persistent (default oneshot).",
+                required=False
+            ),
+            ToolParameter(
+                name="action",
+                type="string",
+                description="For persistent sessions: send, read, close, list.",
+                required=False
+            ),
+            ToolParameter(
+                name="pty_id",
+                type="string",
+                description="Persistent PTY session id.",
+                required=False
+            ),
+            ToolParameter(
+                name="pty",
+                type="boolean",
+                description="Whether to use a PTY if supported (default auto).",
+                required=False
+            ),
+            ToolParameter(
+                name="stdin",
+                type="string",
+                description="Stdin content to write (one-shot or send).",
+                required=False
             ),
             ToolParameter(
                 name="cwd",
@@ -1179,22 +2350,94 @@ class RunShellTool(Tool):
             ToolParameter(
                 name="timeout_sec",
                 type="number",
-                description="Timeout in seconds.",
+                description="Timeout in seconds (ignored if timeout is provided).",
+                required=False
+            ),
+            ToolParameter(
+                name="timeout",
+                type="number",
+                description="Timeout in milliseconds (overrides timeout_sec if provided).",
+                required=False
+            ),
+            ToolParameter(
+                name="idle_timeout",
+                type="number",
+                description="Idle timeout in milliseconds (default 120000 for oneshot, 0 for persistent).",
                 required=False
             ),
             ToolParameter(
                 name="max_output",
                 type="number",
-                description="Max output characters.",
+                description="Max combined stdout/stderr characters to return.",
+                required=False
+            ),
+            ToolParameter(
+                name="buffer_size",
+                type="number",
+                description="Persistent buffer size in bytes (default ~2MB).",
+                required=False
+            ),
+            ToolParameter(
+                name="cursor",
+                type="number",
+                description="Read cursor for persistent sessions.",
                 required=False
             )
         ]
 
     async def execute(self, input_data: str) -> str:
         data = _parse_json_input(input_data)
+        action = str(data.get("action") or "").strip().lower()
+        if action:
+            session_id = _get_session_id()
+            manager = get_pty_manager()
+            if action == "list":
+                items = manager.list(session_id)
+                lines = [f"[pty_list count={len(items)}]"]
+                for item in items:
+                    lines.append(
+                        f"- id={item.id} status={item.status} pty={str(item.pty_enabled).lower()} exit_code={item.exit_code}"
+                    )
+                return "\n".join(lines)
+            pty_id = data.get("pty_id")
+            if not pty_id:
+                return "Missing pty_id."
+            proc = manager.get(session_id, str(pty_id))
+            if not proc:
+                return "PTY not found."
+            if action == "send":
+                stdin_bytes = _encode_stdin(data.get("stdin"))
+                written = proc.write(stdin_bytes)
+                return f"[pty_id={proc.id} status={proc.status} bytes_written={written}]"
+            if action == "read":
+                max_output = data.get("max_output")
+                if max_output is None:
+                    max_output = int(get_tool_config().get("shell", {}).get("max_output", 20000))
+                else:
+                    max_output = int(max_output)
+                cursor = data.get("cursor")
+                if cursor is not None:
+                    try:
+                        cursor = int(cursor)
+                    except (TypeError, ValueError):
+                        cursor = None
+                chunk, new_cursor, reset = proc.read(cursor, max_output)
+                header = f"[pty_id={proc.id} status={proc.status} cursor={new_cursor} reset={str(reset).lower()}]"
+                if proc.status == "exited":
+                    header = f"{header} exit_code={proc.exit_code}"
+                return f"{header}\n{chunk if chunk else '(no output)'}"
+            if action == "close":
+                manager.close(session_id, str(pty_id))
+                return f"[pty_id={pty_id} status=closed]"
+            return f"Unknown action: {action}"
+
         command = data.get("command") or input_data
         if not command:
             raise ValueError("Missing command.")
+        mode = str(data.get("mode") or "oneshot").strip().lower()
+        if mode not in ("oneshot", "persistent"):
+            mode = "oneshot"
+
         cmd_name = _extract_command_name(command)
         root = _get_root_path()
         tool_ctx = get_tool_context()
@@ -1204,6 +2447,7 @@ class RunShellTool(Tool):
         allowset = {str(item).lower() for item in allowlist}
         unrestricted_allowlist = get_tool_config().get("shell", {}).get("unrestricted_allowlist", [])
         unrestricted_allowset = {str(item).lower() for item in unrestricted_allowlist}
+
         reasons = []
         if agent_mode != "super":
             if not shell_unrestricted and cmd_name not in allowset:
@@ -1237,10 +2481,26 @@ class RunShellTool(Tool):
         cwd = data.get("cwd")
         workdir = _resolve_path(cwd, self.name, "execute") if cwd else root
 
-        timeout = data.get("timeout_sec")
-        timeout_sec = float(timeout) if timeout is not None else float(get_tool_config().get("shell", {}).get("timeout_sec", 30))
+        timeout_ms = data.get("timeout")
+        if timeout_ms is not None:
+            timeout_sec = float(timeout_ms) / 1000.0
+        else:
+            timeout_value = data.get("timeout_sec")
+            timeout_sec = float(timeout_value) if timeout_value is not None else float(get_tool_config().get("shell", {}).get("timeout_sec", 30))
+        idle_timeout_ms = _resolve_idle_timeout_ms(mode, data.get("idle_timeout"))
+        buffer_size = _resolve_buffer_size(data.get("buffer_size"))
         max_output = data.get("max_output")
         max_output = int(max_output) if max_output is not None else int(get_tool_config().get("shell", {}).get("max_output", 20000))
+
+        stdin_bytes = _encode_stdin(data.get("stdin"))
+        pty_requested = data.get("pty")
+        pty_supported = _supports_pty()
+        if pty_requested is None:
+            pty_enabled = pty_supported
+            pty_fallback = False
+        else:
+            pty_enabled = bool(pty_requested) and pty_supported
+            pty_fallback = bool(pty_requested) and not pty_supported
 
         def _run_unsandboxed() -> Tuple[int, str]:
             completed = subprocess.run(
@@ -1251,21 +2511,61 @@ class RunShellTool(Tool):
                 text=True,
                 timeout=timeout_sec
             )
-            output = (completed.stdout or "") + (completed.stderr or "")
-            return completed.returncode, output
+            output_text = (completed.stdout or "") + (completed.stderr or "")
+            return completed.returncode, output_text
 
-        def _run_sandboxed() -> Tuple[int, str]:
-            return _run_sandboxed_command(command, workdir, timeout_sec)
+        def _run_oneshot(use_sandbox: bool) -> Tuple[int, str]:
+            if pty_enabled:
+                if _is_windows():
+                    if use_sandbox:
+                        return _run_windows_pty_oneshot(command, workdir, timeout_sec, idle_timeout_ms, stdin_bytes)
+                    return _run_unsandboxed()
+                return _run_posix_pty_oneshot(command, workdir, timeout_sec, idle_timeout_ms, stdin_bytes, use_sandbox)
+            if use_sandbox:
+                return _run_sandboxed_command(command, workdir, timeout_sec)
+            return _run_unsandboxed()
+
+        def _start_persistent(use_sandbox: bool) -> PtyProcess:
+            if _is_windows():
+                if pty_enabled:
+                    if use_sandbox:
+                        return _start_windows_pty_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size)
+                    return _start_windows_unrestricted_pipe_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size)
+                if use_sandbox:
+                    return _start_windows_pipe_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size)
+                return _start_windows_unrestricted_pipe_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size)
+            if pty_enabled:
+                return _start_posix_pty_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size, use_sandbox)
+            return _start_posix_pipe_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size, use_sandbox)
 
         ran_sandbox = False
         try:
+            if mode == "persistent":
+                if agent_mode == "super":
+                    pty_proc = _start_persistent(use_sandbox=False)
+                elif cmd_name in unrestricted_allowset:
+                    pty_proc = _start_persistent(use_sandbox=False)
+                else:
+                    ran_sandbox = True
+                    pty_proc = _start_persistent(use_sandbox=True)
+                manager = get_pty_manager()
+                manager.register(pty_proc)
+                chunk, cursor, _ = pty_proc.read(None, max_output)
+                header = (
+                    f"[pty_id={pty_proc.id} status={pty_proc.status} pty={str(pty_proc.pty_enabled).lower()} "
+                    f"idle_timeout={pty_proc.idle_timeout_ms} buffer_size={pty_proc.buffer_size}]"
+                )
+                if pty_fallback:
+                    header = f"{header} pty_fallback=true"
+                return f"{header}\n{chunk if chunk else '(no output)'}"
+
             if agent_mode == "super":
-                returncode, output = await asyncio.to_thread(_run_unsandboxed)
+                returncode, output = await asyncio.to_thread(_run_oneshot, False)
             elif cmd_name in unrestricted_allowset:
-                returncode, output = await asyncio.to_thread(_run_unsandboxed)
+                returncode, output = await asyncio.to_thread(_run_oneshot, False)
             else:
                 ran_sandbox = True
-                returncode, output = await asyncio.to_thread(_run_sandboxed)
+                returncode, output = await asyncio.to_thread(_run_oneshot, True)
         except subprocess.TimeoutExpired:
             return "Command timed out."
         except Exception as exc:
@@ -1294,10 +2594,20 @@ class RunShellTool(Tool):
             if status == "approved" and agent_mode == "default" and not shell_unrestricted and cmd_name not in unrestricted_allowset:
                 _ensure_shell_unrestricted_allowlist_entry(cmd_name)
 
-            try:
-                returncode, output = await asyncio.to_thread(_run_unsandboxed)
-            except subprocess.TimeoutExpired:
-                return "Command timed out."
+            if mode == "persistent":
+                pty_proc = _start_persistent(use_sandbox=False)
+                manager = get_pty_manager()
+                manager.register(pty_proc)
+                chunk, cursor, _ = pty_proc.read(None, max_output)
+                header = (
+                    f"[pty_id={pty_proc.id} status={pty_proc.status} pty={str(pty_proc.pty_enabled).lower()} "
+                    f"idle_timeout={pty_proc.idle_timeout_ms} buffer_size={pty_proc.buffer_size}]"
+                )
+                if pty_fallback:
+                    header = f"{header} pty_fallback=true"
+                return f"{header}\n{chunk if chunk else '(no output)'}"
+
+            returncode, output = await asyncio.to_thread(_run_oneshot, False)
 
         if ran_sandbox and returncode != 0 and _looks_like_permission_denied(output):
             request_id = None
@@ -1325,17 +2635,14 @@ class RunShellTool(Tool):
             if status == "approved" and agent_mode == "default" and not shell_unrestricted and cmd_name not in unrestricted_allowset:
                 _ensure_shell_unrestricted_allowlist_entry(cmd_name)
 
-            try:
-                returncode, output = await asyncio.to_thread(_run_unsandboxed)
-            except subprocess.TimeoutExpired:
-                return "Command timed out."
+            returncode, output = await asyncio.to_thread(_run_oneshot, False)
 
-        if not output:
-            output = "(no output)"
-        if max_output > 0 and len(output) > max_output:
-            output = output[:max_output] + "\n... (truncated)"
-
-        return f"[exit_code={returncode}]\n{output}"
+        output = output or "(no output)"
+        output = _apply_max_output(output, max_output)
+        header = f"[exit_code={returncode}]"
+        if pty_fallback:
+            header = f"{header} pty_fallback=true"
+        return f"{header}\n{output}"
 
 
 class RgTool(Tool):
