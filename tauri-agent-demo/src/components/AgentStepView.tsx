@@ -53,6 +53,7 @@ const STEP_CATEGORY: Record<AgentStep['step_type'], Category> = {
     action: 'tool',
     action_delta: 'tool',
     observation: 'tool',
+    observation_delta: 'tool',
     answer: 'final',
     answer_delta: 'final',
     error: 'error',
@@ -193,6 +194,7 @@ type ShellHeader = {
     cursor?: number;
     reset?: boolean;
     pty_fallback?: boolean;
+    command?: string;
 };
 
 function parseShellHeaderLine(line: string) {
@@ -242,6 +244,9 @@ function parseShellHeaderLine(line: string) {
             case 'pty_fallback':
                 header.pty_fallback = lower === 'true';
                 return true;
+            case 'command':
+                header.command = value;
+                return true;
             default:
                 return false;
         }
@@ -273,6 +278,17 @@ function parseShellOutput(raw: string) {
         header,
         body: rest.join('\n')
     };
+}
+
+function stripAnsi(input: string) {
+    if (!input) return '';
+    // Strip OSC sequences like \x1b]...(\x07 or \x1b\\)
+    let output = input.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '');
+    // Strip CSI and other ANSI escape sequences (covers ESC= / ESC> too)
+    output = output.replace(/[\u001B\u009B][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
+    // Remove stray bell characters
+    output = output.replace(/\x07/g, '');
+    return output;
 }
 
 type ApplyPatchResult = {
@@ -1825,6 +1841,7 @@ function AgentStepView({
                 let shellPayload: ReturnType<typeof parseShellOutput> | null = null;
                 let shellBody = '';
                 let shellPreview = '';
+                const shellCommandFromMeta = typeof step.metadata?.command === 'string' ? step.metadata.command : '';
                 if (isObservation) {
                     observationText = rawContent.replace(/\r\n/g, '\n');
                     const exitCode = parseExitCode(observationText);
@@ -1846,7 +1863,17 @@ function AgentStepView({
                     } else if (isRunShell) {
                         shellPayload = parseShellOutput(observationText);
                         if (shellPayload) {
-                            shellBody = shellPayload.body || '';
+                            if (shellCommandFromMeta && !shellPayload.header.command) {
+                                shellPayload.header.command = shellCommandFromMeta;
+                            }
+                            shellBody = stripAnsi(shellPayload.body || '');
+                            const commandText = shellPayload.header.command || '';
+                            if (commandText) {
+                                const prefix = `$ ${commandText}`;
+                                if (!shellBody.startsWith(prefix)) {
+                                    shellBody = shellBody ? `${prefix}\n${shellBody}` : prefix;
+                                }
+                            }
                             const bodyLines = shellBody.split('\n');
                             observationHasMore = bodyLines.length > 1;
                             shellPreview = observationHasMore ? `${bodyLines[0]} ...` : bodyLines[0] || '';
@@ -1969,9 +1996,11 @@ function AgentStepView({
                                                 )}
                                             </div>
                                             <div className={`shell-card-output${isObservationExpanded ? ' expanded' : ''}`}>
-                                                {renderLinkedText(
-                                                    (isObservationExpanded ? shellBody : shellPreview) || '(no output)'
-                                                )}
+                                                {(() => {
+                                                    const text = isObservationExpanded ? shellBody : shellPreview;
+                                                    const display = text || (shellPayload.header.status === 'exited' ? '(no output)' : '');
+                                                    return <pre className="shell-output-plain">{display}</pre>;
+                                                })()}
                                             </div>
                                         </div>
                                     ) : isApplyPatch && applyPatchResult ? (

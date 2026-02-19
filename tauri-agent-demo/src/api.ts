@@ -364,7 +364,7 @@ export async function* sendMessageStream(request: ChatRequest): AsyncGenerator<s
 // ==================== Agent Chat API ====================
 
 export interface AgentStep {
-    step_type: 'thought' | 'thought_delta' | 'action' | 'action_delta' | 'observation' | 'answer' | 'answer_delta' | 'error' | 'context_estimate';
+    step_type: 'thought' | 'thought_delta' | 'action' | 'action_delta' | 'observation' | 'observation_delta' | 'answer' | 'answer_delta' | 'error' | 'context_estimate';
     content: string;
     metadata?: Record<string, any>;
 }

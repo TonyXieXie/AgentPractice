@@ -556,13 +556,19 @@
     font-size: 0.78rem;
     line-height: 1.4;
     color: #e2e8f0;
-    white-space: pre-wrap;
-    word-break: break-word;
+    white-space: pre;
+    overflow-x: auto;
 }
 
 .shell-card-output.expanded {
     max-height: 360px;
     overflow: auto;
+}
+
+.shell-output-plain {
+    margin: 0;
+    white-space: pre;
+    font: inherit;
 }
 
 .ast-view {
