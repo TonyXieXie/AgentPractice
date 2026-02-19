@@ -2388,6 +2388,20 @@ class RunShellTool(Tool):
     async def execute(self, input_data: str) -> str:
         data = _parse_json_input(input_data)
         action = str(data.get("action") or "").strip().lower()
+        mode_override: Optional[str] = None
+        if action:
+            if action != "list" and not data.get("pty_id"):
+                # If action is set but no pty_id is provided:
+                # - For send with a command, auto-start a persistent session.
+                # - Otherwise, fall back to oneshot when a command exists.
+                if action == "send" and data.get("command"):
+                    mode_override = "persistent"
+                    action = ""
+                elif data.get("command"):
+                    action = ""
+                else:
+                    return "Missing pty_id."
+
         if action:
             session_id = _get_session_id()
             manager = get_pty_manager()
@@ -2435,6 +2449,8 @@ class RunShellTool(Tool):
         if not command:
             raise ValueError("Missing command.")
         mode = str(data.get("mode") or "oneshot").strip().lower()
+        if mode_override:
+            mode = mode_override
         if mode not in ("oneshot", "persistent"):
             mode = "oneshot"
 
