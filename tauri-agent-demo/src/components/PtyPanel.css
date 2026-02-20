@@ -118,77 +118,48 @@
   flex-direction: column;
   gap: 12px;
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.25) rgba(15, 17, 21, 0.35);
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
 }
 
 .pty-content::-webkit-scrollbar {
-  width: 10px;
+  width: 6px;
+  height: 6px;
 }
 
 .pty-content::-webkit-scrollbar-track {
-  background: rgba(15, 17, 21, 0.35);
-  border-radius: 8px;
-}
-
-.pty-content::-webkit-scrollbar-track:hover {
-  background: rgba(15, 17, 21, 0.45);
+  background: transparent;
 }
 
 .pty-content::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.22);
-  border-radius: 8px;
-  border: 2px solid rgba(15, 17, 21, 0.35);
-  background-clip: padding-box;
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
 }
 
 .pty-content::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.32);
-}
-
-.pty-content::-webkit-scrollbar-thumb:active {
-  background: rgba(255, 255, 255, 0.38);
-}
-
-.pty-content::-webkit-scrollbar-corner {
-  background: transparent;
+  background: rgba(255, 255, 255, 0.24);
 }
 
 .pty-output {
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.25) rgba(15, 17, 21, 0.35);
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
 }
 
 .pty-output::-webkit-scrollbar {
-  height: 10px;
-  width: 10px;
+  height: 6px;
+  width: 6px;
 }
 
 .pty-output::-webkit-scrollbar-track {
-  background: rgba(15, 17, 21, 0.35);
-  border-radius: 8px;
-}
-
-.pty-output::-webkit-scrollbar-track:hover {
-  background: rgba(15, 17, 21, 0.45);
+  background: transparent;
 }
 
 .pty-output::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.22);
-  border-radius: 8px;
-  border: 2px solid rgba(15, 17, 21, 0.35);
-  background-clip: padding-box;
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
 }
 
 .pty-output::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.32);
-}
-
-.pty-output::-webkit-scrollbar-thumb:active {
-  background: rgba(255, 255, 255, 0.38);
-}
-
-.pty-output::-webkit-scrollbar-corner {
-  background: transparent;
+  background: rgba(255, 255, 255, 0.24);
 }
 
 .pty-empty {
