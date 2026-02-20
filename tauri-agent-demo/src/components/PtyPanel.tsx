@@ -249,7 +249,7 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
           const status = buffer?.status || item.status;
           const exitCode = buffer?.exit_code ?? item.exit_code;
           const isRunning = status === 'running';
-          const isClosed = status === 'closed';
+          const isInteractive = isRunning;
           return (
             <div key={item.pty_id} className={`pty-card ${isRunning ? 'running' : 'exited'}`}>
               <div className="pty-card-header">
@@ -260,7 +260,7 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
                     <span className={`pty-exit ${exitCode === 0 ? 'ok' : 'err'}`}>exit {exitCode}</span>
                   )}
                 </div>
-                {!isClosed && (
+                {isInteractive && (
                   <div className="pty-actions">
                     <button type="button" className="pty-btn" onClick={() => handleClose(item.pty_id)}>
                       Close
@@ -271,7 +271,7 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
               <div className="pty-output">
                 <pre>{output}</pre>
               </div>
-              {!isClosed && (
+              {isInteractive && (
                 <div className="pty-input-row">
                   <input
                     type="text"
