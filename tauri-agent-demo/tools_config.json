@@ -43,7 +43,8 @@
       "del",
       "find",
       "grep",
-      "sed"
+      "sed",
+      "bash"
     ],
     "timeout_sec": 30,
     "buffer_size": 2097152,

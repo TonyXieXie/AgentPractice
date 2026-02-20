@@ -1,6 +1,7 @@
 ﻿from fastapi import FastAPI, HTTPException, Response, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import asyncio
 import uvicorn
 import json
@@ -131,6 +132,8 @@ def local_file_exists(path: str = Query(...)):
 TITLE_MAX_CHARS = 40
 TITLE_FALLBACK_CHARS = 20
 TITLE_REQUEST_TIMEOUT = 15.0
+PTY_PROMPT_MAX_ITEMS = 6
+PTY_PROMPT_CMD_MAX_CHARS = 160
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -147,6 +150,33 @@ def _fallback_title(user_message: str) -> str:
     if len(base) > TITLE_FALLBACK_CHARS:
         return base[:TITLE_FALLBACK_CHARS].rstrip() + "..."
     return base
+
+
+def _build_live_pty_prompt(session_id: Optional[str]) -> str:
+    if not session_id:
+        return "None."
+    try:
+        items = get_pty_manager().list(session_id)
+    except Exception:
+        return "None."
+    running = [item for item in items if item.status == "running"]
+    if not running:
+        return "None."
+    running.sort(key=lambda item: item.created_at, reverse=True)
+    now = time.time()
+    now_mono = time.monotonic()
+    lines: List[str] = []
+    for item in running[:PTY_PROMPT_MAX_ITEMS]:
+        cmd = _truncate_text(item.command or "", PTY_PROMPT_CMD_MAX_CHARS)
+        if not cmd:
+            cmd = "(no command)"
+        idle_sec = max(0, int(now_mono - item.last_output_at))
+        age_sec = max(0, int(now - item.created_at))
+        mode = "pty" if item.pty_enabled else "pipe"
+        lines.append(f"- {item.id} | {mode} | age={age_sec}s | idle={idle_sec}s | cmd={cmd}")
+    if len(running) > PTY_PROMPT_MAX_ITEMS:
+        lines.append(f"... and {len(running) - PTY_PROMPT_MAX_ITEMS} more.")
+    return "\n".join(lines)
 
 
 def _clean_title(raw_title: str) -> str:
@@ -1151,10 +1181,12 @@ async def chat_agent_stream(request: ChatRequest):
         agent_type = request.agent_type_override if hasattr(request, 'agent_type_override') else getattr(session, 'agent_type', 'react')
         profile_id = request.agent_profile or getattr(session, "agent_profile", None)
         include_tools = agent_type != "simple"
+        pty_prompt = _build_live_pty_prompt(session.id)
         system_prompt, tools, resolved_profile_id, ability_ids = build_agent_prompt_and_tools(
             profile_id,
             ToolRegistry.get_all(),
             include_tools=include_tools,
+            extra_context={"pty_sessions": pty_prompt},
             exclude_ability_ids=["code_map"]
         )
         if resolved_profile_id and resolved_profile_id != getattr(session, "agent_profile", None):
@@ -1530,6 +1562,113 @@ async def revert_patch(request: PatchRevertRequest):
         "user_message_id": user_msg.id,
         "assistant_message_id": assistant_msg.id
     }
+
+# ==================== PTY ====================
+
+class PtyReadRequest(BaseModel):
+    session_id: str
+    pty_id: str
+    cursor: Optional[int] = None
+    max_output: Optional[int] = None
+
+
+class PtySendRequest(BaseModel):
+    session_id: str
+    pty_id: str
+    input: str
+
+
+class PtyCloseRequest(BaseModel):
+    session_id: str
+    pty_id: str
+
+
+@app.get("/pty/list")
+def list_ptys(
+    session_id: str = Query(...),
+    include_exited: bool = Query(True),
+    max_exited: int = Query(8)
+):
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Missing session_id")
+    manager = get_pty_manager()
+    items = manager.list(session_id)
+    running = [item for item in items if item.status == "running"]
+    exited = [item for item in items if item.status != "running"]
+    running.sort(key=lambda item: item.created_at, reverse=True)
+    exited.sort(key=lambda item: item.created_at, reverse=True)
+    if not include_exited:
+        merged = running
+    else:
+        try:
+            max_exited = int(max_exited)
+        except (TypeError, ValueError):
+            max_exited = 8
+        if max_exited < 0:
+            max_exited = 0
+        merged = running + exited[:max_exited]
+    payload = []
+    for item in merged:
+        payload.append({
+            "pty_id": item.id,
+            "status": item.status,
+            "pty": item.pty_enabled,
+            "exit_code": item.exit_code,
+            "command": item.command,
+            "created_at": item.created_at,
+            "idle_timeout": item.idle_timeout_ms,
+            "buffer_size": item.buffer_size,
+            "last_output_at": item.last_output_at
+        })
+    return {"ok": True, "items": payload}
+
+
+@app.post("/pty/read")
+def read_pty(request: PtyReadRequest):
+    manager = get_pty_manager()
+    proc = manager.get(request.session_id, request.pty_id)
+    if not proc:
+        raise HTTPException(status_code=404, detail="PTY not found")
+    max_output = request.max_output
+    if max_output is None:
+        try:
+            max_output = int(get_tool_config().get("shell", {}).get("max_output", 20000))
+        except (TypeError, ValueError):
+            max_output = 20000
+    try:
+        max_output = int(max_output)
+    except (TypeError, ValueError):
+        max_output = 20000
+    chunk, cursor, reset = proc.read(request.cursor, max_output)
+    return {
+        "ok": True,
+        "pty_id": proc.id,
+        "status": proc.status,
+        "pty": proc.pty_enabled,
+        "exit_code": proc.exit_code,
+        "command": proc.command,
+        "cursor": cursor,
+        "reset": reset,
+        "chunk": chunk
+    }
+
+
+@app.post("/pty/send")
+def send_pty(request: PtySendRequest):
+    manager = get_pty_manager()
+    proc = manager.get(request.session_id, request.pty_id)
+    if not proc:
+        raise HTTPException(status_code=404, detail="PTY not found")
+    data = (request.input or "").encode("utf-8", errors="replace")
+    written = proc.write(data)
+    return {"ok": True, "pty_id": proc.id, "bytes_written": written}
+
+
+@app.post("/pty/close")
+def close_pty(request: PtyCloseRequest):
+    manager = get_pty_manager()
+    closed = manager.close(request.session_id, request.pty_id)
+    return {"ok": closed, "pty_id": request.pty_id}
 
 # ==================== Tools ====================
 
