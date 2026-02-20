@@ -143,7 +143,7 @@ def build_history_for_llm(
     summary: str,
     code_map: Optional[str],
     trunc_cfg: Optional[Dict[str, Any]] = None
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     messages = db.get_dialogue_messages_after(session_id, after_message_id)
     filtered = []
     for msg in messages:
@@ -164,11 +164,20 @@ def build_history_for_llm(
                 continue
             steps_by_message.setdefault(message_id, []).append(step)
 
-    history: List[Dict[str, str]] = []
+    history: List[Dict[str, Any]] = []
+    tool_call_counter = 0
     for msg in filtered:
         if msg.get("role") == "assistant":
             msg_id = msg.get("id")
             steps = steps_by_message.get(msg_id, [])
+            pending_calls: List[Dict[str, str]] = []
+
+            def _next_call_id(sequence: Optional[int], tool_name: str) -> str:
+                nonlocal tool_call_counter
+                tool_call_counter += 1
+                seq = sequence if isinstance(sequence, int) else tool_call_counter
+                return f"hist_call_{msg_id}_{seq}_{tool_call_counter}"
+
             for step in steps:
                 step_type = step.get("step_type")
                 metadata = step.get("metadata") or {}
@@ -182,12 +191,52 @@ def build_history_for_llm(
                     if tool_input is None:
                         tool_input = ""
                     tool_input = _truncate_text_middle(tool_input, trunc_cfg)
-                    content = f"[Tool Call] {tool_name}\n{tool_input}"
-                    history.append({"role": "assistant", "content": content})
+                    call_id = _next_call_id(step.get("sequence"), str(tool_name))
+                    pending_calls.append({"tool": str(tool_name), "id": call_id})
+                    history.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": str(tool_name),
+                                    "arguments": str(tool_input)
+                                }
+                            }
+                        ]
+                    })
                 elif step_type == "observation":
                     tool_output = _truncate_text_middle(step.get("content") or "", trunc_cfg)
-                    content = f"[Tool Result] {tool_name}\n{tool_output}"
-                    history.append({"role": "assistant", "content": content})
+                    call_id = None
+                    for idx, item in enumerate(pending_calls):
+                        if item.get("tool") == str(tool_name):
+                            call_id = item.get("id")
+                            pending_calls.pop(idx)
+                            break
+                    if call_id is None:
+                        call_id = _next_call_id(step.get("sequence"), str(tool_name))
+                        history.append({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": str(tool_name),
+                                        "arguments": ""
+                                    }
+                                }
+                            ]
+                        })
+                    history.append({
+                        "role": "tool",
+                        "content": tool_output,
+                        "tool_call_id": call_id,
+                        "name": str(tool_name)
+                    })
 
         history.append({"role": msg.get("role"), "content": msg.get("content")})
 
