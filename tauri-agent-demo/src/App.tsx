@@ -710,7 +710,10 @@ function App() {
   const userScrollRef = useRef(false);
   const lastUserScrollAtRef = useRef(0);
   const lastScrollTopRef = useRef(0);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const INPUT_MAX_HEIGHT = 240;
+  const resizeInputRef = useRef<number | null>(null);
+  const composingRef = useRef(false);
   const messagesCacheRef = useRef<Record<string, Message[]>>({});
   const messagePagingRef = useRef<Record<string, { loading: boolean; hasMore: boolean; oldestId: number | null }>>({});
   const pendingPrependRef = useRef<{ anchorKey: string; anchorOffset: number } | null>(null);
@@ -1041,6 +1044,25 @@ function App() {
     scheduleScrollToBottom('smooth');
     updateScrollToBottomVisibility();
   };
+
+  const resizeInput = useCallback(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    input.style.height = 'auto';
+    const nextHeight = Math.min(input.scrollHeight, INPUT_MAX_HEIGHT);
+    input.style.height = `${nextHeight}px`;
+    input.style.overflowY = input.scrollHeight > INPUT_MAX_HEIGHT ? 'auto' : 'hidden';
+  }, []);
+
+  useEffect(() => {
+    if (resizeInputRef.current !== null) {
+      window.cancelAnimationFrame(resizeInputRef.current);
+    }
+    resizeInputRef.current = window.requestAnimationFrame(() => {
+      resizeInput();
+      resizeInputRef.current = null;
+    });
+  }, [inputMsg, resizeInput]);
 
   useEffect(() => {
     if (!autoScrollRef.current) return;
@@ -3658,17 +3680,32 @@ function App() {
               </div>
             )}
 
-            <input
+            <textarea
               onChange={(e) => {
                 setInputMsg(e.currentTarget.value);
                 autoScrollRef.current = true;
               }}
               onPaste={handlePaste}
-              onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
+              onCompositionStart={() => {
+                composingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                composingRef.current = false;
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  if (composingRef.current || (e.nativeEvent as any).isComposing || e.isComposing) {
+                    return;
+                  }
+                  e.preventDefault();
+                  handleSend();
+                }
+              }}
               value={inputMsg}
               placeholder={currentConfig ? 'Type a message...' : 'Please configure an LLM'}
               disabled={!currentConfig}
               ref={inputRef}
+              rows={1}
             />
 
             <div className="input-footer">

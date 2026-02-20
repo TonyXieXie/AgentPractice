@@ -1531,6 +1531,23 @@ class ReActAgent(AgentStrategy):
             "Thought: I now know the final answer.\n"
             "Final Answer: <your final answer>"
         )
+        if history:
+            history_lines: List[str] = []
+            for msg in history:
+                role = (msg.get("role") or "user").lower()
+                content = str(msg.get("content") or "").strip()
+                if not content:
+                    continue
+                if role == "user":
+                    label = "User"
+                elif role == "assistant":
+                    label = "Assistant"
+                else:
+                    label = role.capitalize()
+                content = _truncate_text_middle(content, trunc_cfg)
+                history_lines.append(f"{label}: {content}")
+            if history_lines:
+                sections.append("## History\n" + "\n".join(history_lines))
         sections.append(f"## Scratchpad\n{scratchpad_text}")
         return "\n\n".join(sections).strip()
 

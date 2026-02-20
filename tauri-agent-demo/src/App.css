@@ -661,7 +661,7 @@ body[data-platform="mac"] .app-titlebar {
   background: rgba(21, 27, 34, 0.95);
 }
 
-.input-area input {
+.input-area textarea {
   flex: 0 0 auto;
   padding: 10px 14px;
   background: #0f1216;
@@ -670,19 +670,23 @@ body[data-platform="mac"] .app-titlebar {
   color: #e5e7eb;
   font-size: 1rem;
   transition: all 0.2s;
+  min-height: 44px;
+  line-height: 1.4;
+  resize: none;
+  overflow-y: hidden;
 }
 
-.input-area input:focus {
+.input-area textarea:focus {
   outline: none;
   border-color: rgba(255, 255, 255, 0.25);
   background: #141820;
 }
 
-.input-area input::placeholder {
+.input-area textarea::placeholder {
   color: #7b818d;
 }
 
-.input-area input:disabled {
+.input-area textarea:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
