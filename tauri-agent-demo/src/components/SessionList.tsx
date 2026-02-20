@@ -14,6 +14,7 @@ interface SessionListProps {
     refreshTrigger?: number;
     inFlightBySession?: Record<string, boolean>;
     unreadBySession?: Record<string, boolean>;
+    pendingPermissionBySession?: Record<string, boolean>;
 }
 
 export default function SessionList({
@@ -25,7 +26,8 @@ export default function SessionList({
     debugActive,
     refreshTrigger,
     inFlightBySession,
-    unreadBySession
+    unreadBySession,
+    pendingPermissionBySession
 }: SessionListProps) {
     const [sessions, setSessions] = useState<ChatSession[]>([]);
     const [editingId, setEditingId] = useState<string | null>(null);
@@ -310,9 +312,10 @@ export default function SessionList({
                             <div className="session-group-items">
                                 {group.sessions.map((session) => {
                                     const isStreaming = Boolean(inFlightBySession?.[session.id]);
+                                    const isPending = Boolean(pendingPermissionBySession?.[session.id]);
                                     const isUnread = !isStreaming && Boolean(unreadBySession?.[session.id]) && currentSessionId !== session.id;
-                                    const showStatus = isStreaming || isUnread;
-                                    const statusClass = isStreaming ? 'streaming' : 'unread';
+                                    const showStatus = isPending || isStreaming || isUnread;
+                                    const statusClass = isPending ? 'permission' : isStreaming ? 'streaming' : 'unread';
 
                                     return (
                                         <div

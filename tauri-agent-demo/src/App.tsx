@@ -705,6 +705,8 @@ function App() {
   const streamingRef = useRef(false);
   const scrollRafRef = useRef<number | null>(null);
   const forceAutoScrollRef = useRef(false);
+  const userScrollRef = useRef(false);
+  const lastUserScrollAtRef = useRef(0);
   const lastScrollTopRef = useRef(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const messagesCacheRef = useRef<Record<string, Message[]>>({});
@@ -1006,6 +1008,11 @@ function App() {
     setShowScrollToBottom((prev) => (prev === shouldShow ? prev : shouldShow));
   }, []);
 
+  const markUserScroll = useCallback(() => {
+    userScrollRef.current = true;
+    lastUserScrollAtRef.current = Date.now();
+  }, []);
+
   const scheduleScrollToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
     if (!autoScrollRef.current) return;
     const container = messagesContainerRef.current;
@@ -1027,6 +1034,8 @@ function App() {
 
   const handleScrollToBottomClick = () => {
     autoScrollRef.current = true;
+    userScrollRef.current = false;
+    lastUserScrollAtRef.current = 0;
     scheduleScrollToBottom('smooth');
     updateScrollToBottomVisibility();
   };
@@ -1482,6 +1491,16 @@ function App() {
     });
     return next;
   }, [inFlightTick]);
+
+  const pendingPermissionBySession = useMemo(() => {
+    const next: Record<string, boolean> = {};
+    Object.entries(pendingPermissionBySessionRef.current).forEach(([key, pending]) => {
+      if (key !== DRAFT_SESSION_KEY && pending) {
+        next[key] = true;
+      }
+    });
+    return next;
+  }, [permissionTick]);
 
   const clearPendingContextForItem = (queueId: string) => {
     setPendingContextEstimate((prev) => {
@@ -3219,14 +3238,19 @@ function App() {
   const handleMessagesScroll = () => {
     const container = messagesContainerRef.current;
     if (!container) return;
+    const now = Date.now();
+    const userScrollActive = userScrollRef.current && now - lastUserScrollAtRef.current < 200;
     const threshold = 10;
     const currentScrollTop = container.scrollTop;
     const distanceToBottom = container.scrollHeight - currentScrollTop - container.clientHeight;
     const nearBottom = distanceToBottom <= threshold;
-    if (currentScrollTop < lastScrollTopRef.current) {
-      autoScrollRef.current = false;
-    } else if (nearBottom) {
+    if (nearBottom) {
       autoScrollRef.current = true;
+      userScrollRef.current = false;
+    } else if (currentScrollTop < lastScrollTopRef.current) {
+      if (userScrollActive) {
+        autoScrollRef.current = false;
+      }
     }
     lastScrollTopRef.current = currentScrollTop;
     updateScrollToBottomVisibility();
@@ -3407,13 +3431,20 @@ function App() {
           refreshTrigger={sessionRefreshTrigger}
           inFlightBySession={inFlightBySession}
           unreadBySession={unreadBySession}
+          pendingPermissionBySession={pendingPermissionBySession}
         />
       )}
 
       <div className="main-content">
         <div className="chat-container">
           <div className="messages-wrapper">
-            <div className="messages" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
+            <div
+              className="messages"
+              ref={messagesContainerRef}
+              onScroll={handleMessagesScroll}
+              onWheel={markUserScroll}
+              onTouchMove={markUserScroll}
+            >
               {renderMessages.length === 0 ? (
                 <div className="welcome-message">
                   <h2>Welcome to Agent Chat</h2>

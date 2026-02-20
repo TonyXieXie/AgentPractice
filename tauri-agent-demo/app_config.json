@@ -99,7 +99,7 @@
     "min_keep_messages": 1,
     "keep_recent_calls": 10,
     "step_calls": 5,
-    "truncate_long_data": false,
+    "truncate_long_data": true,
     "long_data_threshold": 1000,
     "long_data_head_chars": 600,
     "long_data_tail_chars": 400
