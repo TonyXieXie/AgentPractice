@@ -154,15 +154,19 @@ class PtyManager:
         with self._lock:
             return list(self._sessions.get(session_id, {}).values())
 
-    def close(self, session_id: str, pty_id: str) -> bool:
+    def close(self, session_id: str, pty_id: str, keep: bool = True) -> bool:
         proc = None
         with self._lock:
             session_map = self._sessions.get(session_id)
             if not session_map:
                 return False
-            proc = session_map.pop(pty_id, None)
-            if not session_map:
-                self._sessions.pop(session_id, None)
+            proc = session_map.get(pty_id)
+            if not proc:
+                return False
+            if not keep:
+                session_map.pop(pty_id, None)
+                if not session_map:
+                    self._sessions.pop(session_id, None)
         if proc:
             proc.close()
             return True
@@ -194,4 +198,3 @@ _PTY_MANAGER = PtyManager()
 
 def get_pty_manager() -> PtyManager:
     return _PTY_MANAGER
-

@@ -55,6 +55,12 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 "prompt": "Prefer apply_patch for file modifications; avoid rewriting entire files unless necessary.\napply_patch format (strict):\n  *** Begin Patch\n  *** Update File: path\n  @@\n  - old line\n  + new line\n  *** End Patch\n- Each change line must start with + or -, and context lines must be included under @@ hunks.\n- Do NOT wrap apply_patch content in code fences; send raw patch text only.\n- apply_patch matches by context; if the match is not unique, request more surrounding context.\n- If apply_patch fails due to context, ask for more context and retry."
             },
             {
+                "id": "pty_status",
+                "name": "Live PTY",
+                "type": "workflow",
+                "prompt": "Live PTY sessions for this chat:\n{{pty_sessions}}"
+            },
+            {
                 "id": "code_map",
                 "name": "Code Map",
                 "type": "domain_knowledge",
@@ -77,7 +83,7 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
             {
                 "id": "default",
                 "name": "Default",
-                "abilities": ["tools_all", "rg_search", "apply_patch", "code_map", "tool_json", "output_concise"]
+                "abilities": ["tools_all", "rg_search", "apply_patch", "pty_status", "code_map", "tool_json", "output_concise"]
             }
         ],
         "default_profile": "default"

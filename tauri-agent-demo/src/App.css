@@ -19,6 +19,13 @@ body {
   background: #0f1115;
 }
 
+.app-body {
+  display: flex;
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+}
+
 .app-titlebar {
   height: 36px;
   display: flex;
@@ -113,6 +120,7 @@ body[data-platform="mac"] .app-titlebar {
   flex: 1;
   width: 100%;
   min-height: 0;
+  min-width: 0;
 }
 
 .main-content {
@@ -1239,6 +1247,39 @@ body[data-platform="mac"] .app-titlebar {
   align-items: center;
   gap: 6px;
   margin-left: auto;
+}
+
+.pty-toggle-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: #cbd5e1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.2s, background 0.2s, border-color 0.2s, transform 0.2s;
+}
+
+.pty-toggle-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #e2e8f0;
+  transform: translateY(-1px);
+}
+
+.pty-toggle-btn.active {
+  background: rgba(56, 189, 248, 0.2);
+  border-color: rgba(56, 189, 248, 0.6);
+  color: #e0f2fe;
+  transform: none;
+}
+
+.pty-icon {
+  width: 16px;
+  height: 16px;
 }
 
 .context-usage {

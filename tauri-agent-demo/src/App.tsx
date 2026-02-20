@@ -46,6 +46,7 @@ import {
 import ConfigManager from './components/ConfigManager';
 import SessionList from './components/SessionList';
 import DebugPanel from './components/DebugPanel';
+import PtyPanel from './components/PtyPanel';
 import AgentStepView from './components/AgentStepView';
 import ConfirmDialog from './components/ConfirmDialog';
 import { loadExtraWorkPaths, migrateExtraWorkPaths, saveExtraWorkPaths } from './workdirStorage';
@@ -664,6 +665,7 @@ function App() {
   const [showConfigSelector, setShowConfigSelector] = useState(false);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
   const showDebugPanelRef = useRef(false);
+  const [showPtyPanel, setShowPtyPanel] = useState(false);
   const [debugFocus, setDebugFocus] = useState<{ key: string; messageId: number; iteration: number; callId?: number } | null>(null);
   const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
   const [pendingContextEstimate, setPendingContextEstimate] = useState<PendingContextEstimate | null>(null);
@@ -1791,7 +1793,7 @@ function App() {
           break;
         }
 
-        const step = chunk as AgentStep;
+        let step = chunk as AgentStep;
         if (step.step_type === 'context_estimate') {
           const sessionKeyForEstimate = newSessionId || activeSessionKey;
           applyContextEstimate(sessionKeyForEstimate, normalizeContextEstimate(step.metadata));
@@ -1805,7 +1807,7 @@ function App() {
             const existingSteps = (msg.metadata?.agent_steps || []) as AgentStep[];
             let nextSteps = [...existingSteps];
             let nextMetadata = { ...(msg.metadata || {}) } as any;
-            const stepMeta = (step.metadata || {}) as any;
+            const stepMeta = { ...(step.metadata || {}) } as any;
             const toolName = String(stepMeta.tool || '').toLowerCase();
             const isRunShellStep = toolName === 'run_shell';
             if (step.step_type === 'action' && isRunShellStep) {
@@ -1825,6 +1827,9 @@ function App() {
               if (resolved && !stepMeta.command) {
                 stepMeta.command = resolved;
               }
+            }
+            if (stepMeta && (step.metadata !== stepMeta)) {
+              step = { ...step, metadata: stepMeta };
             }
 
             if (step.step_type === 'answer_delta') {
@@ -3419,6 +3424,7 @@ function App() {
           </button>
         </div>
       </div>
+      <div className="app-body">
       <div className="app-container">
       {showSidebar && (
         <SessionList
@@ -3884,6 +3890,31 @@ function App() {
               )}
 
               <div className="input-actions">
+                <button
+                  type="button"
+                  className={`pty-toggle-btn${showPtyPanel ? ' active' : ''}`}
+                  onClick={() => setShowPtyPanel((prev) => !prev)}
+                  aria-label="PTY panel"
+                  title="PTY sessions"
+                >
+                  <svg className="pty-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      d="M4 6l6 6-6 6"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                    <path
+                      d="M13 18h7"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                </button>
                 {currentConfig && (
                 <div
                   className={`context-usage${contextUsage.ratio >= 0.8 ? ' warn' : contextUsage.ratio >= 0.6 ? ' mid' : ''}`}
@@ -3972,7 +4003,12 @@ function App() {
           </div>
         </div>
       </div>
-
+      {showPtyPanel && (
+        <PtyPanel
+          sessionId={currentSessionId}
+          onClose={() => setShowPtyPanel(false)}
+        />
+      )}
       {showDebugPanel && (
         <DebugPanel
           messages={messages}
@@ -3989,6 +4025,7 @@ function App() {
           focusTarget={debugFocus}
         />
       )}
+      </div>
 
       {showConfigManager && (
         <ConfigManager
