@@ -179,6 +179,22 @@ def _build_live_pty_prompt(session_id: Optional[str]) -> str:
     return "\n".join(lines)
 
 
+def _append_reasoning_summary_prompt(system_prompt: str, reasoning_summary: Optional[str]) -> str:
+    if not reasoning_summary:
+        return system_prompt
+    summary = str(reasoning_summary).strip().lower()
+    if summary == "concise":
+        instruction = "If you include reasoning summaries, keep them concise (1-3 short bullets)."
+    elif summary == "detailed":
+        instruction = "If you include reasoning summaries, make them detailed and step-by-step; keep final answers concise."
+    else:
+        instruction = "Provide a reasoning summary only when helpful; otherwise answer directly."
+    block = f"## Reasoning Summary\n{instruction}"
+    if not system_prompt:
+        return block
+    return f"{system_prompt}\n\n{block}"
+
+
 def _clean_title(raw_title: str) -> str:
     title = (raw_title or "").strip().strip('"').strip("'")
     title = title.splitlines()[0].strip() if title else ""
@@ -1178,6 +1194,15 @@ async def chat_agent_stream(request: ChatRequest):
             int(last_compressed_call_id or 0)
         ) if last_compressed_call_id else None
 
+        app_config = get_app_config()
+        llm_app_config = app_config.get("llm", {}) if isinstance(app_config, dict) else {}
+        global_reasoning_summary = llm_app_config.get("reasoning_summary")
+        if global_reasoning_summary:
+            try:
+                config.reasoning_summary = str(global_reasoning_summary)
+            except Exception:
+                pass
+
         agent_type = request.agent_type_override if hasattr(request, 'agent_type_override') else getattr(session, 'agent_type', 'react')
         profile_id = request.agent_profile or getattr(session, "agent_profile", None)
         include_tools = agent_type != "simple"
@@ -1189,11 +1214,11 @@ async def chat_agent_stream(request: ChatRequest):
             extra_context={"pty_sessions": pty_prompt},
             exclude_ability_ids=["code_map"]
         )
+        system_prompt = _append_reasoning_summary_prompt(system_prompt, global_reasoning_summary)
         if resolved_profile_id and resolved_profile_id != getattr(session, "agent_profile", None):
             db.update_session(session.id, ChatSessionUpdate(agent_profile=resolved_profile_id))
 
         llm_client = create_llm_client(config)
-        app_config = get_app_config()
         agent_config = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
         context_config = app_config.get("context", {}) if isinstance(app_config, dict) else {}
         ast_enabled = bool(agent_config.get("ast_enabled", True))

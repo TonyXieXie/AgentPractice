@@ -1,6 +1,7 @@
 {
   "llm": {
-    "timeout_sec": 180.0
+    "timeout_sec": 180.0,
+    "reasoning_summary": "detailed"
   },
   "agent": {
     "react_max_iterations": 200,

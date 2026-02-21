@@ -11,7 +11,8 @@ import {
     AgentConfig,
     AgentAbility,
     AgentProfile,
-    ToolDefinition
+    ToolDefinition,
+    ReasoningSummary
 } from '../types';
 import {
     getConfigs,
@@ -53,6 +54,13 @@ const DEFAULT_CONTEXT_STEP_CALLS = 5;
 const DEFAULT_CONTEXT_LONG_THRESHOLD = 4000;
 const DEFAULT_CONTEXT_LONG_HEAD_CHARS = 1200;
 const DEFAULT_CONTEXT_LONG_TAIL_CHARS = 800;
+const DEFAULT_REASONING_SUMMARY: ReasoningSummary = 'detailed';
+
+const REASONING_SUMMARY_OPTIONS: { value: ReasoningSummary; label: string }[] = [
+    { value: 'auto', label: 'Auto' },
+    { value: 'concise', label: 'Concise' },
+    { value: 'detailed', label: 'Detailed' }
+];
 
 const ABILITY_TYPE_OPTIONS: { value: string; label: string }[] = [
     { value: 'tooling', label: '工具说明' },
@@ -161,6 +169,9 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const [configs, setConfigs] = useState<LLMConfig[]>([]);
     const [activeTab, setActiveTab] = useState<ConfigTab>('models');
     const [globalTimeoutSec, setGlobalTimeoutSec] = useState('180');
+    const [globalReasoningSummary, setGlobalReasoningSummary] = useState<ReasoningSummary>(
+        DEFAULT_REASONING_SUMMARY
+    );
     const [globalReactMaxIterations, setGlobalReactMaxIterations] = useState('50');
     const [globalAstEnabled, setGlobalAstEnabled] = useState(true);
     const [globalCodeMapEnabled, setGlobalCodeMapEnabled] = useState(true);
@@ -271,6 +282,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         if (timeoutValue !== undefined && timeoutValue !== null) {
             setGlobalTimeoutSec(String(timeoutValue));
         }
+        const reasoningSummary = data?.llm?.reasoning_summary ?? DEFAULT_REASONING_SUMMARY;
+        setGlobalReasoningSummary(reasoningSummary);
         const reactMax = data?.agent?.react_max_iterations;
         if (reactMax !== undefined && reactMax !== null) {
             setGlobalReactMaxIterations(String(reactMax));
@@ -494,6 +507,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const buildGlobalExportPayload = (): AppConfigUpdate => ({
         llm: {
             timeout_sec: coerceNumber(globalTimeoutSec, 180),
+            reasoning_summary: globalReasoningSummary,
         },
         agent: {
             react_max_iterations: coerceInt(globalReactMaxIterations, 50),
@@ -520,7 +534,10 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         if (!appConfig) return {};
         const payload: AppConfigUpdate = {};
         if (appConfig.llm) {
-            payload.llm = { timeout_sec: appConfig.llm.timeout_sec };
+            payload.llm = {
+                timeout_sec: appConfig.llm.timeout_sec,
+                reasoning_summary: appConfig.llm.reasoning_summary
+            };
         }
         if (appConfig.context) {
             payload.context = appConfig.context;
@@ -1966,6 +1983,25 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     disabled={globalLoading || globalSaving}
                                 />
                                 <small>应用于所有模型请求。默认 180 秒。</small>
+                            </div>
+
+                            <div className="form-group">
+                                <label>思考过程返回</label>
+                                <select
+                                    value={globalReasoningSummary}
+                                    onChange={(e) => {
+                                        setGlobalReasoningSummary(e.target.value as ReasoningSummary);
+                                        setGlobalSaved(false);
+                                    }}
+                                    disabled={globalLoading || globalSaving}
+                                >
+                                    {REASONING_SUMMARY_OPTIONS.map((option) => (
+                                        <option key={option.value} value={option.value}>
+                                            {option.label}
+                                        </option>
+                                    ))}
+                                </select>
+                                <small>控制思考过程摘要输出强度（auto / concise / detailed）。</small>
                             </div>
 
                             <div className="form-group">

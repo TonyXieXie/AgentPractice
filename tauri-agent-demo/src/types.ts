@@ -71,6 +71,7 @@ export interface ContextEstimate {
 export interface AppConfig {
     llm?: {
         timeout_sec?: number;
+        reasoning_summary?: ReasoningSummary;
     };
     context?: ContextConfig;
     agent?: AgentConfig;
@@ -79,6 +80,7 @@ export interface AppConfig {
 export interface AppConfigUpdate {
     llm?: {
         timeout_sec?: number;
+        reasoning_summary?: ReasoningSummary;
     };
     context?: ContextConfig;
     agent?: AgentConfig;

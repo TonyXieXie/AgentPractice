@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional, Tuple
+import json
 import os
 
 from models import LLMConfig
@@ -83,6 +84,53 @@ def _truncate_text_middle(text: str, cfg: Optional[Dict[str, Any]]) -> str:
         f"{head_text}\n{TRUNCATION_MARKER_START}({omitted} chars omitted)\n"
         f"{TRUNCATION_MARKER_END}\n{tail_text}"
     )
+
+
+def _truncate_json_values(value: Any, cfg: Optional[Dict[str, Any]]) -> Any:
+    if isinstance(value, str):
+        return _truncate_text_middle(value, cfg)
+    if isinstance(value, list):
+        return [_truncate_json_values(item, cfg) for item in value]
+    if isinstance(value, dict):
+        return {key: _truncate_json_values(val, cfg) for key, val in value.items()}
+    return value
+
+
+def _default_tool_args(tool_name: Optional[str], raw_text: str) -> Dict[str, Any]:
+    name = (tool_name or "").strip().lower()
+    if name == "run_shell":
+        return {"command": raw_text}
+    if name == "read_file":
+        return {"path": raw_text}
+    if name == "write_file":
+        return {"path": "", "content": raw_text}
+    if name == "apply_patch":
+        return {"patch": raw_text}
+    if name == "rg":
+        return {"pattern": raw_text}
+    if name == "search":
+        return {"query": raw_text}
+    if name == "calculator":
+        return {"expression": raw_text}
+    if name == "weather":
+        return {"city": raw_text}
+    return {"input": raw_text}
+
+
+def _format_tool_arguments(tool_name: Optional[str], tool_input: Any, trunc_cfg: Optional[Dict[str, Any]]) -> str:
+    raw = "" if tool_input is None else str(tool_input)
+    raw_stripped = raw.strip()
+    if raw_stripped:
+        try:
+            data = json.loads(raw_stripped)
+            if isinstance(data, dict):
+                data = _truncate_json_values(data, trunc_cfg)
+                return json.dumps(data, ensure_ascii=False)
+        except Exception:
+            pass
+    safe_text = _truncate_text_middle(raw, trunc_cfg)
+    payload = _default_tool_args(tool_name, safe_text)
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _build_trunc_cfg(context_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -188,9 +236,6 @@ def build_history_for_llm(
                     continue
                 if step_type == "action":
                     tool_input = metadata.get("input")
-                    if tool_input is None:
-                        tool_input = ""
-                    tool_input = _truncate_text_middle(tool_input, trunc_cfg)
                     call_id = _next_call_id(step.get("sequence"), str(tool_name))
                     pending_calls.append({"tool": str(tool_name), "id": call_id})
                     history.append({
@@ -202,7 +247,7 @@ def build_history_for_llm(
                                 "type": "function",
                                 "function": {
                                     "name": str(tool_name),
-                                    "arguments": str(tool_input)
+                                    "arguments": _format_tool_arguments(str(tool_name), tool_input, trunc_cfg)
                                 }
                             }
                         ]
@@ -226,7 +271,7 @@ def build_history_for_llm(
                                     "type": "function",
                                     "function": {
                                         "name": str(tool_name),
-                                        "arguments": ""
+                                        "arguments": _format_tool_arguments(str(tool_name), None, trunc_cfg)
                                     }
                                 }
                             ]

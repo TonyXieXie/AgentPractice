@@ -6,7 +6,8 @@ from typing import Any, Dict, Optional
 
 _DEFAULT_APP_CONFIG: Dict[str, Any] = {
     "llm": {
-        "timeout_sec": 180.0
+        "timeout_sec": 180.0,
+        "reasoning_summary": "detailed"
     },
     "context": {
         "compression_enabled": False,
@@ -162,6 +163,15 @@ def _coerce_timeout(value: Any) -> float:
     return timeout
 
 
+def _coerce_reasoning_summary(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("llm.reasoning_summary must be a string")
+    normalized = value.strip().lower()
+    if normalized not in ("auto", "concise", "detailed"):
+        raise ValueError("llm.reasoning_summary must be one of: auto, concise, detailed")
+    return normalized
+
+
 def _coerce_react_max_iterations(value: Any) -> int:
     try:
         max_iterations = int(value)
@@ -297,6 +307,8 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     llm = dict(normalized.get("llm", {}))
     if "timeout_sec" in llm:
         llm["timeout_sec"] = _coerce_timeout(llm["timeout_sec"])
+    if "reasoning_summary" in llm:
+        llm["reasoning_summary"] = _coerce_reasoning_summary(llm["reasoning_summary"])
     normalized["llm"] = llm
     context = dict(normalized.get("context", {}))
     normalized["context"] = _normalize_context_config(context)
