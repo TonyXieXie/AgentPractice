@@ -2,6 +2,8 @@
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 set PYTHONUTF8=1
+set TAURI_AGENT_DEV=1
+set CONPTY_KEEP_PIPES=1
 title Backend Server - FastAPI
 cd /d "%~dp0python-backend"
 cls

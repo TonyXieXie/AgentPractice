@@ -1687,6 +1687,15 @@ class ReActAgent(AgentStrategy):
                 metadata={"tool": tool_name, "iteration": iteration}
             )
             return
+        if mode == "oneshot" or args.get("pty") is False:
+            tool_output = await self._execute_tool(tool, tool_input)
+            output_holder["output"] = tool_output
+            yield AgentStep(
+                step_type="observation",
+                content=tool_output,
+                metadata={"tool": tool_name, "iteration": iteration}
+            )
+            return
 
         command = args.get("command")
         if not command:
@@ -1780,6 +1789,7 @@ class ReActAgent(AgentStrategy):
         timed_out = False
         error_output: Optional[str] = None
         last_header_line = header_line
+        idle_timed_out = False
 
         while True:
             if timeout_sec is not None and timeout_sec > 0:
@@ -1816,6 +1826,8 @@ class ReActAgent(AgentStrategy):
                 chunk = ""
 
             if chunk:
+                if "[idle_timeout]" in chunk:
+                    idle_timed_out = True
                 if reset:
                     body_buffer = chunk
                     if command_prefix:
@@ -1871,6 +1883,9 @@ class ReActAgent(AgentStrategy):
 
         await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
         final_body = body_buffer if body_buffer else "(no output)"
+        if idle_timed_out:
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+            final_body = f"{final_body}\n[idle_timeout elapsed_ms={elapsed_ms}]"
         final_output = f"{last_header_line}\n{final_body}"
         output_holder["output"] = final_output
         yield AgentStep(

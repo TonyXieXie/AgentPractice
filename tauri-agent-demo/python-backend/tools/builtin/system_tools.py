@@ -580,7 +580,45 @@ def _is_macos() -> bool:
     return sys.platform == "darwin"
 
 
+def _pty_debug_enabled() -> bool:
+    raw = os.environ.get("PTY_DEBUG")
+    if raw is not None:
+        value = str(raw).strip().lower()
+        if value in ("0", "false", "no", "off"):
+            return False
+        if value in ("1", "true", "yes", "on"):
+            return True
+    dev_value = str(os.environ.get("TAURI_AGENT_DEV", "")).strip().lower()
+    if dev_value in ("1", "true", "yes", "on"):
+        return True
+    env_value = str(os.environ.get("TAURI_AGENT_ENV", "")).strip().lower()
+    return env_value in ("dev", "development")
+
+
+def _pty_debug(message: str) -> None:
+    if _pty_debug_enabled():
+        print(f"[PTY DEBUG] {message}")
+
+
+def _tail_bytes_hex(data: bytes, max_len: int = 16) -> str:
+    if not data:
+        return ""
+    return data[-max_len:].hex()
+
+
+def _use_restricted_conpty(use_sandbox: bool) -> bool:
+    return bool(use_sandbox)
+
+
 _PTY_SUPPORT: Optional[bool] = None
+
+
+def _windows_wrap_command(command: str, keep_open: bool) -> str:
+    comspec = os.environ.get("COMSPEC") or "cmd.exe"
+    flag = "/k" if keep_open else "/c"
+    if not str(command).strip():
+        return f'"{comspec}" {flag}'
+    return f'"{comspec}" {flag} {command}'
 
 
 def _supports_pty() -> bool:
@@ -1024,6 +1062,17 @@ def _apply_max_output(output: str, max_output: int) -> str:
     return output
 
 
+def _append_idle_timeout_info(output: str, elapsed_ms: Optional[int]) -> str:
+    if not output or "[idle_timeout]" not in output:
+        return output
+    if elapsed_ms is None or elapsed_ms < 0:
+        return output
+    marker = f"[idle_timeout elapsed_ms={int(elapsed_ms)}]"
+    if marker in output:
+        return output
+    return f"{output}\n{marker}"
+
+
 def _resolve_idle_timeout_ms(mode: str, idle_timeout_ms: Optional[int]) -> int:
     if idle_timeout_ms is not None:
         try:
@@ -1055,6 +1104,13 @@ def _encode_stdin(stdin_text: Optional[str]) -> bytes:
     if isinstance(stdin_text, bytes):
         return stdin_text
     return str(stdin_text).encode("utf-8", errors="replace")
+
+
+def _normalize_windows_stdin(text: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.endswith("\n"):
+        normalized += "\n"
+    return normalized.replace("\n", "\r\n")
 
 
 def _build_posix_command(command: str, use_sandbox: bool = True) -> List[str]:
@@ -1335,7 +1391,7 @@ def _start_posix_pipe_persistent(
     return pty_proc
 
 
-def _windows_create_restricted_token():
+def _windows_create_restricted_token(low_integrity: bool = True):
     import ctypes
     from ctypes import wintypes
 
@@ -1436,18 +1492,19 @@ def _windows_create_restricted_token():
             kernel32.CloseHandle(h_process)
         raise RuntimeError("CreateRestrictedToken failed")
 
-    sid = wintypes.LPVOID()
-    if advapi32.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)):
-        tml = TOKEN_MANDATORY_LABEL()
-        tml.Label.Sid = sid
-        tml.Label.Attributes = SE_GROUP_INTEGRITY
-        advapi32.SetTokenInformation(
-            restricted_token,
-            TokenIntegrityLevel,
-            ctypes.byref(tml),
-            ctypes.sizeof(tml)
-        )
-        kernel32.LocalFree(sid)
+    if low_integrity:
+        sid = wintypes.LPVOID()
+        if advapi32.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)):
+            tml = TOKEN_MANDATORY_LABEL()
+            tml.Label.Sid = sid
+            tml.Label.Attributes = SE_GROUP_INTEGRITY
+            advapi32.SetTokenInformation(
+                restricted_token,
+                TokenIntegrityLevel,
+                ctypes.byref(tml),
+                ctypes.sizeof(tml)
+            )
+            kernel32.LocalFree(sid)
 
     kernel32.CloseHandle(h_token)
     if h_process_opened:
@@ -1509,11 +1566,25 @@ def _windows_assign_job(kernel32, process_handle):
     return job_handle
 
 
-def _windows_start_conpty_process(command: str, workdir: Path, cols: int = 120, rows: int = 30):
+def _windows_start_conpty_process(
+    command: str,
+    workdir: Path,
+    cols: int = 120,
+    rows: int = 30,
+    keep_open: bool = False,
+    use_restricted_token: bool = True
+):
     import ctypes
     from ctypes import wintypes
 
-    restricted_token, kernel32, advapi32 = _windows_create_restricted_token()
+    restricted_token = None
+    advapi32 = None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if use_restricted_token:
+        # ConPTY needs a restricted token, but low-integrity can block console handle wiring.
+        restricted_token, kernel32, advapi32 = _windows_create_restricted_token(low_integrity=False)
+        _pty_debug("conpty restricted_token_low_integrity=false")
+    _pty_debug(f"conpty restricted_token={str(bool(use_restricted_token)).lower()}")
 
     class SECURITY_ATTRIBUTES(ctypes.Structure):
         _fields_ = [
@@ -1563,6 +1634,7 @@ def _windows_start_conpty_process(command: str, workdir: Path, cols: int = 120, 
     EXTENDED_STARTUPINFO_PRESENT = 0x00080000
     HANDLE_FLAG_INHERIT = 0x00000001
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
+    STARTF_USESTDHANDLES = 0x00000100
 
     if not hasattr(kernel32, "CreatePseudoConsole"):
         kernel32.CloseHandle(restricted_token)
@@ -1585,20 +1657,35 @@ def _windows_start_conpty_process(command: str, workdir: Path, cols: int = 120, 
     kernel32.DeleteProcThreadAttributeList.argtypes = [wintypes.LPVOID]
     kernel32.DeleteProcThreadAttributeList.restype = None
 
-    advapi32.CreateProcessAsUserW.argtypes = [
-        wintypes.HANDLE,
-        wintypes.LPCWSTR,
-        wintypes.LPWSTR,
-        wintypes.LPVOID,
-        wintypes.LPVOID,
-        wintypes.BOOL,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.LPCWSTR,
-        ctypes.POINTER(STARTUPINFOEXW),
-        ctypes.POINTER(PROCESS_INFORMATION),
-    ]
-    advapi32.CreateProcessAsUserW.restype = wintypes.BOOL
+    if use_restricted_token:
+        advapi32.CreateProcessAsUserW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.LPCWSTR,
+            ctypes.POINTER(STARTUPINFOEXW),
+            ctypes.POINTER(PROCESS_INFORMATION),
+        ]
+        advapi32.CreateProcessAsUserW.restype = wintypes.BOOL
+    else:
+        kernel32.CreateProcessW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.LPCWSTR,
+            ctypes.POINTER(STARTUPINFOEXW),
+            ctypes.POINTER(PROCESS_INFORMATION),
+        ]
+        kernel32.CreateProcessW.restype = wintypes.BOOL
 
     sa = SECURITY_ATTRIBUTES()
     sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
@@ -1610,78 +1697,153 @@ def _windows_start_conpty_process(command: str, workdir: Path, cols: int = 120, 
     out_read = wintypes.HANDLE()
     out_write = wintypes.HANDLE()
     if not kernel32.CreatePipe(ctypes.byref(in_read), ctypes.byref(in_write), ctypes.byref(sa), 0):
-        kernel32.CloseHandle(restricted_token)
+        if restricted_token:
+            kernel32.CloseHandle(restricted_token)
         raise RuntimeError("CreatePipe failed (stdin)")
     if not kernel32.CreatePipe(ctypes.byref(out_read), ctypes.byref(out_write), ctypes.byref(sa), 0):
         kernel32.CloseHandle(in_read)
         kernel32.CloseHandle(in_write)
-        kernel32.CloseHandle(restricted_token)
+        if restricted_token:
+            kernel32.CloseHandle(restricted_token)
         raise RuntimeError("CreatePipe failed (stdout)")
     kernel32.SetHandleInformation(in_write, HANDLE_FLAG_INHERIT, 0)
     kernel32.SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0)
 
     h_pc = ctypes.c_void_p()
     size = COORD(cols, rows)
-    if kernel32.CreatePseudoConsole(size, in_read, out_write, 0, ctypes.byref(h_pc)) != 0:
+    create_pc_result = kernel32.CreatePseudoConsole(size, in_read, out_write, 0, ctypes.byref(h_pc))
+    if _pty_debug_enabled():
+        _pty_debug(f"conpty CreatePseudoConsole result={int(create_pc_result)} h_pc={int(h_pc.value or 0)} winerr={ctypes.get_last_error()}")
+    if create_pc_result != 0:
         kernel32.CloseHandle(in_read)
         kernel32.CloseHandle(in_write)
         kernel32.CloseHandle(out_read)
         kernel32.CloseHandle(out_write)
-        kernel32.CloseHandle(restricted_token)
+        if restricted_token:
+            kernel32.CloseHandle(restricted_token)
         raise RuntimeError("CreatePseudoConsole failed")
-    kernel32.CloseHandle(in_read)
-    kernel32.CloseHandle(out_write)
+    keep_pipes = os.environ.get("CONPTY_KEEP_PIPES", "").strip().lower() in ("1", "true", "yes", "on")
+    in_read_dbg = in_read if keep_pipes else None
+    out_write_dbg = out_write if keep_pipes else None
+    if not keep_pipes:
+        kernel32.CloseHandle(in_read)
+        kernel32.CloseHandle(out_write)
+    elif _pty_debug_enabled():
+        _pty_debug("conpty keep pipes enabled (CONPTY_KEEP_PIPES)")
 
     attr_list_size = ctypes.c_size_t()
     kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attr_list_size))
-    attr_list = ctypes.create_string_buffer(attr_list_size.value)
-    attr_list_ptr = ctypes.cast(attr_list, wintypes.LPVOID)
+    # Ensure proper alignment for PROC_THREAD_ATTRIBUTE_LIST (pointer-aligned).
+    attr_align = ctypes.alignment(ctypes.c_void_p)
+    attr_list_buf = ctypes.create_string_buffer(attr_list_size.value + attr_align)
+    attr_buf_addr = ctypes.addressof(attr_list_buf)
+    attr_aligned_addr = (attr_buf_addr + (attr_align - 1)) & ~(attr_align - 1)
+    attr_list_ptr = ctypes.c_void_p(attr_aligned_addr)
+    if _pty_debug_enabled():
+        _pty_debug(
+            "conpty attr_list "
+            f"size={int(attr_list_size.value)} align={int(attr_align)} "
+            f"buf=0x{attr_buf_addr:x} aligned=0x{attr_aligned_addr:x}"
+        )
     if not kernel32.InitializeProcThreadAttributeList(attr_list_ptr, 1, 0, ctypes.byref(attr_list_size)):
         kernel32.ClosePseudoConsole(h_pc)
         kernel32.CloseHandle(in_write)
         kernel32.CloseHandle(out_read)
-        kernel32.CloseHandle(restricted_token)
+        if restricted_token:
+            kernel32.CloseHandle(restricted_token)
         raise RuntimeError("InitializeProcThreadAttributeList failed")
-    if not kernel32.UpdateProcThreadAttribute(
+    # For PSEUDOCONSOLE, lpValue expects the HPCON handle value (not a pointer to it).
+    h_pc_value = ctypes.c_void_p(h_pc.value)
+    update_attr_ok = kernel32.UpdateProcThreadAttribute(
         attr_list_ptr,
         0,
         PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-        ctypes.byref(h_pc),
-        ctypes.sizeof(h_pc),
+        h_pc_value,
+        ctypes.sizeof(h_pc_value),
         None,
         None
-    ):
+    )
+    if _pty_debug_enabled():
+        _pty_debug(
+            f"conpty UpdateProcThreadAttribute ok={bool(update_attr_ok)} "
+            f"hpc={int(h_pc.value or 0)} winerr={ctypes.get_last_error()}"
+        )
+    if not update_attr_ok:
         kernel32.DeleteProcThreadAttributeList(attr_list_ptr)
         kernel32.ClosePseudoConsole(h_pc)
         kernel32.CloseHandle(in_write)
         kernel32.CloseHandle(out_read)
-        kernel32.CloseHandle(restricted_token)
+        if restricted_token:
+            kernel32.CloseHandle(restricted_token)
         raise RuntimeError("UpdateProcThreadAttribute failed")
 
     startup = STARTUPINFOEXW()
     startup.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
     startup.lpAttributeList = attr_list_ptr
+    startup.StartupInfo.lpDesktop = "WinSta0\\Default"
+    if _pty_debug_enabled():
+        try:
+            startinfo_size = ctypes.sizeof(STARTUPINFO)
+            startinfoex_size = ctypes.sizeof(STARTUPINFOEXW)
+            attr_offset = startinfo_size
+            _pty_debug(
+                "conpty startupinfo "
+                f"cb={int(startup.StartupInfo.cb)} "
+                f"startinfo_size={int(startinfo_size)} "
+                f"startinfoex_size={int(startinfoex_size)} "
+                f"attr_offset={int(attr_offset)} "
+                f"lp_attr=0x{int(ctypes.cast(startup.lpAttributeList, ctypes.c_void_p).value or 0):x} "
+                f"attr_ptr=0x{int(ctypes.cast(attr_list_ptr, ctypes.c_void_p).value or 0):x}"
+            )
+        except Exception as exc:
+            _pty_debug(f"conpty startupinfo debug error={exc}")
+    create_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW
+    if _pty_debug_enabled():
+        _pty_debug(
+            "conpty CreateProcess args "
+            f"startup_cb={startup.StartupInfo.cb} "
+            f"startup_flags={startup.StartupInfo.dwFlags} "
+            f"startup_desktop={startup.StartupInfo.lpDesktop} "
+            f"attr_list_ptr={int(ctypes.cast(startup.lpAttributeList, ctypes.c_void_p).value or 0)} "
+            f"inherit_handles=False "
+            f"flags={create_flags}"
+        )
 
-    comspec = os.environ.get("COMSPEC") or "cmd.exe"
-    command_line = ctypes.create_unicode_buffer(f'"{comspec}" /c {command}')
+    command_line = ctypes.create_unicode_buffer(_windows_wrap_command(command, keep_open))
+    _pty_debug(f"conpty start keep_open={keep_open} workdir={workdir} command_line={command_line.value}")
 
     proc_info = PROCESS_INFORMATION()
-    created = advapi32.CreateProcessAsUserW(
-        restricted_token,
-        None,
-        command_line,
-        None,
-        None,
-        True,
-        EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-        None,
-        str(workdir),
-        ctypes.byref(startup),
-        ctypes.byref(proc_info)
-    )
+    if use_restricted_token:
+        created = advapi32.CreateProcessAsUserW(
+            restricted_token,
+            None,
+            command_line,
+            None,
+            None,
+            False,
+            create_flags,
+            None,
+            str(workdir),
+            ctypes.byref(startup),
+            ctypes.byref(proc_info)
+        )
+    else:
+        created = kernel32.CreateProcessW(
+            None,
+            command_line,
+            None,
+            None,
+            False,
+            create_flags,
+            None,
+            str(workdir),
+            ctypes.byref(startup),
+            ctypes.byref(proc_info)
+        )
 
     kernel32.DeleteProcThreadAttributeList(attr_list_ptr)
-    kernel32.CloseHandle(restricted_token)
+    if restricted_token:
+        kernel32.CloseHandle(restricted_token)
 
     if not created:
         kernel32.ClosePseudoConsole(h_pc)
@@ -1689,18 +1851,97 @@ def _windows_start_conpty_process(command: str, workdir: Path, cols: int = 120, 
         kernel32.CloseHandle(out_read)
         raise RuntimeError("CreateProcessAsUserW failed (ConPTY)")
 
+    _pty_debug(f"conpty created pid={proc_info.dwProcessId} keep_open={keep_open}")
+    if _pty_debug_enabled():
+        try:
+            kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
+            session_id = wintypes.DWORD()
+            if kernel32.ProcessIdToSessionId(proc_info.dwProcessId, ctypes.byref(session_id)):
+                _pty_debug(f"conpty session_id={int(session_id.value)}")
+            else:
+                _pty_debug(f"conpty session_id failed winerr={ctypes.get_last_error()}")
+        except Exception as exc:
+            _pty_debug(f"conpty session_id error={exc}")
+        try:
+            TH32CS_SNAPPROCESS = 0x00000002
+            ULONG_PTR = getattr(wintypes, "ULONG_PTR", ctypes.c_size_t)
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ULONG_PTR),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", wintypes.WCHAR * 260),
+                ]
+            kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
+            kernel32.Process32FirstW.restype = wintypes.BOOL
+            kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
+            kernel32.Process32NextW.restype = wintypes.BOOL
+            snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if snapshot and snapshot != wintypes.HANDLE(-1).value:
+                entry = PROCESSENTRY32()
+                entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                has_conhost = False
+                child_count = 0
+                if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                    while True:
+                        if entry.th32ParentProcessID == proc_info.dwProcessId:
+                            child_count += 1
+                            exe_name = entry.szExeFile.lower()
+                            if exe_name == "conhost.exe":
+                                has_conhost = True
+                        if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                            break
+                kernel32.CloseHandle(snapshot)
+                _pty_debug(f"conpty child_processes={child_count} conhost={str(has_conhost).lower()}")
+            else:
+                _pty_debug(f"conpty snapshot failed winerr={ctypes.get_last_error()}")
+        except Exception as exc:
+            _pty_debug(f"conpty snapshot error={exc}")
+        try:
+            kernel32.AttachConsole.argtypes = [wintypes.DWORD]
+            kernel32.AttachConsole.restype = wintypes.BOOL
+            kernel32.FreeConsole.argtypes = []
+            kernel32.FreeConsole.restype = wintypes.BOOL
+            attached = kernel32.AttachConsole(proc_info.dwProcessId)
+            _pty_debug(f"conpty attach_console={str(bool(attached)).lower()} winerr={ctypes.get_last_error()}")
+            if attached:
+                kernel32.FreeConsole()
+        except Exception as exc:
+            _pty_debug(f"conpty attach_console error={exc}")
     job_handle = _windows_assign_job(kernel32, proc_info.hProcess)
-    return kernel32, proc_info, h_pc, in_write, out_read, job_handle
+    return kernel32, proc_info, h_pc, in_write, out_read, job_handle, in_read_dbg, out_write_dbg
 
 
-def _run_windows_pty_oneshot(command: str, workdir: Path, timeout_sec: float, idle_timeout_ms: int, stdin_bytes: bytes) -> Tuple[int, str]:
+def _run_windows_pty_oneshot(
+    command: str,
+    workdir: Path,
+    timeout_sec: float,
+    idle_timeout_ms: int,
+    stdin_bytes: bytes,
+    use_restricted_token: bool = True
+) -> Tuple[int, str]:
     import ctypes
     from ctypes import wintypes
 
-    kernel32, proc_info, h_pc, in_write, out_read, job_handle = _windows_start_conpty_process(command, workdir)
+    kernel32, proc_info, h_pc, in_write, out_read, job_handle, in_read_dbg, out_write_dbg = _windows_start_conpty_process(
+        command,
+        workdir,
+        keep_open=False,
+        use_restricted_token=use_restricted_token
+    )
     output_chunks: List[bytes] = []
     start_time = time.monotonic()
     last_output = start_time
+    timed_out = False
     buffer = ctypes.create_string_buffer(4096)
     bytes_read = wintypes.DWORD()
     WAIT_OBJECT_0 = 0x00000000
@@ -1744,6 +1985,10 @@ def _run_windows_pty_oneshot(command: str, workdir: Path, timeout_sec: float, id
     kernel32.CloseHandle(proc_info.hProcess)
     kernel32.CloseHandle(out_read)
     kernel32.CloseHandle(in_write)
+    if in_read_dbg:
+        kernel32.CloseHandle(in_read_dbg)
+    if out_write_dbg:
+        kernel32.CloseHandle(out_write_dbg)
     kernel32.ClosePseudoConsole(h_pc)
     if job_handle:
         kernel32.CloseHandle(job_handle)
@@ -1759,23 +2004,64 @@ def _start_windows_pty_persistent(
     workdir: Path,
     stdin_bytes: bytes,
     idle_timeout_ms: int,
-    buffer_size: int
+    buffer_size: int,
+    use_restricted_token: bool = True
 ) -> PtyProcess:
     import ctypes
     from ctypes import wintypes
 
-    kernel32, proc_info, h_pc, in_write, out_read, job_handle = _windows_start_conpty_process(command, workdir)
+    launch_command = ""
+    kernel32, proc_info, h_pc, in_write, out_read, job_handle, in_read_dbg, out_write_dbg = _windows_start_conpty_process(
+        launch_command,
+        workdir,
+        keep_open=True,
+        use_restricted_token=use_restricted_token
+    )
+    if _pty_debug_enabled():
+        _pty_debug(
+            "conpty launch shell "
+            f"command_len={len(command or '')} stdin_len={len(stdin_bytes or b'')}"
+        )
+        try:
+            file_type_out = kernel32.GetFileType(out_read)
+            file_type_in = kernel32.GetFileType(in_write)
+            _pty_debug(f"conpty file_type out={file_type_out} in={file_type_in}")
+        except Exception as exc:
+            _pty_debug(f"conpty file_type error={exc}")
 
     def _writer(data: bytes) -> int:
         written = wintypes.DWORD()
         if kernel32.WriteFile(in_write, data, len(data), ctypes.byref(written), None):
+            _pty_debug(f"conpty write ok bytes={int(written.value)} endswith_crlf={data.endswith(b'\r\n')}")
+            _pty_debug(f"conpty write tail_hex={_tail_bytes_hex(data)}")
+            if _pty_debug_enabled():
+                if in_read_dbg:
+                    in_available = wintypes.DWORD()
+                    if kernel32.PeekNamedPipe(in_read_dbg, None, 0, None, ctypes.byref(in_available), None):
+                        _pty_debug(f"conpty in_read_available={int(in_available.value)}")
+                    else:
+                        _pty_debug(f"conpty in_read_peek_failed winerr={ctypes.get_last_error()}")
+                available = wintypes.DWORD()
+                if kernel32.PeekNamedPipe(out_read, None, 0, None, ctypes.byref(available), None):
+                    _pty_debug(f"conpty write peek_available={int(available.value)}")
+                else:
+                    _pty_debug(f"conpty write peek_failed winerr={ctypes.get_last_error()}")
+                exit_code = wintypes.DWORD()
+                kernel32.GetExitCodeProcess(proc_info.hProcess, ctypes.byref(exit_code))
+                wait_result = kernel32.WaitForSingleObject(proc_info.hProcess, 0)
+                _pty_debug(f"conpty write proc_wait={int(wait_result)} exit_code={int(exit_code.value)}")
             return int(written.value)
+        _pty_debug(f"conpty write failed winerr={ctypes.get_last_error()}")
         return 0
 
     def _terminator() -> None:
         kernel32.TerminateProcess(proc_info.hProcess, 1)
         kernel32.CloseHandle(out_read)
         kernel32.CloseHandle(in_write)
+        if in_read_dbg:
+            kernel32.CloseHandle(in_read_dbg)
+        if out_write_dbg:
+            kernel32.CloseHandle(out_write_dbg)
         kernel32.ClosePseudoConsole(h_pc)
         if job_handle:
             kernel32.CloseHandle(job_handle)
@@ -1796,34 +2082,131 @@ def _start_windows_pty_persistent(
         buffer = ctypes.create_string_buffer(4096)
         bytes_read = wintypes.DWORD()
         last_output = time.monotonic()
+        logged_first_chunk = False
+        last_diag = time.monotonic()
+        last_available = 0
+        logged_eof = False
         WAIT_OBJECT_0 = 0x00000000
         WAIT_TIMEOUT = 0x00000102
+        if _pty_debug_enabled():
+            _pty_debug(f"conpty reader start pid={proc_info.dwProcessId}")
+        use_blocking_read = _pty_debug_enabled()
+        if _pty_debug_enabled():
+            _pty_debug(f"conpty read mode={'blocking' if use_blocking_read else 'peek'}")
+            if use_blocking_read:
+                _pty_debug("conpty blocking read start")
+        if use_blocking_read and _pty_debug_enabled():
+            def _diag_loop() -> None:
+                ERROR_BROKEN_PIPE = 109
+                ERROR_INVALID_HANDLE = 6
+                _pty_debug("conpty diag loop enter")
+                while not pty_proc.stop_event.is_set():
+                    time.sleep(2.0)
+                    try:
+                        available = wintypes.DWORD()
+                        if not kernel32.PeekNamedPipe(out_read, None, 0, None, ctypes.byref(available), None):
+                            err = ctypes.get_last_error()
+                            _pty_debug(f"conpty diag peek failed winerr={err}")
+                            if err in (ERROR_BROKEN_PIPE, ERROR_INVALID_HANDLE):
+                                break
+                            continue
+                        _pty_debug(f"conpty diag peek available={int(available.value)}")
+                        if in_read_dbg:
+                            in_available = wintypes.DWORD()
+                            if kernel32.PeekNamedPipe(in_read_dbg, None, 0, None, ctypes.byref(in_available), None):
+                                _pty_debug(f"conpty diag in_read_available={int(in_available.value)}")
+                            else:
+                                _pty_debug(f"conpty diag in_read_peek_failed winerr={ctypes.get_last_error()}")
+                    except Exception as exc:
+                        _pty_debug(f"conpty diag error={exc}")
+                        break
+
+            diag_thread = threading.Thread(
+                target=_diag_loop,
+                name=f"conpty-diag-{pty_proc.id}",
+                daemon=True
+            )
+            diag_thread.start()
+            _pty_debug("conpty diag thread started")
         while not pty_proc.stop_event.is_set():
             wait_result = kernel32.WaitForSingleObject(proc_info.hProcess, 50)
-            while True:
-                available = wintypes.DWORD()
-                if not kernel32.PeekNamedPipe(out_read, None, 0, None, ctypes.byref(available), None):
-                    break
-                if available.value == 0:
-                    break
-                to_read = min(len(buffer), available.value)
-                if kernel32.ReadFile(out_read, buffer, to_read, ctypes.byref(bytes_read), None):
+            if use_blocking_read:
+                if kernel32.ReadFile(out_read, buffer, len(buffer), ctypes.byref(bytes_read), None):
                     if bytes_read.value > 0:
                         pty_proc.append_output(buffer.raw[:bytes_read.value])
+                        if not logged_first_chunk:
+                            _pty_debug(f"conpty read first_chunk bytes={bytes_read.value}")
+                            logged_first_chunk = True
                         last_output = time.monotonic()
+                    elif not logged_eof:
+                        logged_eof = True
+                        _pty_debug("conpty read eof (0 bytes)")
+                else:
+                    _pty_debug(f"conpty read failed winerr={ctypes.get_last_error()}")
+            else:
+                while True:
+                    available = wintypes.DWORD()
+                    if not kernel32.PeekNamedPipe(out_read, None, 0, None, ctypes.byref(available), None):
+                        _pty_debug(f"conpty peek failed winerr={ctypes.get_last_error()}")
+                        break
+                    if available.value == 0:
+                        last_available = 0
+                        break
+                    last_available = int(available.value)
+                    to_read = min(len(buffer), available.value)
+                    if kernel32.ReadFile(out_read, buffer, to_read, ctypes.byref(bytes_read), None):
+                        if bytes_read.value > 0:
+                            pty_proc.append_output(buffer.raw[:bytes_read.value])
+                            if not logged_first_chunk:
+                                _pty_debug(f"conpty read first_chunk bytes={bytes_read.value}")
+                                logged_first_chunk = True
+                            last_output = time.monotonic()
+                    else:
+                        _pty_debug(f"conpty read failed winerr={ctypes.get_last_error()}")
+            if _pty_debug_enabled() and (time.monotonic() - last_diag) >= 2.0:
+                exit_code = wintypes.DWORD()
+                kernel32.GetExitCodeProcess(proc_info.hProcess, ctypes.byref(exit_code))
+                wait_out = kernel32.WaitForSingleObject(out_read, 0)
+                peek_available = wintypes.DWORD()
+                peek_read = wintypes.DWORD()
+                peek_byte_hex = ""
+                try:
+                    peek_buf = ctypes.create_string_buffer(1)
+                    if kernel32.PeekNamedPipe(out_read, peek_buf, 1, ctypes.byref(peek_read), ctypes.byref(peek_available), None):
+                        if peek_read.value:
+                            peek_byte_hex = peek_buf.raw[: peek_read.value].hex()
+                    else:
+                        _pty_debug(f"conpty peek(diag) failed winerr={ctypes.get_last_error()}")
+                except Exception as exc:
+                    _pty_debug(f"conpty peek(diag) error={exc}")
+                _pty_debug(
+                    "conpty poll "
+                    f"wait_result={wait_result} idle_ms={int((time.monotonic() - last_output) * 1000)} "
+                    f"available={last_available} wait_out={wait_out} "
+                    f"peek_available={int(peek_available.value)} peek_read={int(peek_read.value)} peek_byte_hex={peek_byte_hex} "
+                    f"exit_code={int(exit_code.value)}"
+                )
+                last_diag = time.monotonic()
             if wait_result == WAIT_OBJECT_0:
                 break
             if wait_result not in (WAIT_OBJECT_0, WAIT_TIMEOUT):
+                _pty_debug(f"conpty wait unexpected result={wait_result}")
                 break
             if idle_timeout_ms and (time.monotonic() - last_output) * 1000.0 >= idle_timeout_ms:
                 pty_proc.append_output(b"\n[idle_timeout]\n")
+                _pty_debug("conpty idle_timeout reached")
                 kernel32.TerminateProcess(proc_info.hProcess, 1)
                 break
         exit_code = wintypes.DWORD()
         kernel32.GetExitCodeProcess(proc_info.hProcess, ctypes.byref(exit_code))
         pty_proc.mark_exited(int(exit_code.value))
+        _pty_debug(f"conpty exited code={int(exit_code.value)}")
         kernel32.CloseHandle(out_read)
         kernel32.CloseHandle(in_write)
+        if in_read_dbg:
+            kernel32.CloseHandle(in_read_dbg)
+        if out_write_dbg:
+            kernel32.CloseHandle(out_write_dbg)
         kernel32.ClosePseudoConsole(h_pc)
         if job_handle:
             kernel32.CloseHandle(job_handle)
@@ -1833,8 +2216,20 @@ def _start_windows_pty_persistent(
     thread = threading.Thread(target=_reader_loop, name=f"conpty-reader-{pty_proc.id}", daemon=True)
     pty_proc.reader_thread = thread
     thread.start()
+    initial_bytes = b""
+    if command:
+        initial_text = _normalize_windows_stdin(command)
+        initial_bytes += _encode_stdin(initial_text)
+        if _pty_debug_enabled():
+            _pty_debug(
+                "conpty initial command "
+                f"len={len(initial_bytes)} endswith_crlf={initial_bytes.endswith(b'\r\n')} "
+                f"tail_hex={_tail_bytes_hex(initial_bytes)}"
+            )
     if stdin_bytes:
-        _writer(stdin_bytes)
+        initial_bytes += stdin_bytes
+    if initial_bytes:
+        _writer(initial_bytes)
     return pty_proc
 
 
@@ -1933,8 +2328,7 @@ def _start_windows_pipe_persistent(
     startup.hStdOutput = stdout_write
     startup.hStdError = stdout_write
 
-    comspec = os.environ.get("COMSPEC") or "cmd.exe"
-    command_line = ctypes.create_unicode_buffer(f'"{comspec}" /c {command}')
+    command_line = ctypes.create_unicode_buffer(_windows_wrap_command(command, keep_open=True))
 
     proc_info = PROCESS_INFORMATION()
     created = advapi32.CreateProcessAsUserW(
@@ -2046,10 +2440,11 @@ def _start_windows_unrestricted_pipe_persistent(
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
     CREATE_NEW_PROCESS_GROUP = 0x00000200
+    command_line = _windows_wrap_command(command, keep_open=True)
     proc = subprocess.Popen(
-        command,
+        command_line,
         cwd=str(workdir),
-        shell=True,
+        shell=False,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -2219,7 +2614,7 @@ class ReadFileTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "read_file"
-        self.description = "Read a file inside the work path."
+        self.description = "Read a file inside the work path (line-based or smart block mode)."
         self.parameters = [
             ToolParameter(
                 name="path",
@@ -2228,16 +2623,40 @@ class ReadFileTool(Tool):
                 required=True
             ),
             ToolParameter(
-                name="start",
-                type="number",
-                description="Byte offset to start reading.",
+                name="mode",
+                type="string",
+                description="Read mode: lines or smart.",
                 required=False,
-                default=0
+                default="lines"
             ),
             ToolParameter(
-                name="max_bytes",
+                name="start_line",
                 type="number",
-                description="Max bytes to read.",
+                description="Start line (1-based) for lines mode.",
+                required=False
+            ),
+            ToolParameter(
+                name="line_count",
+                type="number",
+                description="Number of lines to read for lines mode.",
+                required=False
+            ),
+            ToolParameter(
+                name="anchor_line",
+                type="number",
+                description="Anchor line (1-based) for smart mode.",
+                required=False
+            ),
+            ToolParameter(
+                name="indent_level",
+                type="number",
+                description="Indent levels above anchor to include for smart mode (1 level = 4 spaces or 1 tab).",
+                required=False
+            ),
+            ToolParameter(
+                name="max_chars",
+                type="number",
+                description="Max characters to output.",
                 required=False
             ),
             ToolParameter(
@@ -2254,25 +2673,147 @@ class ReadFileTool(Tool):
         path = data.get("path") or input_data
         if not path:
             raise ValueError("Missing path.")
-        start = int(data.get("start", 0) or 0)
-        max_bytes = data.get("max_bytes")
-        config_max = int(get_tool_config().get("files", {}).get("max_bytes", 20000))
-        max_bytes = int(max_bytes) if max_bytes is not None else config_max
+        mode = str(data.get("mode") or "").strip().lower()
+        if not mode:
+            mode = "smart" if data.get("anchor_line") else "lines"
+        start_line = int(data.get("start_line", 1) or 1)
+        line_count = data.get("line_count")
+        line_count = int(line_count) if line_count is not None else 200
+        anchor_line = data.get("anchor_line")
+        anchor_line = int(anchor_line) if anchor_line is not None else None
+        indent_level = data.get("indent_level")
+        indent_level = int(indent_level) if indent_level is not None else 1
+        files_cfg = get_tool_config().get("files", {})
+        config_max_bytes = int(files_cfg.get("max_bytes", 20000))
+        config_max_chars = int(files_cfg.get("max_chars", config_max_bytes))
+        max_chars = data.get("max_chars")
+        max_chars = int(max_chars) if max_chars is not None else config_max_chars
+        if max_chars <= 0:
+            raise ValueError("Invalid max_chars.")
         encoding = data.get("encoding") or "utf-8"
 
         file_path = _resolve_path(str(path), self.name, "read")
         if not file_path.exists():
             raise ValueError(f"File not found: {file_path}")
-        if start < 0 or max_bytes <= 0:
-            raise ValueError("Invalid start or max_bytes.")
+        if config_max_bytes <= 0:
+            raise ValueError("Invalid max_bytes configuration.")
 
-        with open(file_path, "rb") as f:
-            f.seek(start)
-            raw = f.read(max_bytes)
+        raw, err = _read_file_bytes(file_path, config_max_bytes)
+        if err:
+            raise ValueError(err)
+        if raw is None:
+            return "No content."
 
         text = raw.decode(encoding, errors="replace")
-        header = f"[read_file] {file_path} bytes={len(raw)} offset={start}"
-        return f"{header}\n{text}"
+        lines = text.splitlines()
+        if not lines:
+            return "No content."
+
+        def _count_indent_width(line: str) -> int:
+            width = 0
+            for ch in line:
+                if ch == " ":
+                    width += 1
+                elif ch == "\t":
+                    width += 4
+                else:
+                    break
+            return width
+
+        def _is_comment_line(line: str) -> bool:
+            stripped = line.lstrip()
+            return stripped.startswith("//") or stripped.startswith("#")
+
+        indent_widths: List[int] = []
+        last_indent = 0
+        for line in lines:
+            if not line.strip():
+                indent = last_indent
+            else:
+                indent = _count_indent_width(line)
+            indent_widths.append(indent)
+            last_indent = indent
+
+        if mode not in ("lines", "smart"):
+            raise ValueError("Invalid mode. Use 'lines' or 'smart'.")
+
+        if mode == "lines":
+            if start_line <= 0:
+                raise ValueError("start_line must be >= 1.")
+            if line_count <= 0:
+                raise ValueError("line_count must be positive.")
+            start_idx = start_line - 1
+            if start_idx >= len(lines):
+                return "No content."
+            end_idx = min(len(lines) - 1, start_idx + line_count - 1)
+            indices = range(start_idx, end_idx + 1)
+        else:
+            if anchor_line is None or anchor_line <= 0:
+                raise ValueError("anchor_line must be provided for smart mode.")
+            if anchor_line > len(lines):
+                raise ValueError("anchor_line exceeds total lines.")
+            if indent_level < 0:
+                indent_level = 0
+            anchor_idx = anchor_line - 1
+            anchor_indent = indent_widths[anchor_idx]
+            threshold = anchor_indent - (indent_level * 4)
+            if threshold < 0:
+                threshold = 0
+
+            start_idx = anchor_idx
+            i = anchor_idx - 1
+            while i >= 0:
+                indent = indent_widths[i]
+                line = lines[i]
+                is_comment = _is_comment_line(line)
+                if indent > threshold:
+                    start_idx = i
+                    i -= 1
+                    continue
+                if is_comment:
+                    start_idx = i
+                    i -= 1
+                    continue
+                break
+
+            end_idx = anchor_idx
+            i = anchor_idx + 1
+            while i < len(lines):
+                indent = indent_widths[i]
+                line = lines[i]
+                is_comment = _is_comment_line(line)
+                if indent > threshold:
+                    end_idx = i
+                    i += 1
+                    continue
+                if is_comment:
+                    end_idx = i
+                    i += 1
+                    continue
+                break
+
+            indices = range(start_idx, end_idx + 1)
+
+        output_parts: List[str] = []
+        total_chars = 0
+        for idx in indices:
+            line = lines[idx]
+            if not line.strip():
+                continue
+            formatted = f"{idx + 1}: {line}"
+            prefix = "\n" if output_parts else ""
+            chunk = f"{prefix}{formatted}"
+            if total_chars + len(chunk) > max_chars:
+                remaining = max_chars - total_chars
+                if remaining <= 0:
+                    break
+                output_parts.append(chunk[:remaining])
+                total_chars = max_chars
+                break
+            output_parts.append(chunk)
+            total_chars += len(chunk)
+
+        return "".join(output_parts) if output_parts else "No content."
 
 
 class WriteFileTool(Tool):
@@ -2408,6 +2949,20 @@ class RunShellTool(Tool):
 
     async def execute(self, input_data: str) -> str:
         data = _parse_json_input(input_data)
+        if _pty_debug_enabled():
+            try:
+                raw_preview = input_data if isinstance(input_data, str) else str(input_data)
+                raw_preview = raw_preview.replace("\r", "\\r").replace("\n", "\\n")
+                if len(raw_preview) > 400:
+                    raw_preview = raw_preview[:400] + "...(truncated)"
+                _pty_debug(f"run_shell input_preview={raw_preview}")
+                _pty_debug(
+                    "run_shell parsed "
+                    f"mode={data.get('mode')} action={data.get('action')} "
+                    f"pty={data.get('pty')} command={data.get('command')}"
+                )
+            except Exception as exc:
+                _pty_debug(f"run_shell debug error={exc}")
         action = str(data.get("action") or "").strip().lower()
         mode_override: Optional[str] = None
         if action:
@@ -2441,7 +2996,30 @@ class RunShellTool(Tool):
             if not proc:
                 return "PTY not found."
             if action == "send":
-                stdin_bytes = _encode_stdin(data.get("stdin"))
+                stdin_value = data.get("stdin")
+                if _pty_debug_enabled():
+                    if isinstance(stdin_value, str):
+                        _pty_debug(
+                            "run_shell send stdin "
+                            f"type=str len={len(stdin_value)} "
+                            f"endswith_lf={stdin_value.endswith('\n')} endswith_crlf={stdin_value.endswith('\r\n')}"
+                        )
+                    else:
+                        _pty_debug(f"run_shell send stdin type={type(stdin_value).__name__}")
+                if _is_windows() and isinstance(stdin_value, str) and stdin_value:
+                    stdin_value = _normalize_windows_stdin(stdin_value)
+                    if _pty_debug_enabled():
+                        _pty_debug(
+                            "run_shell send normalized "
+                            f"len={len(stdin_value)} endswith_crlf={stdin_value.endswith('\r\n')}"
+                        )
+                stdin_bytes = _encode_stdin(stdin_value)
+                if _pty_debug_enabled():
+                    _pty_debug(
+                        "run_shell send bytes "
+                        f"len={len(stdin_bytes)} endswith_crlf={stdin_bytes.endswith(b'\r\n')} "
+                        f"tail_hex={_tail_bytes_hex(stdin_bytes)}"
+                    )
                 written = proc.write(stdin_bytes)
                 return f"[pty_id={proc.id} status={proc.status} bytes_written={written}]"
             if action == "read":
@@ -2457,7 +3035,11 @@ class RunShellTool(Tool):
                     except (TypeError, ValueError):
                         cursor = None
                 chunk, new_cursor, reset = proc.read(cursor, max_output)
-                header = f"[pty_id={proc.id} status={proc.status} cursor={new_cursor} reset={str(reset).lower()}]"
+                header = (
+                    f"[pty_id={proc.id} status={proc.status} pty={str(proc.pty_enabled).lower()} "
+                    f"cursor={new_cursor} reset={str(reset).lower()} idle_timeout={proc.idle_timeout_ms} "
+                    f"buffer_size={proc.buffer_size}]"
+                )
                 if proc.status == "exited":
                     header = f"{header} exit_code={proc.exit_code}"
                 return f"{header}\n{chunk or ''}"
@@ -2466,14 +3048,19 @@ class RunShellTool(Tool):
                 return f"[pty_id={pty_id} status=closed]"
             return f"Unknown action: {action}"
 
-        command = data.get("command") or input_data
-        if not command:
-            raise ValueError("Missing command.")
+        command = data.get("command")
         mode = str(data.get("mode") or "oneshot").strip().lower()
         if mode_override:
             mode = mode_override
         if mode not in ("oneshot", "persistent"):
             mode = "oneshot"
+        if command is None:
+            if mode == "persistent":
+                command = ""
+            else:
+                command = input_data
+        if command is None:
+            raise ValueError("Missing command.")
 
         cmd_name = _extract_command_name(command)
         root = _get_root_path()
@@ -2537,15 +3124,28 @@ class RunShellTool(Tool):
         max_output = data.get("max_output")
         max_output = int(max_output) if max_output is not None else int(get_tool_config().get("shell", {}).get("max_output", 20000))
 
-        stdin_bytes = _encode_stdin(data.get("stdin"))
+        stdin_value = data.get("stdin")
+        if _is_windows() and isinstance(stdin_value, str) and stdin_value:
+            stdin_value = _normalize_windows_stdin(stdin_value)
+        stdin_bytes = _encode_stdin(stdin_value)
         pty_requested = data.get("pty")
         pty_supported = _supports_pty()
         if pty_requested is None:
-            pty_enabled = pty_supported
-            pty_fallback = False
+            if mode == "oneshot":
+                pty_enabled = False
+                pty_fallback = False
+            else:
+                pty_enabled = pty_supported
+                pty_fallback = False
         else:
             pty_enabled = bool(pty_requested) and pty_supported
             pty_fallback = bool(pty_requested) and not pty_supported
+        if _pty_debug_enabled():
+            _pty_debug(
+                "run_shell pty_resolve "
+                f"mode={mode} pty_requested={pty_requested} "
+                f"pty_supported={pty_supported} pty_enabled={pty_enabled}"
+            )
 
         def _run_unsandboxed() -> Tuple[int, str]:
             completed = subprocess.run(
@@ -2562,20 +3162,35 @@ class RunShellTool(Tool):
         def _run_oneshot(use_sandbox: bool) -> Tuple[int, str]:
             if pty_enabled:
                 if _is_windows():
-                    if use_sandbox:
-                        return _run_windows_pty_oneshot(command, workdir, timeout_sec, idle_timeout_ms, stdin_bytes)
-                    return _run_unsandboxed()
+                    return _run_windows_pty_oneshot(
+                        command,
+                        workdir,
+                        timeout_sec,
+                        idle_timeout_ms,
+                        stdin_bytes,
+                        use_restricted_token=_use_restricted_conpty(use_sandbox)
+                    )
                 return _run_posix_pty_oneshot(command, workdir, timeout_sec, idle_timeout_ms, stdin_bytes, use_sandbox)
             if use_sandbox:
                 return _run_sandboxed_command(command, workdir, timeout_sec)
             return _run_unsandboxed()
 
         def _start_persistent(use_sandbox: bool) -> PtyProcess:
+            _pty_debug(
+                "run_shell start_persistent "
+                f"use_sandbox={use_sandbox} pty_enabled={pty_enabled} pty_supported={pty_supported} "
+                f"pty_fallback={pty_fallback} command={command}"
+            )
             if _is_windows():
                 if pty_enabled:
-                    if use_sandbox:
-                        return _start_windows_pty_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size)
-                    return _start_windows_unrestricted_pipe_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size)
+                    return _start_windows_pty_persistent(
+                        command,
+                        workdir,
+                        stdin_bytes,
+                        idle_timeout_ms,
+                        buffer_size,
+                        use_restricted_token=_use_restricted_conpty(use_sandbox)
+                    )
                 if use_sandbox:
                     return _start_windows_pipe_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size)
                 return _start_windows_unrestricted_pipe_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size)
@@ -2596,6 +3211,7 @@ class RunShellTool(Tool):
                 manager = get_pty_manager()
                 manager.register(pty_proc)
                 chunk, cursor, _ = pty_proc.read(None, max_output)
+                _pty_debug(f"run_shell persistent started pty_id={pty_proc.id} initial_chunk_len={len(chunk or '')}")
                 header = (
                     f"[pty_id={pty_proc.id} status={pty_proc.status} pty={str(pty_proc.pty_enabled).lower()} "
                     f"idle_timeout={pty_proc.idle_timeout_ms} buffer_size={pty_proc.buffer_size}]"
@@ -2604,6 +3220,7 @@ class RunShellTool(Tool):
                     header = f"{header} pty_fallback=true"
                 return f"{header}\n{chunk or ''}"
 
+            exec_start = time.monotonic()
             if agent_mode == "super":
                 returncode, output = await asyncio.to_thread(_run_oneshot, False)
             elif cmd_name in unrestricted_allowset:
@@ -2611,6 +3228,8 @@ class RunShellTool(Tool):
             else:
                 ran_sandbox = True
                 returncode, output = await asyncio.to_thread(_run_oneshot, True)
+            elapsed_ms = int((time.monotonic() - exec_start) * 1000)
+            output = _append_idle_timeout_info(output, elapsed_ms)
         except subprocess.TimeoutExpired:
             return "Command timed out."
         except Exception as exc:
@@ -2652,7 +3271,10 @@ class RunShellTool(Tool):
                     header = f"{header} pty_fallback=true"
                 return f"{header}\n{chunk or ''}"
 
+            exec_start = time.monotonic()
             returncode, output = await asyncio.to_thread(_run_oneshot, False)
+            elapsed_ms = int((time.monotonic() - exec_start) * 1000)
+            output = _append_idle_timeout_info(output, elapsed_ms)
 
         if ran_sandbox and returncode != 0 and _looks_like_permission_denied(output):
             request_id = None
@@ -2680,7 +3302,10 @@ class RunShellTool(Tool):
             if status == "approved" and agent_mode == "default" and not shell_unrestricted and cmd_name not in unrestricted_allowset:
                 _ensure_shell_unrestricted_allowlist_entry(cmd_name)
 
+            exec_start = time.monotonic()
             returncode, output = await asyncio.to_thread(_run_oneshot, False)
+            elapsed_ms = int((time.monotonic() - exec_start) * 1000)
+            output = _append_idle_timeout_info(output, elapsed_ms)
 
         output = output or "(no output)"
         output = _apply_max_output(output, max_output)
@@ -2699,7 +3324,7 @@ class RgTool(Tool):
             ToolParameter(
                 name="pattern",
                 type="string",
-                description="Search pattern (rg syntax).",
+                description="Search pattern (regular expression, rg syntax).",
                 required=True
             ),
             ToolParameter(
@@ -2724,9 +3349,9 @@ class RgTool(Tool):
             ToolParameter(
                 name="max_results",
                 type="number",
-                description="Max number of matches.",
+                description="Max number of output lines.",
                 required=False,
-                default=200
+                default=100
             )
         ]
 
@@ -2742,20 +3367,30 @@ class RgTool(Tool):
         case_sensitive = bool(data.get("case_sensitive", False))
         glob = data.get("glob")
         max_results = data.get("max_results")
-        max_results = int(max_results) if max_results is not None else 200
+        output_limit = int(max_results) if max_results is not None else 100
+        if output_limit <= 0:
+            output_limit = 100
 
         rg_exe = _resolve_rg_executable(root)
-        args = [rg_exe, "--line-number", "--column", "--no-heading", "--color", "never"]
+        base_args = [rg_exe, "--no-messages"]
         if not case_sensitive:
-            args.append("-i")
+            base_args.append("-i")
         if glob:
-            args.extend(["--glob", str(glob)])
-        if max_results > 0:
-            args.extend(["--max-count", str(max_results)])
-        # Use "--" to prevent patterns starting with "-" from being parsed as flags.
-        args.extend(["--", str(pattern), str(search_path)])
+            base_args.extend(["--glob", str(glob)])
 
-        def _run() -> Tuple[int, str]:
+        # 1) Collect matching files sorted by recent modification time.
+        files_args = [
+            *base_args,
+            "--files-with-matches",
+            "--sortr",
+            "modified",
+            "--regexp",
+            str(pattern),
+            "--",
+            str(search_path),
+        ]
+
+        def _run(args: List[str]) -> Tuple[int, str]:
             completed = subprocess.run(
                 args,
                 cwd=str(root),
@@ -2766,7 +3401,7 @@ class RgTool(Tool):
             return completed.returncode, output
 
         try:
-            returncode, output = await asyncio.to_thread(_run)
+            returncode, output = await asyncio.to_thread(_run, files_args)
         except FileNotFoundError:
             raise ValueError("rg is not available on this system.")
 
@@ -2775,7 +3410,53 @@ class RgTool(Tool):
         if returncode == 1 and not output.strip():
             return "No matches."
 
-        return output.strip() or "No matches."
+        files = [line.strip() for line in output.splitlines() if line.strip()]
+        if not files:
+            return "No matches."
+
+        # 2) For each matched file, return only file name + line numbers (no content).
+        results: List[str] = []
+        for file_path in files:
+            remaining = output_limit - len(results)
+            if remaining <= 0:
+                break
+            line_args = [
+                *base_args,
+                "--line-number",
+                "--no-heading",
+                "--color",
+                "never",
+                "--regexp",
+                str(pattern),
+            ]
+            if remaining > 0:
+                line_args.extend(["--max-count", str(remaining)])
+            # Use "--" to prevent patterns starting with "-" from being parsed as flags.
+            line_args.extend(["--", file_path])
+
+            try:
+                line_code, line_output = await asyncio.to_thread(_run, line_args)
+            except FileNotFoundError:
+                raise ValueError("rg is not available on this system.")
+
+            if line_code == 2:
+                raise ValueError(line_output.strip() or "rg failed.")
+            if line_code == 1 and not line_output.strip():
+                continue
+
+            for raw in line_output.splitlines():
+                if not raw.strip():
+                    continue
+                parts = raw.rsplit(":", 2)
+                if len(parts) < 2:
+                    continue
+                path_part = parts[0]
+                line_no = parts[1]
+                results.append(f"{path_part}:{line_no}")
+                if len(results) >= output_limit:
+                    break
+
+        return "\n".join(results) if results else "No matches."
 
 
 class ApplyPatchTool(Tool):

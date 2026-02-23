@@ -58,7 +58,7 @@ timeout /t 3 /nobreak >nul
 
 echo.
 echo [Step 3/4] Starting Backend Server...
-start "Backend Server" cmd /k "cd /d "%~dp0python-backend" && python main.py"
+start "Backend Server" cmd /k "set TAURI_AGENT_DEV=1 && cd /d "%~dp0python-backend" && python main.py"
 echo     Backend will run on http://127.0.0.1:8000
 echo.
 

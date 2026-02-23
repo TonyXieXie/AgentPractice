@@ -78,13 +78,19 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 "name": "Concise Output",
                 "type": "output_format",
                 "prompt": "Be concise and actionable."
+            },
+            {
+                "id": "file_references",
+                "name": "File References",
+                "type": "output_format",
+                "prompt": "File References: When referencing files in your response, make sure to include the relevant start line and always follow the below rules:\n- Use inline code to make file paths clickable.\n- Each reference should have a stand alone path. Even if it's the same file.\n- Accepted: absolute, workspace-relative, a/ or b/ diff prefixes, or bare filename/suffix.\n- Line/column (1-based, optional): :line[:column] or #Lline[Ccolumn] (column defaults to 1).\n- Do not use URIs like file://, vscode://, or https://.\n- Do not provide range of lines.\n- Examples: src/app.ts, src/app.ts:42, b/server/index.js#L10, C:\\repo\\project\\main.rs:12:5"
             }
         ],
         "profiles": [
             {
                 "id": "default",
                 "name": "Default",
-                "abilities": ["tools_all", "rg_search", "apply_patch", "pty_status", "code_map", "tool_json", "output_concise"]
+                "abilities": ["tools_all", "rg_search", "apply_patch", "pty_status", "code_map", "tool_json", "output_concise", "file_references"]
             }
         ],
         "default_profile": "default"

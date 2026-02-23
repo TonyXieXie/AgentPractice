@@ -96,6 +96,9 @@ fn spawn_backend<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Child, 
     command.env("TAURI_AGENT_DB_PATH", &db_path);
     command.env("APP_CONFIG_PATH", &app_config_path);
     command.env("TOOLS_CONFIG_PATH", &tools_config_path);
+    if tauri::is_dev() {
+        command.env("TAURI_AGENT_DEV", "1");
+    }
     command.current_dir(&app_data_dir);
     if !tauri::is_dev() {
         command.stdout(Stdio::null()).stderr(Stdio::null());

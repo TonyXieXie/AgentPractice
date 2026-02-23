@@ -1120,7 +1120,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         }
         try {
             const updated = await updateAppConfig({
-                llm: { timeout_sec: timeoutValue },
+                llm: { timeout_sec: timeoutValue, reasoning_summary: globalReasoningSummary },
                 agent: {
                     react_max_iterations: reactMaxValue,
                     ast_enabled: globalAstEnabled,
@@ -1143,6 +1143,9 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             });
             if (updated?.llm?.timeout_sec !== undefined && updated?.llm?.timeout_sec !== null) {
                 setGlobalTimeoutSec(String(updated.llm.timeout_sec));
+            }
+            if (updated?.llm?.reasoning_summary) {
+                setGlobalReasoningSummary(updated.llm.reasoning_summary as ReasoningSummary);
             }
             if (updated?.agent?.react_max_iterations !== undefined && updated?.agent?.react_max_iterations !== null) {
                 setGlobalReactMaxIterations(String(updated.agent.react_max_iterations));

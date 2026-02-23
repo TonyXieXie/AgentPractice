@@ -1608,6 +1608,34 @@ class PtyCloseRequest(BaseModel):
     pty_id: str
 
 
+def _pty_debug_enabled() -> bool:
+    raw = os.environ.get("PTY_DEBUG")
+    if raw is not None:
+        value = str(raw).strip().lower()
+        if value in ("0", "false", "no", "off"):
+            return False
+        if value in ("1", "true", "yes", "on"):
+            return True
+    dev_value = str(os.environ.get("TAURI_AGENT_DEV", "")).strip().lower()
+    if dev_value in ("1", "true", "yes", "on"):
+        return True
+    env_value = str(os.environ.get("TAURI_AGENT_ENV", "")).strip().lower()
+    return env_value in ("dev", "development")
+
+
+def _tail_bytes_hex(data: bytes, max_len: int = 16) -> str:
+    if not data:
+        return ""
+    return data[-max_len:].hex()
+
+
+def _normalize_windows_pty_input(text: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.endswith("\n"):
+        normalized += "\n"
+    return normalized.replace("\n", "\r\n")
+
+
 @app.get("/pty/list")
 def list_ptys(
     session_id: str = Query(...),
@@ -1684,8 +1712,17 @@ def send_pty(request: PtySendRequest):
     proc = manager.get(request.session_id, request.pty_id)
     if not proc:
         raise HTTPException(status_code=404, detail="PTY not found")
-    data = (request.input or "").encode("utf-8", errors="replace")
+    payload = request.input or ""
+    if os.name == "nt" and payload:
+        payload = _normalize_windows_pty_input(payload)
+    data = payload.encode("utf-8", errors="replace")
     written = proc.write(data)
+    if _pty_debug_enabled():
+        print(
+            "[PTY DEBUG] api send "
+            f"pty_id={proc.id} bytes_written={written} input_len={len(payload)} "
+            f"endswith_crlf={payload.endswith('\r\n')} tail_hex={_tail_bytes_hex(data)}"
+        )
     return {"ok": True, "pty_id": proc.id, "bytes_written": written}
 
 
