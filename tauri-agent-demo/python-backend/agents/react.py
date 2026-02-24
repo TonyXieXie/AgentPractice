@@ -1679,7 +1679,8 @@ class ReActAgent(AgentStrategy):
 
         action = str(args.get("action") or "").strip().lower()
         mode = str(args.get("mode") or "").strip().lower()
-        if action or mode == "persistent" or args.get("pty_id"):
+        pty_requested = args.get("pty")
+        if action or args.get("pty_id"):
             tool_output = await self._execute_tool(tool, tool_input)
             output_holder["output"] = tool_output
             yield AgentStep(
@@ -1688,7 +1689,11 @@ class ReActAgent(AgentStrategy):
                 metadata={"tool": tool_name, "iteration": iteration}
             )
             return
-        if mode == "oneshot" or args.get("pty") is False:
+
+        explicit_persistent = mode == "persistent" or pty_requested is True
+        explicit_oneshot = mode == "oneshot" or pty_requested is False
+
+        if explicit_oneshot or not explicit_persistent:
             tool_output = await self._execute_tool(tool, tool_input)
             output_holder["output"] = tool_output
             yield AgentStep(
