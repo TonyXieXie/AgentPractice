@@ -1,4 +1,4 @@
-﻿"""
+"""
 Agent Executor - Orchestrates agent execution
 
 Provides:

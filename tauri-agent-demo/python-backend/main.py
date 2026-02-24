@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI, HTTPException, Response, Query
+from fastapi import FastAPI, HTTPException, Response, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -1718,10 +1718,11 @@ def send_pty(request: PtySendRequest):
     data = payload.encode("utf-8", errors="replace")
     written = proc.write(data)
     if _pty_debug_enabled():
+        endswith_crlf = payload.endswith("\r\n")
         print(
             "[PTY DEBUG] api send "
             f"pty_id={proc.id} bytes_written={written} input_len={len(payload)} "
-            f"endswith_crlf={payload.endswith('\r\n')} tail_hex={_tail_bytes_hex(data)}"
+            f"endswith_crlf={endswith_crlf} tail_hex={_tail_bytes_hex(data)}"
         )
     return {"ok": True, "pty_id": proc.id, "bytes_written": written}
 

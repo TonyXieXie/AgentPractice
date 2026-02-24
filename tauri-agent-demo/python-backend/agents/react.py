@@ -1,4 +1,4 @@
-﻿"""
+"""
 ReActAgent - Reasoning + Acting Agent
 
 Implements a ReAct-style loop with tool calling.

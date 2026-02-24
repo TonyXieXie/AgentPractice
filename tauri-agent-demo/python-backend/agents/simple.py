@@ -1,4 +1,4 @@
-﻿"""
+"""
 SimpleAgent - Backward Compatible Chat Agent
 
 This agent maintains simple conversational behavior:

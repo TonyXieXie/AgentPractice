@@ -1797,7 +1797,7 @@ def _windows_start_conpty_process(
             )
         except Exception as exc:
             _pty_debug(f"conpty startupinfo debug error={exc}")
-    create_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW
+    create_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
     if _pty_debug_enabled():
         _pty_debug(
             "conpty CreateProcess args "
@@ -2032,7 +2032,10 @@ def _start_windows_pty_persistent(
     def _writer(data: bytes) -> int:
         written = wintypes.DWORD()
         if kernel32.WriteFile(in_write, data, len(data), ctypes.byref(written), None):
-            _pty_debug(f"conpty write ok bytes={int(written.value)} endswith_crlf={data.endswith(b'\r\n')}")
+            endswith_crlf = data.endswith(b"\r\n")
+            _pty_debug(
+                f"conpty write ok bytes={int(written.value)} endswith_crlf={endswith_crlf}"
+            )
             _pty_debug(f"conpty write tail_hex={_tail_bytes_hex(data)}")
             if _pty_debug_enabled():
                 if in_read_dbg:
@@ -2221,9 +2224,10 @@ def _start_windows_pty_persistent(
         initial_text = _normalize_windows_stdin(command)
         initial_bytes += _encode_stdin(initial_text)
         if _pty_debug_enabled():
+            endswith_crlf = initial_bytes.endswith(b"\r\n")
             _pty_debug(
                 "conpty initial command "
-                f"len={len(initial_bytes)} endswith_crlf={initial_bytes.endswith(b'\r\n')} "
+                f"len={len(initial_bytes)} endswith_crlf={endswith_crlf} "
                 f"tail_hex={_tail_bytes_hex(initial_bytes)}"
             )
     if stdin_bytes:
@@ -2999,25 +3003,29 @@ class RunShellTool(Tool):
                 stdin_value = data.get("stdin")
                 if _pty_debug_enabled():
                     if isinstance(stdin_value, str):
+                        endswith_lf = stdin_value.endswith("\n")
+                        endswith_crlf = stdin_value.endswith("\r\n")
                         _pty_debug(
                             "run_shell send stdin "
                             f"type=str len={len(stdin_value)} "
-                            f"endswith_lf={stdin_value.endswith('\n')} endswith_crlf={stdin_value.endswith('\r\n')}"
+                            f"endswith_lf={endswith_lf} endswith_crlf={endswith_crlf}"
                         )
                     else:
                         _pty_debug(f"run_shell send stdin type={type(stdin_value).__name__}")
                 if _is_windows() and isinstance(stdin_value, str) and stdin_value:
                     stdin_value = _normalize_windows_stdin(stdin_value)
                     if _pty_debug_enabled():
+                        endswith_crlf = stdin_value.endswith("\r\n")
                         _pty_debug(
                             "run_shell send normalized "
-                            f"len={len(stdin_value)} endswith_crlf={stdin_value.endswith('\r\n')}"
+                            f"len={len(stdin_value)} endswith_crlf={endswith_crlf}"
                         )
                 stdin_bytes = _encode_stdin(stdin_value)
                 if _pty_debug_enabled():
+                    endswith_crlf = stdin_bytes.endswith(b"\r\n")
                     _pty_debug(
                         "run_shell send bytes "
-                        f"len={len(stdin_bytes)} endswith_crlf={stdin_bytes.endswith(b'\r\n')} "
+                        f"len={len(stdin_bytes)} endswith_crlf={endswith_crlf} "
                         f"tail_hex={_tail_bytes_hex(stdin_bytes)}"
                     )
                 written = proc.write(stdin_bytes)
