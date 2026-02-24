@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import { Terminal } from 'xterm';
+import { FitAddon } from 'xterm-addon-fit';
+import 'xterm/css/xterm.css';
 import { closePty, listPtys, readPty, sendPty, type PtyListItem } from '../api';
 import './PtyPanel.css';
 
@@ -16,11 +19,9 @@ const LIST_POLL_MS = 2000;
 const READ_POLL_MS = 500;
 const READ_MAX_OUTPUT = 8000;
 
-const ensureCommandPrefix = (text: string, command?: string) => {
-  if (!command) return text;
-  const prefix = `$ ${command}`;
-  if (!text) return prefix;
-  return text.startsWith(prefix) ? text : `${prefix}\n${text}`;
+type PtyTerminal = {
+  term: Terminal;
+  fit: FitAddon;
 };
 
 interface PtyPanelProps {
@@ -38,6 +39,8 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const itemsRef = useRef<PtyListItem[]>([]);
   const buffersRef = useRef<Record<string, PtyBuffer>>({});
+  const terminalsRef = useRef<Record<string, PtyTerminal>>({});
+  const terminalContainersRef = useRef<Record<string, HTMLDivElement | null>>({});
 
   useEffect(() => {
     itemsRef.current = items;
@@ -51,6 +54,11 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
     setItems([]);
     setBuffers({});
     setInputById({});
+    for (const entry of Object.values(terminalsRef.current)) {
+      entry.term.dispose();
+    }
+    terminalsRef.current = {};
+    terminalContainersRef.current = {};
   }, [sessionId]);
 
   const handleResizeStart = (event: ReactMouseEvent) => {
@@ -91,14 +99,13 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
           for (const item of list) {
             const existing = prev[item.pty_id] || { text: '', cursor: 0 };
             const command = item.command || existing.command;
-            const text = ensureCommandPrefix(existing.text, command);
             next[item.pty_id] = {
               ...existing,
               command,
               status: item.status,
               exit_code: item.exit_code ?? existing.exit_code,
               pty: item.pty,
-              text
+              text: existing.text
             };
           }
           for (const key of Object.keys(prev)) {
@@ -145,7 +152,15 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
             text = text + resp.chunk;
           }
           const command = item.command || resp.command || current.command;
-          text = ensureCommandPrefix(text, command);
+          const terminalEntry = terminalsRef.current[item.pty_id];
+          if (terminalEntry) {
+            if (resp.reset) {
+              terminalEntry.term.reset();
+            }
+            if (resp.chunk) {
+              terminalEntry.term.write(resp.chunk, () => terminalEntry.term.scrollToBottom());
+            }
+          }
           updates[item.pty_id] = {
             ...current,
             text,
@@ -170,6 +185,24 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
       window.clearInterval(interval);
     };
   }, [sessionId]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      for (const entry of Object.values(terminalsRef.current)) {
+        entry.fit.fit();
+      }
+    };
+    window.addEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+    };
+  }, []);
+
+  useEffect(() => {
+    for (const entry of Object.values(terminalsRef.current)) {
+      entry.fit.fit();
+    }
+  }, [panelWidth, items.length]);
 
   const handleSend = async (ptyId: string) => {
     const input = (inputById[ptyId] || '').trim();
@@ -245,7 +278,6 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
         )}
         {orderedItems.map((item) => {
           const buffer = buffers[item.pty_id];
-          const output = buffer?.text || '';
           const status = buffer?.status || item.status;
           const exitCode = buffer?.exit_code ?? item.exit_code;
           const isRunning = status === 'running';
@@ -269,7 +301,47 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
                 )}
               </div>
               <div className="pty-output">
-                <pre>{output}</pre>
+                <div
+                  className="pty-terminal"
+                  ref={(node) => {
+                    terminalContainersRef.current[item.pty_id] = node;
+                    if (!node) {
+                      const existing = terminalsRef.current[item.pty_id];
+                      if (existing) {
+                        existing.term.dispose();
+                        delete terminalsRef.current[item.pty_id];
+                      }
+                      return;
+                    }
+                    if (terminalsRef.current[item.pty_id]) {
+                      return;
+                    }
+                    const term = new Terminal({
+                      convertEol: true,
+                      disableStdin: true,
+                      scrollback: 2000,
+                      fontFamily:
+                        "'SFMono-Regular', 'Menlo', 'Consolas', 'Liberation Mono', 'Courier New', monospace",
+                      fontSize: 12,
+                      lineHeight: 1.4,
+                      theme: {
+                        background: '#0b0f14',
+                        foreground: '#e2e8f0',
+                        cursor: '#e2e8f0',
+                        selection: 'rgba(148, 163, 184, 0.35)'
+                      }
+                    });
+                    const fit = new FitAddon();
+                    term.loadAddon(fit);
+                    term.open(node);
+                    fit.fit();
+                    const existingText = buffersRef.current[item.pty_id]?.text;
+                    if (existingText) {
+                      term.write(existingText, () => term.scrollToBottom());
+                    }
+                    terminalsRef.current[item.pty_id] = { term, fit };
+                  }}
+                />
               </div>
               {isInteractive && (
                 <div className="pty-input-row">

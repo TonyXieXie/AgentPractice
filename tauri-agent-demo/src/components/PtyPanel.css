@@ -285,22 +285,27 @@
 }
 
 .pty-output {
-  padding: 10px 12px;
+  padding: 8px;
   background: #0b0f14;
   border-top: 1px solid rgba(255, 255, 255, 0.04);
   border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-  overflow: auto;
+  overflow: hidden;
   flex: 1;
   min-height: 0;
 }
 
-.pty-output pre {
-  margin: 0;
-  font-family: 'SFMono-Regular', 'Menlo', 'Consolas', 'Liberation Mono', monospace;
-  font-size: 0.75rem;
-  line-height: 1.45;
-  color: #e2e8f0;
-  white-space: pre;
+.pty-terminal {
+  width: 100%;
+  height: 100%;
+}
+
+.pty-output .xterm {
+  width: 100%;
+  height: 100%;
+}
+
+.pty-output .xterm-viewport {
+  overflow-y: auto;
 }
 
 .pty-input-row {
