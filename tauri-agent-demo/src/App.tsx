@@ -76,6 +76,8 @@ const MAIN_DEFAULT_WIDTH = 1200;
 const MAIN_DEFAULT_HEIGHT = 950;
 const WORKDIR_DEFAULT_WIDTH = 1200;
 const WORKDIR_DEFAULT_HEIGHT = 800;
+const DEFAULT_PTY_PANEL_WIDTH = 380;
+const DEFAULT_DEBUG_PANEL_WIDTH = 400;
 const DEFAULT_MAX_CONTEXT_TOKENS = 200000;
 const CONTEXT_RING_RADIUS = 10;
 const AST_DEFAULT_MAX_FILES = 500;
@@ -666,6 +668,9 @@ function App() {
   const [showDebugPanel, setShowDebugPanel] = useState(false);
   const showDebugPanelRef = useRef(false);
   const [showPtyPanel, setShowPtyPanel] = useState(false);
+  const panelWidthRef = useRef({ pty: DEFAULT_PTY_PANEL_WIDTH, debug: DEFAULT_DEBUG_PANEL_WIDTH });
+  const panelOpenRef = useRef({ pty: false, debug: false });
+  const panelAppliedRef = useRef({ pty: 0, debug: 0 });
   const [debugFocus, setDebugFocus] = useState<{ key: string; messageId: number; iteration: number; callId?: number } | null>(null);
   const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
   const [pendingContextEstimate, setPendingContextEstimate] = useState<PendingContextEstimate | null>(null);
@@ -732,6 +737,91 @@ function App() {
   const astWatchRef = useRef<UnwatchFn | null>(null);
   const astNotifyRef = useRef<{ timer: number | null; paths: Set<string> }>({ timer: null, paths: new Set() });
   const appWindow = useMemo(() => getCurrentWindow(), []);
+
+  const adjustWindowWidth = useCallback(async (delta: number) => {
+    if (!delta) return;
+    try {
+      const [isFull, isMax] = await Promise.all([
+        appWindow.isFullscreen(),
+        appWindow.isMaximized()
+      ]);
+      if (isFull || isMax) return;
+      const [size, scale] = await Promise.all([
+        appWindow.outerSize(),
+        appWindow.scaleFactor()
+      ]);
+      const logicalWidth = size.width / scale;
+      const logicalHeight = size.height / scale;
+      const nextWidth = Math.max(800, Math.round(logicalWidth + delta));
+      const nextHeight = Math.max(600, Math.round(logicalHeight));
+      await appWindow.setSize(new LogicalSize(nextWidth, nextHeight));
+    } catch {
+      // ignore sizing errors
+    }
+  }, [appWindow]);
+
+  const handlePanelWidthChange = useCallback((kind: 'pty' | 'debug', width: number) => {
+    panelWidthRef.current[kind] = width;
+  }, []);
+
+  const markStreamActivity = useCallback((sessionId?: string | null) => {
+    const key = sessionId || DRAFT_SESSION_KEY;
+    const inflight = inFlightBySessionRef.current[key];
+    if (inflight) {
+      inflight.lastEventAt = Date.now();
+    }
+  }, []);
+
+  const openPtyPanel = useCallback(() => {
+    if (panelOpenRef.current.pty) return;
+    panelOpenRef.current.pty = true;
+    panelAppliedRef.current.pty = panelWidthRef.current.pty;
+    void adjustWindowWidth(panelAppliedRef.current.pty);
+    setShowPtyPanel(true);
+  }, [adjustWindowWidth]);
+
+  const closePtyPanel = useCallback(() => {
+    if (!panelOpenRef.current.pty) return;
+    panelOpenRef.current.pty = false;
+    const applied = panelAppliedRef.current.pty;
+    panelAppliedRef.current.pty = 0;
+    void adjustWindowWidth(-applied);
+    setShowPtyPanel(false);
+  }, [adjustWindowWidth]);
+
+  const togglePtyPanel = useCallback(() => {
+    if (panelOpenRef.current.pty) {
+      closePtyPanel();
+    } else {
+      openPtyPanel();
+    }
+  }, [closePtyPanel, openPtyPanel]);
+
+  const openDebugPanel = useCallback(() => {
+    if (panelOpenRef.current.debug) return;
+    panelOpenRef.current.debug = true;
+    panelAppliedRef.current.debug = panelWidthRef.current.debug;
+    void adjustWindowWidth(panelAppliedRef.current.debug);
+    setShowDebugPanel(true);
+  }, [adjustWindowWidth]);
+
+  const closeDebugPanel = useCallback(() => {
+    if (!panelOpenRef.current.debug) return;
+    panelOpenRef.current.debug = false;
+    const applied = panelAppliedRef.current.debug;
+    panelAppliedRef.current.debug = 0;
+    void adjustWindowWidth(-applied);
+    setShowDebugPanel(false);
+    setDebugFocus(null);
+  }, [adjustWindowWidth]);
+
+  const toggleDebugPanel = useCallback(() => {
+    if (panelOpenRef.current.debug) {
+      closeDebugPanel();
+    } else {
+      openDebugPanel();
+    }
+  }, [closeDebugPanel, openDebugPanel]);
 
   useEffect(() => {
     loadDefaultConfig();
@@ -1121,6 +1211,11 @@ function App() {
   useEffect(() => {
     showDebugPanelRef.current = showDebugPanel;
   }, [showDebugPanel]);
+
+  useEffect(() => {
+    panelOpenRef.current.pty = showPtyPanel;
+    panelOpenRef.current.debug = showDebugPanel;
+  }, [showPtyPanel, showDebugPanel]);
 
   useEffect(() => {
     if (!workPathMenu) {
@@ -2077,15 +2172,40 @@ function App() {
       markSessionUnread(activeSessionKey);
     } catch (error: any) {
       const stopped = inFlightBySessionRef.current[activeSessionKey]?.stopRequested;
-      if (error?.name === 'AbortError' || stopped) {
-        // User stopped streaming
+      const aborted = abortController.signal.aborted || error?.name === 'AbortError';
+      if (aborted || stopped) {
+        // User stopped streaming or aborted
       } else {
-        console.error('Failed to send message:', error);
+        const inflight = inFlightBySessionRef.current[activeSessionKey];
+        const lastEventAt = inflight?.lastEventAt;
+        const stalledForMs = lastEventAt ? Date.now() - lastEventAt : null;
+        const details = [
+          `name=${error?.name || 'unknown'}`,
+          `message=${error?.message || String(error)}`,
+          `aborted=${abortController.signal.aborted}`,
+          `online=${typeof navigator !== 'undefined' ? String(navigator.onLine) : 'unknown'}`,
+          stalledForMs !== null ? `since_last_event_ms=${stalledForMs}` : null,
+          error?.status ? `status=${error.status}` : null,
+          error?.statusText ? `statusText=${error.statusText}` : null,
+          error?.code ? `code=${error.code}` : null,
+          error?.cause ? `cause=${String(error.cause)}` : null,
+        ].filter(Boolean).join('\n');
+        const stack = error?.stack ? String(error.stack).split('\n').slice(0, 6).join('\n') : '';
+        console.error('Failed to send message:', error, { details });
+        const content = [
+          `Chat error: ${error.message || 'Please check whether the backend is running.'}`,
+          '',
+          'Details:',
+          details,
+          stack ? '' : null,
+          stack ? 'Stack:' : null,
+          stack || null
+        ].filter((line) => line !== null).join('\n');
         const errorMsg: Message = {
           id: Date.now() + 2,
           session_id: newSessionId || targetSessionId || '',
           role: 'assistant',
-          content: `Chat error: ${error.message || 'Please check whether the backend is running.'}`,
+          content,
           timestamp: new Date().toISOString(),
         };
         updateSessionMessages(activeSessionKey, (prev) => [...prev.filter((m) => m.id !== currentAssistantId), errorMsg]);
@@ -3186,8 +3306,12 @@ function App() {
           prev.map((msg) => {
             if (assistantId && msg.id !== assistantId) return msg;
             if (!assistantId && msg.id !== inflight.tempAssistantId) return msg;
+            const stalledForMs = now - inflight.lastEventAt;
             const nextSteps = [...((msg.metadata?.agent_steps as AgentStep[]) || [])];
-            nextSteps.push({ step_type: 'error', content: 'Streaming interrupted. Please retry.' });
+            nextSteps.push({
+              step_type: 'error',
+              content: `Streaming interrupted after ${Math.round(stalledForMs / 1000)}s without events.`
+            });
             return {
               ...msg,
               metadata: { ...(msg.metadata || {}), agent_steps: nextSteps, agent_streaming: false }
@@ -3454,7 +3578,7 @@ function App() {
           onSelectSession={handleSelectSession}
           onNewChat={handleNewChat}
           onOpenConfig={() => setShowConfigManager(true)}
-          onToggleDebug={() => setShowDebugPanel((prev) => !prev)}
+          onToggleDebug={toggleDebugPanel}
           debugActive={showDebugPanel}
           refreshTrigger={sessionRefreshTrigger}
           inFlightBySession={inFlightBySession}
@@ -3930,7 +4054,7 @@ function App() {
                 <button
                   type="button"
                   className={`pty-toggle-btn${showPtyPanel ? ' active' : ''}`}
-                  onClick={() => setShowPtyPanel((prev) => !prev)}
+                  onClick={togglePtyPanel}
                   aria-label="PTY panel"
                   title="PTY sessions"
                 >
@@ -4043,7 +4167,10 @@ function App() {
       {showPtyPanel && (
         <PtyPanel
           sessionId={currentSessionId}
-          onClose={() => setShowPtyPanel(false)}
+          onClose={closePtyPanel}
+          initialWidth={panelWidthRef.current.pty}
+          onWidthChange={(width) => handlePanelWidthChange('pty', width)}
+          onActivity={() => markStreamActivity(currentSessionId)}
         />
       )}
       {showDebugPanel && (
@@ -4055,11 +4182,10 @@ function App() {
           extraWorkPaths={debugExtraWorkPaths}
           agentMode={agentMode}
           onOpenWorkFile={openWorkdirForFile}
-          onClose={() => {
-            setShowDebugPanel(false);
-            setDebugFocus(null);
-          }}
+          onClose={closeDebugPanel}
           focusTarget={debugFocus}
+          initialWidth={panelWidthRef.current.debug}
+          onWidthChange={(width) => handlePanelWidthChange('debug', width)}
         />
       )}
       </div>

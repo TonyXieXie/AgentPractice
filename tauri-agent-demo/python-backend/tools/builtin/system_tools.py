@@ -2953,6 +2953,24 @@ class RunShellTool(Tool):
 
     async def execute(self, input_data: str) -> str:
         data = _parse_json_input(input_data)
+        # Normalize persistent PTY interactions: if a pty_id is provided without an action,
+        # infer send/read to avoid accidentally creating a new PTY session.
+        if isinstance(data, dict):
+            action_hint = str(data.get("action") or "").strip().lower()
+            if not action_hint and data.get("pty_id"):
+                if data.get("stdin") is not None or data.get("command") is not None:
+                    data = dict(data)
+                    data["action"] = "send"
+                    if data.get("stdin") is None and data.get("command") is not None:
+                        data["stdin"] = data.get("command")
+                    data.pop("command", None)
+                else:
+                    data = dict(data)
+                    data["action"] = "read"
+            elif action_hint == "send" and data.get("stdin") is None and data.get("command") is not None:
+                data = dict(data)
+                data["stdin"] = data.get("command")
+                data.pop("command", None)
         if _pty_debug_enabled():
             try:
                 raw_preview = input_data if isinstance(input_data, str) else str(input_data)

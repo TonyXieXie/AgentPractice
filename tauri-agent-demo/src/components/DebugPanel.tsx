@@ -8,6 +8,8 @@ interface DebugPanelProps {
     messages: Message[];
     llmCalls: LLMCall[];
     onClose: () => void;
+    onWidthChange?: (width: number) => void;
+    initialWidth?: number;
     focusTarget?: { key: string; messageId?: number; iteration?: number; callId?: number } | null;
     currentSessionId?: string | null;
     workPath?: string | null;
@@ -20,6 +22,8 @@ function DebugPanel({
     messages,
     llmCalls,
     onClose,
+    onWidthChange,
+    initialWidth,
     focusTarget,
     currentSessionId,
     workPath,
@@ -30,7 +34,7 @@ function DebugPanel({
     const [expandedMessageId, setExpandedMessageId] = useState<string | null>(null);
     const [expandedCallId, setExpandedCallId] = useState<string | null>(null);
     const [rawStreamVisible, setRawStreamVisible] = useState<Record<string, boolean>>({});
-    const [panelWidth, setPanelWidth] = useState(400);
+    const [panelWidth, setPanelWidth] = useState(() => Math.max(320, initialWidth ?? 400));
     const [focusedCallId, setFocusedCallId] = useState<number | null>(null);
     const [suppressedFocusKey, setSuppressedFocusKey] = useState<string | null>(null);
     const [activeTab, setActiveTab] = useState<'llm' | 'ast' | 'cache'>('llm');
@@ -66,6 +70,10 @@ function DebugPanel({
     const [codeMapDurationMs, setCodeMapDurationMs] = useState<number | null>(null);
     const [codeMapUpdatedAt, setCodeMapUpdatedAt] = useState<number | null>(null);
     const panelRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        onWidthChange?.(panelWidth);
+    }, [panelWidth, onWidthChange]);
 
     const toggleExpandMessage = (id: string) => {
         setExpandedMessageId(expandedMessageId === id ? null : id);

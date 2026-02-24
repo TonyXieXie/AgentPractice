@@ -425,7 +425,19 @@ export async function* sendMessageAgentStream(
         signal,
     });
 
-    if (!response.ok) throw new Error('Failed to send agent stream');
+    if (!response.ok) {
+        let detail = `${response.status} ${response.statusText}`.trim();
+        try {
+            const body = await response.text();
+            if (body) {
+                const compact = body.length > 800 ? `${body.slice(0, 800)}...(truncated)` : body;
+                detail = `${detail} | ${compact}`;
+            }
+        } catch {
+            // ignore body read errors
+        }
+        throw new Error(`Agent stream HTTP error: ${detail}`);
+    }
 
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();

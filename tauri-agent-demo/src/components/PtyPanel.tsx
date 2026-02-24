@@ -27,38 +27,43 @@ type PtyTerminal = {
 interface PtyPanelProps {
   sessionId?: string | null;
   onClose: () => void;
+  onWidthChange?: (width: number) => void;
+  initialWidth?: number;
+  onActivity?: () => void;
 }
 
-function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
-  const [panelWidth, setPanelWidth] = useState(380);
+function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity }: PtyPanelProps) {
+  const [panelWidth, setPanelWidth] = useState(() => Math.max(320, initialWidth ?? 380));
   const [includeExited, setIncludeExited] = useState(true);
   const [maxExited, setMaxExited] = useState(DEFAULT_MAX_EXITED);
   const [items, setItems] = useState<PtyListItem[]>([]);
-  const [buffers, setBuffers] = useState<Record<string, PtyBuffer>>({});
+  const buffersRef = useRef<Record<string, PtyBuffer>>({});
   const [inputById, setInputById] = useState<Record<string, string>>({});
   const panelRef = useRef<HTMLDivElement>(null);
   const itemsRef = useRef<PtyListItem[]>([]);
-  const buffersRef = useRef<Record<string, PtyBuffer>>({});
   const terminalsRef = useRef<Record<string, PtyTerminal>>({});
   const terminalContainersRef = useRef<Record<string, HTMLDivElement | null>>({});
+  const terminalRefCallbacks = useRef<Record<string, (node: HTMLDivElement | null) => void>>({});
+  const listSignatureRef = useRef<string>('');
 
   useEffect(() => {
     itemsRef.current = items;
   }, [items]);
 
   useEffect(() => {
-    buffersRef.current = buffers;
-  }, [buffers]);
+    onWidthChange?.(panelWidth);
+  }, [panelWidth, onWidthChange]);
 
   useEffect(() => {
     setItems([]);
-    setBuffers({});
+    buffersRef.current = {};
     setInputById({});
     for (const entry of Object.values(terminalsRef.current)) {
       entry.term.dispose();
     }
     terminalsRef.current = {};
     terminalContainersRef.current = {};
+    terminalRefCallbacks.current = {};
   }, [sessionId]);
 
   const handleResizeStart = (event: ReactMouseEvent) => {
@@ -85,6 +90,7 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
   useEffect(() => {
     if (!sessionId) {
       setItems([]);
+      listSignatureRef.current = '';
       return;
     }
     let active = true;
@@ -92,13 +98,18 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
       try {
         const list = await listPtys(sessionId, { includeExited, maxExited });
         if (!active) return;
-        setItems(list);
-        setBuffers((prev) => {
-          const next: Record<string, PtyBuffer> = {};
-          const keep = new Set(list.map((item) => item.pty_id));
-          for (const item of list) {
-            const existing = prev[item.pty_id] || { text: '', cursor: 0 };
-            const command = item.command || existing.command;
+        const signature = list
+          .map((item) => `${item.pty_id}|${item.status}|${item.exit_code ?? ''}|${item.command ?? ''}|${item.pty}`)
+          .join('||');
+        if (signature !== listSignatureRef.current) {
+          listSignatureRef.current = signature;
+          setItems(list);
+        }
+        const next: Record<string, PtyBuffer> = {};
+        const keep = new Set(list.map((item) => item.pty_id));
+        for (const item of list) {
+          const existing = buffersRef.current[item.pty_id] || { text: '', cursor: 0 };
+          const command = item.command || existing.command;
             next[item.pty_id] = {
               ...existing,
               command,
@@ -108,14 +119,13 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
               text: existing.text
             };
           }
-          for (const key of Object.keys(prev)) {
+          for (const key of Object.keys(buffersRef.current)) {
             if (!keep.has(key)) {
               // drop stale buffers
               continue;
             }
           }
-          return next;
-        });
+        buffersRef.current = next;
       } catch {
         // ignore polling errors
       }
@@ -135,7 +145,7 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
       if (!active) return;
       const currentItems = itemsRef.current;
       if (!currentItems.length) return;
-      const updates: Record<string, PtyBuffer> = {};
+      let hadNewData = false;
       for (const item of currentItems) {
         try {
           const current = buffersRef.current[item.pty_id] || { text: '', cursor: 0 };
@@ -161,7 +171,10 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
               terminalEntry.term.write(resp.chunk, () => terminalEntry.term.scrollToBottom());
             }
           }
-          updates[item.pty_id] = {
+          if (resp.chunk || resp.reset || resp.status === 'running') {
+            onActivity?.();
+          }
+          const nextBuffer = {
             ...current,
             text,
             cursor: resp.cursor,
@@ -170,12 +183,16 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
             pty: resp.pty,
             command
           };
+          if (resp.chunk || resp.reset || resp.cursor !== current.cursor) {
+            hadNewData = true;
+          }
+          buffersRef.current[item.pty_id] = nextBuffer;
         } catch {
           // ignore read errors
         }
       }
-      if (Object.keys(updates).length > 0) {
-        setBuffers((prev) => ({ ...prev, ...updates }));
+      if (hadNewData) {
+        // no state updates required; xterm renders directly
       }
     };
     tick();
@@ -236,6 +253,51 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
     });
   }, [items]);
 
+  const getTerminalRef = (ptyId: string) => {
+    if (!terminalRefCallbacks.current[ptyId]) {
+      terminalRefCallbacks.current[ptyId] = (node) => {
+        terminalContainersRef.current[ptyId] = node;
+        if (!node) {
+          const existing = terminalsRef.current[ptyId];
+          if (existing) {
+            existing.term.dispose();
+            delete terminalsRef.current[ptyId];
+          }
+          delete terminalRefCallbacks.current[ptyId];
+          return;
+        }
+        if (terminalsRef.current[ptyId]) {
+          return;
+        }
+        const term = new Terminal({
+          convertEol: true,
+          disableStdin: true,
+          scrollback: 2000,
+          fontFamily:
+            "'SFMono-Regular', 'Menlo', 'Consolas', 'Liberation Mono', 'Courier New', monospace",
+          fontSize: 12,
+          lineHeight: 1.4,
+          theme: {
+            background: '#0b0f14',
+            foreground: '#e2e8f0',
+            cursor: '#e2e8f0',
+            selection: 'rgba(148, 163, 184, 0.35)'
+          }
+        });
+        const fit = new FitAddon();
+        term.loadAddon(fit);
+        term.open(node);
+        fit.fit();
+        const existingText = buffersRef.current[ptyId]?.text;
+        if (existingText) {
+          term.write(existingText, () => term.scrollToBottom());
+        }
+        terminalsRef.current[ptyId] = { term, fit };
+      };
+    }
+    return terminalRefCallbacks.current[ptyId];
+  };
+
   return (
     <div className="pty-panel" ref={panelRef} style={{ width: panelWidth }}>
       <div className="pty-resize-handle" onMouseDown={handleResizeStart} />
@@ -277,9 +339,8 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
           <div className="pty-empty">暂无存活的 PTY。</div>
         )}
         {orderedItems.map((item) => {
-          const buffer = buffers[item.pty_id];
-          const status = buffer?.status || item.status;
-          const exitCode = buffer?.exit_code ?? item.exit_code;
+          const status = item.status;
+          const exitCode = item.exit_code;
           const isRunning = status === 'running';
           const isInteractive = isRunning;
           return (
@@ -303,44 +364,7 @@ function PtyPanel({ sessionId, onClose }: PtyPanelProps) {
               <div className="pty-output">
                 <div
                   className="pty-terminal"
-                  ref={(node) => {
-                    terminalContainersRef.current[item.pty_id] = node;
-                    if (!node) {
-                      const existing = terminalsRef.current[item.pty_id];
-                      if (existing) {
-                        existing.term.dispose();
-                        delete terminalsRef.current[item.pty_id];
-                      }
-                      return;
-                    }
-                    if (terminalsRef.current[item.pty_id]) {
-                      return;
-                    }
-                    const term = new Terminal({
-                      convertEol: true,
-                      disableStdin: true,
-                      scrollback: 2000,
-                      fontFamily:
-                        "'SFMono-Regular', 'Menlo', 'Consolas', 'Liberation Mono', 'Courier New', monospace",
-                      fontSize: 12,
-                      lineHeight: 1.4,
-                      theme: {
-                        background: '#0b0f14',
-                        foreground: '#e2e8f0',
-                        cursor: '#e2e8f0',
-                        selection: 'rgba(148, 163, 184, 0.35)'
-                      }
-                    });
-                    const fit = new FitAddon();
-                    term.loadAddon(fit);
-                    term.open(node);
-                    fit.fit();
-                    const existingText = buffersRef.current[item.pty_id]?.text;
-                    if (existingText) {
-                      term.write(existingText, () => term.scrollToBottom());
-                    }
-                    terminalsRef.current[item.pty_id] = { term, fit };
-                  }}
+                  ref={getTerminalRef(item.pty_id)}
                 />
               </div>
               {isInteractive && (
