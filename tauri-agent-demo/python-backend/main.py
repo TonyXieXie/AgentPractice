@@ -38,6 +38,7 @@ from agents.base import AgentStep
 from tools.builtin import register_builtin_tools
 from tools.base import ToolRegistry
 from tools.config import get_tool_config, update_tool_config, get_tool_config_path
+from stream_registry import get_stream_registry
 from tools.context import set_tool_context, reset_tool_context
 from tools.builtin.system_tools import ApplyPatchTool, CodeAstTool
 from tools.pty_manager import get_pty_manager
@@ -50,6 +51,7 @@ from ast_settings import get_ast_settings, update_ast_settings, get_all_ast_sett
 from context_compress import build_history_for_llm, maybe_compress_context
 
 app = FastAPI(title="Tauri Agent Chat Backend")
+STREAM_REGISTRY = get_stream_registry()
 
 app.add_middleware(
     CORSMiddleware,
@@ -1146,10 +1148,11 @@ def export_chat_history(request: ExportRequest):
 
 # ==================== Agent Chat (Streaming) ====================
 
-@app.post("/chat/agent/stream")
-async def chat_agent_stream(request: ChatRequest):
+async def _run_agent_stream(request: ChatRequest, state) -> None:
+    new_session_created = False
+    assistant_msg_id = None
     try:
-        new_session_created = False
+        await state.emit({"stream_id": state.stream_id})
         if request.session_id:
             session = db.get_session(request.session_id)
             if not session:
@@ -1253,230 +1256,249 @@ async def chat_agent_stream(request: ChatRequest):
             for i in range(0, len(text), chunk_size):
                 yield text[i:i + chunk_size]
 
-        async def event_generator():
-            nonlocal context_summary, last_compressed_call_id, last_compressed_message_id
-            sequence = 0
-            final_answer = None
-            assistant_msg_id = None
-            saw_delta = False
+        sequence = 0
+        final_answer = None
+        saw_delta = False
 
-            try:
-                temp_assistant_msg = db.create_message(ChatMessageCreate(
-                    session_id=session.id,
-                    role="assistant",
-                    content=""
-                ))
-                assistant_msg_id = temp_assistant_msg.id
-                stop_event = stream_stop_registry.create(assistant_msg_id)
-                yield f"data: {json.dumps({'session_id': session.id, 'user_message_id': user_msg.id, 'assistant_message_id': assistant_msg_id, 'user_attachments': saved_attachments})}\n\n"
-                request_overrides = {
-                    "_debug": {
-                        "session_id": session.id,
-                        "message_id": assistant_msg_id
-                    },
-                    "work_path": request.work_path or getattr(session, 'work_path', None)
-                }
-                request_overrides["prompt_truncation"] = {
-                    "enabled": bool(context_config.get("truncate_long_data", True)),
-                    "threshold": int(context_config.get("long_data_threshold", 4000) or 4000),
-                    "head_chars": int(context_config.get("long_data_head_chars", 1200) or 1200),
-                    "tail_chars": int(context_config.get("long_data_tail_chars", 800) or 800)
-                }
-                if request.extra_work_paths:
-                    request_overrides["extra_work_paths"] = [str(p) for p in request.extra_work_paths if p]
-                request_overrides["_stop_event"] = stop_event
-                if llm_image_urls:
-                    request_overrides["user_content"] = user_content
-                if request.agent_mode is not None:
-                    request_overrides["agent_mode"] = request.agent_mode
-                if request.shell_unrestricted is not None:
-                    request_overrides["shell_unrestricted"] = request.shell_unrestricted
-                request_overrides["_context_state"] = {
+        temp_assistant_msg = db.create_message(ChatMessageCreate(
+            session_id=session.id,
+            role="assistant",
+            content=""
+        ))
+        assistant_msg_id = temp_assistant_msg.id
+        stop_event = stream_stop_registry.create(assistant_msg_id)
+        init_payload = {
+            "session_id": session.id,
+            "user_message_id": user_msg.id,
+            "assistant_message_id": assistant_msg_id,
+            "user_attachments": saved_attachments
+        }
+        await state.set_init_payload(init_payload)
+        await state.emit(init_payload)
+        request_overrides = {
+            "_debug": {
+                "session_id": session.id,
+                "message_id": assistant_msg_id
+            },
+            "work_path": request.work_path or getattr(session, 'work_path', None)
+        }
+        request_overrides["prompt_truncation"] = {
+            "enabled": bool(context_config.get("truncate_long_data", True)),
+            "threshold": int(context_config.get("long_data_threshold", 4000) or 4000),
+            "head_chars": int(context_config.get("long_data_head_chars", 1200) or 1200),
+            "tail_chars": int(context_config.get("long_data_tail_chars", 800) or 800)
+        }
+        if request.extra_work_paths:
+            request_overrides["extra_work_paths"] = [str(p) for p in request.extra_work_paths if p]
+        request_overrides["_stop_event"] = stop_event
+        if llm_image_urls:
+            request_overrides["user_content"] = user_content
+        if request.agent_mode is not None:
+            request_overrides["agent_mode"] = request.agent_mode
+        if request.shell_unrestricted is not None:
+            request_overrides["shell_unrestricted"] = request.shell_unrestricted
+        request_overrides["_context_state"] = {
+            "summary": context_summary,
+            "last_call_id": last_compressed_call_id,
+            "last_message_id": last_compressed_message_id,
+            "current_user_message_id": user_msg.id
+        }
+        if code_map_prompt:
+            request_overrides["_code_map_prompt"] = code_map_prompt
+
+        if agent_type != "react":
+            updated_summary, updated_call_id, updated_message_id, did_compress = await maybe_compress_context(
+                session_id=session.id,
+                config=config,
+                app_config=app_config,
+                llm_client=llm_client,
+                current_summary=context_summary,
+                last_compressed_call_id=last_compressed_call_id,
+                current_user_message_id=user_msg.id,
+                current_user_text=processed_message
+            )
+            if did_compress:
+                context_summary = updated_summary
+                last_compressed_call_id = updated_call_id
+                last_compressed_message_id = updated_message_id
+                request_overrides["_context_state"].update({
                     "summary": context_summary,
                     "last_call_id": last_compressed_call_id,
-                    "last_message_id": last_compressed_message_id,
-                    "current_user_message_id": user_msg.id
-                }
-                if code_map_prompt:
-                    request_overrides["_code_map_prompt"] = code_map_prompt
-
-                if agent_type != "react":
-                    updated_summary, updated_call_id, updated_message_id, did_compress = await maybe_compress_context(
-                        session_id=session.id,
-                        config=config,
-                        app_config=app_config,
-                        llm_client=llm_client,
-                        current_summary=context_summary,
-                        last_compressed_call_id=last_compressed_call_id,
-                        current_user_message_id=user_msg.id,
-                        current_user_text=processed_message
-                    )
-                    if did_compress:
-                        context_summary = updated_summary
-                        last_compressed_call_id = updated_call_id
-                        last_compressed_message_id = updated_message_id
-                        request_overrides["_context_state"].update({
-                            "summary": context_summary,
-                            "last_call_id": last_compressed_call_id,
-                            "last_message_id": last_compressed_message_id
-                        })
-                        try:
-                            db.update_session_context(session.id, context_summary, last_compressed_call_id)
-                        except Exception as exc:
-                            print(f"[Context Compress] Failed to update session context: {exc}")
-
-                        compress_step = AgentStep(
-                            step_type="observation",
-                            content="正在进行上下文压缩...",
-                            metadata={"context_compress": True}
-                        )
-                        db.save_agent_step(
-                            message_id=assistant_msg_id,
-                            step_type=compress_step.step_type,
-                            content=compress_step.content,
-                            sequence=sequence,
-                            metadata=compress_step.metadata
-                        )
-                        yield f"data: {json.dumps(compress_step.to_dict())}\n\n"
-                        sequence += 1
-
-                history_for_llm = build_history_for_llm(
-                    session.id,
-                    last_compressed_message_id,
-                    user_msg.id,
-                    context_summary,
-                    code_map_prompt,
-                    request_overrides.get("prompt_truncation")
-                )
-
-                keepalive_sec = 15
+                    "last_message_id": last_compressed_message_id
+                })
                 try:
-                    keepalive_sec = int(os.getenv("AGENT_STREAM_KEEPALIVE_SEC", "15") or "15")
-                except (TypeError, ValueError):
-                    keepalive_sec = 15
-                if keepalive_sec < 5:
-                    keepalive_sec = 5
+                    db.update_session_context(session.id, context_summary, last_compressed_call_id)
+                except Exception as exc:
+                    print(f"[Context Compress] Failed to update session context: {exc}")
 
-                step_iter = executor.run(
-                    user_input=processed_message,
-                    history=history_for_llm,
-                    session_id=session.id,
-                    request_overrides=request_overrides if request_overrides else None
+                compress_step = AgentStep(
+                    step_type="observation",
+                    content="正在进行上下文压缩...",
+                    metadata={"context_compress": True}
                 )
-                step_queue: asyncio.Queue = asyncio.Queue()
-
-                async def _produce_steps():
-                    try:
-                        async for step in step_iter:
-                            await step_queue.put(step)
-                    finally:
-                        await step_queue.put(None)
-
-                producer_task = asyncio.create_task(_produce_steps())
-                try:
-                    while True:
-                        try:
-                            step = await asyncio.wait_for(step_queue.get(), timeout=keepalive_sec)
-                        except asyncio.TimeoutError:
-                            # SSE keepalive comment to prevent client load timeouts.
-                            yield ":\n\n"
-                            continue
-                        if step is None:
-                            break
-
-                        if step.step_type == "context_estimate":
-                            try:
-                                db.update_session_context_estimate(session.id, step.metadata)
-                            except Exception as exc:
-                                print(f"[Context Estimate] Failed to update session: {exc}")
-                            yield f"data: {json.dumps(step.to_dict())}\n\n"
-                            continue
-
-                        if step.step_type.endswith("_delta"):
-                            saw_delta = True
-                            yield f"data: {json.dumps(step.to_dict())}\n\n"
-                            continue
-                        suppress_prompt = False
-                        if step.step_type == "error":
-                            suppress_prompt = bool(step.metadata.get("suppress_prompt")) if isinstance(step.metadata, dict) else False
-
-                        if suppress_prompt:
-                            yield f"data: {json.dumps(step.to_dict())}\n\n"
-                            continue
-
-                        db.save_agent_step(
-                            message_id=assistant_msg_id,
-                            step_type=step.step_type,
-                            content=step.content,
-                            sequence=sequence,
-                            metadata=step.metadata
-                        )
-
-                        if step.step_type == "action" and "tool" in step.metadata:
-                            db.save_tool_call(
-                                message_id=assistant_msg_id,
-                                tool_name=step.metadata["tool"],
-                                tool_input=step.metadata.get("input", ""),
-                                tool_output=""
-                            )
-
-                        if step.step_type == "answer":
-                            final_answer = step.content
-                            if not saw_delta:
-                                for chunk in stream_text_chunks(step.content, chunk_size=1):
-                                    yield f"data: {json.dumps({'step_type': 'answer_delta', 'content': chunk, 'metadata': step.metadata})}\n\n"
-                            yield f"data: {json.dumps(step.to_dict())}\n\n"
-                            sequence += 1
-                            continue
-
-                        if step.step_type == "error":
-                            final_answer = step.content
-
-                        yield f"data: {json.dumps(step.to_dict())}\n\n"
-                        sequence += 1
-                finally:
-                    if producer_task and not producer_task.done():
-                        producer_task.cancel()
-                        try:
-                            await producer_task
-                        except Exception:
-                            pass
-
-                if final_answer and assistant_msg_id:
-                    conn = db.get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        UPDATE chat_messages
-                        SET content = ?
-                        WHERE id = ?
-                    ''', (final_answer, assistant_msg_id))
-                    conn.commit()
-                    conn.close()
-
-                    await _maybe_update_session_title(
-                        session_id=session.id,
-                        config=config,
-                        user_message=processed_message,
-                        assistant_message=final_answer,
-                        is_first_turn=is_first_turn,
-                        assistant_message_id=assistant_msg_id
-                    )
-
-                yield f"data: {json.dumps({'done': True, 'session_id': session.id})}\n\n"
-
-            except Exception as e:
-                error_step = AgentStep(
-                    step_type="error",
-                    content=f"Agent failed: {str(e)}",
-                    metadata={"error": str(e), "traceback": traceback.format_exc()}
+                db.save_agent_step(
+                    message_id=assistant_msg_id,
+                    step_type=compress_step.step_type,
+                    content=compress_step.content,
+                    sequence=sequence,
+                    metadata=compress_step.metadata
                 )
-                yield f"data: {json.dumps(error_step.to_dict())}\n\n"
+                await state.emit(compress_step.to_dict())
+                sequence += 1
+
+        history_for_llm = build_history_for_llm(
+            session.id,
+            last_compressed_message_id,
+            user_msg.id,
+            context_summary,
+            code_map_prompt,
+            request_overrides.get("prompt_truncation")
+        )
+
+        step_iter = executor.run(
+            user_input=processed_message,
+            history=history_for_llm,
+            session_id=session.id,
+            request_overrides=request_overrides if request_overrides else None
+        )
+        step_queue: asyncio.Queue = asyncio.Queue()
+
+        async def _produce_steps():
+            try:
+                async for step in step_iter:
+                    await step_queue.put(step)
             finally:
-                if assistant_msg_id:
-                    stream_stop_registry.clear(assistant_msg_id)
+                await step_queue.put(None)
 
+        producer_task = asyncio.create_task(_produce_steps())
+        try:
+            while True:
+                step = await step_queue.get()
+                if step is None:
+                    break
+
+                if step.step_type == "context_estimate":
+                    try:
+                        db.update_session_context_estimate(session.id, step.metadata)
+                    except Exception as exc:
+                        print(f"[Context Estimate] Failed to update session: {exc}")
+                    await state.emit(step.to_dict())
+                    continue
+
+                if step.step_type.endswith("_delta"):
+                    saw_delta = True
+                    await state.emit(step.to_dict())
+                    continue
+                suppress_prompt = False
+                if step.step_type == "error":
+                    suppress_prompt = bool(step.metadata.get("suppress_prompt")) if isinstance(step.metadata, dict) else False
+
+                if suppress_prompt:
+                    await state.emit(step.to_dict())
+                    continue
+
+                db.save_agent_step(
+                    message_id=assistant_msg_id,
+                    step_type=step.step_type,
+                    content=step.content,
+                    sequence=sequence,
+                    metadata=step.metadata
+                )
+
+                if step.step_type == "action" and "tool" in step.metadata:
+                    db.save_tool_call(
+                        message_id=assistant_msg_id,
+                        tool_name=step.metadata["tool"],
+                        tool_input=step.metadata.get("input", ""),
+                        tool_output=""
+                    )
+
+                if step.step_type == "answer":
+                    final_answer = step.content
+                    if not saw_delta:
+                        for chunk in stream_text_chunks(step.content, chunk_size=1):
+                            await state.emit({"step_type": "answer_delta", "content": chunk, "metadata": step.metadata})
+                    await state.emit(step.to_dict())
+                    sequence += 1
+                    continue
+
+                if step.step_type == "error":
+                    final_answer = step.content
+
+                await state.emit(step.to_dict())
+                sequence += 1
+        finally:
+            if producer_task and not producer_task.done():
+                producer_task.cancel()
+                try:
+                    await producer_task
+                except Exception:
+                    pass
+
+        if final_answer and assistant_msg_id:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE chat_messages
+                SET content = ?
+                WHERE id = ?
+            ''', (final_answer, assistant_msg_id))
+            conn.commit()
+            conn.close()
+
+            await _maybe_update_session_title(
+                session_id=session.id,
+                config=config,
+                user_message=processed_message,
+                assistant_message=final_answer,
+                is_first_turn=is_first_turn,
+                assistant_message_id=assistant_msg_id
+            )
+
+        await state.emit({"done": True, "session_id": session.id})
+
+    except Exception as e:
+        error_step = AgentStep(
+            step_type="error",
+            content=f"Agent failed: {str(e)}",
+            metadata={"error": str(e), "traceback": traceback.format_exc()}
+        )
+        try:
+            await state.emit(error_step.to_dict())
+        except Exception:
+            pass
+    finally:
+        if assistant_msg_id:
+            stream_stop_registry.clear(assistant_msg_id)
+        try:
+            await state.mark_done()
+        except Exception:
+            pass
+
+@app.post("/chat/agent/stream")
+async def chat_agent_stream(request: ChatRequest):
+    try:
+        if request.resume and request.stream_id:
+            state = await STREAM_REGISTRY.get(request.stream_id)
+            if not state:
+                raise HTTPException(status_code=404, detail="Stream not found")
+            last_seq = request.last_seq or 0
+            return StreamingResponse(
+                state.stream(last_seq),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+
+        keepalive_sec = _resolve_stream_keepalive_sec()
+        state = await STREAM_REGISTRY.create(keepalive_sec)
+        asyncio.create_task(_run_agent_stream(request, state))
+        last_seq = request.last_seq or 0
         return StreamingResponse(
-            event_generator(),
+            state.stream(last_seq),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1627,6 +1649,17 @@ def _tail_bytes_hex(data: bytes, max_len: int = 16) -> str:
     if not data:
         return ""
     return data[-max_len:].hex()
+
+
+def _resolve_stream_keepalive_sec() -> int:
+    keepalive_sec = 15
+    try:
+        keepalive_sec = int(os.getenv("AGENT_STREAM_KEEPALIVE_SEC", "15") or "15")
+    except (TypeError, ValueError):
+        keepalive_sec = 15
+    if keepalive_sec < 5:
+        keepalive_sec = 5
+    return keepalive_sec
 
 
 def _normalize_windows_pty_input(text: str) -> str:

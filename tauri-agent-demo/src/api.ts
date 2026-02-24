@@ -418,67 +418,136 @@ export async function* sendMessageAgentStream(
     void,
     unknown
 > {
-    const response = await fetch(`${API_BASE_URL}/chat/agent/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
-        signal,
-    });
-
-    if (!response.ok) {
-        let detail = `${response.status} ${response.statusText}`.trim();
-        try {
-            const body = await response.text();
-            if (body) {
-                const compact = body.length > 800 ? `${body.slice(0, 800)}...(truncated)` : body;
-                detail = `${detail} | ${compact}`;
-            }
-        } catch {
-            // ignore body read errors
-        }
-        throw new Error(`Agent stream HTTP error: ${detail}`);
-    }
-
-    const reader = response.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+    const maxReconnects = 6;
+    let attempt = 0;
+    let streamId: string | null = null;
+    let lastSeq: number | null = null;
 
     while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        const resume = Boolean(streamId && attempt > 0);
+        const payload: ChatRequest = {
+            ...request,
+            stream_id: resume ? streamId || undefined : undefined,
+            last_seq: resume ? (lastSeq ?? undefined) : undefined,
+            resume: resume ? true : undefined
+        };
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() || '';
+        let response: Response;
+        try {
+            response = await fetch(`${API_BASE_URL}/chat/agent/stream`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                signal,
+            });
+        } catch (error) {
+            if (signal?.aborted) throw error;
+            if (!streamId || attempt >= maxReconnects) throw error;
+            attempt += 1;
+            const backoff = Math.min(30_000, 1000 * 2 ** (attempt - 1));
+            await sleep(backoff);
+            continue;
+        }
 
-        for (const line of lines) {
-            if (!line) continue;
-            if (line.startsWith(':')) {
-                yield { keepalive: true };
+        if (!response.ok) {
+            let detail = `${response.status} ${response.statusText}`.trim();
+            let detailText = '';
+            try {
+                const body = await response.text();
+                if (body) {
+                    detailText = body;
+                    try {
+                        const parsed = JSON.parse(body);
+                        if (parsed?.detail) {
+                            detailText = String(parsed.detail);
+                        }
+                    } catch {
+                        // keep raw body
+                    }
+                    const compact = detailText.length > 800 ? `${detailText.slice(0, 800)}...(truncated)` : detailText;
+                    detail = `${detail} | ${compact}`;
+                }
+            } catch {
+                // ignore body read errors
+            }
+            if (resume && response.status === 404 && detailText.includes('Stream not found')) {
+                streamId = null;
+                lastSeq = null;
+                attempt = 0;
                 continue;
             }
-            if (line.startsWith('data: ')) {
-                const data = line.slice(6);
-                try {
-                    const parsed = JSON.parse(data);
+            throw new Error(`Agent stream HTTP error: ${detail}`);
+        }
 
-                    if (parsed.session_id) {
-                        yield parsed;
-                    } else if (parsed.done) {
-                        yield parsed;
-                        return;
-                    } else if (parsed.step_type) {
-                        yield parsed as AgentStep;
-                    } else if (parsed.error) {
-                        throw new Error(parsed.error);
+        const reader = response.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let sawDone = false;
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split(/\r?\n/);
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (!line) continue;
+                    if (line.startsWith(':')) {
+                        yield { keepalive: true };
+                        continue;
                     }
-                } catch (e) {
-                    if (e instanceof Error && e.message !== 'Unexpected end of JSON input') {
-                        throw e;
+                    if (line.startsWith('data: ')) {
+                        const data = line.slice(6);
+                        try {
+                            const parsed = JSON.parse(data);
+
+                            if (typeof parsed.stream_id === 'string') {
+                                streamId = parsed.stream_id;
+                            }
+                            if (typeof parsed.seq === 'number') {
+                                lastSeq = parsed.seq;
+                            }
+
+                            if (parsed.session_id) {
+                                yield parsed;
+                            } else if (parsed.done) {
+                                sawDone = true;
+                                yield parsed;
+                                return;
+                            } else if (parsed.step_type) {
+                                yield parsed as AgentStep;
+                            } else if (parsed.error) {
+                                throw new Error(parsed.error);
+                            }
+                        } catch (e) {
+                            if (e instanceof Error && e.message !== 'Unexpected end of JSON input') {
+                                throw e;
+                            }
+                        }
                     }
                 }
             }
+        } catch (error) {
+            if (signal?.aborted) throw error;
+            if (!streamId || attempt >= maxReconnects) throw error;
+            attempt += 1;
+            const backoff = Math.min(30_000, 1000 * 2 ** (attempt - 1));
+            await sleep(backoff);
+            continue;
         }
+
+        if (sawDone) return;
+        if (signal?.aborted) return;
+        if (!streamId || attempt >= maxReconnects) {
+            throw new Error('Stream disconnected before completion.');
+        }
+        attempt += 1;
+        const backoff = Math.min(30_000, 1000 * 2 ** (attempt - 1));
+        await sleep(backoff);
     }
 }
 

@@ -8,6 +8,7 @@ Implements a ReAct-style loop with tool calling.
 
 import asyncio
 import json
+import os
 import re
 import time
 import traceback
@@ -1708,6 +1709,8 @@ class ReActAgent(AgentStrategy):
             )
             return
 
+        command_text = str(command)
+
         start_args = dict(args)
         start_args["mode"] = "persistent"
         start_args.pop("action", None)
@@ -1715,6 +1718,7 @@ class ReActAgent(AgentStrategy):
         start_args.pop("cursor", None)
         if "idle_timeout" not in start_args:
             start_args["idle_timeout"] = 120000
+        start_args["command"] = command_text
 
         start_output = await self._execute_tool(tool, json.dumps(start_args))
         header_line, body = self._split_shell_output(start_output)
@@ -1733,7 +1737,6 @@ class ReActAgent(AgentStrategy):
         if body.strip() == "(no output)" and status != "exited":
             body = ""
 
-        command_text = str(command)
         command_prefix = f"$ {command_text}" if command_text else ""
         body_buffer = body
         if command_prefix:
@@ -1825,11 +1828,15 @@ class ReActAgent(AgentStrategy):
             if chunk.strip() == "(no output)":
                 chunk = ""
 
+            emit_chunk = chunk
+
             if chunk:
                 if "[idle_timeout]" in chunk:
                     idle_timed_out = True
+
+            if emit_chunk:
                 if reset:
-                    body_buffer = chunk
+                    body_buffer = emit_chunk
                     if command_prefix:
                         if body_buffer:
                             if not body_buffer.startswith(command_prefix):
@@ -1837,12 +1844,12 @@ class ReActAgent(AgentStrategy):
                         else:
                             body_buffer = command_prefix
                 else:
-                    if command_prefix and body_buffer.startswith(command_prefix) and not body_buffer.endswith("\n") and not chunk.startswith("\n"):
+                    if command_prefix and body_buffer.startswith(command_prefix) and not body_buffer.endswith("\n") and not emit_chunk.startswith("\n"):
                         body_buffer += "\n"
-                    body_buffer += chunk
+                    body_buffer += emit_chunk
                 yield AgentStep(
                     step_type="observation_delta",
-                    content=chunk,
+                    content=emit_chunk,
                     metadata={
                         "tool": tool_name,
                         "iteration": iteration,

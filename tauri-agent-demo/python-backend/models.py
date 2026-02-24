@@ -137,6 +137,9 @@ class ChatRequest(BaseModel):
     agent_mode: Optional[AgentMode] = None
     shell_unrestricted: Optional[bool] = None
     attachments: Optional[List[AttachmentInput]] = None
+    stream_id: Optional[str] = None
+    last_seq: Optional[int] = None
+    resume: Optional[bool] = None
 
 
 class ChatResponse(BaseModel):

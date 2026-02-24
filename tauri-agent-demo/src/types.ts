@@ -338,6 +338,9 @@ export interface ChatRequest {
     agent_mode?: AgentMode;
     shell_unrestricted?: boolean;
     attachments?: ChatAttachmentInput[];
+    stream_id?: string;
+    last_seq?: number;
+    resume?: boolean;
 }
 
 export interface MessageAttachment {

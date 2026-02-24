@@ -4,6 +4,11 @@ chcp 65001 >nul
 set PYTHONUTF8=1
 title Backend Server - FastAPI
 cd /d "%~dp0python-backend"
+set "DB_DIR=%LOCALAPPDATA%\TauriAgent"
+set "DB_PATH=%DB_DIR%\chat_app.db"
+if not exist "%DB_DIR%" mkdir "%DB_DIR%" >nul 2>&1
+if not exist "%DB_PATH%" if exist "%~dp0python-backend\chat_app.db" copy /y "%~dp0python-backend\chat_app.db" "%DB_PATH%" >nul
+set "TAURI_AGENT_DB_PATH=%DB_PATH%"
 cls
 echo ========================================
 echo   Backend Server (FastAPI)
