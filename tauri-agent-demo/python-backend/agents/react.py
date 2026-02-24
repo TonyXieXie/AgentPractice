@@ -43,6 +43,31 @@ def _get_prompt_truncation_config(request_overrides: Optional[Dict[str, Any]]) -
     }
 
 
+def _pty_stream_debug_enabled() -> bool:
+    raw = os.environ.get("PTY_STREAM_DEBUG")
+    if raw is not None:
+        value = str(raw).strip().lower()
+        if value in ("1", "true", "yes", "on"):
+            return True
+        if value in ("0", "false", "no", "off"):
+            return False
+    raw = os.environ.get("PTY_DEBUG")
+    if raw is not None:
+        value = str(raw).strip().lower()
+        if value in ("1", "true", "yes", "on"):
+            return True
+    dev_value = str(os.environ.get("TAURI_AGENT_DEV", "")).strip().lower()
+    if dev_value in ("1", "true", "yes", "on"):
+        return True
+    env_value = str(os.environ.get("TAURI_AGENT_ENV", "")).strip().lower()
+    return env_value in ("dev", "development")
+
+
+def _pty_stream_log(message: str) -> None:
+    if _pty_stream_debug_enabled():
+        print(f"[PTY STREAM] {message}")
+
+
 def _should_truncate(origin_call_seq: Optional[int], current_call_seq: int, cfg: Dict[str, Any]) -> bool:
     if not cfg.get("enabled"):
         return False
@@ -239,6 +264,7 @@ class ReActAgent(AgentStrategy):
         last_compressed_message_id = context_state.get("last_message_id")
         current_user_message_id = context_state.get("current_user_message_id")
         code_map_prompt = request_overrides.get("_code_map_prompt") if request_overrides else None
+        stop_event = request_overrides.get("_stop_event") if request_overrides else None
         current_turn_compresses = 0
 
         def build_base_messages() -> List[Dict[str, Any]]:
@@ -867,7 +893,8 @@ class ReActAgent(AgentStrategy):
                                     tool_name=tool_name,
                                     iteration=iteration,
                                     stream_key=stream_key,
-                                    output_holder=output_holder
+                                    output_holder=output_holder,
+                                    stop_event=stop_event
                                 ):
                                     yield obs_step
                                 tool_output = output_holder.get("output", "")
@@ -1144,7 +1171,8 @@ class ReActAgent(AgentStrategy):
                                 tool_name=tool_name,
                                 iteration=iteration,
                                 stream_key=stream_key,
-                                output_holder=output_holder
+                                output_holder=output_holder,
+                                stop_event=stop_event
                             ):
                                 yield obs_step
                             tool_output = output_holder.get("output", "")
@@ -1215,6 +1243,7 @@ class ReActAgent(AgentStrategy):
             user_content = request_overrides.get("user_content")
         trunc_cfg = _get_prompt_truncation_config(request_overrides)
         call_seq = 0
+        stop_event = request_overrides.get("_stop_event") if request_overrides else None
 
         context_state: Dict[str, Any] = {}
         if request_overrides and isinstance(request_overrides.get("_context_state"), dict):
@@ -1417,7 +1446,8 @@ class ReActAgent(AgentStrategy):
                                 tool_name=action,
                                 iteration=iteration,
                                 stream_key=stream_key,
-                                output_holder=output_holder
+                                output_holder=output_holder,
+                                stop_event=stop_event
                             ):
                                 yield obs_step
                             observation = output_holder.get("output", "")
@@ -1664,8 +1694,39 @@ class ReActAgent(AgentStrategy):
         tool_name: str,
         iteration: int,
         stream_key: str,
-        output_holder: Dict[str, str]
+        output_holder: Dict[str, str],
+        stop_event: Optional[asyncio.Event] = None
     ) -> AsyncGenerator[AgentStep, None]:
+        def _stop_requested() -> bool:
+            if stop_event is None:
+                return False
+            try:
+                return bool(getattr(stop_event, "is_set", lambda: False)())
+            except Exception:
+                return False
+
+        log_interval_sec = 5.0
+        try:
+            log_interval_sec = float(os.environ.get("PTY_STREAM_LOG_INTERVAL_SEC", "5") or "5")
+        except (TypeError, ValueError):
+            log_interval_sec = 5.0
+        if log_interval_sec <= 0:
+            log_interval_sec = 5.0
+        read_timeout_sec: Optional[float] = None
+        try:
+            raw_timeout = os.environ.get("PTY_STREAM_READ_TIMEOUT_SEC")
+            if raw_timeout is not None and str(raw_timeout).strip() != "":
+                read_timeout_sec = float(raw_timeout)
+        except (TypeError, ValueError):
+            read_timeout_sec = None
+        if read_timeout_sec is not None and read_timeout_sec <= 0:
+            read_timeout_sec = None
+        last_log_at = time.monotonic()
+
+        _pty_stream_log(
+            f"start stream_key={stream_key} tool={tool_name} iteration={iteration}"
+        )
+
         args, parse_error = self._safe_json_loads(tool_input)
         if parse_error or not isinstance(args, dict):
             tool_output = parse_error or "Tool arguments must be a JSON object."
@@ -1675,11 +1736,34 @@ class ReActAgent(AgentStrategy):
                 content=tool_output,
                 metadata={"tool": tool_name, "iteration": iteration}
             )
+            _pty_stream_log(
+                f"parse_error stream_key={stream_key} error={tool_output}"
+            )
+            return
+        if _stop_requested():
+            stopped_output = self._append_stop_note("")
+            output_holder["output"] = stopped_output
+            yield AgentStep(
+                step_type="observation",
+                content=stopped_output,
+                metadata={
+                    "tool": tool_name,
+                    "iteration": iteration,
+                    "stream_key": stream_key,
+                    "stopped_by_user": True
+                }
+            )
+            _pty_stream_log(
+                f"stopped_before_start stream_key={stream_key}"
+            )
             return
 
         action = str(args.get("action") or "").strip().lower()
         mode = str(args.get("mode") or "").strip().lower()
         pty_requested = args.get("pty")
+        _pty_stream_log(
+            f"args stream_key={stream_key} action={action or 'none'} mode={mode or 'none'} pty_requested={pty_requested}"
+        )
         if action or args.get("pty_id"):
             tool_output = await self._execute_tool(tool, tool_input)
             output_holder["output"] = tool_output
@@ -1687,6 +1771,9 @@ class ReActAgent(AgentStrategy):
                 step_type="observation",
                 content=tool_output,
                 metadata={"tool": tool_name, "iteration": iteration}
+            )
+            _pty_stream_log(
+                f"action_direct stream_key={stream_key} action={action or 'none'}"
             )
             return
 
@@ -1725,17 +1812,42 @@ class ReActAgent(AgentStrategy):
             start_args["idle_timeout"] = 120000
         start_args["command"] = command_text
 
+        if _stop_requested():
+            stopped_output = self._append_stop_note("")
+            output_holder["output"] = stopped_output
+            yield AgentStep(
+                step_type="observation",
+                content=stopped_output,
+                metadata={
+                    "tool": tool_name,
+                    "iteration": iteration,
+                    "stream_key": stream_key,
+                    "stopped_by_user": True,
+                    "command": str(command)
+                }
+            )
+            _pty_stream_log(
+                f"stopped_before_launch stream_key={stream_key} command={command_text}"
+            )
+            return
+
         start_output = await self._execute_tool(tool, json.dumps(start_args))
         header_line, body = self._split_shell_output(start_output)
         header_data = self._parse_shell_header(header_line)
         pty_id = header_data.get("pty_id")
         status = header_data.get("status")
+        _pty_stream_log(
+            f"started stream_key={stream_key} pty_id={pty_id} status={status} header={header_line}"
+        )
         if not header_line or not pty_id:
             output_holder["output"] = start_output
             yield AgentStep(
                 step_type="observation",
                 content=start_output,
                 metadata={"tool": tool_name, "iteration": iteration}
+            )
+            _pty_stream_log(
+                f"start_failed stream_key={stream_key} output={start_output[:120] if start_output else ''}"
             )
             return
 
@@ -1751,6 +1863,7 @@ class ReActAgent(AgentStrategy):
             else:
                 body_buffer = command_prefix
         initial_content = f"{header_line}\n{body_buffer}"
+        last_emit_at = time.monotonic()
         yield AgentStep(
             step_type="observation",
             content=initial_content,
@@ -1771,6 +1884,12 @@ class ReActAgent(AgentStrategy):
                 max_output = int(max_output)
         except (TypeError, ValueError):
             max_output = int(get_tool_config().get("shell", {}).get("max_output", 20000))
+        try:
+            keepalive_sec = float(get_tool_config().get("shell", {}).get("stream_keepalive_sec", 10))
+        except (TypeError, ValueError):
+            keepalive_sec = 10.0
+        if keepalive_sec <= 0:
+            keepalive_sec = 10.0
 
         timeout_sec = None
         try:
@@ -1798,8 +1917,31 @@ class ReActAgent(AgentStrategy):
         error_output: Optional[str] = None
         last_header_line = header_line
         idle_timed_out = False
+        total_reads = 0
+        total_bytes = 0
+        last_chunk_at = time.monotonic()
 
         while True:
+            if _stop_requested():
+                await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+                stopped_output = self._append_stop_note(body_buffer or "")
+                output_holder["output"] = stopped_output
+                yield AgentStep(
+                    step_type="observation",
+                    content=stopped_output,
+                    metadata={
+                        "tool": tool_name,
+                        "iteration": iteration,
+                        "stream_key": stream_key,
+                        "command": str(command),
+                        "stopped_by_user": True
+                    }
+                )
+                _pty_stream_log(
+                    f"stopped stream_key={stream_key} pty_id={pty_id} reads={total_reads} bytes={total_bytes}"
+                )
+                return
+
             if timeout_sec is not None and timeout_sec > 0:
                 if (time.monotonic() - start_time) >= timeout_sec:
                     timed_out = True
@@ -1811,10 +1953,77 @@ class ReActAgent(AgentStrategy):
             if max_output is not None:
                 read_args["max_output"] = max_output
 
-            read_output = await self._execute_tool(tool, json.dumps(read_args))
+            read_start = time.monotonic()
+            _pty_stream_log(
+                f"read_start stream_key={stream_key} pty_id={pty_id} cursor={cursor} max_output={read_args.get('max_output')}"
+            )
+            try:
+                if read_timeout_sec is not None:
+                    read_output = await asyncio.wait_for(
+                        self._execute_tool(tool, json.dumps(read_args)),
+                        timeout=read_timeout_sec
+                    )
+                else:
+                    read_output = await self._execute_tool(tool, json.dumps(read_args))
+            except asyncio.TimeoutError:
+                _pty_stream_log(
+                    f"read_timeout stream_key={stream_key} pty_id={pty_id} timeout_sec={read_timeout_sec}"
+                )
+                if _stop_requested():
+                    await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+                    stopped_output = self._append_stop_note(body_buffer or "")
+                    output_holder["output"] = stopped_output
+                    yield AgentStep(
+                        step_type="observation",
+                        content=stopped_output,
+                        metadata={
+                            "tool": tool_name,
+                            "iteration": iteration,
+                            "stream_key": stream_key,
+                            "command": str(command),
+                            "stopped_by_user": True
+                        }
+                    )
+                    _pty_stream_log(
+                        f"stopped_after_read_timeout stream_key={stream_key} pty_id={pty_id}"
+                    )
+                    return
+                # Continue loop if not stopped; allow keepalive/logging to continue.
+                continue
+            finally:
+                read_elapsed = time.monotonic() - read_start
+                if read_elapsed >= 1.0:
+                    _pty_stream_log(
+                        f"read_slow stream_key={stream_key} pty_id={pty_id} elapsed={read_elapsed:.2f}s"
+                    )
+            _pty_stream_log(
+                f"read_end stream_key={stream_key} pty_id={pty_id} bytes={len(read_output or '')}"
+            )
+            if _stop_requested():
+                await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+                stopped_output = self._append_stop_note(body_buffer or "")
+                output_holder["output"] = stopped_output
+                yield AgentStep(
+                    step_type="observation",
+                    content=stopped_output,
+                    metadata={
+                        "tool": tool_name,
+                        "iteration": iteration,
+                        "stream_key": stream_key,
+                        "command": str(command),
+                        "stopped_by_user": True
+                    }
+                )
+                _pty_stream_log(
+                    f"stopped_after_read stream_key={stream_key} pty_id={pty_id} reads={total_reads} bytes={total_bytes}"
+                )
+                return
             read_header, chunk = self._split_shell_output(read_output)
             if read_header and not read_header.startswith("["):
                 error_output = read_output
+                _pty_stream_log(
+                    f"read_error stream_key={stream_key} pty_id={pty_id} output={read_output[:120] if read_output else ''}"
+                )
                 break
             if read_header:
                 header_data = self._parse_shell_header(read_header)
@@ -1834,6 +2043,9 @@ class ReActAgent(AgentStrategy):
                 chunk = ""
 
             emit_chunk = chunk
+            total_reads += 1
+            if emit_chunk:
+                total_bytes += len(emit_chunk)
 
             if chunk:
                 if "[idle_timeout]" in chunk:
@@ -1863,6 +2075,35 @@ class ReActAgent(AgentStrategy):
                         "command": str(command)
                     }
                 )
+                last_emit_at = time.monotonic()
+                last_chunk_at = last_emit_at
+            else:
+                now = time.monotonic()
+                if status != "exited" and not _stop_requested() and now - last_emit_at >= keepalive_sec:
+                    yield AgentStep(
+                        step_type="observation_delta",
+                        content="",
+                        metadata={
+                            "tool": tool_name,
+                            "iteration": iteration,
+                            "stream_key": stream_key,
+                            "command": str(command),
+                            "keepalive": True
+                        }
+                    )
+                    last_emit_at = now
+                    _pty_stream_log(
+                        f"keepalive stream_key={stream_key} pty_id={pty_id}"
+                    )
+
+                if now - last_log_at >= log_interval_sec:
+                    since_chunk = now - last_chunk_at
+                    _pty_stream_log(
+                        f"loop stream_key={stream_key} pty_id={pty_id} status={status} "
+                        f"cursor={cursor} reads={total_reads} bytes={total_bytes} "
+                        f"since_last_chunk={since_chunk:.1f}s"
+                    )
+                    last_log_at = now
 
             if status == "exited":
                 if not chunk:
@@ -1891,6 +2132,9 @@ class ReActAgent(AgentStrategy):
                 content=final_output,
                 metadata={"tool": tool_name, "iteration": iteration, "stream_key": stream_key, "command": str(command)}
             )
+            _pty_stream_log(
+                f"timeout stream_key={stream_key} pty_id={pty_id} timeout_sec={timeout_sec}"
+            )
             return
 
         await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
@@ -1904,6 +2148,9 @@ class ReActAgent(AgentStrategy):
             step_type="observation",
             content=final_output,
             metadata={"tool": tool_name, "iteration": iteration, "stream_key": stream_key, "command": str(command)}
+        )
+        _pty_stream_log(
+            f"done stream_key={stream_key} pty_id={pty_id} status={status} reads={total_reads} bytes={total_bytes}"
         )
 
     async def _execute_tool_call(self, tools: List[Tool], tool_name: Optional[str], args_text: str) -> Tuple[str, str]:

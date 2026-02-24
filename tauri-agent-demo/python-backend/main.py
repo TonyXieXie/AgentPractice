@@ -1921,6 +1921,7 @@ def stop_chat(request: ChatStopRequest):
     if message_id is None:
         raise HTTPException(status_code=400, detail="Missing message_id or session_id")
     stopped = stream_stop_registry.stop(int(message_id))
+    print(f"[STREAM STOP] message_id={message_id} stopped={stopped}")
     return {"stopped": stopped, "message_id": message_id}
 
 @app.get("/tools/config")

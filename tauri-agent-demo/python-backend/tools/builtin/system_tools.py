@@ -1243,11 +1243,15 @@ def _start_posix_pty_persistent(
             return 0
 
     def _terminator() -> None:
+        if _pty_debug_enabled():
+            _pty_debug(f"posix pty terminator enter pid={proc.pid}")
         _terminate_posix_process(proc)
         try:
             os.close(master_fd)
         except Exception:
             pass
+        if _pty_debug_enabled():
+            _pty_debug(f"posix pty terminator exit pid={proc.pid}")
 
     pty_proc = PtyProcess(
         session_id=_get_session_id(),
@@ -1325,6 +1329,8 @@ def _start_posix_pipe_persistent(
             return 0
 
     def _terminator() -> None:
+        if _pty_debug_enabled():
+            _pty_debug(f"posix pipe terminator enter pid={proc.pid}")
         _terminate_posix_process(proc)
         try:
             if proc.stdout:
@@ -1336,6 +1342,8 @@ def _start_posix_pipe_persistent(
                 proc.stdin.close()
         except Exception:
             pass
+        if _pty_debug_enabled():
+            _pty_debug(f"posix pipe terminator exit pid={proc.pid}")
 
     pty_proc = PtyProcess(
         session_id=_get_session_id(),
@@ -2058,18 +2066,63 @@ def _start_windows_pty_persistent(
         return 0
 
     def _terminator() -> None:
-        kernel32.TerminateProcess(proc_info.hProcess, 1)
-        kernel32.CloseHandle(out_read)
-        kernel32.CloseHandle(in_write)
+        if _pty_debug_enabled():
+            _pty_debug(f"conpty terminator enter pid={proc_info.dwProcessId}")
+        def _log_call(name: str, ok: Optional[bool] = None) -> None:
+            if not _pty_debug_enabled():
+                return
+            if ok is None:
+                _pty_debug(f"conpty terminator {name}")
+                return
+            if ok:
+                _pty_debug(f"conpty terminator {name} ok")
+            else:
+                err = ctypes.get_last_error()
+                _pty_debug(f"conpty terminator {name} failed winerr={err}")
+
+        _log_call("TerminateProcess enter")
+        ok = bool(kernel32.TerminateProcess(proc_info.hProcess, 1))
+        _log_call("TerminateProcess exit", ok)
+
+        _log_call("CloseHandle out_read enter")
+        ok = bool(kernel32.CloseHandle(out_read))
+        _log_call("CloseHandle out_read exit", ok)
+
+        _log_call("CloseHandle in_write enter")
+        ok = bool(kernel32.CloseHandle(in_write))
+        _log_call("CloseHandle in_write exit", ok)
+
         if in_read_dbg:
-            kernel32.CloseHandle(in_read_dbg)
+            _log_call("CloseHandle in_read_dbg enter")
+            ok = bool(kernel32.CloseHandle(in_read_dbg))
+            _log_call("CloseHandle in_read_dbg exit", ok)
         if out_write_dbg:
-            kernel32.CloseHandle(out_write_dbg)
-        kernel32.ClosePseudoConsole(h_pc)
+            _log_call("CloseHandle out_write_dbg enter")
+            ok = bool(kernel32.CloseHandle(out_write_dbg))
+            _log_call("CloseHandle out_write_dbg exit", ok)
+        skip_close_pc = os.environ.get("PTY_SKIP_CLOSE_PSEUDOCONSOLE")
+        if skip_close_pc is not None and str(skip_close_pc).strip().lower() in ("1", "true", "yes", "on"):
+            if _pty_debug_enabled():
+                _pty_debug("conpty terminator ClosePseudoConsole skipped")
+        else:
+            _log_call("ClosePseudoConsole enter")
+            kernel32.ClosePseudoConsole(h_pc)
+            _log_call("ClosePseudoConsole exit")
+
         if job_handle:
-            kernel32.CloseHandle(job_handle)
-        kernel32.CloseHandle(proc_info.hThread)
-        kernel32.CloseHandle(proc_info.hProcess)
+            _log_call("CloseHandle job_handle enter")
+            ok = bool(kernel32.CloseHandle(job_handle))
+            _log_call("CloseHandle job_handle exit", ok)
+
+        _log_call("CloseHandle hThread enter")
+        ok = bool(kernel32.CloseHandle(proc_info.hThread))
+        _log_call("CloseHandle hThread exit", ok)
+
+        _log_call("CloseHandle hProcess enter")
+        ok = bool(kernel32.CloseHandle(proc_info.hProcess))
+        _log_call("CloseHandle hProcess exit", ok)
+        if _pty_debug_enabled():
+            _pty_debug(f"conpty terminator exit pid={proc_info.dwProcessId}")
 
     pty_proc = PtyProcess(
         session_id=_get_session_id(),
@@ -2093,7 +2146,11 @@ def _start_windows_pty_persistent(
         WAIT_TIMEOUT = 0x00000102
         if _pty_debug_enabled():
             _pty_debug(f"conpty reader start pid={proc_info.dwProcessId}")
-        use_blocking_read = _pty_debug_enabled()
+        raw_blocking = os.environ.get("PTY_CONPTY_BLOCKING_READ")
+        use_blocking_read = False
+        if raw_blocking is not None:
+            if str(raw_blocking).strip().lower() in ("1", "true", "yes", "on"):
+                use_blocking_read = True
         if _pty_debug_enabled():
             _pty_debug(f"conpty read mode={'blocking' if use_blocking_read else 'peek'}")
             if use_blocking_read:
@@ -3060,7 +3117,25 @@ class RunShellTool(Tool):
                         cursor = int(cursor)
                     except (TypeError, ValueError):
                         cursor = None
-                chunk, new_cursor, reset = proc.read(cursor, max_output)
+                if _pty_debug_enabled():
+                    _pty_debug(
+                        "run_shell read enter "
+                        f"pty_id={proc.id} cursor={cursor} max_output={max_output} status={proc.status}"
+                    )
+                read_start = time.monotonic()
+                try:
+                    chunk, new_cursor, reset = await asyncio.to_thread(proc.read, cursor, max_output)
+                except Exception as exc:
+                    if _pty_debug_enabled():
+                        _pty_debug(f"run_shell read error pty_id={proc.id} error={exc}")
+                    return f"[pty_id={proc.id} status=error] PTY read failed: {exc}"
+                if _pty_debug_enabled():
+                    elapsed = time.monotonic() - read_start
+                    _pty_debug(
+                        "run_shell read exit "
+                        f"pty_id={proc.id} elapsed={elapsed:.3f}s chunk_len={len(chunk or '')} "
+                        f"new_cursor={new_cursor} reset={str(reset).lower()} status={proc.status}"
+                    )
                 header = (
                     f"[pty_id={proc.id} status={proc.status} pty={str(proc.pty_enabled).lower()} "
                     f"cursor={new_cursor} reset={str(reset).lower()} idle_timeout={proc.idle_timeout_ms} "
@@ -3070,8 +3145,38 @@ class RunShellTool(Tool):
                     header = f"{header} exit_code={proc.exit_code}"
                 return f"{header}\n{chunk or ''}"
             if action == "close":
-                manager.close(session_id, str(pty_id))
-                return f"[pty_id={pty_id} status=closed]"
+                if _pty_debug_enabled():
+                    _pty_debug(f"run_shell close enter pty_id={pty_id}")
+                    close_start = time.monotonic()
+                close_timeout_sec = 0.5
+                try:
+                    raw_timeout = os.environ.get("PTY_CLOSE_TIMEOUT_SEC")
+                    if raw_timeout is not None and str(raw_timeout).strip() != "":
+                        close_timeout_sec = float(raw_timeout)
+                except (TypeError, ValueError):
+                    close_timeout_sec = 0.5
+                if close_timeout_sec is not None and close_timeout_sec <= 0:
+                    close_timeout_sec = None
+                close_task = asyncio.create_task(asyncio.to_thread(manager.close, session_id, str(pty_id)))
+                closed = False
+                if close_timeout_sec is None:
+                    closed = await close_task
+                else:
+                    try:
+                        closed = await asyncio.wait_for(asyncio.shield(close_task), timeout=close_timeout_sec)
+                    except asyncio.TimeoutError:
+                        closed = False
+                        if _pty_debug_enabled():
+                            _pty_debug(
+                                f"run_shell close timeout pty_id={pty_id} timeout_sec={close_timeout_sec}"
+                            )
+                if _pty_debug_enabled():
+                    elapsed = time.monotonic() - close_start
+                    _pty_debug(
+                        f"run_shell close exit pty_id={pty_id} elapsed={elapsed:.3f}s closed={closed}"
+                    )
+                status = "closed" if closed else "closing"
+                return f"[pty_id={pty_id} status={status}]"
             return f"Unknown action: {action}"
 
         command = data.get("command")

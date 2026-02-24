@@ -99,7 +99,10 @@ class PtyProcess:
     def read(self, cursor: Optional[int], max_output: int) -> Tuple[str, int, bool]:
         if max_output <= 0:
             return "", self._cursor, False
-        with self._buffer_lock:
+        acquired = self._buffer_lock.acquire(timeout=0.1)
+        if not acquired:
+            return "", self._cursor, False
+        try:
             buffer_start = self._total_bytes - len(self._buffer)
             effective_cursor = self._cursor if cursor is None else int(cursor)
             reset = False
@@ -111,6 +114,8 @@ class PtyProcess:
             chunk = bytes(self._buffer[start_idx:end_idx])
             new_cursor = effective_cursor + len(chunk)
             self._cursor = max(self._cursor, new_cursor)
+        finally:
+            self._buffer_lock.release()
         return _decode_output_bytes(chunk), self._cursor, reset
 
     def write(self, data: bytes) -> int:
@@ -129,6 +134,42 @@ class PtyProcess:
             return
         self.status = "closed"
         self.stop_event.set()
+        # Run termination in a background thread to avoid blocking the
+        # asyncio event loop.  The _safe_terminate helper first waits for
+        # the reader thread to exit (so no thread is still touching the
+        # pipe handles), then invokes the platform terminator with a
+        # timeout guard against ClosePseudoConsole hangs.
+        threading.Thread(
+            target=self._safe_terminate,
+            name=f"pty-close-{self.id}",
+            daemon=True
+        ).start()
+
+    def _safe_terminate(self) -> None:
+        # Step 1: Wait for the reader thread to notice stop_event and exit
+        # cleanly.  This ensures no thread is still calling ReadFile /
+        # PeekNamedPipe on the output pipe when we close handles.
+        if self.reader_thread is not None and self.reader_thread.is_alive():
+            self.reader_thread.join(timeout=5.0)
+
+        # Step 2: Run the actual terminator (TerminateProcess, CloseHandle,
+        # ClosePseudoConsole, etc.) inside yet another thread with a timeout
+        # so that even if ClosePseudoConsole blocks indefinitely we do not
+        # leak a permanently-stuck thread.
+        term_thread = threading.Thread(
+            target=self._run_terminator,
+            name=f"pty-term-{self.id}",
+            daemon=True
+        )
+        term_thread.start()
+        term_thread.join(timeout=10.0)
+        if term_thread.is_alive():
+            print(
+                f"[PTY WARN] terminator timed out for pty_id={self.id}, "
+                f"handle may be leaked"
+            )
+
+    def _run_terminator(self) -> None:
         try:
             self._terminator()
         except Exception:

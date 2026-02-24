@@ -9,6 +9,10 @@ set "DB_PATH=%DB_DIR%\chat_app.db"
 if not exist "%DB_DIR%" mkdir "%DB_DIR%" >nul 2>&1
 if not exist "%DB_PATH%" if exist "%~dp0python-backend\chat_app.db" copy /y "%~dp0python-backend\chat_app.db" "%DB_PATH%" >nul
 set "TAURI_AGENT_DB_PATH=%DB_PATH%"
+set "PTY_DEBUG=1"
+set "PTY_STREAM_DEBUG=1"
+set "PTY_STREAM_LOG_INTERVAL_SEC=5"
+set "PTY_STREAM_READ_TIMEOUT_SEC=5"
 cls
 echo ========================================
 echo   Backend Server (FastAPI)
