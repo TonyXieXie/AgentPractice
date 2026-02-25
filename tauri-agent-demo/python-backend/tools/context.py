@@ -10,7 +10,11 @@ def set_tool_context(value: Dict[str, Any]):
 
 
 def reset_tool_context(token) -> None:
-    _tool_context.reset(token)
+    try:
+        _tool_context.reset(token)
+    except ValueError:
+        # Token created in a different Context; avoid crashing background tasks.
+        _tool_context.set({})
 
 
 def get_tool_context() -> Dict[str, Any]:

@@ -1,5 +1,4 @@
 import asyncio
-import contextvars
 import json
 from typing import Any, Dict, Optional
 
@@ -9,7 +8,6 @@ from subagent_runner import prepare_subagent_session, execute_subagent_context
 
 
 _PENDING_TASKS = set()
-_BG_CONTEXT = contextvars.Context()
 
 
 def _parse_json_input(input_data: str) -> Dict[str, Any]:
@@ -79,14 +77,9 @@ class SpawnSubagentTool(Tool):
                 except Exception as exc:
                     print(f"[Subagent] Background task failed: {exc}")
 
-            def _schedule_background(coro):
-                task_handle = asyncio.create_task(coro)
-                _PENDING_TASKS.add(task_handle)
-                task_handle.add_done_callback(_on_done)
-                return task_handle
-
-            # Use a fresh context to avoid inheriting request cancel scopes.
-            _BG_CONTEXT.run(_schedule_background, _run_subagent())
+            task_handle = asyncio.create_task(_run_subagent())
+            _PENDING_TASKS.add(task_handle)
+            task_handle.add_done_callback(_on_done)
 
             return json.dumps(
                 {
