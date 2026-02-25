@@ -19,8 +19,8 @@ class WsClient {
   private shouldReconnect = true;
 
   connect() {
-    if (this.ws || !this.shouldReconnect) return;
     this.shouldReconnect = true;
+    if (this.ws) return;
     this.open();
   }
 

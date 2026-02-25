@@ -6,6 +6,9 @@ from typing import Any, Dict, Optional, Set, List
 from fastapi import WebSocket
 
 
+ALL_SESSIONS_TOKEN = "*"
+
+
 @dataclass
 class WsConnection:
     id: str
@@ -23,7 +26,11 @@ class WsHub:
         self._loop = loop
 
     async def register(self, websocket: WebSocket) -> WsConnection:
-        conn = WsConnection(id=uuid.uuid4().hex[:12], websocket=websocket)
+        conn = WsConnection(
+            id=uuid.uuid4().hex[:12],
+            websocket=websocket,
+            session_ids={ALL_SESSIONS_TOKEN}
+        )
         async with self._lock:
             self._connections[conn.id] = conn
         return conn
@@ -44,6 +51,8 @@ class WsHub:
             existing = self._connections.get(conn.id)
             if not existing:
                 return
+            if ALL_SESSIONS_TOKEN in existing.session_ids:
+                return
             existing.session_ids.update(clean)
 
     async def unsubscribe(self, conn: WsConnection, session_ids: List[str]) -> None:
@@ -55,6 +64,8 @@ class WsHub:
         async with self._lock:
             existing = self._connections.get(conn.id)
             if not existing:
+                return
+            if ALL_SESSIONS_TOKEN in existing.session_ids:
                 return
             existing.session_ids.difference_update(clean)
 
@@ -68,7 +79,10 @@ class WsHub:
 
         to_remove: List[WsConnection] = []
         for conn in candidates:
-            if session_id not in conn.session_ids:
+            if (
+                ALL_SESSIONS_TOKEN not in conn.session_ids
+                and session_id not in conn.session_ids
+            ):
                 continue
             try:
                 await conn.websocket.send_json(payload)
