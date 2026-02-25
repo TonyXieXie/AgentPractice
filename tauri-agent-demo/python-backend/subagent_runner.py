@@ -11,6 +11,7 @@ from tools.base import ToolRegistry
 from message_processor import message_processor
 from context_compress import build_history_for_llm
 from code_map import build_code_map_prompt
+from ws_hub import get_ws_hub
 
 
 def _append_reasoning_summary_prompt(system_prompt: str, reasoning_summary: Optional[str]) -> str:
@@ -47,35 +48,29 @@ def _is_profile_spawnable(profile: Dict[str, Any], subagent_profile_id: str) -> 
     return str(profile.get("id") or "") == subagent_profile_id
 
 
-async def run_subagent_task(
+def prepare_subagent_session(
     task: str,
     parent_session_id: str,
     title: Optional[str] = None
 ) -> Dict[str, Any]:
     if not task or not str(task).strip():
-        return {"status": "error", "error": "Missing task"}
+        raise ValueError("Missing task")
 
     parent = db.get_session(parent_session_id)
     if not parent:
-        return {"status": "error", "error": "Parent session not found"}
+        raise ValueError("Parent session not found")
 
     config = db.get_config(parent.config_id)
     if not config:
-        return {"status": "error", "error": "Parent config not found"}
+        raise ValueError("Parent config not found")
 
     app_config = get_app_config()
     agent_cfg = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
     subagent_profile_id, subagent_profile = _resolve_subagent_profile(agent_cfg)
     if not subagent_profile:
-        return {
-            "status": "error",
-            "error": f"Subagent profile not found: {subagent_profile_id}"
-        }
+        raise ValueError(f"Subagent profile not found: {subagent_profile_id}")
     if not _is_profile_spawnable(subagent_profile, subagent_profile_id):
-        return {
-            "status": "error",
-            "error": f"Profile not spawnable: {subagent_profile_id}"
-        }
+        raise ValueError(f"Profile not spawnable: {subagent_profile_id}")
 
     child_title = title.strip() if isinstance(title, str) and title.strip() else "Subagent Task"
     child_session = db.create_session(ChatSessionCreate(
@@ -97,8 +92,123 @@ async def run_subagent_task(
         role="assistant",
         content=""
     ))
-    assistant_msg_id = assistant_msg.id
 
+    return {
+        "parent_session_id": parent_session_id,
+        "parent_config_id": parent.config_id,
+        "child_session": child_session,
+        "child_session_id": child_session.id,
+        "child_title": child_title,
+        "processed_message": processed_message,
+        "user_message_id": user_msg.id,
+        "assistant_message_id": assistant_msg.id,
+        "subagent_profile_id": subagent_profile_id
+    }
+
+
+async def _notify_parent_subagent_done(
+    parent_session_id: str,
+    child_session_id: str,
+    child_title: str,
+    final_answer: str,
+    status: str
+) -> None:
+    if not parent_session_id:
+        return
+    status_label = "完成" if status == "ok" else "失败"
+    content = f"子agent「{child_title}」{status_label}：\n\n{final_answer}"
+    metadata = {
+        "subagent_done": True,
+        "child_session_id": child_session_id,
+        "child_title": child_title,
+        "status": status
+    }
+    message = db.create_message(ChatMessageCreate(
+        session_id=parent_session_id,
+        role="assistant",
+        content=content,
+        metadata=metadata
+    ))
+
+    try:
+        hub = get_ws_hub()
+        payload = {
+            "type": "subagent_done",
+            "session_id": parent_session_id,
+            "message": message.dict(),
+            "child_session_id": child_session_id,
+            "status": status
+        }
+        await hub.emit(parent_session_id, payload)
+    except Exception as exc:
+        print(f"[Subagent] Failed to emit parent notification: {exc}")
+
+
+async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    child_session = context.get("child_session") or db.get_session(context["child_session_id"])
+    if not child_session:
+        final_answer = "Subagent failed: Child session not found"
+        assistant_msg_id = context.get("assistant_message_id")
+        if assistant_msg_id:
+            try:
+                conn = db.get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    UPDATE chat_messages
+                    SET content = ?
+                    WHERE id = ?
+                    ''',
+                    (final_answer, assistant_msg_id)
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        await _notify_parent_subagent_done(
+            parent_session_id=context.get("parent_session_id", ""),
+            child_session_id=context.get("child_session_id", ""),
+            child_title=context.get("child_title", "Subagent Task"),
+            final_answer=final_answer,
+            status="error"
+        )
+        return {"status": "error", "error": "Child session not found"}
+
+    assistant_msg_id = context["assistant_message_id"]
+    user_msg_id = context["user_message_id"]
+    processed_message = context["processed_message"]
+    child_title = context["child_title"]
+    parent_session_id = context["parent_session_id"]
+    subagent_profile_id = context["subagent_profile_id"]
+
+    config = db.get_config(child_session.config_id)
+    if not config:
+        final_answer = "Subagent failed: Parent config not found"
+        try:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                UPDATE chat_messages
+                SET content = ?
+                WHERE id = ?
+                ''',
+                (final_answer, assistant_msg_id)
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        await _notify_parent_subagent_done(
+            parent_session_id=parent_session_id,
+            child_session_id=child_session.id,
+            child_title=child_title,
+            final_answer=final_answer,
+            status="error"
+        )
+        return {"status": "error", "error": "Parent config not found"}
+
+    app_config = get_app_config()
     llm_app_config = app_config.get("llm", {}) if isinstance(app_config, dict) else {}
     global_reasoning_summary = llm_app_config.get("reasoning_summary")
     if global_reasoning_summary:
@@ -108,6 +218,7 @@ async def run_subagent_task(
             pass
 
     context_config = app_config.get("context", {}) if isinstance(app_config, dict) else {}
+    agent_cfg = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
     agent_config = agent_cfg if isinstance(agent_cfg, dict) else {}
     ast_enabled = bool(agent_config.get("ast_enabled", True))
     code_map_cfg = agent_config.get("code_map", {}) if isinstance(agent_config, dict) else {}
@@ -160,7 +271,7 @@ async def run_subagent_task(
             "summary": "",
             "last_call_id": None,
             "last_message_id": None,
-            "current_user_message_id": user_msg.id
+            "current_user_message_id": user_msg_id
         }
     }
     if code_map_prompt:
@@ -169,7 +280,7 @@ async def run_subagent_task(
     history_for_llm = build_history_for_llm(
         child_session.id,
         None,
-        user_msg.id,
+        user_msg_id,
         "",
         code_map_prompt,
         request_overrides.get("prompt_truncation")
@@ -177,6 +288,7 @@ async def run_subagent_task(
 
     sequence = 0
     final_answer = None
+    had_error = False
 
     try:
         async for step in executor.run(
@@ -221,8 +333,10 @@ async def run_subagent_task(
                 break
             if step.step_type == "error":
                 final_answer = step.content
+                had_error = True
 
     except Exception as exc:
+        had_error = True
         final_answer = f"Subagent failed: {exc}"
         db.save_agent_step(
             message_id=assistant_msg_id,
@@ -248,9 +362,30 @@ async def run_subagent_task(
     conn.commit()
     conn.close()
 
+    status = "error" if had_error else "ok"
+    await _notify_parent_subagent_done(
+        parent_session_id=parent_session_id,
+        child_session_id=child_session.id,
+        child_title=child_title,
+        final_answer=final_answer,
+        status=status
+    )
+
     return {
-        "status": "ok",
+        "status": status,
         "child_session_id": child_session.id,
         "result": final_answer,
         "title": child_title
     }
+
+
+async def run_subagent_task(
+    task: str,
+    parent_session_id: str,
+    title: Optional[str] = None
+) -> Dict[str, Any]:
+    try:
+        context = prepare_subagent_session(task, parent_session_id, title)
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+    return await execute_subagent_context(context)

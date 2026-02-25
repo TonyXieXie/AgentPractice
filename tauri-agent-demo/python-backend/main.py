@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Response, Query
+from fastapi import FastAPI, HTTPException, Response, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -39,6 +39,7 @@ from tools.builtin import register_builtin_tools
 from tools.base import ToolRegistry
 from tools.config import get_tool_config, update_tool_config, get_tool_config_path
 from stream_registry import get_stream_registry
+from ws_hub import get_ws_hub
 from tools.context import set_tool_context, reset_tool_context
 from tools.builtin.system_tools import ApplyPatchTool, CodeAstTool
 from tools.pty_manager import get_pty_manager
@@ -52,6 +53,15 @@ from context_compress import build_history_for_llm, maybe_compress_context
 
 app = FastAPI(title="Tauri Agent Chat Backend")
 STREAM_REGISTRY = get_stream_registry()
+WS_HUB = get_ws_hub()
+
+
+@app.on_event("startup")
+async def on_startup():
+    try:
+        WS_HUB.set_loop(asyncio.get_running_loop())
+    except Exception:
+        pass
 
 app.add_middleware(
     CORSMiddleware,
@@ -561,6 +571,39 @@ def debug_info():
         "tools_enabled": tool_config.get("enabled", {}),
         "tool_names": [tool.name for tool in ToolRegistry.get_all()]
     }
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    conn = await WS_HUB.register(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                payload = json.loads(data)
+            except Exception:
+                continue
+            msg_type = payload.get("type")
+            if msg_type == "subscribe":
+                session_ids = payload.get("session_ids") or []
+                if isinstance(session_ids, str):
+                    session_ids = [session_ids]
+                await WS_HUB.subscribe(conn, session_ids)
+            elif msg_type == "unsubscribe":
+                session_ids = payload.get("session_ids") or []
+                if isinstance(session_ids, str):
+                    session_ids = [session_ids]
+                await WS_HUB.unsubscribe(conn, session_ids)
+            elif msg_type == "ping":
+                try:
+                    await websocket.send_json({"type": "pong"})
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await WS_HUB.unregister(conn)
 
 # ==================== LLM Configs ====================
 

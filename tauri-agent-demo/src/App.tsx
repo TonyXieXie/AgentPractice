@@ -50,6 +50,8 @@ import PtyPanel from './components/PtyPanel';
 import AgentStepView from './components/AgentStepView';
 import ConfirmDialog from './components/ConfirmDialog';
 import { loadExtraWorkPaths, migrateExtraWorkPaths, saveExtraWorkPaths } from './workdirStorage';
+import { wsClient } from './wsClient';
+import type { SubagentDoneEvent } from './wsTypes';
 
 const DRAFT_SESSION_KEY = '__draft__';
 
@@ -738,6 +740,7 @@ function App() {
   const astWatchRef = useRef<UnwatchFn | null>(null);
   const astNotifyRef = useRef<{ timer: number | null; paths: Set<string> }>({ timer: null, paths: new Set() });
   const appWindow = useMemo(() => getCurrentWindow(), []);
+  const wsSessionRef = useRef<string | null>(null);
 
   const adjustWindowWidth = useCallback(async (delta: number) => {
     if (!delta) return;
@@ -1712,6 +1715,39 @@ function App() {
     delete messagesCacheRef.current[sessionKey];
     delete messagePagingRef.current[sessionKey];
   };
+
+  useEffect(() => {
+    wsClient.connect();
+    const cleanupEvents = wsClient.onEvent((event) => {
+      if (event.type !== 'subagent_done') return;
+      const payload = event as SubagentDoneEvent;
+      if (!payload.session_id || !payload.message) return;
+      const sessionKey = getSessionKey(payload.session_id);
+      updateSessionMessages(sessionKey, (prev) => {
+        if (prev.some((msg) => msg.id === payload.message.id)) return prev;
+        return [...prev, payload.message];
+      });
+      if (sessionKey !== getCurrentSessionKey()) {
+        markSessionUnread(sessionKey);
+      }
+      setSessionRefreshTrigger((prev) => prev + 1);
+    });
+    return () => {
+      cleanupEvents();
+      wsClient.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    const prev = wsSessionRef.current;
+    if (prev && prev !== currentSessionId) {
+      wsClient.unsubscribe([prev]);
+    }
+    if (currentSessionId) {
+      wsClient.subscribe([currentSessionId]);
+    }
+    wsSessionRef.current = currentSessionId;
+  }, [currentSessionId]);
 
   const migrateSessionKey = (fromKey: string, toKey: string) => {
     if (!fromKey || !toKey || fromKey === toKey) return;

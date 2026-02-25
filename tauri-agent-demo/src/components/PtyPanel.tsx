@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import 'xterm/css/xterm.css';
 import { closePty, listPtys, readPty, sendPty, type PtyListItem } from '../api';
+import { wsClient } from '../wsClient';
+import type { PtyOutputEvent } from '../wsTypes';
 import './PtyPanel.css';
 
 type PtyBuffer = {
@@ -37,6 +39,7 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
   const [includeExited, setIncludeExited] = useState(true);
   const [maxExited, setMaxExited] = useState(DEFAULT_MAX_EXITED);
   const [items, setItems] = useState<PtyListItem[]>([]);
+  const [wsConnected, setWsConnected] = useState(false);
   const buffersRef = useRef<Record<string, PtyBuffer>>({});
   const [inputById, setInputById] = useState<Record<string, string>>({});
   const panelRef = useRef<HTMLDivElement>(null);
@@ -49,6 +52,42 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
   useEffect(() => {
     itemsRef.current = items;
   }, [items]);
+
+  useEffect(() => {
+    const cleanupStatus = wsClient.onStatus((connected) => {
+      setWsConnected(connected);
+    });
+    const cleanupEvents = wsClient.onEvent((event) => {
+      if (event.type !== 'pty_output') return;
+      const payload = event as PtyOutputEvent;
+      if (!payload.pty_id || payload.session_id !== sessionId) return;
+      const current = buffersRef.current[payload.pty_id] || { text: '', cursor: 0 };
+      const nextCursor = typeof payload.cursor === 'number' ? payload.cursor : current.cursor;
+      let text = current.text;
+      if (payload.chunk) {
+        text = text + payload.chunk;
+      }
+      const terminalEntry = terminalsRef.current[payload.pty_id];
+      if (terminalEntry && payload.chunk) {
+        terminalEntry.term.write(payload.chunk, () => terminalEntry.term.scrollToBottom());
+      }
+      const nextBuffer = {
+        ...current,
+        text,
+        cursor: nextCursor,
+        status: payload.status ?? current.status,
+        exit_code: payload.exit_code ?? current.exit_code,
+      };
+      buffersRef.current[payload.pty_id] = nextBuffer;
+      if (payload.chunk) {
+        onActivity?.();
+      }
+    });
+    return () => {
+      cleanupEvents();
+      cleanupStatus();
+    };
+  }, [sessionId, onActivity]);
 
   useEffect(() => {
     onWidthChange?.(panelWidth);
@@ -138,62 +177,72 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
     };
   }, [sessionId, includeExited, maxExited]);
 
+  const readOnce = useCallback(async () => {
+    if (!sessionId) return;
+    const currentItems = itemsRef.current;
+    if (!currentItems.length) return;
+    for (const item of currentItems) {
+      try {
+        const current = buffersRef.current[item.pty_id] || { text: '', cursor: 0 };
+        const resp = await readPty({
+          session_id: sessionId,
+          pty_id: item.pty_id,
+          cursor: current.cursor,
+          max_output: READ_MAX_OUTPUT
+        });
+        let text = current.text;
+        if (resp.reset) {
+          text = resp.chunk || '';
+        } else if (resp.chunk) {
+          text = text + resp.chunk;
+        }
+        const command = item.command || resp.command || current.command;
+        const terminalEntry = terminalsRef.current[item.pty_id];
+        if (terminalEntry) {
+          if (resp.reset) {
+            terminalEntry.term.reset();
+          }
+          if (resp.chunk) {
+            terminalEntry.term.write(resp.chunk, () => terminalEntry.term.scrollToBottom());
+          }
+        }
+        if (resp.chunk || resp.reset || resp.status === 'running') {
+          onActivity?.();
+        }
+        const nextBuffer = {
+          ...current,
+          text,
+          cursor: resp.cursor,
+          status: resp.status,
+          exit_code: resp.exit_code,
+          pty: resp.pty,
+          command
+        };
+        buffersRef.current[item.pty_id] = nextBuffer;
+      } catch {
+        // ignore read errors
+      }
+    }
+  }, [sessionId, onActivity]);
+
+  useEffect(() => {
+    if (!sessionId || !wsConnected) return;
+    readOnce();
+  }, [sessionId, wsConnected, items, readOnce]);
+
   useEffect(() => {
     if (!sessionId) return;
     let active = true;
+    if (wsConnected) {
+      readOnce();
+      return () => {
+        active = false;
+      };
+    }
+
     const tick = async () => {
       if (!active) return;
-      const currentItems = itemsRef.current;
-      if (!currentItems.length) return;
-      let hadNewData = false;
-      for (const item of currentItems) {
-        try {
-          const current = buffersRef.current[item.pty_id] || { text: '', cursor: 0 };
-          const resp = await readPty({
-            session_id: sessionId,
-            pty_id: item.pty_id,
-            cursor: current.cursor,
-            max_output: READ_MAX_OUTPUT
-          });
-          let text = current.text;
-          if (resp.reset) {
-            text = resp.chunk || '';
-          } else if (resp.chunk) {
-            text = text + resp.chunk;
-          }
-          const command = item.command || resp.command || current.command;
-          const terminalEntry = terminalsRef.current[item.pty_id];
-          if (terminalEntry) {
-            if (resp.reset) {
-              terminalEntry.term.reset();
-            }
-            if (resp.chunk) {
-              terminalEntry.term.write(resp.chunk, () => terminalEntry.term.scrollToBottom());
-            }
-          }
-          if (resp.chunk || resp.reset || resp.status === 'running') {
-            onActivity?.();
-          }
-          const nextBuffer = {
-            ...current,
-            text,
-            cursor: resp.cursor,
-            status: resp.status,
-            exit_code: resp.exit_code,
-            pty: resp.pty,
-            command
-          };
-          if (resp.chunk || resp.reset || resp.cursor !== current.cursor) {
-            hadNewData = true;
-          }
-          buffersRef.current[item.pty_id] = nextBuffer;
-        } catch {
-          // ignore read errors
-        }
-      }
-      if (hadNewData) {
-        // no state updates required; xterm renders directly
-      }
+      await readOnce();
     };
     tick();
     const interval = window.setInterval(tick, READ_POLL_MS);
@@ -201,7 +250,7 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
       active = false;
       window.clearInterval(interval);
     };
-  }, [sessionId]);
+  }, [sessionId, wsConnected, readOnce]);
 
   useEffect(() => {
     const handleResize = () => {

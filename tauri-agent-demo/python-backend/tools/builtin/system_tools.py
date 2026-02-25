@@ -22,6 +22,7 @@ from ..pty_manager import get_pty_manager, PtyProcess, DEFAULT_BUFFER_SIZE, _dec
 from app_config import get_app_config
 from ast_settings import get_ast_settings
 from ast_file_filter import collect_ast_files
+from ws_hub import get_ws_hub
 
 try:
     import pty as posix_pty
@@ -608,6 +609,28 @@ def _tail_bytes_hex(data: bytes, max_len: int = 16) -> str:
 
 def _use_restricted_conpty(use_sandbox: bool) -> bool:
     return bool(use_sandbox)
+
+
+def _attach_pty_ws_emitter(pty_proc: PtyProcess) -> None:
+    session_id = getattr(pty_proc, "session_id", "")
+    if not session_id:
+        return
+    hub = get_ws_hub()
+
+    def _emit(chunk: bytes, cursor: int) -> None:
+        text = _decode_output_bytes(chunk)
+        payload = {
+            "type": "pty_output",
+            "session_id": session_id,
+            "pty_id": pty_proc.id,
+            "chunk": text,
+            "cursor": cursor,
+            "status": pty_proc.status,
+            "exit_code": pty_proc.exit_code
+        }
+        hub.emit_threadsafe(session_id, payload)
+
+    pty_proc.set_on_output(_emit)
 
 
 def _safe_close_pseudo_console(kernel32_dll, h_pc_handle, label: str = "conpty") -> None:
@@ -1301,6 +1324,7 @@ def _start_posix_pty_persistent(
         writer=_writer,
         terminator=_terminator
     )
+    _attach_pty_ws_emitter(pty_proc)
 
     def _reader_loop() -> None:
         last_output = time.monotonic()
@@ -1393,6 +1417,7 @@ def _start_posix_pipe_persistent(
         writer=_writer,
         terminator=_terminator
     )
+    _attach_pty_ws_emitter(pty_proc)
 
     def _reader_loop() -> None:
         last_output = time.monotonic()
@@ -2200,6 +2225,7 @@ def _start_windows_pty_persistent(
         writer=_writer,
         terminator=_terminator
     )
+    _attach_pty_ws_emitter(pty_proc)
 
     def _reader_loop() -> None:
         buffer = ctypes.create_string_buffer(4096)
@@ -2519,6 +2545,7 @@ def _start_windows_pipe_persistent(
         writer=_writer,
         terminator=_terminator
     )
+    _attach_pty_ws_emitter(pty_proc)
 
     def _reader_loop() -> None:
         buffer = ctypes.create_string_buffer(4096)
@@ -2632,6 +2659,7 @@ def _start_windows_unrestricted_pipe_persistent(
         writer=_writer,
         terminator=_terminator
     )
+    _attach_pty_ws_emitter(pty_proc)
 
     def _reader_loop() -> None:
         buffer = ctypes.create_string_buffer(4096)

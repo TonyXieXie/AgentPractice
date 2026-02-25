@@ -1,9 +1,13 @@
+import asyncio
 import json
 from typing import Any, Dict, Optional
 
 from ..base import Tool, ToolParameter
 from ..context import get_tool_context
-from subagent_runner import run_subagent_task
+from subagent_runner import prepare_subagent_session, execute_subagent_context
+
+
+_PENDING_TASKS = set()
 
 
 def _parse_json_input(input_data: str) -> Dict[str, Any]:
@@ -23,7 +27,7 @@ class SpawnSubagentTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "spawn_subagent"
-        self.description = "Spawn a subagent to run a small task and return the result."
+        self.description = "Spawn a subagent to run a small task. Returns immediately with a child session id."
         self.parameters = [
             ToolParameter(
                 name="task",
@@ -55,12 +59,35 @@ class SpawnSubagentTool(Tool):
                     ensure_ascii=False
                 )
 
-            result = await run_subagent_task(
+            context = prepare_subagent_session(
                 task=str(task),
                 parent_session_id=str(parent_session_id),
                 title=title if isinstance(title, str) else None
             )
-            return json.dumps(result, ensure_ascii=False)
+
+            async def _run_subagent():
+                await execute_subagent_context(context)
+
+            task_handle = asyncio.create_task(_run_subagent())
+            _PENDING_TASKS.add(task_handle)
+
+            def _on_done(fut: asyncio.Task) -> None:
+                _PENDING_TASKS.discard(fut)
+                try:
+                    fut.result()
+                except Exception as exc:
+                    print(f"[Subagent] Background task failed: {exc}")
+
+            task_handle.add_done_callback(_on_done)
+
+            return json.dumps(
+                {
+                    "status": "started",
+                    "child_session_id": context["child_session_id"],
+                    "title": context["child_title"]
+                },
+                ensure_ascii=False
+            )
         except Exception as exc:
             return json.dumps(
                 {"status": "error", "error": f"Subagent tool failed: {exc}"},

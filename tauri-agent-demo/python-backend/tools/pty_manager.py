@@ -57,6 +57,7 @@ class PtyProcess:
         idle_timeout_ms: int,
         writer: Optional[Callable[[bytes], int]],
         terminator: Callable[[], None],
+        on_output: Optional[Callable[[bytes, int], None]] = None,
     ):
         self.id: str = uuid.uuid4().hex[:12]
         self.session_id = session_id
@@ -66,6 +67,7 @@ class PtyProcess:
         self.idle_timeout_ms = int(idle_timeout_ms or 0)
         self._writer = writer
         self._terminator = terminator
+        self._on_output = on_output
         self._buffer = bytearray()
         self._buffer_lock = threading.Lock()
         self._cursor = 0
@@ -87,14 +89,25 @@ class PtyProcess:
     def append_output(self, data: bytes) -> None:
         if not data:
             return
+        callback = self._on_output
+        total_bytes = 0
         with self._buffer_lock:
             self._total_bytes += len(data)
+            total_bytes = self._total_bytes
             self._buffer.extend(data)
             if len(self._buffer) > self.buffer_size:
                 overflow = len(self._buffer) - self.buffer_size
                 if overflow > 0:
                     del self._buffer[:overflow]
             self._last_output_at = time.monotonic()
+        if callback:
+            try:
+                callback(data, total_bytes)
+            except Exception:
+                pass
+
+    def set_on_output(self, callback: Optional[Callable[[bytes, int], None]]) -> None:
+        self._on_output = callback
 
     def read(self, cursor: Optional[int], max_output: int) -> Tuple[str, int, bool]:
         if max_output <= 0:

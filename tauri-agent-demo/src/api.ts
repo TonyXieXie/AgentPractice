@@ -512,12 +512,12 @@ export async function* sendMessageAgentStream(
                                 lastSeq = parsed.seq;
                             }
 
-                            if (parsed.session_id) {
-                                yield parsed;
-                            } else if (parsed.done) {
+                            if (parsed.done) {
                                 sawDone = true;
                                 yield parsed;
                                 return;
+                            } else if (parsed.session_id) {
+                                yield parsed;
                             } else if (parsed.step_type) {
                                 yield parsed as AgentStep;
                             } else if (parsed.error) {

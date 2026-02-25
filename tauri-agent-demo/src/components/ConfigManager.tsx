@@ -172,6 +172,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const [globalReasoningSummary, setGlobalReasoningSummary] = useState<ReasoningSummary>(
         DEFAULT_REASONING_SUMMARY
     );
+    const [globalAutoTitleEnabled, setGlobalAutoTitleEnabled] = useState(true);
     const [globalReactMaxIterations, setGlobalReactMaxIterations] = useState('50');
     const [globalAstEnabled, setGlobalAstEnabled] = useState(true);
     const [globalCodeMapEnabled, setGlobalCodeMapEnabled] = useState(true);
@@ -300,6 +301,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         }
         const reasoningSummary = data?.llm?.reasoning_summary ?? DEFAULT_REASONING_SUMMARY;
         setGlobalReasoningSummary(reasoningSummary);
+        setGlobalAutoTitleEnabled(Boolean(data?.llm?.auto_title_enabled ?? true));
         const reactMax = data?.agent?.react_max_iterations;
         if (reactMax !== undefined && reactMax !== null) {
             setGlobalReactMaxIterations(String(reactMax));
@@ -524,6 +526,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         llm: {
             timeout_sec: coerceNumber(globalTimeoutSec, 180),
             reasoning_summary: globalReasoningSummary,
+            auto_title_enabled: globalAutoTitleEnabled,
         },
         agent: {
             react_max_iterations: coerceInt(globalReactMaxIterations, 50),
@@ -552,7 +555,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         if (appConfig.llm) {
             payload.llm = {
                 timeout_sec: appConfig.llm.timeout_sec,
-                reasoning_summary: appConfig.llm.reasoning_summary
+                reasoning_summary: appConfig.llm.reasoning_summary,
+                auto_title_enabled: appConfig.llm.auto_title_enabled
             };
         }
         if (appConfig.context) {
@@ -1136,7 +1140,11 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         }
         try {
             const updated = await updateAppConfig({
-                llm: { timeout_sec: timeoutValue, reasoning_summary: globalReasoningSummary },
+                llm: {
+                    timeout_sec: timeoutValue,
+                    reasoning_summary: globalReasoningSummary,
+                    auto_title_enabled: globalAutoTitleEnabled
+                },
                 agent: {
                     react_max_iterations: reactMaxValue,
                     ast_enabled: globalAstEnabled,
@@ -1162,6 +1170,9 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             }
             if (updated?.llm?.reasoning_summary) {
                 setGlobalReasoningSummary(updated.llm.reasoning_summary as ReasoningSummary);
+            }
+            if (updated?.llm?.auto_title_enabled !== undefined && updated?.llm?.auto_title_enabled !== null) {
+                setGlobalAutoTitleEnabled(Boolean(updated.llm.auto_title_enabled));
             }
             if (updated?.agent?.react_max_iterations !== undefined && updated?.agent?.react_max_iterations !== null) {
                 setGlobalReactMaxIterations(String(updated.agent.react_max_iterations));
@@ -2031,6 +2042,22 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     ))}
                                 </select>
                                 <small>控制思考过程摘要输出强度（auto / concise / detailed）。</small>
+                            </div>
+
+                            <div className="form-group checkbox-group">
+                                <label>
+                                    <input
+                                        type="checkbox"
+                                        checked={globalAutoTitleEnabled}
+                                        onChange={(e) => {
+                                            setGlobalAutoTitleEnabled(e.target.checked);
+                                            setGlobalSaved(false);
+                                        }}
+                                        disabled={globalLoading || globalSaving}
+                                    />
+                                    启用 LLM 自动标题
+                                </label>
+                                <small>关闭后会话标题将使用用户首条消息的默认标题。</small>
                             </div>
 
                             <div className="form-group">

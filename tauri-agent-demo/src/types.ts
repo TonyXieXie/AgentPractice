@@ -74,6 +74,7 @@ export interface AppConfig {
     llm?: {
         timeout_sec?: number;
         reasoning_summary?: ReasoningSummary;
+        auto_title_enabled?: boolean;
     };
     context?: ContextConfig;
     agent?: AgentConfig;
@@ -83,6 +84,7 @@ export interface AppConfigUpdate {
     llm?: {
         timeout_sec?: number;
         reasoning_summary?: ReasoningSummary;
+        auto_title_enabled?: boolean;
     };
     context?: ContextConfig;
     agent?: AgentConfig;
