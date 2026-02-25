@@ -6,6 +6,7 @@
   "agent": {
     "react_max_iterations": 200,
     "base_system_prompt": "You are a helpful AI assistant.",
+    "subagent_profile": "subagent",
     "abilities": [
       {
         "id": "tools_all",
@@ -84,14 +85,28 @@
           "apply_patch",
           "tool_json",
           "output_concise"
-        ]
+        ],
+        "spawnable": false
+      },
+      {
+        "id": "subagent",
+        "name": "Subagent",
+        "abilities": [
+          "tools_all",
+          "rg_search",
+          "apply_patch",
+          "tool_json",
+          "output_concise"
+        ],
+        "spawnable": true
       },
       {
         "id": "search",
         "name": "Search",
         "abilities": [
           "websear"
-        ]
+        ],
+        "spawnable": false
       }
     ],
     "default_profile": "default",

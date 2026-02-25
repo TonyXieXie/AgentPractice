@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect, useRef } from 'react';
+import { useMemo, useState, useEffect, useRef, type CSSProperties } from 'react';
 import { ChatSession } from '../types';
 import { getSessions, deleteSession, updateSession, copySession } from '../api';
 import ConfirmDialog from './ConfirmDialog';
@@ -40,6 +40,47 @@ export default function SessionList({
     } | null>(null);
     const contextMenuRef = useRef<HTMLDivElement | null>(null);
     const NO_WORK_PATH_KEY = '__no_work_path__';
+
+    type SessionNode = { session: ChatSession; children: SessionNode[] };
+    type FlattenedSession = { session: ChatSession; depth: number };
+
+    const buildSessionTree = (items: ChatSession[]): SessionNode[] => {
+        const order = new Map<string, number>();
+        items.forEach((item, idx) => order.set(item.id, idx));
+
+        const nodes = new Map<string, SessionNode>();
+        items.forEach((item) => {
+            nodes.set(item.id, { session: item, children: [] });
+        });
+
+        const roots: SessionNode[] = [];
+        items.forEach((item) => {
+            const node = nodes.get(item.id)!;
+            const parentId = item.parent_session_id;
+            if (parentId && nodes.has(parentId)) {
+                nodes.get(parentId)!.children.push(node);
+            } else {
+                roots.push(node);
+            }
+        });
+
+        const sortNodes = (list: SessionNode[]) => {
+            list.sort((a, b) => (order.get(a.session.id) ?? 0) - (order.get(b.session.id) ?? 0));
+            list.forEach((node) => sortNodes(node.children));
+        };
+        sortNodes(roots);
+        return roots;
+    };
+
+    const flattenSessionTree = (nodes: SessionNode[], depth: number = 0, acc: FlattenedSession[] = []) => {
+        nodes.forEach((node) => {
+            acc.push({ session: node.session, depth });
+            if (node.children.length > 0) {
+                flattenSessionTree(node.children, depth + 1, acc);
+            }
+        });
+        return acc;
+    };
 
     useEffect(() => {
         loadSessions();
@@ -310,19 +351,21 @@ export default function SessionList({
                                 <span className="session-group-title">{group.label}</span>
                             </div>
                             <div className="session-group-items">
-                                {group.sessions.map((session) => {
+                                {flattenSessionTree(buildSessionTree(group.sessions)).map(({ session, depth }) => {
                                     const isStreaming = Boolean(inFlightBySession?.[session.id]);
                                     const isPending = Boolean(pendingPermissionBySession?.[session.id]);
                                     const isUnread = !isStreaming && Boolean(unreadBySession?.[session.id]) && currentSessionId !== session.id;
                                     const showStatus = isPending || isStreaming || isUnread;
                                     const statusClass = isPending ? 'permission' : isStreaming ? 'streaming' : 'unread';
+                                    const isChild = depth > 0;
 
                                     return (
                                         <div
                                             key={session.id}
-                                            className={`session-item ${currentSessionId === session.id ? 'active' : ''}`}
+                                            className={`session-item ${currentSessionId === session.id ? 'active' : ''}${isChild ? ' child' : ''}`}
                                             onClick={() => onSelectSession(session.id)}
                                             onContextMenu={(e) => openContextMenu(session, e)}
+                                            style={{ ['--session-depth' as any]: depth } as CSSProperties}
                                         >
                                             {editingId === session.id ? (
                                                 <input

@@ -7,6 +7,7 @@
     "write_file": true,
     "run_shell": true,
     "code_ast": true,
+    "spawn_subagent": true,
     "calculator": false,
     "weather": false
   },

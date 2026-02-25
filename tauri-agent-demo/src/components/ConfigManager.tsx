@@ -225,7 +225,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         name: '',
         abilities: [] as string[],
         paramsText: '',
-        isDefault: false
+        isDefault: false,
+        spawnable: false
     });
     const [profileFormError, setProfileFormError] = useState<string | null>(null);
     const [showForm, setShowForm] = useState(false);
@@ -251,13 +252,28 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         const raw = isRecord(data) ? data : {};
         const parsedMax = Number.parseInt(String(raw.react_max_iterations ?? ''), 10);
         const reactMaxIterations = Number.isFinite(parsedMax) ? Math.min(200, Math.max(1, parsedMax)) : 50;
+        const profileList = Array.isArray(raw.profiles) ? raw.profiles : [];
+        const subagentProfileValue =
+            typeof raw.subagent_profile === 'string' && raw.subagent_profile.trim()
+                ? raw.subagent_profile.trim()
+                : (profileList.some((profile) => profile?.id === 'subagent')
+                    ? 'subagent'
+                    : (typeof raw.default_profile === 'string' ? raw.default_profile : ''));
+        const normalizedProfiles = profileList.map((profile) => {
+            if (!profile || typeof profile !== 'object') return profile;
+            const spawnable = typeof profile.spawnable === 'boolean'
+                ? profile.spawnable
+                : (profile.id === subagentProfileValue);
+            return { ...profile, spawnable };
+        });
         return {
             ...raw,
             base_system_prompt: raw.base_system_prompt ?? '',
             react_max_iterations: reactMaxIterations,
             abilities: Array.isArray(raw.abilities) ? raw.abilities : [],
-            profiles: Array.isArray(raw.profiles) ? raw.profiles : [],
+            profiles: normalizedProfiles,
             default_profile: raw.default_profile ?? '',
+            subagent_profile: subagentProfileValue
         };
     };
 
@@ -1367,6 +1383,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                 name: rawName || nameKey || finalId,
                 abilities: nextAbilities ?? [],
                 params: incomingProfile.params,
+                spawnable: typeof incomingProfile.spawnable === 'boolean' ? incomingProfile.spawnable : undefined,
             };
             merged.push(created);
             nameToIndex.set(created.name, merged.length - 1);
@@ -1401,6 +1418,10 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                 profiles.find((profile) => profile.name === incomingDefault)?.id ||
                 defaultProfile;
         }
+        const incomingSubagentProfile =
+            typeof incomingRaw.subagent_profile === 'string' && incomingRaw.subagent_profile.trim()
+                ? incomingRaw.subagent_profile.trim()
+                : '';
 
         return {
             ...currentNormalized,
@@ -1410,6 +1431,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             abilities,
             profiles,
             default_profile: defaultProfile,
+            subagent_profile: incomingSubagentProfile || currentNormalized.subagent_profile
         };
     };
 
@@ -1526,7 +1548,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             name: '',
             abilities: [],
             paramsText: '',
-            isDefault: false
+            isDefault: false,
+            spawnable: false
         });
         setProfileFormError(null);
         setShowProfileForm(true);
@@ -1538,7 +1561,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             name: profile.name || '',
             abilities: Array.isArray(profile.abilities) ? profile.abilities : [],
             paramsText: profile.params ? JSON.stringify(profile.params, null, 2) : '',
-            isDefault: profile.id === agentConfig.default_profile
+            isDefault: profile.id === agentConfig.default_profile,
+            spawnable: Boolean(profile.spawnable)
         });
         setProfileFormError(null);
         setShowProfileForm(true);
@@ -1565,7 +1589,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                     ...profiles[index],
                     name: profileForm.name.trim() || profiles[index].name,
                     abilities: profileForm.abilities,
-                    params
+                    params,
+                    spawnable: profileForm.spawnable
                 };
             }
         } else {
@@ -1574,7 +1599,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                 id: profileId,
                 name: profileForm.name.trim() || profileId,
                 abilities: profileForm.abilities,
-                params
+                params,
+                spawnable: profileForm.spawnable
             });
         }
 
@@ -2294,6 +2320,28 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                 <small>用于所有 agent 的基础系统提示词。</small>
                             </div>
 
+                            <div className="form-group">
+                                <label>子agent Profile</label>
+                                <select
+                                    value={agentConfig.subagent_profile || ''}
+                                    onChange={(e) => {
+                                        setAgentConfig((prev) => ({
+                                            ...prev,
+                                            subagent_profile: e.target.value
+                                        }));
+                                        setAgentSaved(false);
+                                    }}
+                                    disabled={(agentConfig.profiles || []).length === 0}
+                                >
+                                    {(agentConfig.profiles || []).map((profile) => (
+                                        <option key={profile.id} value={profile.id}>
+                                            {profile.name || profile.id}
+                                        </option>
+                                    ))}
+                                </select>
+                                <small>用于 spawn_subagent 的固定 profile。</small>
+                            </div>
+
                             <div className="agent-section">
                                 <div className="agent-section-header">
                                     <h4>Abilities</h4>
@@ -2434,6 +2482,22 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                                     <label>
                                                         <input
                                                             type="checkbox"
+                                                            checked={profileForm.spawnable}
+                                                            onChange={(e) =>
+                                                                setProfileForm({
+                                                                    ...profileForm,
+                                                                    spawnable: e.target.checked
+                                                                })
+                                                            }
+                                                        />
+                                                        允许作为子agent
+                                                    </label>
+                                                </div>
+
+                                                <div className="form-group checkbox-group">
+                                                    <label>
+                                                        <input
+                                                            type="checkbox"
                                                             checked={profileForm.isDefault}
                                                             onChange={(e) =>
                                                                 setProfileForm({
@@ -2485,6 +2549,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                                                 })
                                                                 .join(', ')
                                                             : '-'}
+                                                        {' '}
+                                                        <strong>Spawnable:</strong> {profile.spawnable ? 'Yes' : 'No'}
                                                     </p>
                                                 </div>
                                                 <div className="config-actions">

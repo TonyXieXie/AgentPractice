@@ -95,6 +95,7 @@ class ChatSession(BaseModel):
     config_id: str
     work_path: Optional[str] = None
     agent_profile: Optional[str] = None
+    parent_session_id: Optional[str] = None
     context_summary: Optional[str] = None
     last_compressed_llm_call_id: Optional[int] = None
     context_estimate: Optional[Dict[str, Any]] = None
@@ -109,6 +110,7 @@ class ChatSessionCreate(BaseModel):
     config_id: str
     work_path: Optional[str] = None
     agent_profile: Optional[str] = None
+    parent_session_id: Optional[str] = None
 
 
 class ChatSessionUpdate(BaseModel):
@@ -116,6 +118,7 @@ class ChatSessionUpdate(BaseModel):
     work_path: Optional[str] = None
     config_id: Optional[str] = None
     agent_profile: Optional[str] = None
+    parent_session_id: Optional[str] = None
 
 
 class AttachmentInput(BaseModel):

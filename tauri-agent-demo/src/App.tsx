@@ -659,6 +659,7 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [currentConfig, setCurrentConfig] = useState<LLMConfig | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [currentSessionParentId, setCurrentSessionParentId] = useState<string | null>(null);
   const [currentWorkPath, setCurrentWorkPath] = useState('');
   const [showConfigManager, setShowConfigManager] = useState(false);
   const [sessionRefreshTrigger, setSessionRefreshTrigger] = useState(0);
@@ -1895,6 +1896,7 @@ function App() {
           if (!targetSessionId && newSessionId && currentSessionIdRef.current === null) {
             currentSessionIdRef.current = newSessionId;
             setCurrentSessionId(newSessionId);
+            setCurrentSessionParentId(null);
             setSessionRefreshTrigger((prev) => prev + 1);
           }
           if (activeSessionKey === DRAFT_SESSION_KEY && newSessionId) {
@@ -1915,6 +1917,20 @@ function App() {
           const sessionKeyForEstimate = newSessionId || activeSessionKey;
           applyContextEstimate(sessionKeyForEstimate, normalizeContextEstimate(step.metadata));
           continue;
+        }
+
+        if (step.step_type === 'observation') {
+          const toolName = String(step.metadata?.tool || '').toLowerCase();
+          if (toolName === 'spawn_subagent') {
+            try {
+              const parsed = JSON.parse(step.content || '');
+              if (parsed && parsed.child_session_id) {
+                setSessionRefreshTrigger((prev) => prev + 1);
+              }
+            } catch {
+              // ignore parse errors
+            }
+          }
         }
 
         updateSessionMessages(activeSessionKey, (prev) =>
@@ -2772,6 +2788,10 @@ function App() {
   };
 
   const handleSend = async () => {
+    if (isChildSession) {
+      alert('子agent会话为只读，无法发送消息。');
+      return;
+    }
     const userMessage = inputMsg.trim();
     const hasAttachments = pendingAttachments.length > 0;
     if (!userMessage && !hasAttachments) return;
@@ -2984,6 +3004,7 @@ function App() {
         perfMeta.sessionFetchMs = (performance.now() - sessionFetchStart).toFixed(1);
       }
       mark('session');
+      setCurrentSessionParentId(session.parent_session_id || null);
       const sessionWorkPath = session.work_path || '';
       workPathBySessionRef.current[session.id] = sessionWorkPath;
       setCurrentWorkPath(sessionWorkPath);
@@ -3080,6 +3101,7 @@ function App() {
     stashCurrentMessages();
     currentSessionIdRef.current = null;
     setCurrentSessionId(null);
+    setCurrentSessionParentId(null);
     setSessionMessages(DRAFT_SESSION_KEY, []);
     setLlmCalls([]);
     messagePagingRef.current[DRAFT_SESSION_KEY] = { loading: false, hasMore: true, oldestId: null };
@@ -3173,6 +3195,7 @@ function App() {
   };
 
   const currentSessionKey = getSessionKey(currentSessionId);
+  const isChildSession = Boolean(currentSessionParentId);
   const isStreamingCurrent = useMemo(
     () => Boolean(inFlightBySessionRef.current[currentSessionKey]),
     [currentSessionKey, inFlightTick]
@@ -3804,6 +3827,10 @@ function App() {
               </div>
             )}
 
+            {isChildSession && (
+              <div className="input-readonly-hint">子agent会话仅供查看</div>
+            )}
+
             <textarea
               onChange={(e) => {
                 setInputMsg(e.currentTarget.value);
@@ -3826,8 +3853,14 @@ function App() {
                 }
               }}
               value={inputMsg}
-              placeholder={currentConfig ? 'Type a message...' : 'Please configure an LLM'}
-              disabled={!currentConfig}
+              placeholder={
+                !currentConfig
+                  ? 'Please configure an LLM'
+                  : isChildSession
+                    ? '子agent会话为只读'
+                    : 'Type a message...'
+              }
+              disabled={!currentConfig || isChildSession}
               ref={inputRef}
               rows={1}
             />
@@ -4131,7 +4164,7 @@ function App() {
                   type="button"
                   className="send-btn"
                   onClick={handleSend}
-                  disabled={!currentConfig || (!inputMsg.trim() && pendingAttachments.length === 0)}
+                  disabled={isChildSession || !currentConfig || (!inputMsg.trim() && pendingAttachments.length === 0)}
                   aria-label="Send"
                   title="Send"
                 >

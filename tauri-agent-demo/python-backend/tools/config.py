@@ -13,6 +13,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "write_file": True,
         "run_shell": True,
         "code_ast": True,
+        "spawn_subagent": True,
         "calculator": False,
         "weather": False
     },

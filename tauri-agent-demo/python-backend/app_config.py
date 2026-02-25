@@ -25,6 +25,7 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
         "base_system_prompt": "You are a helpful AI assistant.",
         "react_max_iterations": 50,
         "ast_enabled": True,
+        "subagent_profile": "subagent",
         "code_map": {
             "enabled": True,
             "max_symbols": 40,
@@ -90,7 +91,14 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
             {
                 "id": "default",
                 "name": "Default",
-                "abilities": ["tools_all", "rg_search", "apply_patch", "pty_status", "code_map", "tool_json", "output_concise", "file_references"]
+                "abilities": ["tools_all", "rg_search", "apply_patch", "pty_status", "code_map", "tool_json", "output_concise", "file_references"],
+                "spawnable": False
+            },
+            {
+                "id": "subagent",
+                "name": "Subagent",
+                "abilities": ["tools_all", "rg_search", "apply_patch", "pty_status", "code_map", "tool_json", "output_concise", "file_references"],
+                "spawnable": True
             }
         ],
         "default_profile": "default"
@@ -323,6 +331,10 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         agent["react_max_iterations"] = _coerce_react_max_iterations(agent["react_max_iterations"])
     if "ast_enabled" in agent:
         agent["ast_enabled"] = _coerce_bool(agent["ast_enabled"], "agent.ast_enabled")
+    if "subagent_profile" in agent:
+        if not isinstance(agent["subagent_profile"], str):
+            raise ValueError("agent.subagent_profile must be a string")
+        agent["subagent_profile"] = agent["subagent_profile"].strip()
     if "code_map" in agent:
         agent["code_map"] = _coerce_code_map(agent["code_map"])
     normalized["agent"] = agent

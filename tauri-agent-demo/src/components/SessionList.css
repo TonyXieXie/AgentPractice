@@ -62,10 +62,12 @@
 }
 
 .session-item {
+    --session-depth: 0;
     background: transparent;
     border: none;
     border-radius: 0;
     padding: 4px 6px;
+    padding-left: calc(6px + (var(--session-depth) * 16px));
     cursor: pointer;
     transition: background 0.2s, border-color 0.2s;
     display: flex;
@@ -77,6 +79,16 @@
 
 .session-item:hover {
     background: rgba(255, 255, 255, 0.06);
+}
+
+.session-item.child::before {
+    content: '';
+    position: absolute;
+    left: calc(6px + (var(--session-depth) * 16px) - 8px);
+    top: 6px;
+    bottom: 6px;
+    width: 1px;
+    background: rgba(255, 255, 255, 0.08);
 }
 
 .session-item.active {

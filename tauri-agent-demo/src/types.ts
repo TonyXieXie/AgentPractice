@@ -24,6 +24,7 @@ export interface AgentProfile {
     name: string;
     abilities: string[];
     params?: Record<string, any>;
+    spawnable?: boolean;
 }
 
 export interface CodeMapConfig {
@@ -43,6 +44,7 @@ export interface AgentConfig {
     abilities?: AgentAbility[];
     profiles?: AgentProfile[];
     default_profile?: string;
+    subagent_profile?: string;
 }
 
 export interface ContextConfig {
@@ -158,6 +160,7 @@ export interface ChatSession {
     config_id: string;
     work_path?: string | null;
     agent_profile?: string | null;
+    parent_session_id?: string | null;
     context_summary?: string | null;
     last_compressed_llm_call_id?: number | null;
     context_estimate?: ContextEstimate | null;
@@ -172,6 +175,7 @@ export interface ChatSessionCreate {
     config_id: string;
     work_path?: string | null;
     agent_profile?: string | null;
+    parent_session_id?: string | null;
 }
 
 export interface ChatSessionUpdate {
@@ -179,6 +183,7 @@ export interface ChatSessionUpdate {
     work_path?: string | null;
     config_id?: string;
     agent_profile?: string | null;
+    parent_session_id?: string | null;
 }
 
 export interface LLMCall {

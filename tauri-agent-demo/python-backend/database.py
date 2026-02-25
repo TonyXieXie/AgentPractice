@@ -129,6 +129,7 @@ class Database:
                 config_id TEXT NOT NULL,
                 work_path TEXT,
                 agent_profile TEXT,
+                parent_session_id TEXT,
                 context_summary TEXT,
                 last_compressed_llm_call_id INTEGER,
                 context_estimate TEXT,
@@ -151,6 +152,11 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN agent_profile TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN parent_session_id TEXT')
         except sqlite3.OperationalError:
             pass
 
@@ -297,6 +303,7 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_attachments_message ON message_attachments(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_config ON chat_sessions(config_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_parent ON chat_sessions(parent_session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_steps_message ON agent_steps(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_llm_calls_session ON llm_calls(session_id)')
@@ -497,9 +504,9 @@ class Database:
         now = datetime.now().isoformat()
 
         cursor.execute('''
-            INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (session_id, session.title, session.config_id, session.work_path, session.agent_profile, now, now))
+            INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, parent_session_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (session_id, session.title, session.config_id, session.work_path, session.agent_profile, session.parent_session_id, now, now))
         
         conn.commit()
         conn.close()
@@ -582,6 +589,10 @@ class Database:
             fields.append("agent_profile = ?")
             values.append(update.agent_profile)
 
+        if update.parent_session_id is not None:
+            fields.append("parent_session_id = ?")
+            values.append(update.parent_session_id)
+
         if fields:
             fields.append("updated_at = ?")
             values.append(datetime.now().isoformat())
@@ -609,8 +620,8 @@ class Database:
 
             cursor.execute(
                 '''
-                INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, parent_session_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 (
                     new_session_id,
@@ -618,6 +629,7 @@ class Database:
                     source['config_id'],
                     source['work_path'],
                     source['agent_profile'],
+                    None,
                     now,
                     now,
                 )
@@ -845,6 +857,19 @@ class Database:
     
     def delete_session(self, session_id: str) -> bool:
         """Delete session and its messages"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT id FROM chat_sessions WHERE parent_session_id = ?', (session_id,))
+        child_rows = cursor.fetchall()
+        conn.close()
+        for row in child_rows:
+            try:
+                child_id = row["id"]
+            except Exception:
+                child_id = row[0] if row else None
+            if child_id:
+                self.delete_session(str(child_id))
+
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''

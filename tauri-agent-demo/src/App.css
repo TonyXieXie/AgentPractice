@@ -656,6 +656,16 @@ body[data-platform="mac"] .app-titlebar {
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.input-readonly-hint {
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: rgba(250, 204, 21, 0.08);
+  border: 1px solid rgba(250, 204, 21, 0.2);
+  color: #facc15;
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+}
+
 .input-area.drag-active {
   border-color: rgba(56, 189, 248, 0.6);
   box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.35);
