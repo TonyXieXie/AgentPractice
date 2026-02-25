@@ -520,6 +520,13 @@ async def _maybe_update_session_title(
     provisional_title = _fallback_title(user_message)
     if current_title not in ("New Chat", provisional_title):
         return
+    app_config = get_app_config()
+    llm_app_config = app_config.get("llm", {}) if isinstance(app_config, dict) else {}
+    auto_title_enabled = llm_app_config.get("auto_title_enabled", True)
+    if not auto_title_enabled:
+        if provisional_title and provisional_title != current.title:
+            db.update_session(session_id, ChatSessionUpdate(title=provisional_title))
+        return
     title = ""
     try:
         title = await _generate_title(

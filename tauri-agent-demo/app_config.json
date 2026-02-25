@@ -1,7 +1,8 @@
 {
   "llm": {
     "timeout_sec": 180.0,
-    "reasoning_summary": "concise"
+    "reasoning_summary": "concise",
+    "auto_title_enabled": false
   },
   "agent": {
     "react_max_iterations": 200,
@@ -90,13 +91,9 @@
       },
       {
         "id": "subagent",
-        "name": "Subagent",
+        "name": "Subagent-Search",
         "abilities": [
-          "tools_all",
-          "rg_search",
-          "apply_patch",
-          "tool_json",
-          "output_concise"
+          "websear"
         ],
         "spawnable": true
       },

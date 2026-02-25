@@ -7,7 +7,8 @@ from typing import Any, Dict, Optional
 _DEFAULT_APP_CONFIG: Dict[str, Any] = {
     "llm": {
         "timeout_sec": 180.0,
-        "reasoning_summary": "detailed"
+        "reasoning_summary": "detailed",
+        "auto_title_enabled": True
     },
     "context": {
         "compression_enabled": False,
@@ -323,6 +324,8 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         llm["timeout_sec"] = _coerce_timeout(llm["timeout_sec"])
     if "reasoning_summary" in llm:
         llm["reasoning_summary"] = _coerce_reasoning_summary(llm["reasoning_summary"])
+    if "auto_title_enabled" in llm:
+        llm["auto_title_enabled"] = _coerce_bool(llm["auto_title_enabled"], "llm.auto_title_enabled")
     normalized["llm"] = llm
     context = dict(normalized.get("context", {}))
     normalized["context"] = _normalize_context_config(context)

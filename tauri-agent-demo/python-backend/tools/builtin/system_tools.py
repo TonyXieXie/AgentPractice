@@ -610,6 +610,45 @@ def _use_restricted_conpty(use_sandbox: bool) -> bool:
     return bool(use_sandbox)
 
 
+def _safe_close_pseudo_console(kernel32_dll, h_pc_handle, label: str = "conpty") -> None:
+    """Close PseudoConsole with timeout protection to prevent deadlock.
+
+    ClosePseudoConsole is a synchronous blocking call that waits for
+    conhost.exe to finish cleanup. If child processes are still alive,
+    it can block indefinitely, hanging the calling thread.
+    """
+    skip_raw = os.environ.get("PTY_SKIP_CLOSE_PSEUDOCONSOLE")
+    if skip_raw is not None and str(skip_raw).strip().lower() in ("1", "true", "yes", "on"):
+        _pty_debug(f"{label} ClosePseudoConsole skipped")
+        return
+
+    def _do_close():
+        try:
+            kernel32_dll.ClosePseudoConsole(h_pc_handle)
+        except Exception:
+            pass
+
+    _pty_debug(f"{label} ClosePseudoConsole enter")
+    t = threading.Thread(target=_do_close, daemon=True)
+    t.start()
+
+    timeout = 5.0
+    try:
+        raw = os.environ.get("PTY_CLOSE_PSEUDOCONSOLE_TIMEOUT_SEC")
+        if raw is not None:
+            timeout = float(raw)
+    except (TypeError, ValueError):
+        pass
+    if timeout <= 0:
+        timeout = 5.0
+
+    t.join(timeout=timeout)
+    if t.is_alive():
+        _pty_debug(f"{label} ClosePseudoConsole timed out after {timeout}s, abandoned")
+    else:
+        _pty_debug(f"{label} ClosePseudoConsole exit")
+
+
 _PTY_SUPPORT: Optional[bool] = None
 
 
@@ -1989,17 +2028,19 @@ def _run_windows_pty_oneshot(
 
     exit_code = wintypes.DWORD()
     kernel32.GetExitCodeProcess(proc_info.hProcess, ctypes.byref(exit_code))
-    kernel32.CloseHandle(proc_info.hThread)
-    kernel32.CloseHandle(proc_info.hProcess)
     kernel32.CloseHandle(out_read)
     kernel32.CloseHandle(in_write)
     if in_read_dbg:
         kernel32.CloseHandle(in_read_dbg)
     if out_write_dbg:
         kernel32.CloseHandle(out_write_dbg)
-    kernel32.ClosePseudoConsole(h_pc)
+    # Close job handle BEFORE ClosePseudoConsole so
+    # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills any remaining child processes
     if job_handle:
         kernel32.CloseHandle(job_handle)
+    _safe_close_pseudo_console(kernel32, h_pc, label="conpty oneshot")
+    kernel32.CloseHandle(proc_info.hThread)
+    kernel32.CloseHandle(proc_info.hProcess)
 
     output = _decode_output_bytes(b"".join(output_chunks))
     if timed_out:
@@ -2037,6 +2078,9 @@ def _start_windows_pty_persistent(
         except Exception as exc:
             _pty_debug(f"conpty file_type error={exc}")
 
+    _conpty_cleanup_lock = threading.Lock()
+    _conpty_cleaned_up = [False]
+
     def _writer(data: bytes) -> int:
         written = wintypes.DWORD()
         if kernel32.WriteFile(in_write, data, len(data), ctypes.byref(written), None):
@@ -2068,6 +2112,20 @@ def _start_windows_pty_persistent(
     def _terminator() -> None:
         if _pty_debug_enabled():
             _pty_debug(f"conpty terminator enter pid={proc_info.dwProcessId}")
+
+        # Guard against double-cleanup (reader loop may also clean up)
+        with _conpty_cleanup_lock:
+            already = _conpty_cleaned_up[0]
+            _conpty_cleaned_up[0] = True
+        if already:
+            try:
+                kernel32.TerminateProcess(proc_info.hProcess, 1)
+            except Exception:
+                pass
+            if _pty_debug_enabled():
+                _pty_debug(f"conpty terminator skipped (already cleaned up) pid={proc_info.dwProcessId}")
+            return
+
         def _log_call(name: str, ok: Optional[bool] = None) -> None:
             if not _pty_debug_enabled():
                 return
@@ -2079,6 +2137,18 @@ def _start_windows_pty_persistent(
             else:
                 err = ctypes.get_last_error()
                 _pty_debug(f"conpty terminator {name} failed winerr={err}")
+
+        # Kill all processes in the job object first (including grandchildren)
+        if job_handle:
+            try:
+                kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+                kernel32.TerminateJobObject.restype = wintypes.BOOL
+                _log_call("TerminateJobObject enter")
+                ok = bool(kernel32.TerminateJobObject(job_handle, 1))
+                _log_call("TerminateJobObject exit", ok)
+            except Exception as exc:
+                if _pty_debug_enabled():
+                    _pty_debug(f"conpty terminator TerminateJobObject error={exc}")
 
         _log_call("TerminateProcess enter")
         ok = bool(kernel32.TerminateProcess(proc_info.hProcess, 1))
@@ -2100,19 +2170,16 @@ def _start_windows_pty_persistent(
             _log_call("CloseHandle out_write_dbg enter")
             ok = bool(kernel32.CloseHandle(out_write_dbg))
             _log_call("CloseHandle out_write_dbg exit", ok)
-        skip_close_pc = os.environ.get("PTY_SKIP_CLOSE_PSEUDOCONSOLE")
-        if skip_close_pc is not None and str(skip_close_pc).strip().lower() in ("1", "true", "yes", "on"):
-            if _pty_debug_enabled():
-                _pty_debug("conpty terminator ClosePseudoConsole skipped")
-        else:
-            _log_call("ClosePseudoConsole enter")
-            kernel32.ClosePseudoConsole(h_pc)
-            _log_call("ClosePseudoConsole exit")
 
+        # Close job handle BEFORE ClosePseudoConsole so
+        # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills any remaining child processes
         if job_handle:
             _log_call("CloseHandle job_handle enter")
             ok = bool(kernel32.CloseHandle(job_handle))
             _log_call("CloseHandle job_handle exit", ok)
+
+        # ClosePseudoConsole with timeout protection
+        _safe_close_pseudo_console(kernel32, h_pc, label="conpty terminator")
 
         _log_call("CloseHandle hThread enter")
         ok = bool(kernel32.CloseHandle(proc_info.hThread))
@@ -2261,15 +2328,26 @@ def _start_windows_pty_persistent(
         kernel32.GetExitCodeProcess(proc_info.hProcess, ctypes.byref(exit_code))
         pty_proc.mark_exited(int(exit_code.value))
         _pty_debug(f"conpty exited code={int(exit_code.value)}")
+
+        # Guard against double-cleanup (_terminator may also clean up)
+        with _conpty_cleanup_lock:
+            already = _conpty_cleaned_up[0]
+            _conpty_cleaned_up[0] = True
+        if already:
+            _pty_debug("conpty reader cleanup skipped (already cleaned up)")
+            return
+
         kernel32.CloseHandle(out_read)
         kernel32.CloseHandle(in_write)
         if in_read_dbg:
             kernel32.CloseHandle(in_read_dbg)
         if out_write_dbg:
             kernel32.CloseHandle(out_write_dbg)
-        kernel32.ClosePseudoConsole(h_pc)
+        # Close job handle BEFORE ClosePseudoConsole so
+        # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills any remaining child processes
         if job_handle:
             kernel32.CloseHandle(job_handle)
+        _safe_close_pseudo_console(kernel32, h_pc, label="conpty reader")
         kernel32.CloseHandle(proc_info.hThread)
         kernel32.CloseHandle(proc_info.hProcess)
 

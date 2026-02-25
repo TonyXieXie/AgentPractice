@@ -134,6 +134,16 @@ class PtyProcess:
             return
         self.status = "closed"
         self.stop_event.set()
+        # Run terminator in a background thread to avoid blocking
+        # the caller (e.g. asyncio event loop) if ClosePseudoConsole hangs
+        t = threading.Thread(
+            target=self._safe_terminate,
+            daemon=True,
+            name=f"pty-terminate-{self.id}"
+        )
+        t.start()
+
+    def _safe_terminate(self) -> None:
         try:
             self._terminator()
         except Exception:
