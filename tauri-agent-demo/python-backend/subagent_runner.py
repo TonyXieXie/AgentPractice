@@ -1,3 +1,4 @@
+import asyncio
 from typing import Dict, Any, Optional, Tuple
 import traceback
 
@@ -335,6 +336,19 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
                 final_answer = step.content
                 had_error = True
 
+    except asyncio.CancelledError:
+        had_error = True
+        final_answer = "Subagent cancelled."
+        try:
+            db.save_agent_step(
+                message_id=assistant_msg_id,
+                step_type="error",
+                content=final_answer,
+                sequence=sequence,
+                metadata={"error": "cancelled", "cancelled": True}
+            )
+        except Exception:
+            pass
     except Exception as exc:
         had_error = True
         final_answer = f"Subagent failed: {exc}"
