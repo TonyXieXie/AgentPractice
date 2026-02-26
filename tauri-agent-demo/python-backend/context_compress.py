@@ -1,9 +1,11 @@
 from typing import List, Dict, Any, Optional, Tuple
 import json
 import os
+import re
 
 from models import LLMConfig
 from database import db
+from mcp_tools import safe_mcp_tool_name
 
 
 CONTEXT_SUMMARY_PROMPT = (
@@ -19,6 +21,7 @@ CONTEXT_COMPRESS_KEEP_RECENT_CALLS = 10
 CONTEXT_COMPRESS_STEP_CALLS = 5
 TRUNCATION_MARKER_START = "[TRUNCATED_START]"
 TRUNCATION_MARKER_END = "[TRUNCATED_END]"
+SAFE_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _debug_log(message: str) -> None:
@@ -133,6 +136,20 @@ def _format_tool_arguments(tool_name: Optional[str], tool_input: Any, trunc_cfg:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _normalize_tool_name_for_llm(tool_name: Optional[str]) -> str:
+    name = str(tool_name or "").strip()
+    if not name:
+        return ""
+    if name.startswith("mcp:") and "/" in name:
+        server_tool = name[4:]
+        server_label, tool = server_tool.split("/", 1)
+        return safe_mcp_tool_name(server_label, tool)
+    if SAFE_TOOL_NAME_RE.match(name):
+        return name
+    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_")
+    return sanitized or name
+
+
 def _build_trunc_cfg(context_cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "enabled": bool(context_cfg.get("truncate_long_data", True)),
@@ -229,7 +246,7 @@ def build_history_for_llm(
             for step in steps:
                 step_type = step.get("step_type")
                 metadata = step.get("metadata") or {}
-                tool_name = metadata.get("tool")
+                tool_name = _normalize_tool_name_for_llm(metadata.get("tool"))
                 if not tool_name:
                     continue
                 if step_type == "observation" and metadata.get("context_compress"):

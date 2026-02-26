@@ -325,6 +325,39 @@ const parseAstPayload = (raw: string): AstPayload | null => {
 
 type DiffChunk = { path: string; diff: string };
 
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|svg)(?:\?.*)?$/i;
+const IMAGE_QUERY_RE = /[?&](?:format|fm|ext)=?(png|jpe?g|gif|webp|svg)\b/i;
+
+const looksLikeImageUrl = (value: string) => {
+    if (!value) return false;
+    const trimmed = value.trim();
+    if (/^data:image\//i.test(trimmed)) return true;
+    if (!/^https?:\/\//i.test(trimmed)) return false;
+    return IMAGE_EXT_RE.test(trimmed) || IMAGE_QUERY_RE.test(trimmed);
+};
+
+type ImageExtraction = { images: string[]; text: string };
+
+const extractImagesFromText = (raw: string): ImageExtraction => {
+    if (!raw) return { images: [], text: raw };
+    const lines = raw.split('\n');
+    const images: string[] = [];
+    const kept: string[] = [];
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+            kept.push(line);
+            continue;
+        }
+        if (looksLikeImageUrl(trimmed)) {
+            images.push(trimmed);
+            continue;
+        }
+        kept.push(line);
+    }
+    return { images, text: kept.join('\n') };
+};
+
 function parseApplyPatchResult(content: string): ApplyPatchResult | null {
     if (!content) return null;
     try {
@@ -1606,6 +1639,24 @@ function AgentStepView({
         });
     };
 
+    const renderObservationImages = (images: string[], expanded: boolean) => {
+        if (!images.length) return null;
+        const visible = expanded ? images : images.slice(0, 1);
+        const extraCount = images.length - visible.length;
+        return (
+            <div className={`observation-images${expanded ? ' expanded' : ' preview'}`}>
+                {visible.map((src, idx) => (
+                    <div key={`${src}-${idx}`} className="observation-image-item">
+                        <img src={src} alt={`tool output ${idx + 1}`} loading="lazy" />
+                    </div>
+                ))}
+                {!expanded && extraCount > 0 && (
+                    <div className="observation-image-more">还有 {extraCount} 张</div>
+                )}
+            </div>
+        );
+    };
+
     const renderAstPayload = (payload: AstPayload, stepKey: string, expanded: boolean) => (
         <AstViewer
             payload={payload}
@@ -1831,37 +1882,36 @@ function AgentStepView({
                 const hasErrorDetails = Boolean(errorDetails);
                 const errorExpanded = !!expandedErrors[stepKey];
                 let observationText = '';
+                let observationTextRaw = '';
                 let observationPreview = '';
                 let observationHasMore = false;
                 let observationIsDiff = false;
                 let observationFailed = false;
                 let applyPatchResult: ApplyPatchResult | null = null;
                 let isApplyPatch = false;
+                let observationImages: string[] = [];
                 let astPayload: AstPayload | null = null;
                 let shellPayload: ReturnType<typeof parseShellOutput> | null = null;
                 let shellBody = '';
                 let shellPreview = '';
                 const shellCommandFromMeta = typeof step.metadata?.command === 'string' ? step.metadata.command : '';
                 if (isObservation) {
-                    observationText = rawContent.replace(/\r\n/g, '\n');
-                    const exitCode = parseExitCode(observationText);
+                    observationTextRaw = rawContent.replace(/\r\n/g, '\n');
+                    const exitCode = parseExitCode(observationTextRaw);
                     if (exitCode !== null && exitCode !== 0) {
                         observationFailed = true;
                     }
-                    const lines = observationText.split('\n');
-                    observationHasMore = lines.length > 1;
-                    observationPreview = observationHasMore ? `${lines[0]} ...` : lines[0] || '';
-                    observationIsDiff = looksLikeDiff(observationText);
+                    observationIsDiff = looksLikeDiff(observationTextRaw);
                     isApplyPatch = toolName === 'apply_patch';
                     if (isApplyPatch) {
-                        applyPatchResult = parseApplyPatchResult(observationText);
+                        applyPatchResult = parseApplyPatchResult(observationTextRaw);
                         if (applyPatchResult && applyPatchResult.ok === false) {
                             observationFailed = true;
                         }
                     } else if (isAstObservation) {
-                        astPayload = parseAstPayload(observationText);
+                        astPayload = parseAstPayload(observationTextRaw);
                     } else if (isRunShell) {
-                        shellPayload = parseShellOutput(observationText);
+                        shellPayload = parseShellOutput(observationTextRaw);
                         if (shellPayload) {
                             if (shellCommandFromMeta && !shellPayload.header.command) {
                                 shellPayload.header.command = shellCommandFromMeta;
@@ -1882,6 +1932,22 @@ function AgentStepView({
                             if (typeof shellPayload.header.exit_code === 'number' && shellPayload.header.exit_code !== 0) {
                                 observationFailed = true;
                             }
+                        }
+                    }
+
+                    if (!isRunShell) {
+                        let displayText = observationTextRaw;
+                        if (!isApplyPatch && !isAstObservation && !observationIsDiff) {
+                            const extracted = extractImagesFromText(observationTextRaw);
+                            observationImages = extracted.images;
+                            displayText = extracted.text;
+                        }
+                        observationText = displayText;
+                        const lines = displayText.split('\n');
+                        observationHasMore = lines.length > 1 || observationImages.length > 1;
+                        observationPreview = observationHasMore ? `${lines[0]} ...` : lines[0] || '';
+                        if (!displayText.trim() && observationImages.length > 0) {
+                            observationPreview = `图片输出（${observationImages.length}）`;
                         }
                     }
                 }
@@ -2070,13 +2136,19 @@ function AgentStepView({
                                         ) : observationIsDiff ? (
                                             <DiffView content={observationText} />
                                         ) : (
-                                            <div className="observation-text expanded">{renderLinkedText(observationText)}</div>
+                                            <>
+                                                {renderObservationImages(observationImages, true)}
+                                                <div className="observation-text expanded">{renderLinkedText(observationText)}</div>
+                                            </>
                                         )
                                     ) : (
                                         isAstObservation && astPayload ? (
                                             renderAstPayload(astPayload, stepKey, isObservationExpanded)
                                         ) : (
-                                            <div className="observation-text">{renderLinkedText(observationPreview)}</div>
+                                            <>
+                                                {renderObservationImages(observationImages, false)}
+                                                <div className="observation-text">{renderLinkedText(observationPreview)}</div>
+                                            </>
                                         )
                                     )}
                                 </div>

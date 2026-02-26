@@ -23,7 +23,7 @@ from context_estimate import build_context_estimate
 from llm_client import LLMTransientError
 from app_config import get_app_config
 from database import db
-from mcp_tools import build_mcp_tool_name, persist_mcp_tool_approval
+from mcp_tools import build_mcp_tool_name, persist_mcp_tool_approval, safe_mcp_tool_name
 from tools.mcp_tool import MCPTool
 from context_compress import build_history_for_llm, maybe_compress_context, summarize_dialogue
 
@@ -751,6 +751,10 @@ class ReActAgent(AgentStrategy):
                                         tool_name = event.get("name") or ""
                                         args_delta = event.get("arguments_delta", "")
                                         if args_delta or tool_name:
+                                            tool_display = tool_name
+                                            tool_obj = self._get_tool(tools, tool_name)
+                                            if isinstance(tool_obj, MCPTool):
+                                                tool_display = tool_obj.display_name
                                             yield AgentStep(
                                                 step_type="action_delta",
                                                 content=args_delta,
@@ -758,6 +762,7 @@ class ReActAgent(AgentStrategy):
                                                     "iteration": iteration,
                                                     "stream_key": call_key,
                                                     "tool": tool_name,
+                                                    "tool_display": tool_display,
                                                     "call_index": call_index
                                                 }
                                             )
@@ -923,11 +928,13 @@ class ReActAgent(AgentStrategy):
                             tool_name = str(mcp_call.get("name") or "").strip()
                             args_text = str(mcp_call.get("arguments") or "")
                             display_label = build_mcp_tool_name(server_label or "mcp", tool_name or "tool")
+                            safe_label = safe_mcp_tool_name(server_label or "mcp", tool_name or "tool")
                             yield AgentStep(
                                 step_type="action",
                                 content=f"{display_label}[{args_text}]",
                                 metadata={
-                                    "tool": display_label,
+                                    "tool": safe_label,
+                                    "tool_display": display_label,
                                     "input": args_text,
                                     "iteration": iteration,
                                     "mcp": True
@@ -944,7 +951,7 @@ class ReActAgent(AgentStrategy):
                             yield AgentStep(
                                 step_type="observation",
                                 content=output_text,
-                                metadata={"tool": display_label, "iteration": iteration, "mcp": True}
+                                metadata={"tool": safe_label, "tool_display": display_label, "iteration": iteration, "mcp": True}
                             )
 
                     if tool_calls:
@@ -982,12 +989,20 @@ class ReActAgent(AgentStrategy):
                             tool_input = prepared["tool_input"]
                             error_msg = prepared["error_msg"]
                             tool_label = tool_name
+                            tool_meta_name = tool_name
                             if isinstance(tool, MCPTool):
                                 tool_label = tool.display_name
+                                tool_meta_name = tool.name or tool_name
                             yield AgentStep(
                                 step_type="action",
                                 content=f"{tool_label}[{tool_input}]",
-                                metadata={"tool": tool_label, "input": tool_input, "iteration": iteration, "stream_key": call_key}
+                                metadata={
+                                    "tool": tool_meta_name,
+                                    "tool_display": tool_label,
+                                    "input": tool_input,
+                                    "iteration": iteration,
+                                    "stream_key": call_key
+                                }
                             )
 
                             tool_output = ""
@@ -996,14 +1011,14 @@ class ReActAgent(AgentStrategy):
                                 yield AgentStep(
                                     step_type="observation",
                                     content=tool_output,
-                                    metadata={"tool": tool_label, "iteration": iteration}
+                                    metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                                 )
                             elif tool is None:
                                 tool_output = f"Tool not found: '{tool_name}'"
                                 yield AgentStep(
                                     step_type="observation",
                                     content=tool_output,
-                                    metadata={"tool": tool_label, "iteration": iteration}
+                                    metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                                 )
                             elif str(tool_name or "").lower() == "run_shell":
                                 output_holder: Dict[str, str] = {}
@@ -1024,7 +1039,7 @@ class ReActAgent(AgentStrategy):
                                 yield AgentStep(
                                     step_type="observation",
                                     content=tool_output,
-                                    metadata={"tool": tool_label, "iteration": iteration}
+                                    metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                                 )
 
                             dynamic_response_items.append({
@@ -1122,6 +1137,10 @@ class ReActAgent(AgentStrategy):
                                 tool_name = event.get("name") or ""
                                 args_delta = event.get("arguments_delta", "")
                                 if args_delta or tool_name:
+                                    tool_display = tool_name
+                                    tool_obj = self._get_tool(tools, tool_name)
+                                    if isinstance(tool_obj, MCPTool):
+                                        tool_display = tool_obj.display_name
                                     yield AgentStep(
                                         step_type="action_delta",
                                         content=args_delta,
@@ -1129,6 +1148,7 @@ class ReActAgent(AgentStrategy):
                                             "iteration": iteration,
                                             "stream_key": call_key,
                                             "tool": tool_name,
+                                            "tool_display": tool_display,
                                             "call_index": call_index
                                         }
                                     )
@@ -1264,12 +1284,20 @@ class ReActAgent(AgentStrategy):
                         tool_input = prepared["tool_input"]
                         error_msg = prepared["error_msg"]
                         tool_label = tool_name
+                        tool_meta_name = tool_name
                         if isinstance(tool, MCPTool):
                             tool_label = tool.display_name
+                            tool_meta_name = tool.name or tool_name
                         yield AgentStep(
                             step_type="action",
                             content=f"{tool_label}[{tool_input}]",
-                            metadata={"tool": tool_label, "input": tool_input, "iteration": iteration, "stream_key": call_key}
+                            metadata={
+                                "tool": tool_meta_name,
+                                "tool_display": tool_label,
+                                "input": tool_input,
+                                "iteration": iteration,
+                                "stream_key": call_key
+                            }
                         )
                         tool_output = ""
                         if error_msg:
@@ -1277,14 +1305,14 @@ class ReActAgent(AgentStrategy):
                             yield AgentStep(
                                 step_type="observation",
                                 content=tool_output,
-                                metadata={"tool": tool_label, "iteration": iteration}
+                                metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                             )
                         elif tool is None:
                             tool_output = f"Tool not found: '{tool_name}'"
                             yield AgentStep(
                                 step_type="observation",
                                 content=tool_output,
-                                metadata={"tool": tool_label, "iteration": iteration}
+                                metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                             )
                         elif str(tool_name or "").lower() == "run_shell":
                             output_holder: Dict[str, str] = {}
@@ -1305,7 +1333,7 @@ class ReActAgent(AgentStrategy):
                             yield AgentStep(
                                 step_type="observation",
                                 content=tool_output,
-                                metadata={"tool": tool_label, "iteration": iteration}
+                                metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                             )
 
                     dynamic_messages.append({
@@ -1551,12 +1579,14 @@ class ReActAgent(AgentStrategy):
             if action and action_input:
                 tool = self._get_tool(tools, action)
                 tool_label = action
+                tool_meta_name = action
                 if isinstance(tool, MCPTool):
                     tool_label = tool.display_name
+                    tool_meta_name = tool.name or action
                 yield AgentStep(
                     step_type="action",
                     content=f"{tool_label}[{action_input}]",
-                    metadata={"tool": tool_label, "input": action_input, "iteration": iteration}
+                    metadata={"tool": tool_meta_name, "tool_display": tool_label, "input": action_input, "iteration": iteration}
                 )
                 scratchpad.append({"text": f"Action: {action}", "origin_call_seq": current_call_seq})
                 scratchpad.append({"text": f"Action Input: {action_input}", "origin_call_seq": current_call_seq})
@@ -1583,7 +1613,7 @@ class ReActAgent(AgentStrategy):
                             yield AgentStep(
                                 step_type="observation",
                                 content=observation,
-                                metadata={"tool": tool_label, "iteration": iteration}
+                                metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                             )
                         scratchpad.append({"text": f"Observation: {observation}", "origin_call_seq": current_call_seq})
                     except Exception as e:
@@ -1591,7 +1621,7 @@ class ReActAgent(AgentStrategy):
                         yield AgentStep(
                             step_type="observation",
                             content=error_msg,
-                            metadata={"tool": tool_label, "error": str(e), "iteration": iteration}
+                            metadata={"tool": tool_meta_name, "tool_display": tool_label, "error": str(e), "iteration": iteration}
                         )
                         scratchpad.append({"text": f"Observation: {error_msg}", "origin_call_seq": current_call_seq})
                 else:
@@ -1599,7 +1629,7 @@ class ReActAgent(AgentStrategy):
                     yield AgentStep(
                         step_type="error",
                         content=error_msg,
-                        metadata={"tool": tool_label, "iteration": iteration}
+                        metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                     )
                     scratchpad.append({"text": f"Observation: {error_msg}", "origin_call_seq": current_call_seq})
             else:
