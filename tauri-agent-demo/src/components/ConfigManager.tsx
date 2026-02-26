@@ -23,6 +23,7 @@ import {
     deleteConfig,
     getAppConfig,
     updateAppConfig,
+    refreshMcpTools,
     getTools,
     getAstSettingsAll,
     updateAstSettings
@@ -64,8 +65,6 @@ const REASONING_SUMMARY_OPTIONS: { value: ReasoningSummary; label: string }[] = 
     { value: 'detailed', label: 'Detailed' }
 ];
 
-type MCPApprovalMode = 'always' | 'never' | 'custom';
-
 type MCPServerForm = {
     enabled: boolean;
     server_label: string;
@@ -74,12 +73,7 @@ type MCPServerForm = {
     server_description: string;
     authorization_env: string;
     headers_env: string;
-    allowed_tools: string;
-    approval_mode: MCPApprovalMode;
-    never_tools: string;
 };
-
-const DEFAULT_MCP_APPROVAL_MODE: MCPApprovalMode = 'always';
 
 const ABILITY_TYPE_OPTIONS: { value: string; label: string }[] = [
     { value: 'tooling', label: '工具说明' },
@@ -183,48 +177,9 @@ const normalizeAstImportLanguages = (value: unknown): string[] => {
     return [];
 };
 
-const parseCommaList = (value: string): string[] => {
-    if (!value) return [];
-    return value
-        .split(/[,\r\n]+/)
-        .map((item) => item.trim())
-        .filter(Boolean);
-};
-
-const joinCommaList = (value: unknown): string => {
-    if (!Array.isArray(value)) return '';
-    return value
-        .map((item) => String(item).trim())
-        .filter(Boolean)
-        .join(', ');
-};
-
 const normalizeMcpServers = (mcp?: MCPConfig | null): MCPServerForm[] => {
     const servers = Array.isArray(mcp?.servers) ? (mcp?.servers as MCPServerConfig[]) : [];
     return servers.map((server) => {
-        const allowedTools = server.allowed_tools;
-        let allowedToolsText = '';
-        if (Array.isArray(allowedTools)) {
-            allowedToolsText = joinCommaList(allowedTools);
-        } else if (allowedTools && typeof allowedTools === 'object') {
-            allowedToolsText = joinCommaList((allowedTools as { tool_names?: string[] }).tool_names);
-        }
-
-        const requireApproval = server.require_approval;
-        let approvalMode: MCPApprovalMode = DEFAULT_MCP_APPROVAL_MODE;
-        let neverTools = '';
-        if (requireApproval === 'never') {
-            approvalMode = 'never';
-        } else if (requireApproval === 'always') {
-            approvalMode = 'always';
-        } else if (requireApproval && typeof requireApproval === 'object') {
-            approvalMode = 'custom';
-            const neverFilter = (requireApproval as { never?: { tool_names?: string[] } }).never;
-            if (neverFilter?.tool_names) {
-                neverTools = joinCommaList(neverFilter.tool_names);
-            }
-        }
-
         return {
             enabled: server.enabled ?? true,
             server_label: server.server_label || '',
@@ -232,10 +187,7 @@ const normalizeMcpServers = (mcp?: MCPConfig | null): MCPServerForm[] => {
             connector_id: server.connector_id || '',
             server_description: server.server_description || '',
             authorization_env: server.authorization_env || '',
-            headers_env: server.headers_env || '',
-            allowed_tools: allowedToolsText,
-            approval_mode: approvalMode,
-            never_tools: neverTools
+            headers_env: server.headers_env || ''
         };
     });
 };
@@ -259,10 +211,10 @@ const buildMcpServersPayload = (
 
         const serverUrl = server.server_url.trim();
         const connectorId = server.connector_id.trim();
-        if ((!serverUrl && !connectorId) || (serverUrl && connectorId)) {
+        if (!serverUrl) {
             return {
                 servers: payload,
-                error: `MCP 服务器 ${label} 需要填写 server_url 或 connector_id（二选一）。`
+                error: `MCP 服务器 ${label} 需要填写 server_url（connector_id 已不支持）。`
             };
         }
 
@@ -280,17 +232,6 @@ const buildMcpServersPayload = (
         const headersEnv = server.headers_env.trim();
         if (headersEnv) item.headers_env = headersEnv;
 
-        const allowedList = parseCommaList(server.allowed_tools);
-        if (allowedList.length > 0) item.allowed_tools = allowedList;
-
-        const approvalMode = server.approval_mode || DEFAULT_MCP_APPROVAL_MODE;
-        if (approvalMode === 'always' || approvalMode === 'never') {
-            item.require_approval = approvalMode;
-        } else {
-            const neverList = parseCommaList(server.never_tools);
-            item.require_approval = { never: { tool_names: neverList } };
-        }
-
         payload.push(item);
     }
 
@@ -304,14 +245,35 @@ const createEmptyMcpServer = (): MCPServerForm => ({
     connector_id: '',
     server_description: '',
     authorization_env: '',
-    headers_env: '',
-    allowed_tools: '',
-    approval_mode: DEFAULT_MCP_APPROVAL_MODE,
-    never_tools: ''
+    headers_env: ''
 });
 
+const sanitizeMcpSegment = (value: string, fallback: string) => {
+    const cleaned = value
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '');
+    return cleaned || fallback;
+};
+
+const getMcpToolPrefix = (serverLabel: string) => {
+    const safeServer = sanitizeMcpSegment(serverLabel || '', 'server');
+    return `mcp__${safeServer}__`;
+};
+
+const splitMcpToolDescription = (tool: ToolDefinition): { title: string; description: string } => {
+    const name = tool.name || '';
+    const desc = tool.description || '';
+    if (desc.startsWith('mcp:') && desc.includes(' - ')) {
+        const [title, ...rest] = desc.split(' - ');
+        return { title: title.trim() || name, description: rest.join(' - ').trim() };
+    }
+    return { title: name, description: desc };
+};
+
 export default function ConfigManager({ onClose, onConfigCreated }: ConfigManagerProps) {
-    type ConfigTab = 'models' | 'global' | 'agents';
+    type ConfigTab = 'models' | 'global' | 'mcp' | 'agents';
     const [configs, setConfigs] = useState<LLMConfig[]>([]);
     const [activeTab, setActiveTab] = useState<ConfigTab>('models');
     const [globalTimeoutSec, setGlobalTimeoutSec] = useState('180');
@@ -352,6 +314,12 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const [globalLoading, setGlobalLoading] = useState(false);
     const [globalSaving, setGlobalSaving] = useState(false);
     const [globalSaved, setGlobalSaved] = useState(false);
+    const [mcpSaving, setMcpSaving] = useState(false);
+    const [mcpSaved, setMcpSaved] = useState(false);
+    const [mcpRefreshing, setMcpRefreshing] = useState(false);
+    const [mcpRefreshed, setMcpRefreshed] = useState(false);
+    const [mcpRefreshError, setMcpRefreshError] = useState<string | null>(null);
+    const [mcpExpanded, setMcpExpanded] = useState<Record<string, boolean>>({});
     const [agentConfig, setAgentConfig] = useState<AgentConfig>({});
     const [agentLoading, setAgentLoading] = useState(false);
     const [agentSaving, setAgentSaving] = useState(false);
@@ -516,6 +484,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         }
         setGlobalMcpServers(normalizeMcpServers(data?.agent?.mcp));
         setAgentConfig(normalizeAgentConfig(data?.agent));
+        setMcpRefreshed(false);
+        setMcpRefreshError(null);
     };
 
     const loadAppConfig = async () => {
@@ -551,17 +521,33 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         setGlobalMcpServers((prev) =>
             prev.map((server, idx) => (idx === index ? { ...server, ...patch } : server))
         );
-        setGlobalSaved(false);
+        setMcpSaved(false);
+        setMcpRefreshed(false);
+        setMcpRefreshError(null);
     };
 
     const addMcpServer = () => {
         setGlobalMcpServers((prev) => [...prev, createEmptyMcpServer()]);
-        setGlobalSaved(false);
+        setMcpSaved(false);
+        setMcpRefreshed(false);
+        setMcpRefreshError(null);
     };
 
     const removeMcpServer = (index: number) => {
         setGlobalMcpServers((prev) => prev.filter((_, idx) => idx !== index));
-        setGlobalSaved(false);
+        setMcpSaved(false);
+        setMcpRefreshed(false);
+        setMcpRefreshError(null);
+    };
+
+    const getMcpCardKey = (server: MCPServerForm, index: number) =>
+        `${server.server_label || 'mcp'}-${index}`;
+
+    const toggleMcpCard = (cardKey: string) => {
+        setMcpExpanded((prev) => ({
+            ...prev,
+            [cardKey]: !(prev[cardKey] ?? false)
+        }));
     };
 
     const extractConfigImportItems = (data: unknown): unknown[] => {
@@ -1312,12 +1298,6 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             setGlobalSaving(false);
             return;
         }
-        const mcpResult = buildMcpServersPayload(globalMcpServers);
-        if (mcpResult.error) {
-            alert(mcpResult.error);
-            setGlobalSaving(false);
-            return;
-        }
         try {
             const updated = await updateAppConfig({
                 llm: {
@@ -1330,9 +1310,6 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                     ast_enabled: globalAstEnabled,
                     code_map: {
                         enabled: globalCodeMapEnabled
-                    },
-                    mcp: {
-                        servers: mcpResult.servers
                     }
                 },
                 context: {
@@ -1410,6 +1387,60 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             alert(errorMessage);
         } finally {
             setGlobalSaving(false);
+        }
+    };
+
+    const handleMcpSave = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setMcpSaving(true);
+        setMcpSaved(false);
+        const mcpResult = buildMcpServersPayload(globalMcpServers);
+        if (mcpResult.error) {
+            alert(mcpResult.error);
+            setMcpSaving(false);
+            return;
+        }
+        try {
+            const updated = await updateAppConfig({
+                agent: {
+                    mcp: {
+                        servers: mcpResult.servers
+                    }
+                }
+            });
+            if (updated?.agent) {
+                setGlobalMcpServers(normalizeMcpServers(updated.agent.mcp));
+            }
+            setMcpSaved(true);
+        } catch (error: any) {
+            console.error('Failed to save MCP config:', error);
+            let errorMessage = 'Failed to save MCP config';
+            if (error.message) {
+                errorMessage += `: ${error.message}`;
+            }
+            alert(errorMessage);
+        } finally {
+            setMcpSaving(false);
+        }
+    };
+
+    const handleMcpRefresh = async () => {
+        setMcpRefreshing(true);
+        setMcpRefreshed(false);
+        setMcpRefreshError(null);
+        try {
+            await refreshMcpTools();
+            await loadTools();
+            setMcpRefreshed(true);
+        } catch (error: any) {
+            console.error('Failed to refresh MCP tools:', error);
+            let errorMessage = 'Failed to refresh MCP tools';
+            if (error?.message) {
+                errorMessage += `: ${error.message}`;
+            }
+            setMcpRefreshError(errorMessage);
+        } finally {
+            setMcpRefreshing(false);
         }
     };
 
@@ -2034,7 +2065,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     };
 
     const allToolsSelected = abilityForm.tools.includes('*');
-    const bundleDisabled = bundleBusy || globalLoading || globalSaving || agentLoading || agentSaving || loading;
+    const bundleDisabled = bundleBusy || globalLoading || globalSaving || mcpSaving || agentLoading || agentSaving || loading;
 
     return (
         <div className="modal-overlay">
@@ -2082,6 +2113,16 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                             type="button"
                         >
                             全局配置
+                        </button>
+                        <button
+                            className={`config-tab ${activeTab === 'mcp' ? 'active' : ''}`}
+                            onClick={() => {
+                                setActiveTab('mcp');
+                                setMcpSaved(false);
+                            }}
+                            type="button"
+                        >
+                            MCP配置
                         </button>
                         <button
                             className={`config-tab ${activeTab === 'agents' ? 'active' : ''}`}
@@ -2474,206 +2515,6 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                 </div>
                             </div>
 
-                            <div className="config-subsection">
-                                <div className="config-subsection-header">
-                                    <div>
-                                        <h4>MCP 服务器</h4>
-                                        <span>仅在 OpenAI Responses + OpenAI profile 下生效。</span>
-                                    </div>
-                                    <button
-                                        type="button"
-                                        className="add-btn add-inline"
-                                        onClick={addMcpServer}
-                                        disabled={globalLoading || globalSaving}
-                                    >
-                                        + 添加
-                                    </button>
-                                </div>
-
-                                {globalMcpServers.length === 0 ? (
-                                    <p className="mcp-empty">暂无 MCP 服务器配置。</p>
-                                ) : (
-                                    globalMcpServers.map((server, index) => (
-                                        <div
-                                            key={`${server.server_label || 'mcp'}-${index}`}
-                                            className="mcp-server-card"
-                                        >
-                                            <div className="mcp-server-header">
-                                                <div className="mcp-server-title">
-                                                    <strong>{server.server_label || `服务器 ${index + 1}`}</strong>
-                                                    {server.server_description ? (
-                                                        <span>{server.server_description}</span>
-                                                    ) : null}
-                                                </div>
-                                                <div className="config-form-actions">
-                                                    <button
-                                                        type="button"
-                                                        className="add-btn add-inline"
-                                                        onClick={() => removeMcpServer(index)}
-                                                        disabled={globalLoading || globalSaving}
-                                                    >
-                                                        删除
-                                                    </button>
-                                                </div>
-                                            </div>
-
-                                            <div className="form-row">
-                                                <div className="form-group">
-                                                    <label>server_label</label>
-                                                    <input
-                                                        type="text"
-                                                        value={server.server_label}
-                                                        onChange={(e) =>
-                                                            updateMcpServer(index, { server_label: e.target.value })
-                                                        }
-                                                        disabled={globalLoading || globalSaving}
-                                                    />
-                                                    <small>唯一标识该 MCP 服务器。</small>
-                                                </div>
-                                                <div className="form-group checkbox-group">
-                                                    <label>
-                                                        <input
-                                                            type="checkbox"
-                                                            checked={server.enabled}
-                                                            onChange={(e) =>
-                                                                updateMcpServer(index, { enabled: e.target.checked })
-                                                            }
-                                                            disabled={globalLoading || globalSaving}
-                                                        />
-                                                        启用
-                                                    </label>
-                                                    <small>关闭后该服务器不会注入工具。</small>
-                                                </div>
-                                            </div>
-
-                                            <div className="form-row">
-                                                <div className="form-group">
-                                                    <label>server_url</label>
-                                                    <input
-                                                        type="text"
-                                                        value={server.server_url}
-                                                        onChange={(e) =>
-                                                            updateMcpServer(index, { server_url: e.target.value })
-                                                        }
-                                                        disabled={globalLoading || globalSaving}
-                                                        placeholder="https://mcp.example.com"
-                                                    />
-                                                    <small>与 connector_id 二选一。</small>
-                                                </div>
-                                                <div className="form-group">
-                                                    <label>connector_id</label>
-                                                    <input
-                                                        type="text"
-                                                        value={server.connector_id}
-                                                        onChange={(e) =>
-                                                            updateMcpServer(index, { connector_id: e.target.value })
-                                                        }
-                                                        disabled={globalLoading || globalSaving}
-                                                        placeholder="mcp-connector-id"
-                                                    />
-                                                    <small>与 server_url 二选一。</small>
-                                                </div>
-                                            </div>
-
-                                            <div className="form-group">
-                                                <label>server_description</label>
-                                                <input
-                                                    type="text"
-                                                    value={server.server_description}
-                                                    onChange={(e) =>
-                                                        updateMcpServer(index, {
-                                                            server_description: e.target.value
-                                                        })
-                                                    }
-                                                    disabled={globalLoading || globalSaving}
-                                                />
-                                            </div>
-
-                                            <div className="form-row">
-                                                <div className="form-group">
-                                                    <label>authorization_env</label>
-                                                    <input
-                                                        type="text"
-                                                        value={server.authorization_env}
-                                                        onChange={(e) =>
-                                                            updateMcpServer(index, {
-                                                                authorization_env: e.target.value
-                                                            })
-                                                        }
-                                                        disabled={globalLoading || globalSaving}
-                                                        placeholder="MCP_AUTH_TOKEN"
-                                                    />
-                                                    <small>环境变量名，值作为 Authorization。</small>
-                                                </div>
-                                                <div className="form-group">
-                                                    <label>headers_env (JSON)</label>
-                                                    <input
-                                                        type="text"
-                                                        value={server.headers_env}
-                                                        onChange={(e) =>
-                                                            updateMcpServer(index, { headers_env: e.target.value })
-                                                        }
-                                                        disabled={globalLoading || globalSaving}
-                                                        placeholder="MCP_HEADERS_JSON"
-                                                    />
-                                                    <small>环境变量名，值需是 JSON。</small>
-                                                </div>
-                                            </div>
-
-                                            <div className="form-group">
-                                                <label>allowed_tools</label>
-                                                <input
-                                                    type="text"
-                                                    value={server.allowed_tools}
-                                                    onChange={(e) =>
-                                                        updateMcpServer(index, { allowed_tools: e.target.value })
-                                                    }
-                                                    disabled={globalLoading || globalSaving}
-                                                    placeholder="tool_a, tool_b"
-                                                />
-                                                <small>逗号分隔，留空表示不限制。</small>
-                                            </div>
-
-                                            <div className="form-row">
-                                                <div className="form-group">
-                                                    <label>require_approval</label>
-                                                    <select
-                                                        value={server.approval_mode}
-                                                        onChange={(e) =>
-                                                            updateMcpServer(index, {
-                                                                approval_mode: e.target.value as MCPApprovalMode
-                                                            })
-                                                        }
-                                                        disabled={globalLoading || globalSaving}
-                                                    >
-                                                        <option value="always">always</option>
-                                                        <option value="never">never</option>
-                                                        <option value="custom">custom</option>
-                                                    </select>
-                                                </div>
-                                                <div className="form-group">
-                                                    <label>永不审批工具</label>
-                                                    <input
-                                                        type="text"
-                                                        value={server.never_tools}
-                                                        onChange={(e) =>
-                                                            updateMcpServer(index, { never_tools: e.target.value })
-                                                        }
-                                                        disabled={
-                                                            globalLoading ||
-                                                            globalSaving ||
-                                                            server.approval_mode !== 'custom'
-                                                        }
-                                                        placeholder="tool_x, tool_y"
-                                                    />
-                                                    <small>custom 模式下生效。</small>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    ))
-                                )}
-                            </div>
-
                             <div className="form-actions">
                                 <button
                                     type="button"
@@ -2690,6 +2531,244 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                 </button>
                             </div>
                             {globalSaved && <div className="save-hint">已保存</div>}
+                        </form>
+                    ) : activeTab === 'mcp' ? (
+                        <form onSubmit={handleMcpSave} className="config-form">
+                            <div className="config-form-header">
+                                <h3>MCP配置</h3>
+                            </div>
+
+                            <div className="config-subsection">
+                                <div className="config-subsection-header">
+                                    <div>
+                                        <h4>MCP 服务器</h4>
+                                        <span>通过本地工具调用，适用于所有 API（仅支持 server_url）。</span>
+                                    </div>
+                                    <div className="config-subsection-actions">
+                                        <button
+                                            type="button"
+                                            className="add-btn add-inline"
+                                            onClick={handleMcpRefresh}
+                                            disabled={globalLoading || mcpSaving || mcpRefreshing}
+                                        >
+                                            {mcpRefreshing ? '刷新中...' : '刷新工具'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            className="add-btn add-inline"
+                                            onClick={addMcpServer}
+                                            disabled={globalLoading || mcpSaving}
+                                        >
+                                            + 添加
+                                        </button>
+                                    </div>
+                                </div>
+                                {mcpRefreshError && <div className="form-error">{mcpRefreshError}</div>}
+                                {mcpRefreshed && <div className="save-hint mcp-refresh-hint">工具已刷新</div>}
+
+                                {globalMcpServers.length === 0 ? (
+                                    <p className="mcp-empty">暂无 MCP 服务器配置。</p>
+                                ) : (
+                                    globalMcpServers.map((server, index) => {
+                                        const cardKey = getMcpCardKey(server, index);
+                                        const expanded = mcpExpanded[cardKey] ?? false;
+                                        const summary =
+                                            server.server_description?.trim() ||
+                                            server.server_url?.trim() ||
+                                            '未设置 server_url';
+                                        const toolPrefix = getMcpToolPrefix(server.server_label || '');
+                                        const mcpTools = toolPrefix
+                                            ? availableTools.filter((tool) => tool.name.startsWith(toolPrefix))
+                                            : [];
+                                        return (
+                                            <div key={cardKey} className="mcp-server-card">
+                                                <div className="mcp-server-header">
+                                                    <div className="mcp-server-title">
+                                                        <strong>{server.server_label || `服务器 ${index + 1}`}</strong>
+                                                        <span>{summary}</span>
+                                                    </div>
+                                                    <div className="mcp-server-actions">
+                                                        <button
+                                                            type="button"
+                                                            className={`icon-btn mcp-toggle-btn${expanded ? ' expanded' : ''}`}
+                                                            onClick={() => toggleMcpCard(cardKey)}
+                                                            aria-label={expanded ? 'Collapse' : 'Expand'}
+                                                            title={expanded ? '收起' : '展开'}
+                                                        >
+                                                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                                                                <path d="M7 10l5 5 5-5z" />
+                                                            </svg>
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            className="add-btn add-inline"
+                                                            onClick={() => removeMcpServer(index)}
+                                                            disabled={globalLoading || mcpSaving}
+                                                        >
+                                                            删除
+                                                        </button>
+                                                    </div>
+                                                </div>
+
+                                                {expanded && (
+                                                    <div className="mcp-server-body">
+                                                        <div className="form-row">
+                                                            <div className="form-group">
+                                                                <label>server_label</label>
+                                                                <input
+                                                                    type="text"
+                                                                    value={server.server_label}
+                                                                    onChange={(e) =>
+                                                                        updateMcpServer(index, {
+                                                                            server_label: e.target.value
+                                                                        })
+                                                                    }
+                                                                    disabled={globalLoading || mcpSaving}
+                                                                />
+                                                                <small>唯一标识该 MCP 服务器。</small>
+                                                            </div>
+                                                            <div className="form-group checkbox-group">
+                                                                <label>
+                                                                    <input
+                                                                        type="checkbox"
+                                                                        checked={server.enabled}
+                                                                        onChange={(e) =>
+                                                                            updateMcpServer(index, {
+                                                                                enabled: e.target.checked
+                                                                            })
+                                                                        }
+                                                                        disabled={globalLoading || mcpSaving}
+                                                                    />
+                                                                    启用
+                                                                </label>
+                                                                <small>关闭后该服务器不会注入工具。</small>
+                                                            </div>
+                                                        </div>
+
+                                                        <div className="form-row">
+                                                            <div className="form-group">
+                                                                <label>server_url</label>
+                                                                <input
+                                                                    type="text"
+                                                                    value={server.server_url}
+                                                                    onChange={(e) =>
+                                                                        updateMcpServer(index, {
+                                                                            server_url: e.target.value
+                                                                        })
+                                                                    }
+                                                                    disabled={globalLoading || mcpSaving}
+                                                                    placeholder="https://mcp.example.com"
+                                                                />
+                                                                <small>仅支持 server_url。</small>
+                                                            </div>
+                                                            <div className="form-group">
+                                                                <label>connector_id</label>
+                                                                <input
+                                                                    type="text"
+                                                                    value={server.connector_id}
+                                                                    onChange={(e) =>
+                                                                        updateMcpServer(index, {
+                                                                            connector_id: e.target.value
+                                                                        })
+                                                                    }
+                                                                    disabled={globalLoading || mcpSaving}
+                                                                    placeholder="mcp-connector-id"
+                                                                />
+                                                                <small>已不支持，填写会被忽略。</small>
+                                                            </div>
+                                                        </div>
+                                                        <div className="form-group">
+                                                            <label>server_description</label>
+                                                            <input
+                                                                type="text"
+                                                                value={server.server_description}
+                                                                onChange={(e) =>
+                                                                    updateMcpServer(index, {
+                                                                        server_description: e.target.value
+                                                                    })
+                                                                }
+                                                                disabled={globalLoading || mcpSaving}
+                                                            />
+                                                        </div>
+
+                                                        <div className="form-row">
+                                                            <div className="form-group">
+                                                                <label>authorization_env</label>
+                                                                <input
+                                                                    type="text"
+                                                                    value={server.authorization_env}
+                                                                    onChange={(e) =>
+                                                                        updateMcpServer(index, {
+                                                                            authorization_env: e.target.value
+                                                                        })
+                                                                    }
+                                                                    disabled={globalLoading || mcpSaving}
+                                                                    placeholder="MCP_AUTH_TOKEN"
+                                                                />
+                                                                <small>环境变量名，值作为 Authorization。</small>
+                                                            </div>
+                                                            <div className="form-group">
+                                                                <label>headers_env (JSON)</label>
+                                                                <input
+                                                                    type="text"
+                                                                    value={server.headers_env}
+                                                                    onChange={(e) =>
+                                                                        updateMcpServer(index, { headers_env: e.target.value })
+                                                                    }
+                                                                    disabled={globalLoading || mcpSaving}
+                                                                    placeholder="MCP_HEADERS_JSON"
+                                                                />
+                                                                <small>环境变量名，值需是 JSON。</small>
+                                                            </div>
+                                                        </div>
+                                                        <div className="mcp-tool-section">
+                                                            <details className="mcp-tool-list">
+                                                                <summary>工具列表（{mcpTools.length}）</summary>
+                                                                {mcpTools.length === 0 ? (
+                                                                    <p className="mcp-empty">暂无工具，点击上方“刷新工具”。</p>
+                                                                ) : (
+                                                                    <div className="mcp-tool-items">
+                                                                        {mcpTools.map((tool) => {
+                                                                            const info = splitMcpToolDescription(tool);
+                                                                            return (
+                                                                                <div key={tool.name} className="mcp-tool-item">
+                                                                                    <div className="mcp-tool-name">
+                                                                                        {info.title}
+                                                                                    </div>
+                                                                                    <div className="mcp-tool-desc">
+                                                                                        {info.description || '无描述'}
+                                                                                    </div>
+                                                                                </div>
+                                                                            );
+                                                                        })}
+                                                                    </div>
+                                                                )}
+                                                            </details>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                    </div>
+                                );
+                            })
+                                )}
+                            </div>
+
+                            <div className="form-actions">
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        setMcpSaved(false);
+                                        loadAppConfig();
+                                    }}
+                                    disabled={globalLoading || mcpSaving}
+                                >
+                                    重置
+                                </button>
+                                <button type="submit" disabled={globalLoading || mcpSaving}>
+                                    {mcpSaving ? 'Saving...' : 'Save'}
+                                </button>
+                            </div>
+                            {mcpSaved && <div className="save-hint">已保存</div>}
                         </form>
                     ) : (
                         <form onSubmit={handleAgentSave} className="config-form">

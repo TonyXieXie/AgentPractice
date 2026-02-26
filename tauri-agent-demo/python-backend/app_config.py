@@ -351,12 +351,16 @@ def _normalize_mcp_server(value: Any, index: int, labels: set) -> Dict[str, Any]
 
     server_url = value.get("server_url")
     connector_id = value.get("connector_id")
-    if (not server_url and not connector_id) or (server_url and connector_id):
+    server_url = str(server_url).strip() if server_url is not None else None
+    connector_id = str(connector_id).strip() if connector_id is not None else None
+    if not server_url:
+        server_url = None
+    if not connector_id:
+        connector_id = None
+    if not server_url and not connector_id:
         raise ValueError(
-            f"agent.mcp.servers[{index}] must set exactly one of server_url or connector_id"
+            f"agent.mcp.servers[{index}] must set server_url (connector_id is ignored)"
         )
-    server_url = str(server_url).strip() if server_url else None
-    connector_id = str(connector_id).strip() if connector_id else None
 
     enabled = True
     if "enabled" in value:

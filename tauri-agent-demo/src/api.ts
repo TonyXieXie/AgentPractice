@@ -124,6 +124,19 @@ export async function updateAppConfig(update: AppConfigUpdate): Promise<AppConfi
     return response.json();
 }
 
+export async function refreshMcpTools(): Promise<{ ok: boolean; registered?: string[] }> {
+    const response = await fetch(`${API_BASE_URL}/mcp/refresh`, {
+        method: 'POST',
+    });
+    if (!response.ok) {
+        if (response.status === 404) {
+            throw new Error('MCP refresh endpoint not found. Please restart the backend.');
+        }
+        throw await buildApiError(response, 'Failed to refresh MCP tools');
+    }
+    return response.json();
+}
+
 export async function getTools(): Promise<ToolDefinition[]> {
     const response = await fetch(`${API_BASE_URL}/tools`);
     if (!response.ok) {

@@ -428,6 +428,52 @@
   gap: 12px;
 }
 
+.mcp-server-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mcp-server-actions .icon-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+  background: #2b3036;
+  color: #e2e8f0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mcp-server-actions .icon-btn:hover {
+  background: #343a42;
+}
+
+.mcp-server-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mcp-toggle-btn {
+  color: #cbd5e1;
+}
+
+.mcp-toggle-btn svg {
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
+  transition: transform 0.2s ease;
+}
+
+.mcp-toggle-btn.expanded svg {
+  transform: rotate(180deg);
+}
+
 .mcp-server-title {
   display: flex;
   flex-direction: column;
@@ -450,6 +496,73 @@
   font-size: 0.85rem;
 }
 
+.mcp-refresh-hint {
+  text-align: left;
+  margin-top: 4px;
+}
+
+.mcp-tool-section {
+  margin-top: 4px;
+}
+
+.mcp-tool-list {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.mcp-tool-list summary {
+  cursor: pointer;
+  color: #cbd5e1;
+  font-size: 0.82rem;
+  font-weight: 600;
+  list-style: none;
+}
+
+.mcp-tool-list summary::-webkit-details-marker {
+  display: none;
+}
+
+.mcp-tool-list summary::after {
+  content: '▾';
+  float: right;
+  color: #94a3b8;
+  transition: transform 0.2s ease;
+}
+
+.mcp-tool-list[open] summary::after {
+  transform: rotate(180deg);
+}
+
+.mcp-tool-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.mcp-tool-item {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.mcp-tool-name {
+  color: #f8fafc;
+  font-size: 0.82rem;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.mcp-tool-desc {
+  color: #94a3b8;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
 .config-subsection-header {
   display: flex;
   align-items: baseline;
@@ -466,6 +579,12 @@
 .config-subsection-header span {
   font-size: 0.75rem;
   color: #8b949e;
+}
+
+.config-subsection-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .form-group {

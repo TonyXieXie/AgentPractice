@@ -45,6 +45,7 @@ from tools.builtin.system_tools import ApplyPatchTool, CodeAstTool
 from tools.pty_manager import get_pty_manager
 from stream_control import stream_stop_registry
 from app_config import get_app_config, update_app_config, get_app_config_path
+from mcp_tools import register_mcp_tools_from_config, refresh_mcp_tools
 from ghost_snapshot import restore_snapshot
 from code_map import build_code_map_prompt
 from ast_index import get_ast_index
@@ -72,6 +73,10 @@ app.add_middleware(
 )
 
 register_builtin_tools()
+try:
+    register_mcp_tools_from_config()
+except Exception as exc:
+    print(f"[MCP] Failed to register MCP tools: {exc}")
 
 def _close_all_ptys() -> None:
     try:
@@ -1574,7 +1579,19 @@ def set_app_config(payload: Dict[str, Any]):
         updated = update_app_config(payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    try:
+        refresh_mcp_tools()
+    except Exception as exc:
+        print(f"[MCP] Failed to refresh MCP tools: {exc}")
     return updated
+
+@app.post("/mcp/refresh")
+def refresh_mcp_tools_route():
+    try:
+        registered = refresh_mcp_tools()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to refresh MCP tools: {exc}")
+    return {"ok": True, "registered": registered}
 
 # ==================== Patch Revert ====================
 
