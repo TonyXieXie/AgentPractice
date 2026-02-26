@@ -10,6 +10,35 @@ export interface ToolDefinition {
     parameters?: Record<string, any>[];
 }
 
+export interface MCPToolFilter {
+    tool_names?: string[];
+    read_only?: boolean;
+}
+
+export type MCPApprovalPolicy =
+    | 'always'
+    | 'never'
+    | {
+          always?: MCPToolFilter;
+          never?: MCPToolFilter;
+      };
+
+export interface MCPServerConfig {
+    enabled?: boolean;
+    server_label: string;
+    server_url?: string;
+    connector_id?: string;
+    server_description?: string;
+    authorization_env?: string;
+    headers_env?: string;
+    allowed_tools?: string[] | MCPToolFilter;
+    require_approval?: MCPApprovalPolicy;
+}
+
+export interface MCPConfig {
+    servers?: MCPServerConfig[];
+}
+
 export interface AgentAbility {
     id: string;
     name: string;
@@ -41,6 +70,7 @@ export interface AgentConfig {
     react_max_iterations?: number;
     ast_enabled?: boolean;
     code_map?: CodeMapConfig;
+    mcp?: MCPConfig;
     abilities?: AgentAbility[];
     profiles?: AgentProfile[];
     default_profile?: string;

@@ -23,6 +23,7 @@ from context_estimate import build_context_estimate
 from llm_client import LLMTransientError
 from app_config import get_app_config
 from database import db
+from mcp_tools import build_mcp_tools, build_mcp_tool_name, persist_mcp_tool_approval
 from context_compress import build_history_for_llm, maybe_compress_context, summarize_dialogue
 
 
@@ -66,6 +67,38 @@ def _pty_stream_debug_enabled() -> bool:
 def _pty_stream_log(message: str) -> None:
     if _pty_stream_debug_enabled():
         print(f"[PTY STREAM] {message}")
+
+
+async def _wait_for_mcp_permission(
+    request_id: Optional[int],
+    timeout_sec: Optional[float],
+    stop_event: Optional[asyncio.Event] = None
+) -> str:
+    if not request_id:
+        return "denied"
+    start = time.monotonic()
+    while True:
+        if stop_event is not None:
+            try:
+                if getattr(stop_event, "is_set", lambda: False)():
+                    return "denied"
+            except Exception:
+                pass
+        try:
+            record = db.get_permission_request(request_id)
+            if record and record.get("status") and record["status"] != "pending":
+                return record["status"]
+        except Exception:
+            pass
+
+        if timeout_sec is not None and (time.monotonic() - start) >= timeout_sec:
+            try:
+                db.update_permission_request(request_id, "timeout")
+            except Exception:
+                pass
+            return "timeout"
+
+        await asyncio.sleep(0.5)
 
 
 def _should_truncate(origin_call_seq: Optional[int], current_call_seq: int, cfg: Dict[str, Any]) -> bool:
@@ -282,6 +315,15 @@ class ReActAgent(AgentStrategy):
             openai_tools = [tool_to_openai_responses_tool(t) for t in tools] if tools else []
         else:
             openai_tools = [tool_to_openai_function(t) for t in tools] if tools else []
+
+        mcp_tools: List[Dict[str, Any]] = []
+        if openai_format == "openai_responses" and profile == "openai":
+            try:
+                mcp_tools = build_mcp_tools(get_app_config())
+            except Exception as exc:
+                print(f"[MCP] Failed to load MCP tools: {exc}")
+        if mcp_tools:
+            openai_tools = list(openai_tools) + mcp_tools
 
         base_messages = build_base_messages()
         messages: List[Dict[str, Any]] = list(base_messages)
@@ -630,158 +672,207 @@ class ReActAgent(AgentStrategy):
                     llm_overrides["_debug"] = debug_ctx
 
                 if openai_format == "openai_responses":
-                    llm_overrides["input"] = _sanitize_response_input(response_input, current_call_seq, trunc_cfg)
-
-                    max_connect_retries = 3
-                    connect_attempt = 0
-                    connect_ok = False
-                    content_buffer = ""
-                    reasoning_buffer = ""
-                    tool_calls = []
+                    base_overrides = dict(llm_overrides)
+                    pending_previous_response_id: Optional[str] = None
+                    pending_input = _sanitize_response_input(response_input, current_call_seq, trunc_cfg)
+                    approval_rounds = 0
+                    mcp_calls: List[Dict[str, Any]] = []
+                    response_obj: Optional[Dict[str, Any]] = None
                     response_output_items: List[Dict[str, Any]] = []
-                    thought_stream_key = f"assistant_content_{iteration}"
-                    reasoning_stream_key = f"assistant_reasoning_{iteration}"
-                    stream_mode = "answer"
-                    stopped = False
 
-                    while connect_attempt < max_connect_retries:
-                        connect_attempt += 1
+                    while True:
+                        llm_overrides = dict(base_overrides)
+                        llm_overrides["input"] = pending_input
+                        if pending_previous_response_id:
+                            llm_overrides["previous_response_id"] = pending_previous_response_id
+
+                        max_connect_retries = 3
+                        connect_attempt = 0
+                        connect_ok = False
                         content_buffer = ""
                         reasoning_buffer = ""
                         tool_calls = []
                         response_output_items = []
+                        response_obj = None
+                        thought_stream_key = f"assistant_content_{iteration}"
+                        reasoning_stream_key = f"assistant_reasoning_{iteration}"
                         stream_mode = "answer"
                         stopped = False
-                        received_any = False
 
-                        if connect_attempt > 1:
-                            yield AgentStep(
-                                step_type="thought",
-                                content=f"网络连接中（第{connect_attempt}/{max_connect_retries}次）...",
-                                metadata={"iteration": iteration, "stream_key": thought_stream_key, "network_retry": connect_attempt}
-                            )
+                        while connect_attempt < max_connect_retries:
+                            connect_attempt += 1
+                            content_buffer = ""
+                            reasoning_buffer = ""
+                            tool_calls = []
+                            response_output_items = []
+                            response_obj = None
+                            stream_mode = "answer"
+                            stopped = False
+                            received_any = False
 
-                        try:
-                            sanitized_messages = _sanitize_messages_for_prompt(messages, current_call_seq, trunc_cfg)
-                            if not estimate_emitted:
-                                estimate_emitted = True
-                                max_tokens = getattr(llm_client.config, "max_context_tokens", 0) or 0
-                                estimate = build_context_estimate(
-                                    sanitized_messages,
-                                    tools_payload=openai_tools,
-                                    max_tokens=max_tokens,
-                                    updated_at=datetime.now().isoformat()
+                            if connect_attempt > 1:
+                                yield AgentStep(
+                                    step_type="thought",
+                                    content=f"网络连接中（第{connect_attempt}/{max_connect_retries}次）...",
+                                    metadata={"iteration": iteration, "stream_key": thought_stream_key, "network_retry": connect_attempt}
                                 )
-                                yield AgentStep(step_type="context_estimate", content="", metadata=estimate)
-                            async for event in llm_client.chat_stream_events(sanitized_messages, llm_overrides if llm_overrides else None):
-                                received_any = True
-                                event_type = event.get("type")
-                                if event_type == "content":
-                                    delta = event.get("delta", "")
-                                    if delta:
-                                        content_buffer += delta
-                                        step_type = "answer_delta" if stream_mode == "answer" else "thought_delta"
-                                        yield AgentStep(
-                                            step_type=step_type,
-                                            content=delta,
-                                            metadata={"iteration": iteration, "stream_key": thought_stream_key}
-                                        )
-                                elif event_type == "reasoning":
-                                    delta = event.get("delta", "")
-                                    if delta:
-                                        reasoning_buffer += delta
-                                        yield AgentStep(
-                                            step_type="thought_delta",
-                                            content=delta,
-                                            metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
-                                        )
-                                elif event_type == "tool_call_delta":
-                                    if stream_mode != "thought":
-                                        stream_mode = "thought"
-                                    call_index = event.get("index", 0)
-                                    call_key = f"tool-{iteration}-{call_index}"
-                                    tool_name = event.get("name") or ""
-                                    args_delta = event.get("arguments_delta", "")
-                                    if args_delta or tool_name:
-                                        yield AgentStep(
-                                            step_type="action_delta",
-                                            content=args_delta,
-                                            metadata={
-                                                "iteration": iteration,
-                                                "stream_key": call_key,
-                                                "tool": tool_name,
-                                                "call_index": call_index
-                                            }
-                                        )
-                                elif event_type == "done":
-                                    content_buffer = event.get("content", "") or ""
-                                    tool_calls = event.get("tool_calls", []) or []
-                                    response_obj = event.get("response") or {}
-                                    if isinstance(response_obj, dict):
-                                        response_output_items = response_obj.get("output", []) or []
-                                    stopped = bool(event.get("stopped"))
-                            connect_ok = True
-                            break
-                        except httpx.ConnectError as e:
-                            if received_any:
+
+                            try:
+                                sanitized_messages = _sanitize_messages_for_prompt(messages, current_call_seq, trunc_cfg)
+                                if not estimate_emitted:
+                                    estimate_emitted = True
+                                    max_tokens = getattr(llm_client.config, "max_context_tokens", 0) or 0
+                                    estimate = build_context_estimate(
+                                        sanitized_messages,
+                                        tools_payload=openai_tools,
+                                        max_tokens=max_tokens,
+                                        updated_at=datetime.now().isoformat()
+                                    )
+                                    yield AgentStep(step_type="context_estimate", content="", metadata=estimate)
+                                async for event in llm_client.chat_stream_events(sanitized_messages, llm_overrides if llm_overrides else None):
+                                    received_any = True
+                                    event_type = event.get("type")
+                                    if event_type == "content":
+                                        delta = event.get("delta", "")
+                                        if delta:
+                                            content_buffer += delta
+                                            step_type = "answer_delta" if stream_mode == "answer" else "thought_delta"
+                                            yield AgentStep(
+                                                step_type=step_type,
+                                                content=delta,
+                                                metadata={"iteration": iteration, "stream_key": thought_stream_key}
+                                            )
+                                    elif event_type == "reasoning":
+                                        delta = event.get("delta", "")
+                                        if delta:
+                                            reasoning_buffer += delta
+                                            yield AgentStep(
+                                                step_type="thought_delta",
+                                                content=delta,
+                                                metadata={"iteration": iteration, "stream_key": reasoning_stream_key, "reasoning": True}
+                                            )
+                                    elif event_type == "tool_call_delta":
+                                        if stream_mode != "thought":
+                                            stream_mode = "thought"
+                                        call_index = event.get("index", 0)
+                                        call_key = f"tool-{iteration}-{call_index}"
+                                        tool_name = event.get("name") or ""
+                                        args_delta = event.get("arguments_delta", "")
+                                        if args_delta or tool_name:
+                                            yield AgentStep(
+                                                step_type="action_delta",
+                                                content=args_delta,
+                                                metadata={
+                                                    "iteration": iteration,
+                                                    "stream_key": call_key,
+                                                    "tool": tool_name,
+                                                    "call_index": call_index
+                                                }
+                                            )
+                                    elif event_type == "done":
+                                        content_buffer = event.get("content", "") or ""
+                                        tool_calls = event.get("tool_calls", []) or []
+                                        response_obj = event.get("response") or {}
+                                        if isinstance(response_obj, dict):
+                                            response_output_items = response_obj.get("output", []) or []
+                                        stopped = bool(event.get("stopped"))
+                                connect_ok = True
+                                break
+                            except httpx.ConnectError as e:
+                                if received_any:
+                                    yield AgentStep(
+                                        step_type="error",
+                                        content="网络错误：连接中断，请重试。",
+                                        metadata={
+                                            "error": str(e),
+                                            "error_type": "ConnectError",
+                                            "suppress_prompt": True,
+                                            "transient_error": True
+                                        }
+                                    )
+                                    return
+                                if connect_attempt >= max_connect_retries:
+                                    yield AgentStep(
+                                        step_type="error",
+                                        content=f"网络错误：连接失败（已重试{max_connect_retries}次）",
+                                        metadata={
+                                            "error": str(e),
+                                            "error_type": "ConnectError",
+                                            "suppress_prompt": True,
+                                            "transient_error": True
+                                        }
+                                    )
+                                    return
+                                continue
+                            except LLMTransientError as e:
                                 yield AgentStep(
                                     step_type="error",
-                                    content="网络错误：连接中断，请重试。",
+                                    content=str(e),
                                     metadata={
                                         "error": str(e),
-                                        "error_type": "ConnectError",
+                                        "error_type": type(e).__name__,
                                         "suppress_prompt": True,
                                         "transient_error": True
                                     }
                                 )
                                 return
-                            if connect_attempt >= max_connect_retries:
-                                yield AgentStep(
-                                    step_type="error",
-                                    content=f"网络错误：连接失败（已重试{max_connect_retries}次）",
-                                    metadata={
-                                        "error": str(e),
-                                        "error_type": "ConnectError",
-                                        "suppress_prompt": True,
-                                        "transient_error": True
-                                    }
-                                )
-                                return
-                            continue
-                        except LLMTransientError as e:
+
+                        if not connect_ok:
+                            return
+
+                        call_seq += 1
+                        llm_call_id = None
+                        if llm_overrides.get("_debug"):
+                            llm_call_id = llm_overrides.get("_debug", {}).get("llm_call_id")
+
+                        if stopped:
+                            stopped_text = self._append_stop_note(content_buffer)
+                            if llm_call_id:
+                                self._update_llm_processed(llm_call_id, {
+                                    "stopped_by_user": True,
+                                    "content": stopped_text
+                                })
                             yield AgentStep(
-                                step_type="error",
-                                content=str(e),
-                                metadata={
-                                    "error": str(e),
-                                    "error_type": type(e).__name__,
-                                    "suppress_prompt": True,
-                                    "transient_error": True
-                                }
+                                step_type="answer",
+                                content=stopped_text,
+                                metadata={"agent_type": "react", "iterations": iteration + 1, "stopped_by_user": True}
                             )
                             return
 
-                    if not connect_ok:
-                        return
-
-                    call_seq += 1
-                    llm_call_id = None
-                    if llm_overrides.get("_debug"):
-                        llm_call_id = llm_overrides.get("_debug", {}).get("llm_call_id")
-
-                    if stopped:
-                        stopped_text = self._append_stop_note(content_buffer)
-                        if llm_call_id:
-                            self._update_llm_processed(llm_call_id, {
-                                "stopped_by_user": True,
-                                "content": stopped_text
-                            })
-                        yield AgentStep(
-                            step_type="answer",
-                            content=stopped_text,
-                            metadata={"agent_type": "react", "iterations": iteration + 1, "stopped_by_user": True}
-                        )
-                        return
+                        response_id = response_obj.get("id") if isinstance(response_obj, dict) else None
+                        mcp_calls, mcp_approvals = self._extract_mcp_items(response_output_items)
+                        if mcp_approvals:
+                            approval_rounds += 1
+                            if approval_rounds > 3:
+                                yield AgentStep(
+                                    step_type="error",
+                                    content="MCP approvals exceeded maximum retries.",
+                                    metadata={"iteration": iteration, "mcp_approval": True}
+                                )
+                                return
+                            if not response_id:
+                                yield AgentStep(
+                                    step_type="error",
+                                    content="MCP approval requires response id.",
+                                    metadata={"iteration": iteration, "mcp_approval": True}
+                                )
+                                return
+                            approval_items = await self._resolve_mcp_approvals(
+                                mcp_approvals,
+                                session_id=session_id,
+                                stop_event=stop_event
+                            )
+                            if not approval_items:
+                                yield AgentStep(
+                                    step_type="error",
+                                    content="MCP approval failed.",
+                                    metadata={"iteration": iteration, "mcp_approval": True}
+                                )
+                                return
+                            pending_previous_response_id = response_id
+                            pending_input = approval_items
+                            continue
+                        break
 
                     prepared_calls: List[Dict[str, Any]] = []
                     if tool_calls:
@@ -834,9 +925,44 @@ class ReActAgent(AgentStrategy):
                         if item_type in ("function_call", "function_call_output"):
                             item.setdefault("__origin_call_seq", current_call_seq)
 
+                    if mcp_calls:
+                        for mcp_call in mcp_calls:
+                            server_label = str(mcp_call.get("server_label") or "").strip()
+                            tool_name = str(mcp_call.get("name") or "").strip()
+                            args_text = str(mcp_call.get("arguments") or "")
+                            display_label = build_mcp_tool_name(server_label or "mcp", tool_name or "tool")
+                            yield AgentStep(
+                                step_type="action",
+                                content=f"{display_label}[{args_text}]",
+                                metadata={
+                                    "tool": display_label,
+                                    "input": args_text,
+                                    "iteration": iteration,
+                                    "mcp": True
+                                }
+                            )
+                            output_text = ""
+                            if mcp_call.get("error"):
+                                output_text = str(mcp_call.get("error"))
+                            elif mcp_call.get("output") is not None:
+                                output_text = str(mcp_call.get("output"))
+                            else:
+                                status = mcp_call.get("status") or "unknown"
+                                output_text = f"MCP tool call status: {status}"
+                            yield AgentStep(
+                                step_type="observation",
+                                content=output_text,
+                                metadata={"tool": display_label, "iteration": iteration, "mcp": True}
+                            )
+
                     if tool_calls:
                         if output_items:
-                            dynamic_response_items.extend(output_items)
+                            response_items_for_history = [
+                                item for item in output_items
+                                if item.get("type") not in ("mcp_call", "mcp_approval_request")
+                            ]
+                            if response_items_for_history:
+                                dynamic_response_items.extend(response_items_for_history)
                         if llm_call_id:
                             self._update_llm_processed(llm_call_id, {
                                 "tool_calls": tool_calls,
@@ -1603,6 +1729,80 @@ class ReActAgent(AgentStrategy):
         if base.endswith(note):
             return base
         return f"{base}\n\n{note}"
+
+    def _extract_mcp_items(
+        self,
+        output_items: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        mcp_calls: List[Dict[str, Any]] = []
+        approvals: List[Dict[str, Any]] = []
+        for item in output_items or []:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "mcp_call":
+                mcp_calls.append(item)
+            elif item_type == "mcp_approval_request":
+                approvals.append(item)
+        return mcp_calls, approvals
+
+    async def _resolve_mcp_approvals(
+        self,
+        approvals: List[Dict[str, Any]],
+        session_id: Optional[str],
+        stop_event: Optional[asyncio.Event]
+    ) -> Optional[List[Dict[str, Any]]]:
+        if not approvals:
+            return []
+        try:
+            timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
+        except Exception:
+            timeout_sec = 300.0
+
+        response_items: List[Dict[str, Any]] = []
+        for approval in approvals:
+            if not isinstance(approval, dict):
+                continue
+            approval_id = approval.get("id") or approval.get("approval_request_id")
+            server_label = str(approval.get("server_label") or "").strip()
+            tool_name = str(approval.get("name") or "").strip()
+            args_text = str(approval.get("arguments") or "")
+            if not approval_id:
+                return None
+
+            display_label = build_mcp_tool_name(server_label or "mcp", tool_name or "tool")
+            reason = f"MCP tool approval: {display_label}"
+            if args_text:
+                trunc_cfg = {"enabled": True, "threshold": 800, "head_chars": 500, "tail_chars": 200}
+                reason = f"{reason}\nArgs: {_truncate_text_middle(args_text, trunc_cfg)}"
+
+            request_id = None
+            try:
+                request_id = db.create_permission_request(
+                    tool_name=display_label,
+                    action="mcp_approval",
+                    path=display_label,
+                    reason=reason,
+                    session_id=session_id or "global"
+                )
+            except Exception:
+                request_id = None
+
+            status = await _wait_for_mcp_permission(request_id, timeout_sec, stop_event)
+            approve = status in ("approved", "approved_once")
+            if approve and status == "approved" and server_label and tool_name:
+                persist_mcp_tool_approval(server_label, tool_name)
+
+            response_item: Dict[str, Any] = {
+                "type": "mcp_approval_response",
+                "approval_request_id": approval_id,
+                "approve": approve
+            }
+            if status in ("denied", "timeout"):
+                response_item["reason"] = "User denied" if status == "denied" else "Timed out"
+            response_items.append(response_item)
+
+        return response_items
 
     def _get_tool(self, tools: List[Tool], name: Optional[str]) -> Optional[Tool]:
         if not name:

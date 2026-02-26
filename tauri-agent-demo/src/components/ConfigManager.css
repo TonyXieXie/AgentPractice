@@ -411,6 +411,45 @@
   background: rgba(255, 255, 255, 0.03);
 }
 
+.mcp-server-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.mcp-server-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mcp-server-title {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mcp-server-title strong {
+  color: #f1f5f9;
+  font-size: 0.92rem;
+}
+
+.mcp-server-title span {
+  color: #8b949e;
+  font-size: 0.75rem;
+}
+
+.mcp-empty {
+  margin: 0;
+  color: #8b949e;
+  font-size: 0.85rem;
+}
+
 .config-subsection-header {
   display: flex;
   align-items: baseline;

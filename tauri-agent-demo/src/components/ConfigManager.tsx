@@ -12,6 +12,8 @@ import {
     AgentAbility,
     AgentProfile,
     ToolDefinition,
+    MCPConfig,
+    MCPServerConfig,
     ReasoningSummary
 } from '../types';
 import {
@@ -61,6 +63,23 @@ const REASONING_SUMMARY_OPTIONS: { value: ReasoningSummary; label: string }[] = 
     { value: 'concise', label: 'Concise' },
     { value: 'detailed', label: 'Detailed' }
 ];
+
+type MCPApprovalMode = 'always' | 'never' | 'custom';
+
+type MCPServerForm = {
+    enabled: boolean;
+    server_label: string;
+    server_url: string;
+    connector_id: string;
+    server_description: string;
+    authorization_env: string;
+    headers_env: string;
+    allowed_tools: string;
+    approval_mode: MCPApprovalMode;
+    never_tools: string;
+};
+
+const DEFAULT_MCP_APPROVAL_MODE: MCPApprovalMode = 'always';
 
 const ABILITY_TYPE_OPTIONS: { value: string; label: string }[] = [
     { value: 'tooling', label: '工具说明' },
@@ -119,7 +138,7 @@ const coerceInt = (value: unknown, fallback: number) => {
 
 const stripAgentGlobalFields = (agent: AgentConfig): AgentConfig => {
     if (!agent || typeof agent !== 'object') return {};
-    const { react_max_iterations, ast_enabled, code_map, ...rest } = agent as Record<string, any>;
+    const { react_max_iterations, ast_enabled, code_map, mcp, ...rest } = agent as Record<string, any>;
     return rest as AgentConfig;
 };
 
@@ -164,6 +183,133 @@ const normalizeAstImportLanguages = (value: unknown): string[] => {
     return [];
 };
 
+const parseCommaList = (value: string): string[] => {
+    if (!value) return [];
+    return value
+        .split(/[,\r\n]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+};
+
+const joinCommaList = (value: unknown): string => {
+    if (!Array.isArray(value)) return '';
+    return value
+        .map((item) => String(item).trim())
+        .filter(Boolean)
+        .join(', ');
+};
+
+const normalizeMcpServers = (mcp?: MCPConfig | null): MCPServerForm[] => {
+    const servers = Array.isArray(mcp?.servers) ? (mcp?.servers as MCPServerConfig[]) : [];
+    return servers.map((server) => {
+        const allowedTools = server.allowed_tools;
+        let allowedToolsText = '';
+        if (Array.isArray(allowedTools)) {
+            allowedToolsText = joinCommaList(allowedTools);
+        } else if (allowedTools && typeof allowedTools === 'object') {
+            allowedToolsText = joinCommaList((allowedTools as { tool_names?: string[] }).tool_names);
+        }
+
+        const requireApproval = server.require_approval;
+        let approvalMode: MCPApprovalMode = DEFAULT_MCP_APPROVAL_MODE;
+        let neverTools = '';
+        if (requireApproval === 'never') {
+            approvalMode = 'never';
+        } else if (requireApproval === 'always') {
+            approvalMode = 'always';
+        } else if (requireApproval && typeof requireApproval === 'object') {
+            approvalMode = 'custom';
+            const neverFilter = (requireApproval as { never?: { tool_names?: string[] } }).never;
+            if (neverFilter?.tool_names) {
+                neverTools = joinCommaList(neverFilter.tool_names);
+            }
+        }
+
+        return {
+            enabled: server.enabled ?? true,
+            server_label: server.server_label || '',
+            server_url: server.server_url || '',
+            connector_id: server.connector_id || '',
+            server_description: server.server_description || '',
+            authorization_env: server.authorization_env || '',
+            headers_env: server.headers_env || '',
+            allowed_tools: allowedToolsText,
+            approval_mode: approvalMode,
+            never_tools: neverTools
+        };
+    });
+};
+
+const buildMcpServersPayload = (
+    servers: MCPServerForm[]
+): { servers: MCPServerConfig[]; error?: string } => {
+    const payload: MCPServerConfig[] = [];
+    const labels = new Set<string>();
+
+    for (let index = 0; index < servers.length; index += 1) {
+        const server = servers[index];
+        const label = server.server_label.trim();
+        if (!label) {
+            return { servers: payload, error: `MCP 服务器 ${index + 1} 的 server_label 不能为空。` };
+        }
+        if (labels.has(label)) {
+            return { servers: payload, error: `MCP 服务器 server_label 不能重复: ${label}` };
+        }
+        labels.add(label);
+
+        const serverUrl = server.server_url.trim();
+        const connectorId = server.connector_id.trim();
+        if ((!serverUrl && !connectorId) || (serverUrl && connectorId)) {
+            return {
+                servers: payload,
+                error: `MCP 服务器 ${label} 需要填写 server_url 或 connector_id（二选一）。`
+            };
+        }
+
+        const item: MCPServerConfig = {
+            server_label: label,
+            enabled: Boolean(server.enabled)
+        };
+        if (serverUrl) item.server_url = serverUrl;
+        if (connectorId) item.connector_id = connectorId;
+
+        const description = server.server_description.trim();
+        if (description) item.server_description = description;
+        const authEnv = server.authorization_env.trim();
+        if (authEnv) item.authorization_env = authEnv;
+        const headersEnv = server.headers_env.trim();
+        if (headersEnv) item.headers_env = headersEnv;
+
+        const allowedList = parseCommaList(server.allowed_tools);
+        if (allowedList.length > 0) item.allowed_tools = allowedList;
+
+        const approvalMode = server.approval_mode || DEFAULT_MCP_APPROVAL_MODE;
+        if (approvalMode === 'always' || approvalMode === 'never') {
+            item.require_approval = approvalMode;
+        } else {
+            const neverList = parseCommaList(server.never_tools);
+            item.require_approval = { never: { tool_names: neverList } };
+        }
+
+        payload.push(item);
+    }
+
+    return { servers: payload };
+};
+
+const createEmptyMcpServer = (): MCPServerForm => ({
+    enabled: true,
+    server_label: '',
+    server_url: '',
+    connector_id: '',
+    server_description: '',
+    authorization_env: '',
+    headers_env: '',
+    allowed_tools: '',
+    approval_mode: DEFAULT_MCP_APPROVAL_MODE,
+    never_tools: ''
+});
+
 export default function ConfigManager({ onClose, onConfigCreated }: ConfigManagerProps) {
     type ConfigTab = 'models' | 'global' | 'agents';
     const [configs, setConfigs] = useState<LLMConfig[]>([]);
@@ -202,6 +348,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const [globalContextLongTailChars, setGlobalContextLongTailChars] = useState(
         String(DEFAULT_CONTEXT_LONG_TAIL_CHARS)
     );
+    const [globalMcpServers, setGlobalMcpServers] = useState<MCPServerForm[]>([]);
     const [globalLoading, setGlobalLoading] = useState(false);
     const [globalSaving, setGlobalSaving] = useState(false);
     const [globalSaved, setGlobalSaved] = useState(false);
@@ -367,6 +514,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         if (Number.isFinite(longTail)) {
             setGlobalContextLongTailChars(String(longTail));
         }
+        setGlobalMcpServers(normalizeMcpServers(data?.agent?.mcp));
         setAgentConfig(normalizeAgentConfig(data?.agent));
     };
 
@@ -397,6 +545,23 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         } catch (error) {
             console.error('Failed to load tools:', error);
         }
+    };
+
+    const updateMcpServer = (index: number, patch: Partial<MCPServerForm>) => {
+        setGlobalMcpServers((prev) =>
+            prev.map((server, idx) => (idx === index ? { ...server, ...patch } : server))
+        );
+        setGlobalSaved(false);
+    };
+
+    const addMcpServer = () => {
+        setGlobalMcpServers((prev) => [...prev, createEmptyMcpServer()]);
+        setGlobalSaved(false);
+    };
+
+    const removeMcpServer = (index: number) => {
+        setGlobalMcpServers((prev) => prev.filter((_, idx) => idx !== index));
+        setGlobalSaved(false);
     };
 
     const extractConfigImportItems = (data: unknown): unknown[] => {
@@ -522,32 +687,41 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         alert(`${summary}${detailText}`);
     };
 
-    const buildGlobalExportPayload = (): AppConfigUpdate => ({
-        llm: {
-            timeout_sec: coerceNumber(globalTimeoutSec, 180),
-            reasoning_summary: globalReasoningSummary,
-            auto_title_enabled: globalAutoTitleEnabled,
-        },
-        agent: {
-            react_max_iterations: coerceInt(globalReactMaxIterations, 50),
-            ast_enabled: globalAstEnabled,
-            code_map: {
-                enabled: globalCodeMapEnabled,
+    const buildGlobalExportPayload = (): AppConfigUpdate => {
+        const mcpResult = buildMcpServersPayload(globalMcpServers);
+        if (mcpResult.error) {
+            throw new Error(mcpResult.error);
+        }
+        return {
+            llm: {
+                timeout_sec: coerceNumber(globalTimeoutSec, 180),
+                reasoning_summary: globalReasoningSummary,
+                auto_title_enabled: globalAutoTitleEnabled,
             },
-        },
-        context: {
-            compression_enabled: globalContextCompressionEnabled,
-            compress_start_pct: coerceInt(globalContextCompressStartPct, DEFAULT_CONTEXT_START_PCT),
-            compress_target_pct: coerceInt(globalContextCompressTargetPct, DEFAULT_CONTEXT_TARGET_PCT),
-            min_keep_messages: coerceInt(globalContextMinKeepMessages, DEFAULT_CONTEXT_MIN_KEEP_MESSAGES),
-            keep_recent_calls: coerceInt(globalContextKeepRecentCalls, DEFAULT_CONTEXT_KEEP_RECENT_CALLS),
-            step_calls: coerceInt(globalContextStepCalls, DEFAULT_CONTEXT_STEP_CALLS),
-            truncate_long_data: globalContextTruncateLongData,
-            long_data_threshold: coerceInt(globalContextLongThreshold, DEFAULT_CONTEXT_LONG_THRESHOLD),
-            long_data_head_chars: coerceInt(globalContextLongHeadChars, DEFAULT_CONTEXT_LONG_HEAD_CHARS),
-            long_data_tail_chars: coerceInt(globalContextLongTailChars, DEFAULT_CONTEXT_LONG_TAIL_CHARS),
-        },
-    });
+            agent: {
+                react_max_iterations: coerceInt(globalReactMaxIterations, 50),
+                ast_enabled: globalAstEnabled,
+                code_map: {
+                    enabled: globalCodeMapEnabled,
+                },
+                mcp: {
+                    servers: mcpResult.servers
+                }
+            },
+            context: {
+                compression_enabled: globalContextCompressionEnabled,
+                compress_start_pct: coerceInt(globalContextCompressStartPct, DEFAULT_CONTEXT_START_PCT),
+                compress_target_pct: coerceInt(globalContextCompressTargetPct, DEFAULT_CONTEXT_TARGET_PCT),
+                min_keep_messages: coerceInt(globalContextMinKeepMessages, DEFAULT_CONTEXT_MIN_KEEP_MESSAGES),
+                keep_recent_calls: coerceInt(globalContextKeepRecentCalls, DEFAULT_CONTEXT_KEEP_RECENT_CALLS),
+                step_calls: coerceInt(globalContextStepCalls, DEFAULT_CONTEXT_STEP_CALLS),
+                truncate_long_data: globalContextTruncateLongData,
+                long_data_threshold: coerceInt(globalContextLongThreshold, DEFAULT_CONTEXT_LONG_THRESHOLD),
+                long_data_head_chars: coerceInt(globalContextLongHeadChars, DEFAULT_CONTEXT_LONG_HEAD_CHARS),
+                long_data_tail_chars: coerceInt(globalContextLongTailChars, DEFAULT_CONTEXT_LONG_TAIL_CHARS),
+            },
+        };
+    };
 
     const buildGlobalExportFromAppConfig = (appConfig: AppConfig | null | undefined): AppConfigUpdate => {
         if (!appConfig) return {};
@@ -1138,6 +1312,12 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             setGlobalSaving(false);
             return;
         }
+        const mcpResult = buildMcpServersPayload(globalMcpServers);
+        if (mcpResult.error) {
+            alert(mcpResult.error);
+            setGlobalSaving(false);
+            return;
+        }
         try {
             const updated = await updateAppConfig({
                 llm: {
@@ -1150,6 +1330,9 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                     ast_enabled: globalAstEnabled,
                     code_map: {
                         enabled: globalCodeMapEnabled
+                    },
+                    mcp: {
+                        servers: mcpResult.servers
                     }
                 },
                 context: {
@@ -1215,6 +1398,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             }
             if (updated?.agent) {
                 setAgentConfig(normalizeAgentConfig(updated.agent));
+                setGlobalMcpServers(normalizeMcpServers(updated.agent.mcp));
             }
             setGlobalSaved(true);
         } catch (error: any) {
@@ -2288,6 +2472,206 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     />
                                     <small>截断时保留的尾部长度。</small>
                                 </div>
+                            </div>
+
+                            <div className="config-subsection">
+                                <div className="config-subsection-header">
+                                    <div>
+                                        <h4>MCP 服务器</h4>
+                                        <span>仅在 OpenAI Responses + OpenAI profile 下生效。</span>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        className="add-btn add-inline"
+                                        onClick={addMcpServer}
+                                        disabled={globalLoading || globalSaving}
+                                    >
+                                        + 添加
+                                    </button>
+                                </div>
+
+                                {globalMcpServers.length === 0 ? (
+                                    <p className="mcp-empty">暂无 MCP 服务器配置。</p>
+                                ) : (
+                                    globalMcpServers.map((server, index) => (
+                                        <div
+                                            key={`${server.server_label || 'mcp'}-${index}`}
+                                            className="mcp-server-card"
+                                        >
+                                            <div className="mcp-server-header">
+                                                <div className="mcp-server-title">
+                                                    <strong>{server.server_label || `服务器 ${index + 1}`}</strong>
+                                                    {server.server_description ? (
+                                                        <span>{server.server_description}</span>
+                                                    ) : null}
+                                                </div>
+                                                <div className="config-form-actions">
+                                                    <button
+                                                        type="button"
+                                                        className="add-btn add-inline"
+                                                        onClick={() => removeMcpServer(index)}
+                                                        disabled={globalLoading || globalSaving}
+                                                    >
+                                                        删除
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            <div className="form-row">
+                                                <div className="form-group">
+                                                    <label>server_label</label>
+                                                    <input
+                                                        type="text"
+                                                        value={server.server_label}
+                                                        onChange={(e) =>
+                                                            updateMcpServer(index, { server_label: e.target.value })
+                                                        }
+                                                        disabled={globalLoading || globalSaving}
+                                                    />
+                                                    <small>唯一标识该 MCP 服务器。</small>
+                                                </div>
+                                                <div className="form-group checkbox-group">
+                                                    <label>
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={server.enabled}
+                                                            onChange={(e) =>
+                                                                updateMcpServer(index, { enabled: e.target.checked })
+                                                            }
+                                                            disabled={globalLoading || globalSaving}
+                                                        />
+                                                        启用
+                                                    </label>
+                                                    <small>关闭后该服务器不会注入工具。</small>
+                                                </div>
+                                            </div>
+
+                                            <div className="form-row">
+                                                <div className="form-group">
+                                                    <label>server_url</label>
+                                                    <input
+                                                        type="text"
+                                                        value={server.server_url}
+                                                        onChange={(e) =>
+                                                            updateMcpServer(index, { server_url: e.target.value })
+                                                        }
+                                                        disabled={globalLoading || globalSaving}
+                                                        placeholder="https://mcp.example.com"
+                                                    />
+                                                    <small>与 connector_id 二选一。</small>
+                                                </div>
+                                                <div className="form-group">
+                                                    <label>connector_id</label>
+                                                    <input
+                                                        type="text"
+                                                        value={server.connector_id}
+                                                        onChange={(e) =>
+                                                            updateMcpServer(index, { connector_id: e.target.value })
+                                                        }
+                                                        disabled={globalLoading || globalSaving}
+                                                        placeholder="mcp-connector-id"
+                                                    />
+                                                    <small>与 server_url 二选一。</small>
+                                                </div>
+                                            </div>
+
+                                            <div className="form-group">
+                                                <label>server_description</label>
+                                                <input
+                                                    type="text"
+                                                    value={server.server_description}
+                                                    onChange={(e) =>
+                                                        updateMcpServer(index, {
+                                                            server_description: e.target.value
+                                                        })
+                                                    }
+                                                    disabled={globalLoading || globalSaving}
+                                                />
+                                            </div>
+
+                                            <div className="form-row">
+                                                <div className="form-group">
+                                                    <label>authorization_env</label>
+                                                    <input
+                                                        type="text"
+                                                        value={server.authorization_env}
+                                                        onChange={(e) =>
+                                                            updateMcpServer(index, {
+                                                                authorization_env: e.target.value
+                                                            })
+                                                        }
+                                                        disabled={globalLoading || globalSaving}
+                                                        placeholder="MCP_AUTH_TOKEN"
+                                                    />
+                                                    <small>环境变量名，值作为 Authorization。</small>
+                                                </div>
+                                                <div className="form-group">
+                                                    <label>headers_env (JSON)</label>
+                                                    <input
+                                                        type="text"
+                                                        value={server.headers_env}
+                                                        onChange={(e) =>
+                                                            updateMcpServer(index, { headers_env: e.target.value })
+                                                        }
+                                                        disabled={globalLoading || globalSaving}
+                                                        placeholder="MCP_HEADERS_JSON"
+                                                    />
+                                                    <small>环境变量名，值需是 JSON。</small>
+                                                </div>
+                                            </div>
+
+                                            <div className="form-group">
+                                                <label>allowed_tools</label>
+                                                <input
+                                                    type="text"
+                                                    value={server.allowed_tools}
+                                                    onChange={(e) =>
+                                                        updateMcpServer(index, { allowed_tools: e.target.value })
+                                                    }
+                                                    disabled={globalLoading || globalSaving}
+                                                    placeholder="tool_a, tool_b"
+                                                />
+                                                <small>逗号分隔，留空表示不限制。</small>
+                                            </div>
+
+                                            <div className="form-row">
+                                                <div className="form-group">
+                                                    <label>require_approval</label>
+                                                    <select
+                                                        value={server.approval_mode}
+                                                        onChange={(e) =>
+                                                            updateMcpServer(index, {
+                                                                approval_mode: e.target.value as MCPApprovalMode
+                                                            })
+                                                        }
+                                                        disabled={globalLoading || globalSaving}
+                                                    >
+                                                        <option value="always">always</option>
+                                                        <option value="never">never</option>
+                                                        <option value="custom">custom</option>
+                                                    </select>
+                                                </div>
+                                                <div className="form-group">
+                                                    <label>永不审批工具</label>
+                                                    <input
+                                                        type="text"
+                                                        value={server.never_tools}
+                                                        onChange={(e) =>
+                                                            updateMcpServer(index, { never_tools: e.target.value })
+                                                        }
+                                                        disabled={
+                                                            globalLoading ||
+                                                            globalSaving ||
+                                                            server.approval_mode !== 'custom'
+                                                        }
+                                                        placeholder="tool_x, tool_y"
+                                                    />
+                                                    <small>custom 模式下生效。</small>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ))
+                                )}
                             </div>
 
                             <div className="form-actions">

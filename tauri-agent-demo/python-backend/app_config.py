@@ -35,6 +35,9 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
             "weight_refs": 1.0,
             "weight_mentions": 2.0
         },
+        "mcp": {
+            "servers": []
+        },
         "abilities": [
             {
                 "id": "tools_all",
@@ -317,6 +320,141 @@ def _coerce_code_map(value: Any) -> Dict[str, Any]:
     return result
 
 
+def _normalize_mcp_filter(value: Any, field: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
+    result: Dict[str, Any] = {}
+    if "tool_names" in value:
+        if not isinstance(value["tool_names"], list):
+            raise ValueError(f"{field}.tool_names must be a list of strings")
+        names = [
+            str(item).strip()
+            for item in value["tool_names"]
+            if isinstance(item, (str, int, float))
+        ]
+        names = [name for name in names if name]
+        result["tool_names"] = names
+    if "read_only" in value:
+        result["read_only"] = _coerce_bool(value["read_only"], f"{field}.read_only")
+    return result
+
+
+def _normalize_mcp_server(value: Any, index: int, labels: set) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"agent.mcp.servers[{index}] must be an object")
+    server_label = str(value.get("server_label") or "").strip()
+    if not server_label:
+        raise ValueError(f"agent.mcp.servers[{index}].server_label is required")
+    if server_label in labels:
+        raise ValueError("agent.mcp.servers.server_label must be unique")
+    labels.add(server_label)
+
+    server_url = value.get("server_url")
+    connector_id = value.get("connector_id")
+    if (not server_url and not connector_id) or (server_url and connector_id):
+        raise ValueError(
+            f"agent.mcp.servers[{index}] must set exactly one of server_url or connector_id"
+        )
+    server_url = str(server_url).strip() if server_url else None
+    connector_id = str(connector_id).strip() if connector_id else None
+
+    enabled = True
+    if "enabled" in value:
+        enabled = _coerce_bool(value.get("enabled"), f"agent.mcp.servers[{index}].enabled")
+
+    server_description = value.get("server_description")
+    if server_description is not None and not isinstance(server_description, str):
+        raise ValueError(f"agent.mcp.servers[{index}].server_description must be a string")
+    server_description = server_description.strip() if isinstance(server_description, str) else None
+
+    authorization_env = value.get("authorization_env")
+    if authorization_env is not None and not isinstance(authorization_env, str):
+        raise ValueError(f"agent.mcp.servers[{index}].authorization_env must be a string")
+    authorization_env = authorization_env.strip() if isinstance(authorization_env, str) else None
+
+    headers_env = value.get("headers_env")
+    if headers_env is not None and not isinstance(headers_env, str):
+        raise ValueError(f"agent.mcp.servers[{index}].headers_env must be a string")
+    headers_env = headers_env.strip() if isinstance(headers_env, str) else None
+
+    allowed_tools = value.get("allowed_tools")
+    normalized_allowed: Any = None
+    if allowed_tools is not None:
+        if isinstance(allowed_tools, list):
+            names = [
+                str(item).strip()
+                for item in allowed_tools
+                if isinstance(item, (str, int, float))
+            ]
+            names = [name for name in names if name]
+            normalized_allowed = names
+        elif isinstance(allowed_tools, dict):
+            normalized_allowed = _normalize_mcp_filter(
+                allowed_tools, f"agent.mcp.servers[{index}].allowed_tools"
+            )
+        else:
+            raise ValueError(f"agent.mcp.servers[{index}].allowed_tools must be a list or object")
+
+    require_approval = value.get("require_approval")
+    normalized_require: Any = None
+    if require_approval is not None:
+        if isinstance(require_approval, str):
+            normalized = require_approval.strip().lower()
+            if normalized not in ("always", "never"):
+                raise ValueError(
+                    f"agent.mcp.servers[{index}].require_approval must be always, never, or an object"
+                )
+            normalized_require = normalized
+        elif isinstance(require_approval, dict):
+            require_obj: Dict[str, Any] = {}
+            for key in ("always", "never"):
+                if key in require_approval and require_approval[key] is not None:
+                    require_obj[key] = _normalize_mcp_filter(
+                        require_approval[key],
+                        f"agent.mcp.servers[{index}].require_approval.{key}"
+                    )
+            normalized_require = require_obj
+        else:
+            raise ValueError(
+                f"agent.mcp.servers[{index}].require_approval must be always, never, or an object"
+            )
+
+    normalized: Dict[str, Any] = {
+        "server_label": server_label,
+        "enabled": enabled
+    }
+    if server_url:
+        normalized["server_url"] = server_url
+    if connector_id:
+        normalized["connector_id"] = connector_id
+    if server_description:
+        normalized["server_description"] = server_description
+    if authorization_env:
+        normalized["authorization_env"] = authorization_env
+    if headers_env:
+        normalized["headers_env"] = headers_env
+    if normalized_allowed is not None:
+        normalized["allowed_tools"] = normalized_allowed
+    if normalized_require is not None:
+        normalized["require_approval"] = normalized_require
+    return normalized
+
+
+def _normalize_mcp_config(mcp: Any) -> Dict[str, Any]:
+    if not isinstance(mcp, dict):
+        raise ValueError("agent.mcp must be an object")
+    servers = mcp.get("servers")
+    if servers is None:
+        servers = []
+    if not isinstance(servers, list):
+        raise ValueError("agent.mcp.servers must be a list")
+    normalized_servers = []
+    labels: set = set()
+    for idx, server in enumerate(servers):
+        normalized_servers.append(_normalize_mcp_server(server, idx, labels))
+    return {"servers": normalized_servers}
+
+
 def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(config)
     llm = dict(normalized.get("llm", {}))
@@ -340,6 +478,8 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         agent["subagent_profile"] = agent["subagent_profile"].strip()
     if "code_map" in agent:
         agent["code_map"] = _coerce_code_map(agent["code_map"])
+    if "mcp" in agent:
+        agent["mcp"] = _normalize_mcp_config(agent["mcp"])
     normalized["agent"] = agent
     return normalized
 
