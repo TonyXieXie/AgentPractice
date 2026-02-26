@@ -10,6 +10,13 @@ export interface ToolDefinition {
     parameters?: Record<string, any>[];
 }
 
+export interface SkillSummary {
+    name: string;
+    description?: string;
+    source?: string;
+    path?: string;
+}
+
 export interface MCPToolFilter {
     tool_names?: string[];
     read_only?: boolean;

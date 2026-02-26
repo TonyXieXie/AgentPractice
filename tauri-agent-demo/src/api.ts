@@ -14,6 +14,7 @@
     ToolPermissionRequest,
     PatchRevertResponse,
     ToolDefinition,
+    SkillSummary,
     AstRequest,
     AstPathSettings,
     AstSettingsResponse,
@@ -141,6 +142,14 @@ export async function getTools(): Promise<ToolDefinition[]> {
     const response = await fetch(`${API_BASE_URL}/tools`);
     if (!response.ok) {
         throw await buildApiError(response, 'Failed to fetch tools');
+    }
+    return response.json();
+}
+
+export async function getSkills(): Promise<SkillSummary[]> {
+    const response = await fetch(`${API_BASE_URL}/skills`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to fetch skills');
     }
     return response.json();
 }

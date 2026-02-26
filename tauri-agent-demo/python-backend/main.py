@@ -51,6 +51,12 @@ from code_map import build_code_map_prompt
 from ast_index import get_ast_index
 from ast_settings import get_ast_settings, update_ast_settings, get_all_ast_settings
 from context_compress import build_history_for_llm, maybe_compress_context
+from skills import (
+    list_skills,
+    get_enabled_skills,
+    extract_skill_invocations,
+    build_skill_prompt_sections
+)
 
 app = FastAPI(title="Tauri Agent Chat Backend")
 STREAM_REGISTRY = get_stream_registry()
@@ -1272,6 +1278,18 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
             extra_context={"pty_sessions": pty_prompt},
             exclude_ability_ids=["code_map"]
         )
+        enabled_skills = get_enabled_skills()
+        invoked_skill_names = extract_skill_invocations(processed_message)
+        invoked_skills = []
+        if enabled_skills and invoked_skill_names:
+            skill_map = {skill.name.lower(): skill for skill in enabled_skills}
+            for name in invoked_skill_names:
+                skill = skill_map.get(name.lower())
+                if skill:
+                    invoked_skills.append(skill)
+        skills_prompt = build_skill_prompt_sections(enabled_skills, invoked_skills)
+        if skills_prompt:
+            system_prompt = f"{system_prompt}\n\n{skills_prompt}" if system_prompt else skills_prompt
         system_prompt = _append_reasoning_summary_prompt(system_prompt, global_reasoning_summary)
         if resolved_profile_id and resolved_profile_id != getattr(session, "agent_profile", None):
             db.update_session(session.id, ChatSessionUpdate(agent_profile=resolved_profile_id))
@@ -1592,6 +1610,12 @@ def refresh_mcp_tools_route():
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to refresh MCP tools: {exc}")
     return {"ok": True, "registered": registered}
+
+# ==================== Skills ====================
+
+@app.get("/skills")
+def get_skills_route():
+    return list_skills()
 
 # ==================== Patch Revert ====================
 

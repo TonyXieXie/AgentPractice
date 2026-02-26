@@ -13,6 +13,7 @@ from message_processor import message_processor
 from context_compress import build_history_for_llm
 from code_map import build_code_map_prompt
 from ws_hub import get_ws_hub
+from skills import get_enabled_skills, extract_skill_invocations, build_skill_prompt_sections
 
 
 def _append_reasoning_summary_prompt(system_prompt: str, reasoning_summary: Optional[str]) -> str:
@@ -233,6 +234,18 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
         extra_context={"pty_sessions": pty_prompt},
         exclude_ability_ids=["code_map"]
     )
+    enabled_skills = get_enabled_skills()
+    invoked_names = extract_skill_invocations(processed_message)
+    invoked_skills = []
+    if enabled_skills and invoked_names:
+        skill_map = {skill.name.lower(): skill for skill in enabled_skills}
+        for name in invoked_names:
+            skill = skill_map.get(name.lower())
+            if skill:
+                invoked_skills.append(skill)
+    skills_prompt = build_skill_prompt_sections(enabled_skills, invoked_skills)
+    if skills_prompt:
+        system_prompt = f"{system_prompt}\n\n{skills_prompt}" if system_prompt else skills_prompt
     system_prompt = _append_reasoning_summary_prompt(system_prompt, global_reasoning_summary)
     if resolved_profile_id and resolved_profile_id != getattr(child_session, "agent_profile", None):
         db.update_session(child_session.id, ChatSessionUpdate(agent_profile=resolved_profile_id))

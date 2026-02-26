@@ -17,7 +17,8 @@ import {
   ReasoningEffort,
   AgentMode,
   AgentConfig,
-  ContextEstimate
+  ContextEstimate,
+  SkillSummary
 } from './types';
 import {
   sendMessageAgentStream,
@@ -25,6 +26,7 @@ import {
   getAppConfig,
   getConfig,
   getConfigs,
+  getSkills,
   getSession,
   getSessionMessages,
   getSessionLLMCalls,
@@ -318,6 +320,17 @@ const parseFileLocation = (rawValue: string) => {
     return { path: candidate };
   }
   return { path: '' };
+};
+
+const SKILL_TRIGGER_PATTERN = /(^|\s)\\([A-Za-z0-9_-]*)$/;
+
+const findSkillTrigger = (value: string, cursor: number | null) => {
+  if (cursor == null || cursor < 0) return null;
+  const slice = value.slice(0, cursor);
+  const match = slice.match(SKILL_TRIGGER_PATTERN);
+  if (!match || match.index == null) return null;
+  const start = match.index + match[1].length;
+  return { start, end: cursor, query: match[2] || '' };
 };
 
 const joinPath = (base: string, child: string) => {
@@ -655,6 +668,12 @@ type PendingContextEstimate = {
 
 function App() {
   const [inputMsg, setInputMsg] = useState('');
+  const [skills, setSkills] = useState<SkillSummary[]>([]);
+  const [skillSuggestions, setSkillSuggestions] = useState<SkillSummary[]>([]);
+  const [showSkillSuggestions, setShowSkillSuggestions] = useState(false);
+  const [skillActiveIndex, setSkillActiveIndex] = useState(0);
+  const skillTriggerRef = useRef<{ start: number; end: number; query: string } | null>(null);
+  const skillQueryRef = useRef('');
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [dragActive, setDragActive] = useState(false);
   const [imagePreview, setImagePreview] = useState<{ src: string; name?: string } | null>(null);
@@ -831,6 +850,7 @@ function App() {
     loadDefaultConfig();
     loadAllConfigs();
     loadAgentConfig();
+    loadSkills();
   }, []);
 
   useEffect(() => {
@@ -1526,6 +1546,72 @@ function App() {
       console.error('Failed to load agent config:', error);
     }
   };
+
+  const loadSkills = async () => {
+    try {
+      const data = await getSkills();
+      setSkills(Array.isArray(data) ? data : []);
+    } catch (error) {
+      console.error('Failed to load skills:', error);
+      setSkills([]);
+    }
+  };
+
+  const closeSkillSuggestions = useCallback(() => {
+    setShowSkillSuggestions(false);
+    setSkillSuggestions([]);
+    setSkillActiveIndex(0);
+    skillTriggerRef.current = null;
+    skillQueryRef.current = '';
+  }, []);
+
+  const updateSkillSuggestions = useCallback((value: string, cursor: number | null) => {
+    if (!skills.length) {
+      closeSkillSuggestions();
+      return;
+    }
+    const trigger = findSkillTrigger(value, cursor);
+    if (!trigger) {
+      closeSkillSuggestions();
+      return;
+    }
+    const query = trigger.query.toLowerCase();
+    const matches = skills.filter((skill) => skill.name.toLowerCase().startsWith(query));
+    skillTriggerRef.current = trigger;
+    if (!matches.length) {
+      setShowSkillSuggestions(false);
+      setSkillSuggestions([]);
+      skillQueryRef.current = query;
+      return;
+    }
+    const queryChanged = skillQueryRef.current !== query;
+    skillQueryRef.current = query;
+    setSkillSuggestions(matches);
+    setShowSkillSuggestions(true);
+    setSkillActiveIndex((prev) => {
+      if (queryChanged) return 0;
+      return prev >= matches.length ? 0 : prev;
+    });
+  }, [skills, closeSkillSuggestions]);
+
+  const applySkillSuggestion = useCallback((skillName: string) => {
+    const trigger = skillTriggerRef.current;
+    const currentValue = inputRef.current?.value ?? inputMsg;
+    if (!trigger) return;
+    const before = currentValue.slice(0, trigger.start);
+    const after = currentValue.slice(trigger.end);
+    const insertion = `\\${skillName} `;
+    const nextValue = `${before}${insertion}${after}`;
+    setInputMsg(nextValue);
+    closeSkillSuggestions();
+    requestAnimationFrame(() => {
+      const input = inputRef.current;
+      if (!input) return;
+      const caret = before.length + insertion.length;
+      input.focus();
+      input.setSelectionRange(caret, caret);
+    });
+  }, [inputMsg, closeSkillSuggestions]);
 
   const getSessionKey = (sessionId: string | null) => sessionId ?? DRAFT_SESSION_KEY;
 
@@ -2836,6 +2922,7 @@ function App() {
     const attachments = hasAttachments ? [...pendingAttachments] : [];
     setInputMsg('');
     setPendingAttachments([]);
+    closeSkillSuggestions();
     await enqueueMessage(userMessage, currentSessionIdRef.current, attachments);
   };
 
@@ -3869,10 +3956,31 @@ function App() {
               <div className="input-readonly-hint">子agent会话仅供查看</div>
             )}
 
+            {showSkillSuggestions && skillSuggestions.length > 0 && (
+              <div className="skill-suggestions">
+                {skillSuggestions.map((skill, index) => (
+                  <button
+                    key={skill.name}
+                    type="button"
+                    className={`skill-suggestion${index === skillActiveIndex ? ' active' : ''}`}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      applySkillSuggestion(skill.name);
+                    }}
+                  >
+                    <div className="skill-name">{skill.name}</div>
+                    {skill.description && <div className="skill-desc">{skill.description}</div>}
+                  </button>
+                ))}
+              </div>
+            )}
+
             <textarea
               onChange={(e) => {
-                setInputMsg(e.currentTarget.value);
+                const value = e.currentTarget.value;
+                setInputMsg(value);
                 autoScrollRef.current = true;
+                updateSkillSuggestions(value, e.currentTarget.selectionStart);
               }}
               onPaste={handlePaste}
               onCompositionStart={() => {
@@ -3881,7 +3989,44 @@ function App() {
               onCompositionEnd={() => {
                 composingRef.current = false;
               }}
+              onClick={(e) => {
+                updateSkillSuggestions(e.currentTarget.value, e.currentTarget.selectionStart);
+              }}
+              onKeyUp={(e) => {
+                if (showSkillSuggestions && ['ArrowUp', 'ArrowDown', 'Enter', 'Tab', 'Escape'].includes(e.key)) {
+                  return;
+                }
+                updateSkillSuggestions(e.currentTarget.value, e.currentTarget.selectionStart);
+              }}
+              onBlur={() => {
+                closeSkillSuggestions();
+              }}
               onKeyDown={(e) => {
+                if (showSkillSuggestions && skillSuggestions.length > 0) {
+                  if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setSkillActiveIndex((prev) => (prev + 1) % skillSuggestions.length);
+                    return;
+                  }
+                  if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setSkillActiveIndex((prev) => (prev - 1 + skillSuggestions.length) % skillSuggestions.length);
+                    return;
+                  }
+                  if (e.key === 'Enter' || e.key === 'Tab') {
+                    e.preventDefault();
+                    const target = skillSuggestions[skillActiveIndex];
+                    if (target) {
+                      applySkillSuggestion(target.name);
+                    }
+                    return;
+                  }
+                  if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeSkillSuggestions();
+                    return;
+                  }
+                }
                 if (e.key === 'Enter' && !e.shiftKey) {
                   if (composingRef.current || (e.nativeEvent as any).isComposing || e.isComposing) {
                     return;
