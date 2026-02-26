@@ -31,6 +31,21 @@ from context_compress import build_history_for_llm, maybe_compress_context, summ
 TRUNCATION_MARKER_START = "[TRUNCATED_START]"
 TRUNCATION_MARKER_END = "[TRUNCATED_END]"
 TRUNCATION_DELAY_CALLS = 2
+SAFE_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _normalize_tool_name_for_llm(name: Optional[str]) -> str:
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("mcp:") and "/" in raw:
+        server_tool = raw[4:]
+        server_label, tool = server_tool.split("/", 1)
+        return safe_mcp_tool_name(server_label, tool)
+    if SAFE_TOOL_NAME_RE.match(raw):
+        return raw
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_")
+    return cleaned or raw
 
 
 def _get_prompt_truncation_config(request_overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -141,6 +156,13 @@ def _sanitize_tool_call_arguments(call: Dict[str, Any], current_call_seq: int, c
             if "arguments" in func:
                 func["arguments"] = _truncate_text_middle(func.get("arguments", ""), cfg)
             new_call["function"] = func
+    if "name" in new_call:
+        new_call["name"] = _normalize_tool_name_for_llm(new_call.get("name"))
+    if "function" in new_call and isinstance(new_call["function"], dict):
+        func = dict(new_call["function"])
+        if "name" in func:
+            func["name"] = _normalize_tool_name_for_llm(func.get("name"))
+        new_call["function"] = func
     return new_call
 
 
@@ -155,6 +177,8 @@ def _sanitize_messages_for_prompt(
         origin = new_msg.pop("__origin_call_seq", None)
         if new_msg.get("role") == "tool" and _should_truncate(origin, current_call_seq, cfg):
             new_msg["content"] = _truncate_text_middle(new_msg.get("content", ""), cfg)
+        if new_msg.get("role") == "tool" and "name" in new_msg:
+            new_msg["name"] = _normalize_tool_name_for_llm(new_msg.get("name"))
         if "tool_calls" in new_msg and isinstance(new_msg.get("tool_calls"), list):
             new_calls = [
                 _sanitize_tool_call_arguments(call, current_call_seq, cfg)
@@ -180,6 +204,9 @@ def _sanitize_response_input(
                 new_item["arguments"] = _truncate_text_middle(new_item.get("arguments", ""), cfg)
             elif item_type == "function_call_output":
                 new_item["output"] = _truncate_text_middle(new_item.get("output", ""), cfg)
+        item_type = str(new_item.get("type", "") or "")
+        if item_type == "function_call" and "name" in new_item:
+            new_item["name"] = _normalize_tool_name_for_llm(new_item.get("name"))
         sanitized.append(new_item)
     return sanitized
 

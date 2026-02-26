@@ -2069,43 +2069,45 @@ function App() {
               return { ...msg, metadata: nextMetadata };
             }
 
-            if (step.step_type === 'action_delta') {
-              const streamKey = String(step.metadata?.stream_key || 'tool-0');
-              const toolName = String(step.metadata?.tool || '');
-              const buffers = { ...(nextMetadata.agent_action_buffers || {}) } as Record<string, string>;
-              const buffer = String(buffers[streamKey] || '') + (step.content || '');
-              buffers[streamKey] = buffer;
-              nextMetadata.agent_action_buffers = buffers;
-              nextMetadata.agent_streaming = true;
+              if (step.step_type === 'action_delta') {
+                const streamKey = String(step.metadata?.stream_key || 'tool-0');
+                const toolName = String(step.metadata?.tool || '');
+                const toolDisplay = String(step.metadata?.tool_display || toolName);
+                const buffers = { ...(nextMetadata.agent_action_buffers || {}) } as Record<string, string>;
+                const buffer = String(buffers[streamKey] || '') + (step.content || '');
+                buffers[streamKey] = buffer;
+                nextMetadata.agent_action_buffers = buffers;
+                nextMetadata.agent_streaming = true;
 
-              const display = toolName ? `${toolName}[${buffer}]` : buffer;
-              const streamingIndex = nextSteps.findIndex(
-                (s) => s.step_type === 'action' && s.metadata?.streaming && s.metadata?.stream_key === streamKey
-              );
-              if (streamingIndex >= 0) {
-                nextSteps[streamingIndex] = {
-                  ...nextSteps[streamingIndex],
-                  content: display,
-                  metadata: { ...(nextSteps[streamingIndex].metadata || {}), stream_key: streamKey, streaming: true, tool: toolName }
-                };
-              } else {
-                nextSteps.push({
-                  step_type: 'action',
-                  content: display,
-                  metadata: { stream_key: streamKey, streaming: true, tool: toolName }
-                });
-              }
+                const display = toolDisplay ? `${toolDisplay}[${buffer}]` : buffer;
+                const streamingIndex = nextSteps.findIndex(
+                  (s) => s.step_type === 'action' && s.metadata?.streaming && s.metadata?.stream_key === streamKey
+                );
+                if (streamingIndex >= 0) {
+                  nextSteps[streamingIndex] = {
+                    ...nextSteps[streamingIndex],
+                    content: display,
+                    metadata: { ...(nextSteps[streamingIndex].metadata || {}), stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay }
+                  };
+                } else {
+                  nextSteps.push({
+                    step_type: 'action',
+                    content: display,
+                    metadata: { stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay }
+                  });
+                }
 
               nextMetadata.agent_steps = nextSteps;
               return { ...msg, metadata: nextMetadata };
             }
 
-            if (step.step_type === 'observation_delta') {
-              const streamKey = String(step.metadata?.stream_key || 'obs-0');
-              const toolName = String(step.metadata?.tool || '');
-              const reset = Boolean(step.metadata?.reset);
-              const buffers = { ...(nextMetadata.agent_observation_buffers || {}) } as Record<string, string>;
-              let baseBuffer = String(buffers[streamKey] || '');
+              if (step.step_type === 'observation_delta') {
+                const streamKey = String(step.metadata?.stream_key || 'obs-0');
+                const toolName = String(step.metadata?.tool || '');
+                const toolDisplay = String(step.metadata?.tool_display || toolName);
+                const reset = Boolean(step.metadata?.reset);
+                const buffers = { ...(nextMetadata.agent_observation_buffers || {}) } as Record<string, string>;
+                let baseBuffer = String(buffers[streamKey] || '');
               if (!baseBuffer) {
                 const streamingIndex = nextSteps.findIndex(
                   (s) => s.step_type === 'observation' && s.metadata?.streaming && s.metadata?.stream_key === streamKey
@@ -2129,18 +2131,18 @@ function App() {
                 (s) => s.step_type === 'observation' && s.metadata?.streaming && s.metadata?.stream_key === streamKey
               );
               if (streamingIndex >= 0) {
-                nextSteps[streamingIndex] = {
-                  ...nextSteps[streamingIndex],
-                  content: buffer,
-                  metadata: { ...(nextSteps[streamingIndex].metadata || {}), stream_key: streamKey, streaming: true, tool: toolName }
-                };
-              } else {
-                nextSteps.push({
-                  step_type: 'observation',
-                  content: buffer,
-                  metadata: { stream_key: streamKey, streaming: true, tool: toolName }
-                });
-              }
+                  nextSteps[streamingIndex] = {
+                    ...nextSteps[streamingIndex],
+                    content: buffer,
+                    metadata: { ...(nextSteps[streamingIndex].metadata || {}), stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay }
+                  };
+                } else {
+                  nextSteps.push({
+                    step_type: 'observation',
+                    content: buffer,
+                    metadata: { stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay }
+                  });
+                }
 
               nextMetadata.agent_steps = nextSteps;
               return { ...msg, metadata: nextMetadata };
