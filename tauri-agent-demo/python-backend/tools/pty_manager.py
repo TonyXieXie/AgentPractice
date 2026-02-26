@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 import uuid
@@ -39,6 +40,24 @@ def _decode_output_bytes(data: bytes) -> str:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         pass
+    if os.name == "nt":
+        encodings = []
+        try:
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            oem_cp = int(kernel32.GetOEMCP() or 0)
+            if oem_cp:
+                encodings.append(f"cp{oem_cp}")
+            ansi_cp = int(kernel32.GetACP() or 0)
+            if ansi_cp and ansi_cp != oem_cp:
+                encodings.append(f"cp{ansi_cp}")
+        except Exception:
+            encodings = []
+        for enc in encodings:
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
     try:
         import locale
         encoding = locale.getpreferredencoding(False) or "utf-8"

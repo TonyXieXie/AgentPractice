@@ -10,6 +10,7 @@ import locale
 import select
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional, List, Set
 
@@ -2841,13 +2842,32 @@ class ReadFileTool(Tool):
         if not path:
             raise ValueError("Missing path.")
         mode = str(data.get("mode") or "").strip().lower()
+        raw_start_line = data.get("start_line")
+        if raw_start_line is None:
+            raw_start_line = data.get("startLine")
+        raw_line_count = data.get("line_count")
+        if raw_line_count is None:
+            raw_line_count = data.get("lineCount")
+        raw_anchor_line = data.get("anchor_line")
+        if raw_anchor_line is None:
+            raw_anchor_line = data.get("anchorLine")
+
+        has_start = raw_start_line is not None
+        has_line_count = raw_line_count is not None
+        has_anchor = raw_anchor_line is not None
+
         if not mode:
-            mode = "smart" if data.get("anchor_line") else "lines"
-        start_line = int(data.get("start_line", 1) or 1)
-        line_count = data.get("line_count")
-        line_count = int(line_count) if line_count is not None else 200
-        anchor_line = data.get("anchor_line")
-        anchor_line = int(anchor_line) if anchor_line is not None else None
+            if has_start or has_line_count:
+                mode = "lines"
+            elif has_anchor:
+                mode = "smart"
+            else:
+                mode = "lines"
+        if mode == "smart" and not has_anchor and (has_start or has_line_count):
+            mode = "lines"
+        start_line = int(raw_start_line if raw_start_line is not None else 1)
+        line_count = int(raw_line_count) if raw_line_count is not None else 200
+        anchor_line = int(raw_anchor_line) if raw_anchor_line is not None else None
         indent_level = data.get("indent_level")
         indent_level = int(indent_level) if indent_level is not None else 1
         files_cfg = get_tool_config().get("files", {})
@@ -2981,6 +3001,110 @@ class ReadFileTool(Tool):
             total_chars += len(chunk)
 
         return "".join(output_parts) if output_parts else "No content."
+
+
+class ListFilesTool(Tool):
+    def __init__(self):
+        super().__init__()
+        self.name = "list_files"
+        self.description = "List files in a directory using BFS with a tree-like display."
+        self.parameters = [
+            ToolParameter(
+                name="path",
+                type="string",
+                description="Directory path (absolute or relative to work path).",
+                required=False
+            ),
+            ToolParameter(
+                name="max_depth",
+                type="number",
+                description="Max depth to traverse (default 2, max 5).",
+                required=False
+            ),
+            ToolParameter(
+                name="max_entries",
+                type="number",
+                description="Max number of entries to output (default 100, max 500).",
+                required=False
+            )
+        ]
+
+    async def execute(self, input_data: str) -> str:
+        raw_text = (input_data or "").strip()
+        data = _parse_json_input(input_data)
+
+        path = data.get("path")
+        if not path and raw_text and not data:
+            path = raw_text
+
+        max_depth = _coerce_int(data.get("max_depth"), 2)
+        if max_depth <= 0:
+            max_depth = 2
+        if max_depth > 5:
+            max_depth = 5
+
+        max_entries = _coerce_int(data.get("max_entries"), 100)
+        if max_entries <= 0:
+            max_entries = 100
+        if max_entries > 500:
+            max_entries = 500
+
+        if path:
+            root = _resolve_path(str(path), self.name, "read")
+        else:
+            root = _get_root_path()
+
+        if not root.exists():
+            raise ValueError(f"Path not found: {root}")
+        if root.is_file():
+            raise ValueError(f"Path must be a directory: {root}")
+
+        output_lines: List[str] = [f"Absolute path: {root}"]
+        queue = deque([(root, 0)])
+        entries = 0
+        truncated = False
+
+        while queue and not truncated:
+            current_dir, depth = queue.popleft()
+            try:
+                children = list(current_dir.iterdir())
+            except Exception as exc:
+                raise ValueError(f"Failed to list directory: {exc}")
+
+            children_sorted = sorted(children, key=lambda p: p.name.lower())
+            for child in children_sorted:
+                if entries >= max_entries:
+                    truncated = True
+                    break
+
+                try:
+                    is_symlink = child.is_symlink()
+                except Exception:
+                    is_symlink = False
+                try:
+                    is_dir = child.is_dir()
+                except Exception:
+                    is_dir = False
+
+                suffix = ""
+                enqueue = False
+                if is_symlink:
+                    suffix = "@"
+                elif is_dir:
+                    suffix = "/"
+                    enqueue = True
+
+                indent = "  " * depth
+                output_lines.append(f"{indent}{child.name}{suffix}")
+                entries += 1
+
+                if enqueue and depth < max_depth:
+                    queue.append((child, depth + 1))
+
+        if truncated:
+            output_lines.append(f"More than {max_entries} entries found")
+
+        return "\n".join(output_lines)
 
 
 class WriteFileTool(Tool):
@@ -3390,10 +3514,11 @@ class RunShellTool(Tool):
                 cwd=str(workdir),
                 shell=True,
                 capture_output=True,
-                text=True,
                 timeout=timeout_sec
             )
-            output_text = (completed.stdout or "") + (completed.stderr or "")
+            stdout = completed.stdout or b""
+            stderr = completed.stderr or b""
+            output_text = _decode_output_bytes(stdout + stderr)
             return completed.returncode, output_text
 
         def _run_oneshot(use_sandbox: bool) -> Tuple[int, str]:
@@ -3651,14 +3776,37 @@ class RgTool(Tool):
         if not files:
             return "No matches."
 
-        # 2) For each matched file, return only file name + line numbers (no content).
+        # 2) For each matched file, return grouped results with relative path and line context.
         results: List[str] = []
+        grouped: Dict[str, List[str]] = {}
+        root_path = root.resolve()
+
+        def _to_relative_path(raw_path: str) -> str:
+            try:
+                p = Path(raw_path)
+                if not p.is_absolute():
+                    return str(p)
+                p = p.resolve()
+                if _is_within_root(p, root_path):
+                    return os.path.relpath(str(p), str(root_path))
+            except Exception:
+                return raw_path
+            return raw_path
+
+        def _format_match_text(text: str, max_len: int = 120) -> str:
+            cleaned = " ".join(str(text).strip().split())
+            if not cleaned:
+                return "(empty)"
+            if len(cleaned) <= max_len:
+                return cleaned
+            return f"{cleaned[:max_len - 3]}..."
         for file_path in files:
             remaining = output_limit - len(results)
             if remaining <= 0:
                 break
             line_args = [
                 *base_args,
+                "--with-filename",
                 "--line-number",
                 "--no-heading",
                 "--color",
@@ -3687,13 +3835,27 @@ class RgTool(Tool):
                 parts = raw.rsplit(":", 2)
                 if len(parts) < 2:
                     continue
-                path_part = parts[0]
+                path_part = _to_relative_path(parts[0])
                 line_no = parts[1]
-                results.append(f"{path_part}:{line_no}")
+                line_text = parts[2] if len(parts) > 2 else ""
+                entry = f"  {_format_match_text(line_text)}:L{line_no}"
+                grouped.setdefault(path_part, []).append(entry)
+                results.append(path_part)
                 if len(results) >= output_limit:
                     break
 
-        return "\n".join(results) if results else "No matches."
+        if not grouped:
+            return "No matches."
+
+        output_lines: List[str] = []
+        for file_path in files:
+            rel_path = _to_relative_path(file_path)
+            items = grouped.get(rel_path)
+            if not items:
+                continue
+            output_lines.append(rel_path)
+            output_lines.extend(items)
+        return "\n".join(output_lines)
 
 
 class ApplyPatchTool(Tool):

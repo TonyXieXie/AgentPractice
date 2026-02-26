@@ -11,6 +11,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "search": True,
         "read_file": True,
         "write_file": True,
+        "list_files": True,
         "run_shell": True,
         "code_ast": True,
         "spawn_subagent": True,

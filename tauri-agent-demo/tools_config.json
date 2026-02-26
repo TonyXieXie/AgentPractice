@@ -5,6 +5,7 @@
     "search": true,
     "read_file": true,
     "write_file": true,
+    "list_files": true,
     "run_shell": true,
     "code_ast": true,
     "spawn_subagent": true,

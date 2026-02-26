@@ -6,12 +6,13 @@ This module provides basic tools that are included by default:
 - ApplyPatchTool: Patch-based file edits
 - TavilySearchTool: Web search (Tavily)
 - ReadFileTool / WriteFileTool: Project file access
+- ListFilesTool: Directory listing (BFS tree output)
 - RunShellTool: Shell execution with allowlist
 """
 
 from ..base import Tool, ToolParameter
 from ..config import is_tool_enabled
-from .system_tools import ReadFileTool, WriteFileTool, RunShellTool, TavilySearchTool, RgTool, ApplyPatchTool, CodeAstTool
+from .system_tools import ReadFileTool, WriteFileTool, RunShellTool, TavilySearchTool, RgTool, ApplyPatchTool, CodeAstTool, ListFilesTool
 from .subagent_tool import SpawnSubagentTool
 
 
@@ -118,6 +119,8 @@ def register_builtin_tools():
         ToolRegistry.register(ReadFileTool())
     if is_tool_enabled("write_file"):
         ToolRegistry.register(WriteFileTool())
+    if is_tool_enabled("list_files"):
+        ToolRegistry.register(ListFilesTool())
     if is_tool_enabled("run_shell"):
         ToolRegistry.register(RunShellTool())
     if is_tool_enabled("code_ast"):
