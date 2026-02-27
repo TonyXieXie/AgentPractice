@@ -51,6 +51,7 @@ from code_map import build_code_map_prompt
 from ast_index import get_ast_index
 from ast_settings import get_ast_settings, update_ast_settings, get_all_ast_settings
 from context_compress import build_history_for_llm, maybe_compress_context
+from subagent_runner import cancel_subagent_task, suppress_subagent_parent_notify
 from skills import (
     list_skills,
     get_enabled_skills,
@@ -63,6 +64,32 @@ from skills import (
 app = FastAPI(title="Tauri Agent Chat Backend")
 STREAM_REGISTRY = get_stream_registry()
 WS_HUB = get_ws_hub()
+
+
+# ==================== Subagent Cleanup ====================
+
+def _cleanup_spawned_subagents(child_session_ids: List[str]) -> None:
+    if not child_session_ids:
+        return
+    for child_session_id in child_session_ids:
+        if not child_session_id:
+            continue
+        try:
+            suppress_subagent_parent_notify(child_session_id)
+        except Exception:
+            pass
+        try:
+            cancel_subagent_task(child_session_id)
+        except Exception:
+            pass
+        try:
+            get_pty_manager().close_session(child_session_id)
+        except Exception:
+            pass
+        try:
+            db.delete_session(child_session_id)
+        except Exception as exc:
+            print(f"[Subagent Cleanup] Failed to delete child session {child_session_id}: {exc}")
 
 
 @app.on_event("startup")
@@ -821,12 +848,21 @@ def get_session_agent_steps(session_id: str, message_ids: Optional[str] = None):
     return steps
 
 @app.post("/sessions/{session_id}/rollback")
-def rollback_session(session_id: str, request: RollbackRequest):
+async def rollback_session(session_id: str, request: RollbackRequest):
     target = db.get_message(session_id, request.message_id)
     if not target:
         raise HTTPException(status_code=404, detail="Message not found in session")
     if target.get("role") != "user":
         raise HTTPException(status_code=400, detail="Rollback target must be a user message.")
+
+    try:
+        child_session_ids = db.get_spawned_subagent_child_sessions(
+            session_id,
+            min_message_id=request.message_id
+        )
+        _cleanup_spawned_subagents(child_session_ids)
+    except Exception as exc:
+        print(f"[Subagent Cleanup] Rollback cleanup failed: {exc}")
 
     snapshot = db.get_snapshot_for_rollback(session_id, request.message_id)
     if snapshot:
@@ -1235,6 +1271,9 @@ def export_chat_history(request: ExportRequest):
 async def _run_agent_stream(request: ChatRequest, state) -> None:
     new_session_created = False
     assistant_msg_id = None
+    stop_event = None
+    had_error = False
+    parent_session_id = None
     try:
         await state.emit({"stream_id": state.stream_id})
         if request.session_id:
@@ -1252,6 +1291,7 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
                 agent_profile=request.agent_profile
             ))
             new_session_created = True
+        parent_session_id = session.id
         is_first_turn = (session.message_count or 0) == 0
 
         config = db.get_config(session.config_id)
@@ -1497,6 +1537,7 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
                     continue
                 suppress_prompt = False
                 if step.step_type == "error":
+                    had_error = True
                     suppress_prompt = bool(step.metadata.get("suppress_prompt")) if isinstance(step.metadata, dict) else False
 
                 if suppress_prompt:
@@ -1564,6 +1605,7 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
         await state.emit({"done": True, "session_id": session.id})
 
     except Exception as e:
+        had_error = True
         error_step = AgentStep(
             step_type="error",
             content=f"Agent failed: {str(e)}",

@@ -53,7 +53,7 @@ import AgentStepView from './components/AgentStepView';
 import ConfirmDialog from './components/ConfirmDialog';
 import { loadExtraWorkPaths, migrateExtraWorkPaths, saveExtraWorkPaths } from './workdirStorage';
 import { wsClient } from './wsClient';
-import type { SubagentDoneEvent } from './wsTypes';
+import type { SubagentDoneEvent, SubagentStartedEvent } from './wsTypes';
 
 const DRAFT_SESSION_KEY = '__draft__';
 
@@ -1988,18 +1988,25 @@ function App() {
   useEffect(() => {
     wsClient.connect();
     const cleanupEvents = wsClient.onEvent((event) => {
-      if (event.type !== 'subagent_done') return;
-      const payload = event as SubagentDoneEvent;
-      if (!payload.session_id || !payload.message) return;
-      const sessionKey = getSessionKey(payload.session_id);
-      updateSessionMessages(sessionKey, (prev) => {
-        if (prev.some((msg) => msg.id === payload.message.id)) return prev;
-        return [...prev, payload.message];
-      });
-      if (sessionKey !== getCurrentSessionKey()) {
-        markSessionUnread(sessionKey);
+      if (event.type === 'subagent_done') {
+        const payload = event as SubagentDoneEvent;
+        if (!payload.session_id || !payload.message) return;
+        const sessionKey = getSessionKey(payload.session_id);
+        updateSessionMessages(sessionKey, (prev) => {
+          if (prev.some((msg) => msg.id === payload.message.id)) return prev;
+          return [...prev, payload.message];
+        });
+        if (sessionKey !== getCurrentSessionKey()) {
+          markSessionUnread(sessionKey);
+        }
+        setSessionRefreshTrigger((prev) => prev + 1);
+        return;
       }
-      setSessionRefreshTrigger((prev) => prev + 1);
+      if (event.type === 'subagent_started') {
+        const payload = event as SubagentStartedEvent;
+        if (!payload.session_id) return;
+        setSessionRefreshTrigger((prev) => prev + 1);
+      }
     });
     return () => {
       cleanupEvents();

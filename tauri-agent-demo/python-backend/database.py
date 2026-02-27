@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 import json
 import os
 from datetime import datetime
@@ -1309,6 +1309,65 @@ class Database:
             }
             for row in rows
         ]
+
+    def get_spawned_subagent_child_sessions(
+        self,
+        session_id: str,
+        message_id: Optional[int] = None,
+        min_message_id: Optional[int] = None
+    ) -> List[str]:
+        """Extract spawned subagent child session ids from agent steps."""
+        if not session_id:
+            return []
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        params: List[Any] = [session_id]
+        where = "m.session_id = ? AND s.step_type = 'observation'"
+        if message_id is not None:
+            where += " AND m.id = ?"
+            params.append(message_id)
+        elif min_message_id is not None:
+            where += " AND m.id >= ?"
+            params.append(min_message_id)
+        cursor.execute(
+            f'''
+            SELECT s.content, s.metadata
+            FROM agent_steps s
+            JOIN chat_messages m ON s.message_id = m.id
+            WHERE {where}
+            ORDER BY s.message_id ASC, s.sequence ASC
+            ''',
+            params
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        results: List[str] = []
+        seen: Set[str] = set()
+        for row in rows:
+            metadata = {}
+            try:
+                metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            except Exception:
+                metadata = {}
+            tool_name = str(metadata.get("tool") or "")
+            if tool_name.lower() != "spawn_subagent":
+                continue
+            payload = None
+            content = row["content"]
+            if content:
+                try:
+                    payload = json.loads(content)
+                except Exception:
+                    payload = None
+            if isinstance(payload, dict):
+                child_id = payload.get("child_session_id")
+                if child_id:
+                    child_id = str(child_id)
+                    if child_id and child_id not in seen:
+                        seen.add(child_id)
+                        results.append(child_id)
+        return results
     
     def save_tool_call(self, message_id: int, tool_name: str, tool_input: str, tool_output: str) -> int:
         """Save tool call record"""

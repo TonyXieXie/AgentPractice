@@ -10,7 +10,9 @@ from subagent_runner import (
     prepare_subagent_session,
     execute_subagent_context,
     list_spawnable_profiles,
-    run_subagent_task
+    run_subagent_task,
+    register_subagent_task,
+    notify_parent_subagent_started
 )
 
 
@@ -134,13 +136,19 @@ class SpawnSubagentTool(Tool):
                 )
 
             if wait:
-                result = await run_subagent_task(
+                context = prepare_subagent_session(
                     task=str(task),
                     parent_session_id=str(parent_session_id),
                     title=title if isinstance(title, str) else None,
                     profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None,
                     suppress_parent_notify=True
                 )
+                await notify_parent_subagent_started(
+                    str(parent_session_id),
+                    str(context.get("child_session_id", "")),
+                    str(context.get("child_title", "Subagent Task"))
+                )
+                result = await execute_subagent_context(context)
                 return json.dumps(result, ensure_ascii=False)
 
             context = prepare_subagent_session(
@@ -149,6 +157,11 @@ class SpawnSubagentTool(Tool):
                 title=title if isinstance(title, str) else None,
                 profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None,
                 suppress_parent_notify=False
+            )
+            await notify_parent_subagent_started(
+                str(parent_session_id),
+                str(context.get("child_session_id", "")),
+                str(context.get("child_title", "Subagent Task"))
             )
 
             async def _run_subagent():
@@ -165,6 +178,7 @@ class SpawnSubagentTool(Tool):
 
             task_handle = asyncio.create_task(_run_subagent())
             _PENDING_TASKS.add(task_handle)
+            register_subagent_task(context.get("child_session_id"), task_handle)
             task_handle.add_done_callback(_on_done)
 
             return json.dumps(

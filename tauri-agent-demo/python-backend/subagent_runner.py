@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, Set
 import traceback
 
 from app_config import get_app_config
@@ -14,6 +14,76 @@ from context_compress import build_history_for_llm
 from code_map import build_code_map_prompt
 from ws_hub import get_ws_hub
 from skills import get_enabled_skills, extract_skill_invocations, build_skill_prompt_sections
+
+
+_SUBAGENT_TASKS: Dict[str, asyncio.Task] = {}
+_SUBAGENT_SUPPRESS_NOTIFY: Set[str] = set()
+
+
+def register_subagent_task(child_session_id: Optional[str], task: Optional[asyncio.Task]) -> None:
+    if not child_session_id or task is None:
+        return
+    key = str(child_session_id)
+    _SUBAGENT_TASKS[key] = task
+
+    def _cleanup(_fut: asyncio.Task) -> None:
+        _SUBAGENT_TASKS.pop(key, None)
+
+    task.add_done_callback(_cleanup)
+
+
+def unregister_subagent_task(child_session_id: Optional[str]) -> None:
+    if not child_session_id:
+        return
+    _SUBAGENT_TASKS.pop(str(child_session_id), None)
+
+
+def cancel_subagent_task(child_session_id: Optional[str]) -> bool:
+    if not child_session_id:
+        return False
+    task = _SUBAGENT_TASKS.get(str(child_session_id))
+    if task and not task.done():
+        task.cancel()
+        return True
+    return False
+
+
+def suppress_subagent_parent_notify(child_session_id: Optional[str]) -> None:
+    if not child_session_id:
+        return
+    _SUBAGENT_SUPPRESS_NOTIFY.add(str(child_session_id))
+
+
+def is_subagent_parent_notify_suppressed(child_session_id: Optional[str]) -> bool:
+    if not child_session_id:
+        return False
+    return str(child_session_id) in _SUBAGENT_SUPPRESS_NOTIFY
+
+
+def clear_subagent_parent_notify_suppression(child_session_id: Optional[str]) -> None:
+    if not child_session_id:
+        return
+    _SUBAGENT_SUPPRESS_NOTIFY.discard(str(child_session_id))
+
+
+async def notify_parent_subagent_started(
+    parent_session_id: str,
+    child_session_id: str,
+    child_title: str
+) -> None:
+    if not parent_session_id:
+        return
+    try:
+        hub = get_ws_hub()
+        payload = {
+            "type": "subagent_started",
+            "session_id": parent_session_id,
+            "child_session_id": child_session_id,
+            "child_title": child_title
+        }
+        await hub.emit(parent_session_id, payload)
+    except Exception as exc:
+        print(f"[Subagent] Failed to emit start notification: {exc}")
 
 
 def _append_reasoning_summary_prompt(system_prompt: str, reasoning_summary: Optional[str]) -> str:
@@ -166,6 +236,8 @@ async def _notify_parent_subagent_done(
 ) -> None:
     if not parent_session_id:
         return
+    if is_subagent_parent_notify_suppressed(child_session_id):
+        return
     status_label = "完成" if status == "ok" else "失败"
     content = f"子agent「{child_title}」{status_label}：\n\n{final_answer}"
     metadata = {
@@ -196,297 +268,303 @@ async def _notify_parent_subagent_done(
 
 
 async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
-    child_session = context.get("child_session") or db.get_session(context["child_session_id"])
-    if not child_session:
-        final_answer = "Subagent failed: Child session not found"
+    child_session_id = context.get("child_session_id")
+    try:
+        child_session = context.get("child_session") or db.get_session(context["child_session_id"])
+        if not child_session:
+            final_answer = "Subagent failed: Child session not found"
+            assistant_msg_id = context.get("assistant_message_id")
+            if assistant_msg_id:
+                try:
+                    conn = db.get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        '''
+                        UPDATE chat_messages
+                        SET content = ?
+                        WHERE id = ?
+                        ''',
+                        (final_answer, assistant_msg_id)
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+            if not context.get("suppress_parent_notify"):
+                await _notify_parent_subagent_done(
+                    parent_session_id=context.get("parent_session_id", ""),
+                    child_session_id=context.get("child_session_id", ""),
+                    child_title=context.get("child_title", "Subagent Task"),
+                    final_answer=final_answer,
+                    status="error"
+                )
+            return {"status": "error", "error": "Child session not found"}
+
         assistant_msg_id = context.get("assistant_message_id")
-        if assistant_msg_id:
-            try:
-                conn = db.get_connection()
-                cursor = conn.cursor()
-                cursor.execute(
-                    '''
-                    UPDATE chat_messages
-                    SET content = ?
-                    WHERE id = ?
-                    ''',
-                    (final_answer, assistant_msg_id)
+        user_msg_id = context["user_message_id"]
+        processed_message = context["processed_message"]
+        child_title = context["child_title"]
+        parent_session_id = context["parent_session_id"]
+        subagent_profile_id = context["subagent_profile_id"]
+
+        config = db.get_config(child_session.config_id)
+        if not config:
+            final_answer = "Subagent failed: Parent config not found"
+            if assistant_msg_id:
+                try:
+                    conn = db.get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        '''
+                        UPDATE chat_messages
+                        SET content = ?
+                        WHERE id = ?
+                        ''',
+                        (final_answer, assistant_msg_id)
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+            else:
+                try:
+                    db.create_message(ChatMessageCreate(
+                        session_id=child_session.id,
+                        role="assistant",
+                        content=final_answer
+                    ))
+                except Exception:
+                    pass
+            if not context.get("suppress_parent_notify"):
+                await _notify_parent_subagent_done(
+                    parent_session_id=parent_session_id,
+                    child_session_id=child_session.id,
+                    child_title=child_title,
+                    final_answer=final_answer,
+                    status="error"
                 )
-                conn.commit()
-                conn.close()
+            return {"status": "error", "error": "Parent config not found"}
+
+        app_config = get_app_config()
+        llm_app_config = app_config.get("llm", {}) if isinstance(app_config, dict) else {}
+        global_reasoning_summary = llm_app_config.get("reasoning_summary")
+        if global_reasoning_summary:
+            try:
+                config.reasoning_summary = str(global_reasoning_summary)
             except Exception:
                 pass
-    if not context.get("suppress_parent_notify"):
-        await _notify_parent_subagent_done(
-            parent_session_id=context.get("parent_session_id", ""),
-            child_session_id=context.get("child_session_id", ""),
-            child_title=context.get("child_title", "Subagent Task"),
-            final_answer=final_answer,
-            status="error"
+
+        context_config = app_config.get("context", {}) if isinstance(app_config, dict) else {}
+        agent_cfg = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
+        agent_config = agent_cfg if isinstance(agent_cfg, dict) else {}
+        ast_enabled = bool(agent_config.get("ast_enabled", True))
+        code_map_cfg = agent_config.get("code_map", {}) if isinstance(agent_config, dict) else {}
+        code_map_enabled = bool(code_map_cfg.get("enabled", True))
+
+        pty_prompt = "None."
+        system_prompt, tools, resolved_profile_id, ability_ids = build_agent_prompt_and_tools(
+            subagent_profile_id,
+            ToolRegistry.get_all(),
+            include_tools=True,
+            extra_context={"pty_sessions": pty_prompt},
+            exclude_ability_ids=["code_map"]
         )
-        return {"status": "error", "error": "Child session not found"}
+        enabled_skills = get_enabled_skills()
+        invoked_names = extract_skill_invocations(processed_message, max_count=1)
+        invoked_skills = []
+        if enabled_skills and invoked_names:
+            skill_map = {skill.name.lower(): skill for skill in enabled_skills}
+            for name in invoked_names:
+                skill = skill_map.get(name.lower())
+                if skill:
+                    invoked_skills.append(skill)
+        skills_prompt = build_skill_prompt_sections([], invoked_skills)
+        system_prompt = _append_reasoning_summary_prompt(system_prompt, global_reasoning_summary)
+        if resolved_profile_id and resolved_profile_id != getattr(child_session, "agent_profile", None):
+            db.update_session(child_session.id, ChatSessionUpdate(agent_profile=resolved_profile_id))
 
-    assistant_msg_id = context.get("assistant_message_id")
-    user_msg_id = context["user_message_id"]
-    processed_message = context["processed_message"]
-    child_title = context["child_title"]
-    parent_session_id = context["parent_session_id"]
-    subagent_profile_id = context["subagent_profile_id"]
+        code_map_prompt = None
+        if "code_map" in ability_ids and ast_enabled and code_map_enabled:
+            code_map_prompt = build_code_map_prompt(
+                child_session.id,
+                getattr(child_session, "work_path", None)
+            )
 
-    config = db.get_config(child_session.config_id)
-    if not config:
-        final_answer = "Subagent failed: Parent config not found"
-        if assistant_msg_id:
+        react_max_iterations = agent_config.get("react_max_iterations", 50)
+        try:
+            react_max_iterations = int(react_max_iterations)
+        except (TypeError, ValueError):
+            react_max_iterations = 50
+
+        llm_client = create_llm_client(config)
+        executor = create_agent_executor(
+            agent_type="react",
+            llm_client=llm_client,
+            tools=tools,
+            max_iterations=react_max_iterations,
+            system_prompt=system_prompt
+        )
+
+        prompt_truncation_cfg = {
+            "enabled": bool(context_config.get("truncate_long_data", True)),
+            "threshold": int(context_config.get("long_data_threshold", 4000) or 4000),
+            "head_chars": int(context_config.get("long_data_head_chars", 1200) or 1200),
+            "tail_chars": int(context_config.get("long_data_tail_chars", 800) or 800)
+        }
+
+        history_for_llm = build_history_for_llm(
+            child_session.id,
+            None,
+            user_msg_id,
+            "",
+            code_map_prompt,
+            prompt_truncation_cfg
+        )
+        if skills_prompt:
+            skill_meta = {"skill_prompt": True}
+            if invoked_skills:
+                skill_meta["skill_name"] = invoked_skills[0].name
+                skill_meta["skill_path"] = invoked_skills[0].path
+            db.create_message(ChatMessageCreate(
+                session_id=child_session.id,
+                role="user",
+                content=skills_prompt,
+                metadata=skill_meta
+            ))
+
+        if not assistant_msg_id:
+            temp_assistant_msg = db.create_message(ChatMessageCreate(
+                session_id=child_session.id,
+                role="assistant",
+                content=""
+            ))
+            assistant_msg_id = temp_assistant_msg.id
+
+        request_overrides: Dict[str, Any] = {
+            "_debug": {"session_id": child_session.id, "message_id": assistant_msg_id},
+            "work_path": getattr(child_session, "work_path", None),
+            "prompt_truncation": prompt_truncation_cfg,
+            "_context_state": {
+                "summary": "",
+                "last_call_id": None,
+                "last_message_id": None,
+                "current_user_message_id": user_msg_id
+            }
+        }
+        if code_map_prompt:
+            request_overrides["_code_map_prompt"] = code_map_prompt
+        if skills_prompt:
+            request_overrides["_post_user_messages"] = [{"role": "user", "content": skills_prompt}]
+
+        sequence = 0
+        final_answer = None
+        had_error = False
+
+        try:
+            async for step in executor.run(
+                user_input=processed_message,
+                history=history_for_llm,
+                session_id=child_session.id,
+                request_overrides=request_overrides
+            ):
+                if step.step_type == "context_estimate":
+                    try:
+                        db.update_session_context_estimate(child_session.id, step.metadata)
+                    except Exception:
+                        pass
+                    continue
+
+                if step.step_type.endswith("_delta"):
+                    continue
+
+                suppress_prompt = False
+                if step.step_type == "error":
+                    suppress_prompt = bool(step.metadata.get("suppress_prompt")) if isinstance(step.metadata, dict) else False
+
+                if not suppress_prompt:
+                    db.save_agent_step(
+                        message_id=assistant_msg_id,
+                        step_type=step.step_type,
+                        content=step.content,
+                        sequence=sequence,
+                        metadata=step.metadata
+                    )
+                    if step.step_type == "action" and isinstance(step.metadata, dict) and "tool" in step.metadata:
+                        db.save_tool_call(
+                            message_id=assistant_msg_id,
+                            tool_name=step.metadata["tool"],
+                            tool_input=step.metadata.get("input", ""),
+                            tool_output=""
+                        )
+                    sequence += 1
+
+                if step.step_type == "answer":
+                    final_answer = step.content
+                    break
+                if step.step_type == "error":
+                    final_answer = step.content
+                    had_error = True
+
+        except asyncio.CancelledError:
+            had_error = True
+            final_answer = "Subagent cancelled."
             try:
-                conn = db.get_connection()
-                cursor = conn.cursor()
-                cursor.execute(
-                    '''
-                    UPDATE chat_messages
-                    SET content = ?
-                    WHERE id = ?
-                    ''',
-                    (final_answer, assistant_msg_id)
+                db.save_agent_step(
+                    message_id=assistant_msg_id,
+                    step_type="error",
+                    content=final_answer,
+                    sequence=sequence,
+                    metadata={"error": "cancelled", "cancelled": True}
                 )
-                conn.commit()
-                conn.close()
             except Exception:
                 pass
-        else:
-            try:
-                db.create_message(ChatMessageCreate(
-                    session_id=child_session.id,
-                    role="assistant",
-                    content=final_answer
-                ))
-            except Exception:
-                pass
+        except Exception as exc:
+            had_error = True
+            final_answer = f"Subagent failed: {exc}"
+            db.save_agent_step(
+                message_id=assistant_msg_id,
+                step_type="error",
+                content=final_answer,
+                sequence=sequence,
+                metadata={"error": str(exc), "traceback": traceback.format_exc()}
+            )
+
+        if final_answer is None:
+            final_answer = ""
+
+        conn = db.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE chat_messages
+            SET content = ?
+            WHERE id = ?
+            ''',
+            (final_answer, assistant_msg_id)
+        )
+        conn.commit()
+        conn.close()
+
+        status = "error" if had_error else "ok"
         if not context.get("suppress_parent_notify"):
             await _notify_parent_subagent_done(
                 parent_session_id=parent_session_id,
                 child_session_id=child_session.id,
                 child_title=child_title,
                 final_answer=final_answer,
-                status="error"
+                status=status
             )
-        return {"status": "error", "error": "Parent config not found"}
 
-    app_config = get_app_config()
-    llm_app_config = app_config.get("llm", {}) if isinstance(app_config, dict) else {}
-    global_reasoning_summary = llm_app_config.get("reasoning_summary")
-    if global_reasoning_summary:
-        try:
-            config.reasoning_summary = str(global_reasoning_summary)
-        except Exception:
-            pass
-
-    context_config = app_config.get("context", {}) if isinstance(app_config, dict) else {}
-    agent_cfg = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
-    agent_config = agent_cfg if isinstance(agent_cfg, dict) else {}
-    ast_enabled = bool(agent_config.get("ast_enabled", True))
-    code_map_cfg = agent_config.get("code_map", {}) if isinstance(agent_config, dict) else {}
-    code_map_enabled = bool(code_map_cfg.get("enabled", True))
-
-    pty_prompt = "None."
-    system_prompt, tools, resolved_profile_id, ability_ids = build_agent_prompt_and_tools(
-        subagent_profile_id,
-        ToolRegistry.get_all(),
-        include_tools=True,
-        extra_context={"pty_sessions": pty_prompt},
-        exclude_ability_ids=["code_map"]
-    )
-    enabled_skills = get_enabled_skills()
-    invoked_names = extract_skill_invocations(processed_message, max_count=1)
-    invoked_skills = []
-    if enabled_skills and invoked_names:
-        skill_map = {skill.name.lower(): skill for skill in enabled_skills}
-        for name in invoked_names:
-            skill = skill_map.get(name.lower())
-            if skill:
-                invoked_skills.append(skill)
-    skills_prompt = build_skill_prompt_sections([], invoked_skills)
-    system_prompt = _append_reasoning_summary_prompt(system_prompt, global_reasoning_summary)
-    if resolved_profile_id and resolved_profile_id != getattr(child_session, "agent_profile", None):
-        db.update_session(child_session.id, ChatSessionUpdate(agent_profile=resolved_profile_id))
-
-    code_map_prompt = None
-    if "code_map" in ability_ids and ast_enabled and code_map_enabled:
-        code_map_prompt = build_code_map_prompt(
-            child_session.id,
-            getattr(child_session, "work_path", None)
-        )
-
-    react_max_iterations = agent_config.get("react_max_iterations", 50)
-    try:
-        react_max_iterations = int(react_max_iterations)
-    except (TypeError, ValueError):
-        react_max_iterations = 50
-
-    llm_client = create_llm_client(config)
-    executor = create_agent_executor(
-        agent_type="react",
-        llm_client=llm_client,
-        tools=tools,
-        max_iterations=react_max_iterations,
-        system_prompt=system_prompt
-    )
-
-    prompt_truncation_cfg = {
-        "enabled": bool(context_config.get("truncate_long_data", True)),
-        "threshold": int(context_config.get("long_data_threshold", 4000) or 4000),
-        "head_chars": int(context_config.get("long_data_head_chars", 1200) or 1200),
-        "tail_chars": int(context_config.get("long_data_tail_chars", 800) or 800)
-    }
-
-    history_for_llm = build_history_for_llm(
-        child_session.id,
-        None,
-        user_msg_id,
-        "",
-        code_map_prompt,
-        prompt_truncation_cfg
-    )
-    if skills_prompt:
-        skill_meta = {"skill_prompt": True}
-        if invoked_skills:
-            skill_meta["skill_name"] = invoked_skills[0].name
-            skill_meta["skill_path"] = invoked_skills[0].path
-        db.create_message(ChatMessageCreate(
-            session_id=child_session.id,
-            role="user",
-            content=skills_prompt,
-            metadata=skill_meta
-        ))
-
-    if not assistant_msg_id:
-        temp_assistant_msg = db.create_message(ChatMessageCreate(
-            session_id=child_session.id,
-            role="assistant",
-            content=""
-        ))
-        assistant_msg_id = temp_assistant_msg.id
-
-    request_overrides: Dict[str, Any] = {
-        "_debug": {"session_id": child_session.id, "message_id": assistant_msg_id},
-        "work_path": getattr(child_session, "work_path", None),
-        "prompt_truncation": prompt_truncation_cfg,
-        "_context_state": {
-            "summary": "",
-            "last_call_id": None,
-            "last_message_id": None,
-            "current_user_message_id": user_msg_id
+        return {
+            "status": status,
+            "child_session_id": child_session.id,
+            "result": final_answer,
+            "title": child_title
         }
-    }
-    if code_map_prompt:
-        request_overrides["_code_map_prompt"] = code_map_prompt
-    if skills_prompt:
-        request_overrides["_post_user_messages"] = [{"role": "user", "content": skills_prompt}]
-
-    sequence = 0
-    final_answer = None
-    had_error = False
-
-    try:
-        async for step in executor.run(
-            user_input=processed_message,
-            history=history_for_llm,
-            session_id=child_session.id,
-            request_overrides=request_overrides
-        ):
-            if step.step_type == "context_estimate":
-                try:
-                    db.update_session_context_estimate(child_session.id, step.metadata)
-                except Exception:
-                    pass
-                continue
-
-            if step.step_type.endswith("_delta"):
-                continue
-
-            suppress_prompt = False
-            if step.step_type == "error":
-                suppress_prompt = bool(step.metadata.get("suppress_prompt")) if isinstance(step.metadata, dict) else False
-
-            if not suppress_prompt:
-                db.save_agent_step(
-                    message_id=assistant_msg_id,
-                    step_type=step.step_type,
-                    content=step.content,
-                    sequence=sequence,
-                    metadata=step.metadata
-                )
-                if step.step_type == "action" and isinstance(step.metadata, dict) and "tool" in step.metadata:
-                    db.save_tool_call(
-                        message_id=assistant_msg_id,
-                        tool_name=step.metadata["tool"],
-                        tool_input=step.metadata.get("input", ""),
-                        tool_output=""
-                    )
-                sequence += 1
-
-            if step.step_type == "answer":
-                final_answer = step.content
-                break
-            if step.step_type == "error":
-                final_answer = step.content
-                had_error = True
-
-    except asyncio.CancelledError:
-        had_error = True
-        final_answer = "Subagent cancelled."
-        try:
-            db.save_agent_step(
-                message_id=assistant_msg_id,
-                step_type="error",
-                content=final_answer,
-                sequence=sequence,
-                metadata={"error": "cancelled", "cancelled": True}
-            )
-        except Exception:
-            pass
-    except Exception as exc:
-        had_error = True
-        final_answer = f"Subagent failed: {exc}"
-        db.save_agent_step(
-            message_id=assistant_msg_id,
-            step_type="error",
-            content=final_answer,
-            sequence=sequence,
-            metadata={"error": str(exc), "traceback": traceback.format_exc()}
-        )
-
-    if final_answer is None:
-        final_answer = ""
-
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        '''
-        UPDATE chat_messages
-        SET content = ?
-        WHERE id = ?
-        ''',
-        (final_answer, assistant_msg_id)
-    )
-    conn.commit()
-    conn.close()
-
-    status = "error" if had_error else "ok"
-    if not context.get("suppress_parent_notify"):
-        await _notify_parent_subagent_done(
-            parent_session_id=parent_session_id,
-            child_session_id=child_session.id,
-            child_title=child_title,
-            final_answer=final_answer,
-            status=status
-        )
-
-    return {
-        "status": status,
-        "child_session_id": child_session.id,
-        "result": final_answer,
-        "title": child_title
-    }
+    finally:
+        if child_session_id:
+            unregister_subagent_task(child_session_id)
+            clear_subagent_parent_notify_suppression(child_session_id)
 
 
 async def run_subagent_task(

@@ -1,6 +1,6 @@
 import type { Message } from './types';
 
-export type WsEvent = SubagentDoneEvent | PtyOutputEvent;
+export type WsEvent = SubagentDoneEvent | SubagentStartedEvent | PtyOutputEvent;
 
 export interface SubagentDoneEvent {
   type: 'subagent_done';
@@ -8,6 +8,13 @@ export interface SubagentDoneEvent {
   message: Message;
   child_session_id?: string;
   status?: 'ok' | 'error';
+}
+
+export interface SubagentStartedEvent {
+  type: 'subagent_started';
+  session_id: string;
+  child_session_id?: string;
+  child_title?: string;
 }
 
 export interface PtyOutputEvent {
