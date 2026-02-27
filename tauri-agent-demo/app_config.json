@@ -12,19 +12,14 @@
       "servers": [
         {
           "server_label": "figma_desktop",
-          "enabled": true,
+          "enabled": false,
           "server_url": "http://127.0.0.1:3845/mcp"
         },
         {
           "server_label": "mcp_demo",
           "enabled": true,
           "server_url": "http://127.0.0.1:8765/mcp",
-          "server_description": "本地 MCP 示例（echo / image_demo）",
-          "allowed_tools": [
-            "echo",
-            "image_demo"
-          ],
-          "require_approval": "never"
+          "server_description": "本地 MCP 示例（echo / image_demo）"
         }
       ]
     },
@@ -189,13 +184,14 @@
       },
       {
         "id": "subagent-find",
-        "name": "subagent_Find",
-        "description": "A subagent can list/rg/read files",
+        "name": "subagent_Analyze",
+        "description": "Analyze subagent can list/rg/read files",
         "abilities": [
           "file_references",
           "rg_search",
           "tool-read-file",
-          "tool-list-files"
+          "tool-list-files",
+          "output_concise"
         ],
         "spawnable": true
       }

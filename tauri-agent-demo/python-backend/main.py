@@ -1626,14 +1626,56 @@ def get_app_config_route():
 
 @app.put("/app/config")
 def set_app_config(payload: Dict[str, Any]):
+    def _normalize_tool_filter(value: Any) -> Any:
+        if isinstance(value, list):
+            return sorted({str(item).strip() for item in value if str(item).strip()})
+        if isinstance(value, dict):
+            normalized = dict(value)
+            tool_names = normalized.get("tool_names")
+            if isinstance(tool_names, list):
+                normalized["tool_names"] = sorted({str(item).strip() for item in tool_names if str(item).strip()})
+            return normalized
+        return value
+
+    def _mcp_servers_signature(config: Any) -> str:
+        agent_cfg = config.get("agent", {}) if isinstance(config, dict) else {}
+        mcp_cfg = agent_cfg.get("mcp", {}) if isinstance(agent_cfg, dict) else {}
+        servers = mcp_cfg.get("servers", []) if isinstance(mcp_cfg, dict) else []
+        normalized = []
+        if isinstance(servers, list):
+            for server in servers:
+                if not isinstance(server, dict):
+                    continue
+                normalized.append({
+                    "server_label": server.get("server_label"),
+                    "server_url": server.get("server_url"),
+                    "connector_id": server.get("connector_id"),
+                    "enabled": server.get("enabled"),
+                    "server_description": server.get("server_description"),
+                    "authorization_env": server.get("authorization_env"),
+                    "headers_env": server.get("headers_env"),
+                    "allowed_tools": _normalize_tool_filter(server.get("allowed_tools")),
+                    "require_approval": {
+                        key: _normalize_tool_filter(value)
+                        for key, value in (server.get("require_approval") or {}).items()
+                    } if isinstance(server.get("require_approval"), dict) else server.get("require_approval"),
+                    "protocol_version": server.get("protocol_version"),
+                    "protocol_versions": _normalize_tool_filter(server.get("protocol_versions")),
+                })
+        normalized.sort(key=lambda item: str(item.get("server_label") or ""))
+        return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+
+    before_sig = _mcp_servers_signature(get_app_config())
     try:
         updated = update_app_config(payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    try:
-        refresh_mcp_tools()
-    except Exception as exc:
-        print(f"[MCP] Failed to refresh MCP tools: {exc}")
+    after_sig = _mcp_servers_signature(updated)
+    if before_sig != after_sig:
+        try:
+            refresh_mcp_tools()
+        except Exception as exc:
+            print(f"[MCP] Failed to refresh MCP tools: {exc}")
     return updated
 
 

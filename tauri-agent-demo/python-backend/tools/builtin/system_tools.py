@@ -946,19 +946,7 @@ def _run_windows_restricted(command: str, workdir: Path, timeout_sec: float) -> 
             kernel32.CloseHandle(h_process)
         _raise_last_error("CreateRestrictedToken failed")
 
-    sid = wintypes.LPVOID()
-    if advapi32.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)):
-        tml = TOKEN_MANDATORY_LABEL()
-        tml.Label.Sid = sid
-        tml.Label.Attributes = SE_GROUP_INTEGRITY
-        if not advapi32.SetTokenInformation(
-            restricted_token,
-            TokenIntegrityLevel,
-            ctypes.byref(tml),
-            ctypes.sizeof(tml)
-        ):
-            print(f"[Shell Sandbox] SetTokenInformation failed (winerr={ctypes.get_last_error()})")
-        kernel32.LocalFree(sid)
+    # Do not lower integrity by default; leave token at the caller's integrity level.
 
     sa = SECURITY_ATTRIBUTES()
     sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
@@ -1463,7 +1451,7 @@ def _start_posix_pipe_persistent(
     return pty_proc
 
 
-def _windows_create_restricted_token(low_integrity: bool = True):
+def _windows_create_restricted_token(low_integrity: bool = False):
     import ctypes
     from ctypes import wintypes
 
@@ -3050,7 +3038,11 @@ class ListFilesTool(Tool):
             max_entries = 500
 
         if path:
-            root = _resolve_path(str(path), self.name, "read")
+            # List files without path restrictions by default.
+            root = Path(str(path)).expanduser()
+            if not root.is_absolute():
+                root = _get_root_path() / root
+            root = root.resolve()
         else:
             root = _get_root_path()
 
