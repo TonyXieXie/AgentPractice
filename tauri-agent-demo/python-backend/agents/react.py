@@ -316,6 +316,11 @@ class ReActAgent(AgentStrategy):
         if request_overrides and request_overrides.get("user_content") is not None:
             user_content = request_overrides.get("user_content")
         user_message_content = user_content if user_content is not None else user_input
+        post_user_messages: List[Dict[str, Any]] = []
+        if request_overrides and isinstance(request_overrides.get("_post_user_messages"), list):
+            for item in request_overrides.get("_post_user_messages") or []:
+                if isinstance(item, dict) and item.get("role") and item.get("content") is not None:
+                    post_user_messages.append({"role": item.get("role"), "content": item.get("content")})
 
         context_state: Dict[str, Any] = {}
         if request_overrides and isinstance(request_overrides.get("_context_state"), dict):
@@ -330,9 +335,21 @@ class ReActAgent(AgentStrategy):
 
         def build_base_messages() -> List[Dict[str, Any]]:
             base_messages: List[Dict[str, Any]] = [{"role": prompt_role, "content": prompt}]
-            if history:
-                base_messages.extend(history)
+            pre_history: List[Dict[str, Any]] = []
+            post_history: List[Dict[str, Any]] = []
+            for msg in history or []:
+                if isinstance(msg, dict) and msg.get("_after_user"):
+                    cleaned = {k: v for k, v in msg.items() if k != "_after_user"}
+                    post_history.append(cleaned)
+                else:
+                    pre_history.append(msg)
+            if pre_history:
+                base_messages.extend(pre_history)
             base_messages.append({"role": "user", "content": user_message_content})
+            if post_history:
+                base_messages.extend(post_history)
+            if post_user_messages:
+                base_messages.extend(post_user_messages)
             return base_messages
 
         openai_format = "openai_chat_completions"

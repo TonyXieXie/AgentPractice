@@ -206,7 +206,15 @@ class ToolRegistry:
         Returns:
             List of all registered tools
         """
-        return list(cls._tools.values())
+        tools = list(cls._tools.values())
+        for tool in tools:
+            refresh = getattr(tool, "refresh_metadata", None)
+            if callable(refresh):
+                try:
+                    refresh()
+                except Exception:
+                    pass
+        return tools
     
     @classmethod
     def clear(cls):

@@ -12,6 +12,17 @@ echo Press Ctrl+C to stop the app
 echo.
 echo ========================================
 echo.
+set "PORT_FILE=%~dp0backend_port.txt"
+set "BACKEND_PORT=8000"
+if exist "%PORT_FILE%" (
+  for /f "usebackq delims=" %%P in ("%PORT_FILE%") do set "BACKEND_PORT=%%P"
+)
+set /a PORT_TEST=%BACKEND_PORT% >nul 2>&1
+if errorlevel 1 set "BACKEND_PORT=8000"
+set "VITE_API_BASE_URL=http://127.0.0.1:%BACKEND_PORT%"
+set "TAURI_AGENT_EXTERNAL_BACKEND=1"
+echo [Info] Using backend: %VITE_API_BASE_URL%
+echo.
 set "NODE_HOME=%~dp0..\.tools\node-v20.19.0-win-x64"
 if exist "%NODE_HOME%\node.exe" (
   set "PATH=%NODE_HOME%;%PATH%"

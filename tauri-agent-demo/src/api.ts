@@ -14,6 +14,7 @@
     ToolPermissionRequest,
     PatchRevertResponse,
     ToolDefinition,
+    AgentPromptResponse,
     SkillSummary,
     AstRequest,
     AstPathSettings,
@@ -21,7 +22,44 @@
     AstSettingsAllResponse
 } from './types';
 
-export const API_BASE_URL = 'http://127.0.0.1:8000';
+export const DEFAULT_API_BASE_URL = 'http://127.0.0.1:8000';
+
+const normalizeBaseUrl = (value: string | undefined): string | undefined => {
+    const trimmed = value?.trim();
+    if (!trimmed) return undefined;
+    return trimmed.replace(/\/+$/, '');
+};
+
+const envBaseUrl = normalizeBaseUrl(import.meta.env.VITE_API_BASE_URL);
+export let API_BASE_URL = envBaseUrl ?? DEFAULT_API_BASE_URL;
+let apiBaseUrlResolved = Boolean(envBaseUrl);
+let apiBaseUrlPromise: Promise<string> | null = null;
+
+export async function resolveApiBaseUrl(): Promise<string> {
+    if (apiBaseUrlResolved) return API_BASE_URL;
+    if (apiBaseUrlPromise) return apiBaseUrlPromise;
+    apiBaseUrlPromise = (async () => {
+        const envOverride = normalizeBaseUrl(import.meta.env.VITE_API_BASE_URL);
+        if (envOverride) {
+            API_BASE_URL = envOverride;
+            apiBaseUrlResolved = true;
+            return API_BASE_URL;
+        }
+        try {
+            const { invoke } = await import('@tauri-apps/api/core');
+            const resolved = await invoke<string>('get_backend_base_url');
+            const normalized = normalizeBaseUrl(resolved);
+            if (normalized) {
+                API_BASE_URL = normalized;
+            }
+        } catch {
+            // Keep default base URL when Tauri is unavailable.
+        }
+        apiBaseUrlResolved = true;
+        return API_BASE_URL;
+    })();
+    return apiBaseUrlPromise;
+}
 
 async function buildApiError(response: Response, baseMessage: string): Promise<Error> {
     const text = await response.text();
@@ -142,6 +180,25 @@ export async function getTools(): Promise<ToolDefinition[]> {
     const response = await fetch(`${API_BASE_URL}/tools`);
     if (!response.ok) {
         throw await buildApiError(response, 'Failed to fetch tools');
+    }
+    return response.json();
+}
+
+export async function getAgentPrompt(params?: {
+    profileId?: string;
+    sessionId?: string;
+    includeTools?: boolean;
+    agentType?: string;
+}): Promise<AgentPromptResponse> {
+    const query = new URLSearchParams();
+    if (params?.profileId) query.set('profile_id', params.profileId);
+    if (params?.sessionId) query.set('session_id', params.sessionId);
+    if (params?.includeTools !== undefined) query.set('include_tools', params.includeTools ? 'true' : 'false');
+    if (params?.agentType) query.set('agent_type', params.agentType);
+    const suffix = query.toString();
+    const response = await fetch(`${API_BASE_URL}/agent/prompt${suffix ? `?${suffix}` : ''}`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to fetch agent prompt');
     }
     return response.json();
 }

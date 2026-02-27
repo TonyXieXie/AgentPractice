@@ -1,4 +1,4 @@
-﻿import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
 import {
@@ -17,6 +17,7 @@ import {
     ReasoningSummary
 } from '../types';
 import {
+    API_BASE_URL,
     getConfigs,
     createConfig,
     updateConfig,
@@ -25,6 +26,7 @@ import {
     updateAppConfig,
     refreshMcpTools,
     getTools,
+    getAgentPrompt,
     getAstSettingsAll,
     updateAstSettings
 } from '../api';
@@ -35,6 +37,7 @@ import './ConfigManager.css';
 interface ConfigManagerProps {
     onClose: () => void;
     onConfigCreated?: () => void;
+    currentSessionId?: string | null;
 }
 
 const FORMAT_OPTIONS: { value: LLMApiFormat; label: string }[] = [
@@ -76,7 +79,7 @@ type MCPServerForm = {
 };
 
 const ABILITY_TYPE_OPTIONS: { value: string; label: string }[] = [
-    { value: 'tooling', label: '工具说明' },
+    { value: 'tooling', label: '工具' },
     { value: 'tool_policy', label: '工具策略' },
     { value: 'output_format', label: '输出要求' },
     { value: 'workflow', label: '工作流' },
@@ -110,6 +113,22 @@ const normalizeTools = (tools: unknown): ToolDefinition[] => {
         normalized.push({ name, description, parameters });
     }
     return normalized;
+};
+
+const isMcpTool = (tool: ToolDefinition) => {
+    const name = (tool.name || '').trim();
+    const desc = (tool.description || '').trim().toLowerCase();
+    return name.startsWith('mcp__') || desc.startsWith('mcp:');
+};
+
+const filterLocalTools = (tools: ToolDefinition[]) => tools.filter((tool) => !isMcpTool(tool));
+
+const formatToolAbilityName = (toolName: string) => {
+    const cleaned = toolName
+        .replace(/[_-]+/g, ' ')
+        .trim();
+    if (!cleaned) return toolName;
+    return cleaned.replace(/\b\w/g, (letter) => letter.toUpperCase());
 };
 
 const isRecord = (value: unknown): value is Record<string, any> =>
@@ -272,7 +291,7 @@ const splitMcpToolDescription = (tool: ToolDefinition): { title: string; descrip
     return { title: name, description: desc };
 };
 
-export default function ConfigManager({ onClose, onConfigCreated }: ConfigManagerProps) {
+export default function ConfigManager({ onClose, onConfigCreated, currentSessionId }: ConfigManagerProps) {
     type ConfigTab = 'models' | 'global' | 'mcp' | 'agents';
     const [configs, setConfigs] = useState<LLMConfig[]>([]);
     const [activeTab, setActiveTab] = useState<ConfigTab>('models');
@@ -331,20 +350,17 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         name: '',
         type: 'tooling',
         prompt: '',
-        tools: [] as string[],
-        paramsText: ''
+        tools: [] as string[]
     });
-    const [abilityFormError, setAbilityFormError] = useState<string | null>(null);
     const [showProfileForm, setShowProfileForm] = useState(false);
     const [editingProfileId, setEditingProfileId] = useState<string | null>(null);
     const [profileForm, setProfileForm] = useState({
         name: '',
+        description: '',
         abilities: [] as string[],
-        paramsText: '',
         isDefault: false,
         spawnable: false
     });
-    const [profileFormError, setProfileFormError] = useState<string | null>(null);
     const [showForm, setShowForm] = useState(false);
     const [editingConfig, setEditingConfig] = useState<LLMConfig | null>(null);
     const [loading, setLoading] = useState(false);
@@ -369,12 +385,12 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         const parsedMax = Number.parseInt(String(raw.react_max_iterations ?? ''), 10);
         const reactMaxIterations = Number.isFinite(parsedMax) ? Math.min(200, Math.max(1, parsedMax)) : 50;
         const profileList = Array.isArray(raw.profiles) ? raw.profiles : [];
-        const subagentProfileValue =
-            typeof raw.subagent_profile === 'string' && raw.subagent_profile.trim()
-                ? raw.subagent_profile.trim()
-                : (profileList.some((profile) => profile?.id === 'subagent')
-                    ? 'subagent'
-                    : (typeof raw.default_profile === 'string' ? raw.default_profile : ''));
+        const hasSubagentProfile = Object.prototype.hasOwnProperty.call(raw, 'subagent_profile');
+        const subagentProfileValue = hasSubagentProfile
+            ? (typeof raw.subagent_profile === 'string' ? raw.subagent_profile.trim() : '')
+            : (profileList.some((profile) => profile?.id === 'subagent')
+                ? 'subagent'
+                : (typeof raw.default_profile === 'string' ? raw.default_profile : ''));
         const normalizedProfiles = profileList.map((profile) => {
             if (!profile || typeof profile !== 'object') return profile;
             const spawnable = typeof profile.spawnable === 'boolean'
@@ -500,7 +516,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                 errorMessage += `: ${error.message}`;
             }
             if (error?.message?.includes('fetch')) {
-                errorMessage += '\n\nPlease verify:\n1) Backend is running\n2) http://127.0.0.1:8000 is reachable';
+                errorMessage += `\n\nPlease verify:\n1) Backend is running\n2) ${API_BASE_URL} is reachable`;
             }
             alert(errorMessage);
         } finally {
@@ -511,11 +527,47 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
     const loadTools = async () => {
         try {
             const tools = await getTools();
-            setAvailableTools(normalizeTools(tools));
+            setAvailableTools(filterLocalTools(normalizeTools(tools)));
         } catch (error) {
             console.error('Failed to load tools:', error);
         }
     };
+
+    useEffect(() => {
+        if (!availableTools.length) return;
+        setAgentConfig((prev) => {
+            if (!prev) return prev;
+            const abilities = Array.isArray(prev.abilities) ? [...prev.abilities] : [];
+            const existingIds = abilities.map((ability) => ability.id);
+            const singleToolAbilities = new Set<string>();
+            abilities.forEach((ability) => {
+                if (Array.isArray(ability.tools) && ability.tools.length === 1) {
+                    singleToolAbilities.add(ability.tools[0]);
+                }
+            });
+
+            let changed = false;
+            availableTools.forEach((tool) => {
+                const toolName = (tool.name || '').trim();
+                if (!toolName) return;
+                if (singleToolAbilities.has(toolName)) return;
+                const nextId = makeId(`tool-${toolName}`, existingIds, 'ability');
+                existingIds.push(nextId);
+                abilities.push({
+                    id: nextId,
+                    name: formatToolAbilityName(toolName),
+                    type: 'tooling',
+                    tools: [toolName],
+                    prompt: ''
+                });
+                changed = true;
+            });
+
+            if (!changed) return prev;
+            setAgentSaved(false);
+            return { ...prev, abilities };
+        });
+    }, [availableTools]);
 
     const updateMcpServer = (index: number, patch: Partial<MCPServerForm>) => {
         setGlobalMcpServers((prev) =>
@@ -1211,7 +1263,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                 errorMessage += `: ${error.message}`;
             }
             if (error.message?.includes('fetch')) {
-                errorMessage += '\n\nPlease verify:\n1) Backend is running\n2) http://127.0.0.1:8000 is reachable';
+                errorMessage += `\n\nPlease verify:\n1) Backend is running\n2) ${API_BASE_URL} is reachable`;
             }
             alert(errorMessage);
         } finally {
@@ -1607,6 +1659,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             const created: AgentProfile = {
                 id: finalId,
                 name: rawName || nameKey || finalId,
+                description: incomingProfile.description,
                 abilities: nextAbilities ?? [],
                 params: incomingProfile.params,
                 spawnable: typeof incomingProfile.spawnable === 'boolean' ? incomingProfile.spawnable : undefined,
@@ -1644,10 +1697,10 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                 profiles.find((profile) => profile.name === incomingDefault)?.id ||
                 defaultProfile;
         }
-        const incomingSubagentProfile =
-            typeof incomingRaw.subagent_profile === 'string' && incomingRaw.subagent_profile.trim()
-                ? incomingRaw.subagent_profile.trim()
-                : '';
+        const hasIncomingSubagentProfile = Object.prototype.hasOwnProperty.call(incomingRaw, 'subagent_profile');
+        const incomingSubagentProfile = hasIncomingSubagentProfile
+            ? (typeof incomingRaw.subagent_profile === 'string' ? incomingRaw.subagent_profile.trim() : '')
+            : '';
 
         return {
             ...currentNormalized,
@@ -1657,7 +1710,9 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             abilities,
             profiles,
             default_profile: defaultProfile,
-            subagent_profile: incomingSubagentProfile || currentNormalized.subagent_profile
+            subagent_profile: hasIncomingSubagentProfile
+                ? incomingSubagentProfile
+                : currentNormalized.subagent_profile
         };
     };
 
@@ -1689,41 +1744,31 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             name: '',
             type: 'tooling',
             prompt: '',
-            tools: [],
-            paramsText: ''
+            tools: []
         });
-        setAbilityFormError(null);
         setShowAbilityForm(true);
     };
 
     const openEditAbilityForm = (ability: AgentAbility) => {
+        const rawTools = Array.isArray(ability.tools) ? ability.tools : [];
+        const filteredTools = rawTools.filter((name) => !String(name).startsWith('mcp__') && name !== '*');
         setEditingAbilityId(ability.id);
         setAbilityForm({
             name: ability.name || '',
             type: ability.type || 'tooling',
             prompt: ability.prompt || '',
-            tools: Array.isArray(ability.tools) ? ability.tools : [],
-            paramsText: ability.params ? JSON.stringify(ability.params, null, 2) : ''
+            tools: filteredTools
         });
-        setAbilityFormError(null);
         setShowAbilityForm(true);
     };
 
     const handleSaveAbility = () => {
         const abilities = Array.isArray(agentConfig.abilities) ? [...agentConfig.abilities] : [];
         const existingIds = abilities.map((ability) => ability.id);
-        let params: Record<string, any> | undefined;
-        if (abilityForm.paramsText.trim()) {
-            try {
-                params = JSON.parse(abilityForm.paramsText);
-            } catch (error: any) {
-                setAbilityFormError('参数必须是合法的 JSON');
-                return;
-            }
-        }
-
-        const cleanedTools = abilityForm.tools.filter((tool) => typeof tool === 'string' && tool.trim());
-        const normalizedTools = cleanedTools.includes('*') ? ['*'] : cleanedTools;
+        const cleanedTools = abilityForm.tools
+            .filter((tool) => typeof tool === 'string' && tool.trim())
+            .filter((tool) => !tool.startsWith('mcp__') && tool !== '*');
+        const normalizedTools = cleanedTools;
 
         if (editingAbilityId) {
             const index = abilities.findIndex((ability) => ability.id === editingAbilityId);
@@ -1733,8 +1778,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                     name: abilityForm.name.trim() || abilities[index].name,
                     type: abilityForm.type,
                     prompt: abilityForm.prompt,
-                    tools: normalizedTools,
-                    params
+                    tools: normalizedTools
                 };
             }
         } else {
@@ -1744,8 +1788,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                 name: abilityForm.name.trim() || id,
                 type: abilityForm.type,
                 prompt: abilityForm.prompt,
-                tools: normalizedTools,
-                params
+                tools: normalizedTools
             });
         }
 
@@ -1772,12 +1815,11 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         setEditingProfileId(null);
         setProfileForm({
             name: '',
+            description: '',
             abilities: [],
-            paramsText: '',
             isDefault: false,
             spawnable: false
         });
-        setProfileFormError(null);
         setShowProfileForm(true);
     };
 
@@ -1785,27 +1827,50 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         setEditingProfileId(profile.id);
         setProfileForm({
             name: profile.name || '',
+            description: profile.description || '',
             abilities: Array.isArray(profile.abilities) ? profile.abilities : [],
-            paramsText: profile.params ? JSON.stringify(profile.params, null, 2) : '',
             isDefault: profile.id === agentConfig.default_profile,
             spawnable: Boolean(profile.spawnable)
         });
-        setProfileFormError(null);
         setShowProfileForm(true);
     };
+
+    const abilityTypeLabel = useMemo(() => {
+        const map = new Map<string, string>();
+        ABILITY_TYPE_OPTIONS.forEach((option) => map.set(option.value, option.label));
+        return map;
+    }, []);
+
+    const abilityGroups = useMemo(() => {
+        const abilities = Array.isArray(agentConfig.abilities) ? agentConfig.abilities : [];
+        const grouped = new Map<string, AgentAbility[]>();
+        abilities.forEach((ability) => {
+            const type = ability.type || 'misc';
+            if (!grouped.has(type)) grouped.set(type, []);
+            grouped.get(type)!.push(ability);
+        });
+
+        const orderedTypes = ABILITY_TYPE_OPTIONS.map((option) => option.value);
+        const remainingTypes = Array.from(grouped.keys())
+            .filter((type) => !orderedTypes.includes(type))
+            .sort((a, b) => a.localeCompare(b));
+        const finalTypes = [...orderedTypes, ...remainingTypes];
+
+        return finalTypes
+            .map((type) => {
+                const items = grouped.get(type);
+                if (!items || items.length === 0) return null;
+                const label = abilityTypeLabel.get(type) || (type === 'misc' ? '其他' : type);
+                const sorted = [...items].sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+                return { type, label, abilities: sorted };
+            })
+            .filter((group): group is { type: string; label: string; abilities: AgentAbility[] } => Boolean(group));
+    }, [agentConfig.abilities, abilityTypeLabel]);
 
     const handleSaveProfile = () => {
         const profiles = Array.isArray(agentConfig.profiles) ? [...agentConfig.profiles] : [];
         const existingIds = profiles.map((profile) => profile.id);
-        let params: Record<string, any> | undefined;
-        if (profileForm.paramsText.trim()) {
-            try {
-                params = JSON.parse(profileForm.paramsText);
-            } catch (error: any) {
-                setProfileFormError('参数必须是合法的 JSON');
-                return;
-            }
-        }
+        const description = profileForm.description.trim();
 
         let profileId = editingProfileId;
         if (editingProfileId) {
@@ -1814,8 +1879,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                 profiles[index] = {
                     ...profiles[index],
                     name: profileForm.name.trim() || profiles[index].name,
+                    description: description || undefined,
                     abilities: profileForm.abilities,
-                    params,
                     spawnable: profileForm.spawnable
                 };
             }
@@ -1824,8 +1889,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
             profiles.push({
                 id: profileId,
                 name: profileForm.name.trim() || profileId,
+                description: description || undefined,
                 abilities: profileForm.abilities,
-                params,
                 spawnable: profileForm.spawnable
             });
         }
@@ -1846,61 +1911,29 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         setShowProfileForm(false);
     };
 
-    const handleExportAgentPrompt = async () => {
-        if (!agentConfig) return;
-        const basePrompt = (agentConfig.base_system_prompt || '').trim();
-        const profiles = Array.isArray(agentConfig.profiles) ? agentConfig.profiles : [];
-        const profileId = agentConfig.default_profile || profiles[0]?.id || '';
-        const profile = profiles.find((item) => item.id === profileId) || null;
-        const abilityMap = new Map(
-            (agentConfig.abilities || []).map((ability) => [ability.id, ability])
-        );
-        const abilityIds = profile?.abilities?.length
-            ? profile.abilities
-            : (agentConfig.abilities || []).map((ability) => ability.id);
-        const promptAbilities = abilityIds
-            .map((id) => abilityMap.get(id))
-            .filter((ability): ability is AgentAbility => Boolean(ability))
-            .filter((ability) => ability.id !== 'code_map' && ability.prompt && ability.prompt.trim());
-
-        const lines: string[] = [];
-        lines.push('# Agent Prompt');
-        lines.push('');
-        lines.push(`Exported: ${new Date().toLocaleString()}`);
-        if (profile) {
-            lines.push(`Profile: ${profile.name || profile.id}`);
-        }
-        lines.push('');
-        lines.push('## Base System Prompt');
-        lines.push('');
-        lines.push('```');
-        lines.push(basePrompt);
-        lines.push('```');
-
-        if (promptAbilities.length > 0) {
-            lines.push('');
-            lines.push('## Abilities');
-            for (const ability of promptAbilities) {
-                lines.push('');
-                lines.push(`### ${ability.name || ability.id}`);
-                lines.push('');
-                lines.push('```');
-                lines.push((ability.prompt || '').trim());
-                lines.push('```');
-            }
-        }
-
-        const defaultName = profile?.name
-            ? `agent-prompt-${profile.name.replace(/[^a-z0-9-_]+/gi, '_')}.md`
-            : 'agent-prompt.md';
+    const handleExportAgentPrompt = async (profile: AgentProfile) => {
+        if (!profile?.id) return;
         try {
+            const response = await getAgentPrompt({
+                profileId: profile.id,
+                includeTools: true,
+                sessionId: currentSessionId || undefined
+            });
+            const promptText = response?.prompt ?? '';
+            if (!promptText.trim()) {
+                alert('提示词为空，无法导出。');
+                return;
+            }
+            const nameSource = response?.profile_name || profile.name || profile.id;
+            const safeName = nameSource.replace(/[^a-z0-9-_]+/gi, '_');
+            const defaultName = safeName ? `agent-prompt-${safeName}.md` : 'agent-prompt.md';
             const target = await saveDialog({
                 title: '导出提示词',
                 defaultPath: defaultName,
                 filters: [{ name: 'Markdown', extensions: ['md'] }]
             });
             if (!target) return;
-            await writeTextFile(target, lines.join('\n'));
+            await writeTextFile(target, promptText);
             alert('提示词已导出。');
         } catch (error: any) {
             console.error('Failed to export prompt:', error);
@@ -1979,7 +2012,7 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                 errorMessage += `: ${error.message}`;
             }
             if (error.message?.includes('fetch')) {
-                errorMessage += '\n\nPlease verify:\n1) Backend is running\n2) http://127.0.0.1:8000 is reachable';
+                errorMessage += `\n\nPlease verify:\n1) Backend is running\n2) ${API_BASE_URL} is reachable`;
             }
             alert(errorMessage);
         }
@@ -2064,7 +2097,6 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         setFormData({ ...formData, api_profile: value });
     };
 
-    const allToolsSelected = abilityForm.tools.includes('*');
     const bundleDisabled = bundleBusy || globalLoading || globalSaving || mcpSaving || agentLoading || agentSaving || loading;
 
     return (
@@ -2811,9 +2843,9 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                             </div>
 
                             <div className="form-group">
-                                <label>子agent Profile</label>
+                                <label>默认子agent Profile（可选）</label>
                                 <select
-                                    value={agentConfig.subagent_profile || ''}
+                                    value={agentConfig.subagent_profile ?? ''}
                                     onChange={(e) => {
                                         setAgentConfig((prev) => ({
                                             ...prev,
@@ -2823,13 +2855,16 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     }}
                                     disabled={(agentConfig.profiles || []).length === 0}
                                 >
+                                    <option value="">自动选择</option>
                                     {(agentConfig.profiles || []).map((profile) => (
                                         <option key={profile.id} value={profile.id}>
                                             {profile.name || profile.id}
                                         </option>
                                     ))}
                                 </select>
-                                <small>用于 spawn_subagent 的固定 profile。</small>
+                                <small>
+                                    spawn_subagent 可选择任意允许作为子agent的 profile；仅当未指定 profile_id 且可选 profile 只有一个时会自动使用。
+                                </small>
                             </div>
 
                             <div className="agent-section">
@@ -2891,9 +2926,6 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                 <div className="agent-section-header">
                                     <h4>Profiles</h4>
                                     <div className="agent-section-actions">
-                                        <button type="button" className="add-btn add-inline" onClick={handleExportAgentPrompt}>
-                                            导出提示词
-                                        </button>
                                         <button type="button" className="add-btn add-inline" onClick={openNewProfileForm}>
                                             + Add Profile
                                         </button>
@@ -2925,47 +2957,57 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                                         required
                                                     />
                                                 </div>
-
                                                 <div className="form-group">
-                                                    <label>Abilities</label>
-                                                    <div className="checkbox-grid">
-                                                        {(agentConfig.abilities || []).map((ability) => {
-                                                            const checked = profileForm.abilities.includes(ability.id);
-                                                            return (
-                                                                <label key={ability.id} className="checkbox-inline">
-                                                                    <input
-                                                                        type="checkbox"
-                                                                        checked={checked}
-                                                                        onChange={(e) => {
-                                                                            const next = new Set(profileForm.abilities);
-                                                                            if (e.target.checked) {
-                                                                                next.add(ability.id);
-                                                                            } else {
-                                                                                next.delete(ability.id);
-                                                                            }
-                                                                            setProfileForm({
-                                                                                ...profileForm,
-                                                                                abilities: Array.from(next)
-                                                                            });
-                                                                        }}
-                                                                    />
-                                                                    {ability.name}
-                                                                </label>
-                                                            );
-                                                        })}
-                                                    </div>
+                                                    <label>Description</label>
+                                                    <textarea
+                                                        rows={3}
+                                                        value={profileForm.description}
+                                                        onChange={(e) =>
+                                                            setProfileForm({ ...profileForm, description: e.target.value })
+                                                        }
+                                                        placeholder="Describe what this profile is best for"
+                                                    />
                                                 </div>
 
                                                 <div className="form-group">
-                                                    <label>Params (JSON)</label>
-                                                    <textarea
-                                                        rows={4}
-                                                        value={profileForm.paramsText}
-                                                        onChange={(e) =>
-                                                            setProfileForm({ ...profileForm, paramsText: e.target.value })
-                                                        }
-                                                        placeholder='{"key": "value"}'
-                                                    />
+                                                    <label>Abilities</label>
+                                                    <div className="ability-group-list">
+                                                        {abilityGroups.length === 0 ? (
+                                                            <p className="empty-message">No abilities yet.</p>
+                                                        ) : (
+                                                            abilityGroups.map((group) => (
+                                                                <div key={group.type} className="ability-group">
+                                                                    <div className="ability-group-title">{group.label}</div>
+                                                                    <div className="checkbox-grid">
+                                                                        {group.abilities.map((ability) => {
+                                                                            const checked = profileForm.abilities.includes(ability.id);
+                                                                            return (
+                                                                                <label key={ability.id} className="checkbox-inline">
+                                                                                    <input
+                                                                                        type="checkbox"
+                                                                                        checked={checked}
+                                                                                        onChange={(e) => {
+                                                                                            const next = new Set(profileForm.abilities);
+                                                                                            if (e.target.checked) {
+                                                                                                next.add(ability.id);
+                                                                                            } else {
+                                                                                                next.delete(ability.id);
+                                                                                            }
+                                                                                            setProfileForm({
+                                                                                                ...profileForm,
+                                                                                                abilities: Array.from(next)
+                                                                                            });
+                                                                                        }}
+                                                                                    />
+                                                                                    {ability.name}
+                                                                                </label>
+                                                                            );
+                                                                        })}
+                                                                    </div>
+                                                                </div>
+                                                            ))
+                                                        )}
+                                                    </div>
                                                 </div>
 
                                                 <div className="form-group checkbox-group">
@@ -3000,8 +3042,6 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                                     </label>
                                                 </div>
 
-                                                {profileFormError && <div className="form-error">{profileFormError}</div>}
-
                                                 <div className="form-actions">
                                                     <button type="button" onClick={() => setShowProfileForm(false)}>
                                                         Cancel
@@ -3027,6 +3067,9 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                                             <span className="badge">Default</span>
                                                         )}
                                                     </h4>
+                                                    {profile.description && (
+                                                        <p className="agent-detail">{profile.description}</p>
+                                                    )}
                                                     <p className="agent-detail">
                                                         <strong>Abilities:</strong>{' '}
                                                         {(profile.abilities || []).length > 0
@@ -3044,6 +3087,18 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                                     </p>
                                                 </div>
                                                 <div className="config-actions">
+                                                    <button
+                                                        className="icon-btn"
+                                                        onClick={() => handleExportAgentPrompt(profile)}
+                                                        type="button"
+                                                        aria-label="导出提示词"
+                                                        title="导出提示词"
+                                                    >
+                                                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                                                            <path d="M12 3v10.17l3.59-3.58L17 11l-5 5-5-5 1.41-1.41L11 13.17V3h1z" />
+                                                            <path d="M5 19h14v-2H5v2z" />
+                                                        </svg>
+                                                    </button>
                                                     <button
                                                         className="icon-btn"
                                                         onClick={() => openEditProfileForm(profile)}
@@ -3291,20 +3346,6 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                 <div className="form-group">
                                     <label>Tools</label>
                                     <div className="checkbox-grid">
-                                        <label className="checkbox-inline">
-                                            <input
-                                                type="checkbox"
-                                                checked={allToolsSelected}
-                                                onChange={(e) => {
-                                                    if (e.target.checked) {
-                                                        setAbilityForm({ ...abilityForm, tools: ['*'] });
-                                                    } else {
-                                                        setAbilityForm({ ...abilityForm, tools: [] });
-                                                    }
-                                                }}
-                                            />
-                                            All tools
-                                        </label>
                                         {availableTools.map((tool) => {
                                             const checked = abilityForm.tools.includes(tool.name);
                                             return (
@@ -3312,11 +3353,8 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                                     <input
                                                         type="checkbox"
                                                         checked={checked}
-                                                        disabled={allToolsSelected}
                                                         onChange={(e) => {
-                                                            const next = new Set(
-                                                                abilityForm.tools.filter((name) => name !== '*')
-                                                            );
+                                                            const next = new Set(abilityForm.tools);
                                                             if (e.target.checked) {
                                                                 next.add(tool.name);
                                                             } else {
@@ -3347,21 +3385,6 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
                                     />
                                 </div>
 
-                                <div className="form-group">
-                                    <label>Params (JSON)</label>
-                                    <textarea
-                                        rows={4}
-                                        value={abilityForm.paramsText}
-                                        onChange={(e) =>
-                                            setAbilityForm({ ...abilityForm, paramsText: e.target.value })
-                                        }
-                                        placeholder='{"key": "value"}'
-                                    />
-                                    <small>可选。支持 {'{{param}}'} 占位符。</small>
-                                </div>
-
-                                {abilityFormError && <div className="form-error">{abilityFormError}</div>}
-
                                 <div className="form-actions">
                                     <button type="button" onClick={() => setShowAbilityForm(false)}>
                                         Cancel
@@ -3388,3 +3411,4 @@ export default function ConfigManager({ onClose, onConfigCreated }: ConfigManage
         </div>
     );
 }
+

@@ -27,6 +27,35 @@ body {
   position: relative;
 }
 
+.sidebar-float-toggle {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.08);
+  color: #e5e7eb;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 20;
+  transition: background 0.2s, border-color 0.2s, transform 0.2s;
+}
+
+.sidebar-float-toggle:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.2);
+  transform: translateY(-1px);
+}
+
+.sidebar-float-toggle svg {
+  width: 18px;
+  height: 18px;
+}
+
 .app-titlebar {
   height: 36px;
   display: flex;
@@ -666,7 +695,46 @@ body[data-platform="mac"] .app-titlebar {
   letter-spacing: 0.02em;
 }
 
-.skill-suggestions {
+.input-skill-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.input-skill-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(139, 92, 246, 0.18);
+  border: 1px solid rgba(139, 92, 246, 0.5);
+  color: #e9d5ff;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.input-skill-icon {
+  font-size: 0.8rem;
+  color: #c4b5fd;
+}
+
+.input-skill-clear {
+  margin-left: 2px;
+  border: none;
+  background: transparent;
+  color: #e9d5ff;
+  font-size: 0.85rem;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.input-skill-clear:hover {
+  color: #f5f3ff;
+}
+
+.command-suggestions {
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -678,7 +746,15 @@ body[data-platform="mac"] .app-titlebar {
   overflow-y: auto;
 }
 
-.skill-suggestion {
+.command-suggestions-header {
+  padding: 2px 6px 0;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #94a3b8;
+}
+
+.command-suggestion {
   text-align: left;
   padding: 8px 10px;
   border-radius: 8px;
@@ -689,23 +765,29 @@ body[data-platform="mac"] .app-titlebar {
   transition: background 0.15s ease, border-color 0.15s ease;
 }
 
-.skill-suggestion.active,
-.skill-suggestion:hover {
+.command-suggestion.active,
+.command-suggestion:hover {
   background: rgba(56, 189, 248, 0.12);
   border-color: rgba(56, 189, 248, 0.35);
 }
 
-.skill-name {
+.command-name {
   font-size: 0.85rem;
   font-weight: 600;
   color: #e5e7eb;
 }
 
-.skill-desc {
+.command-desc {
   margin-top: 4px;
   font-size: 0.75rem;
   color: #9ca3af;
   line-height: 1.3;
+}
+
+.command-empty {
+  padding: 6px 10px;
+  font-size: 0.75rem;
+  color: #64748b;
 }
 
 .input-area.drag-active {

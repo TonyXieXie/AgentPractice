@@ -95,12 +95,14 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
             {
                 "id": "default",
                 "name": "Default",
+                "description": "Primary profile for the main assistant.",
                 "abilities": ["tools_all", "rg_search", "apply_patch", "pty_status", "code_map", "tool_json", "output_concise", "file_references"],
                 "spawnable": False
             },
             {
                 "id": "subagent",
                 "name": "Subagent",
+                "description": "Spawnable profile for delegated tasks.",
                 "abilities": ["tools_all", "rg_search", "apply_patch", "pty_status", "code_map", "tool_json", "output_concise", "file_references"],
                 "spawnable": True
             }

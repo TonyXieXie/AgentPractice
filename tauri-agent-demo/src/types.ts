@@ -10,6 +10,14 @@ export interface ToolDefinition {
     parameters?: Record<string, any>[];
 }
 
+export interface AgentPromptResponse {
+    prompt: string;
+    profile_id?: string | null;
+    profile_name?: string | null;
+    include_tools?: boolean;
+    tool_names?: string[];
+}
+
 export interface SkillSummary {
     name: string;
     description?: string;
@@ -58,6 +66,7 @@ export interface AgentAbility {
 export interface AgentProfile {
     id: string;
     name: string;
+    description?: string;
     abilities: string[];
     params?: Record<string, any>;
     spawnable?: boolean;

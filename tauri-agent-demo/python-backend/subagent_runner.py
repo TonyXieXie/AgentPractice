@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import traceback
 
 from app_config import get_app_config
@@ -32,28 +32,84 @@ def _append_reasoning_summary_prompt(system_prompt: str, reasoning_summary: Opti
     return f"{system_prompt}\n\n{block}"
 
 
-def _resolve_subagent_profile(agent_cfg: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
-    profile_id = str(agent_cfg.get("subagent_profile") or "subagent").strip() or "subagent"
+def _normalize_profile_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _iter_profiles(agent_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     profiles = agent_cfg.get("profiles") or []
-    for profile in profiles:
-        if isinstance(profile, dict) and str(profile.get("id") or "") == profile_id:
-            return profile_id, profile
-    return profile_id, None
+    return [profile for profile in profiles if isinstance(profile, dict)]
 
 
-def _is_profile_spawnable(profile: Dict[str, Any], subagent_profile_id: str) -> bool:
+def _format_profile_label(profile: Dict[str, Any]) -> str:
+    profile_id = _normalize_profile_id(profile.get("id"))
+    name = str(profile.get("name") or "").strip()
+    if profile_id and name and name != profile_id:
+        return f"{profile_id} ({name})"
+    return profile_id or name or "unknown"
+
+
+def _is_profile_spawnable(profile: Dict[str, Any], legacy_profile_id: str) -> bool:
     if not isinstance(profile, dict):
         return False
     value = profile.get("spawnable")
     if isinstance(value, bool):
         return value
-    return str(profile.get("id") or "") == subagent_profile_id
+    profile_id = _normalize_profile_id(profile.get("id"))
+    return bool(legacy_profile_id) and profile_id == legacy_profile_id
+
+
+def list_spawnable_profiles(agent_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    profiles = _iter_profiles(agent_cfg)
+    legacy_profile_id = _normalize_profile_id(agent_cfg.get("subagent_profile"))
+    return [profile for profile in profiles if _is_profile_spawnable(profile, legacy_profile_id)]
+
+
+def _resolve_subagent_profile(
+    agent_cfg: Dict[str, Any],
+    desired_profile_id: Optional[str] = None
+) -> Tuple[str, Dict[str, Any]]:
+    profiles = _iter_profiles(agent_cfg)
+    legacy_profile_id = _normalize_profile_id(agent_cfg.get("subagent_profile"))
+    spawnable_profiles = [profile for profile in profiles if _is_profile_spawnable(profile, legacy_profile_id)]
+    desired = _normalize_profile_id(desired_profile_id)
+
+    if desired:
+        selected = next(
+            (profile for profile in profiles if _normalize_profile_id(profile.get("id")) == desired),
+            None
+        )
+        if not selected:
+            choices = ", ".join([_format_profile_label(profile) for profile in spawnable_profiles])
+            raise ValueError(
+                f"Subagent profile not found: {desired}"
+                + (f". Spawnable profiles: {choices}" if choices else "")
+            )
+        if not _is_profile_spawnable(selected, legacy_profile_id):
+            choices = ", ".join([_format_profile_label(profile) for profile in spawnable_profiles])
+            raise ValueError(
+                f"Profile not spawnable: {desired}"
+                + (f". Spawnable profiles: {choices}" if choices else "")
+            )
+        return desired, selected
+
+    if len(spawnable_profiles) == 1:
+        selected = spawnable_profiles[0]
+        profile_id = _normalize_profile_id(selected.get("id")) or legacy_profile_id or "subagent"
+        return profile_id, selected
+
+    if not spawnable_profiles:
+        raise ValueError("No spawnable profiles configured. Mark a profile as spawnable.")
+
+    choices = ", ".join([_format_profile_label(profile) for profile in spawnable_profiles])
+    raise ValueError(f"Multiple spawnable profiles available: {choices}. Please specify profile_id.")
 
 
 def prepare_subagent_session(
     task: str,
     parent_session_id: str,
-    title: Optional[str] = None
+    title: Optional[str] = None,
+    profile_id: Optional[str] = None
 ) -> Dict[str, Any]:
     if not task or not str(task).strip():
         raise ValueError("Missing task")
@@ -68,11 +124,7 @@ def prepare_subagent_session(
 
     app_config = get_app_config()
     agent_cfg = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
-    subagent_profile_id, subagent_profile = _resolve_subagent_profile(agent_cfg)
-    if not subagent_profile:
-        raise ValueError(f"Subagent profile not found: {subagent_profile_id}")
-    if not _is_profile_spawnable(subagent_profile, subagent_profile_id):
-        raise ValueError(f"Profile not spawnable: {subagent_profile_id}")
+    subagent_profile_id, subagent_profile = _resolve_subagent_profile(agent_cfg, profile_id)
 
     child_title = title.strip() if isinstance(title, str) and title.strip() else "Subagent Task"
     child_session = db.create_session(ChatSessionCreate(
@@ -89,11 +141,6 @@ def prepare_subagent_session(
         role="user",
         content=processed_message
     ))
-    assistant_msg = db.create_message(ChatMessageCreate(
-        session_id=child_session.id,
-        role="assistant",
-        content=""
-    ))
 
     return {
         "parent_session_id": parent_session_id,
@@ -103,7 +150,7 @@ def prepare_subagent_session(
         "child_title": child_title,
         "processed_message": processed_message,
         "user_message_id": user_msg.id,
-        "assistant_message_id": assistant_msg.id,
+        "assistant_message_id": None,
         "subagent_profile_id": subagent_profile_id
     }
 
@@ -176,7 +223,7 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
         )
         return {"status": "error", "error": "Child session not found"}
 
-    assistant_msg_id = context["assistant_message_id"]
+    assistant_msg_id = context.get("assistant_message_id")
     user_msg_id = context["user_message_id"]
     processed_message = context["processed_message"]
     child_title = context["child_title"]
@@ -186,21 +233,31 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
     config = db.get_config(child_session.config_id)
     if not config:
         final_answer = "Subagent failed: Parent config not found"
-        try:
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                '''
-                UPDATE chat_messages
-                SET content = ?
-                WHERE id = ?
-                ''',
-                (final_answer, assistant_msg_id)
-            )
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
+        if assistant_msg_id:
+            try:
+                conn = db.get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    UPDATE chat_messages
+                    SET content = ?
+                    WHERE id = ?
+                    ''',
+                    (final_answer, assistant_msg_id)
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        else:
+            try:
+                db.create_message(ChatMessageCreate(
+                    session_id=child_session.id,
+                    role="assistant",
+                    content=final_answer
+                ))
+            except Exception:
+                pass
         await _notify_parent_subagent_done(
             parent_session_id=parent_session_id,
             child_session_id=child_session.id,
@@ -235,7 +292,7 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
         exclude_ability_ids=["code_map"]
     )
     enabled_skills = get_enabled_skills()
-    invoked_names = extract_skill_invocations(processed_message)
+    invoked_names = extract_skill_invocations(processed_message, max_count=1)
     invoked_skills = []
     if enabled_skills and invoked_names:
         skill_map = {skill.name.lower(): skill for skill in enabled_skills}
@@ -243,9 +300,7 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
             skill = skill_map.get(name.lower())
             if skill:
                 invoked_skills.append(skill)
-    skills_prompt = build_skill_prompt_sections(enabled_skills, invoked_skills)
-    if skills_prompt:
-        system_prompt = f"{system_prompt}\n\n{skills_prompt}" if system_prompt else skills_prompt
+    skills_prompt = build_skill_prompt_sections([], invoked_skills)
     system_prompt = _append_reasoning_summary_prompt(system_prompt, global_reasoning_summary)
     if resolved_profile_id and resolved_profile_id != getattr(child_session, "agent_profile", None):
         db.update_session(child_session.id, ChatSessionUpdate(agent_profile=resolved_profile_id))
@@ -272,15 +327,45 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
         system_prompt=system_prompt
     )
 
+    prompt_truncation_cfg = {
+        "enabled": bool(context_config.get("truncate_long_data", True)),
+        "threshold": int(context_config.get("long_data_threshold", 4000) or 4000),
+        "head_chars": int(context_config.get("long_data_head_chars", 1200) or 1200),
+        "tail_chars": int(context_config.get("long_data_tail_chars", 800) or 800)
+    }
+
+    history_for_llm = build_history_for_llm(
+        child_session.id,
+        None,
+        user_msg_id,
+        "",
+        code_map_prompt,
+        prompt_truncation_cfg
+    )
+    if skills_prompt:
+        skill_meta = {"skill_prompt": True}
+        if invoked_skills:
+            skill_meta["skill_name"] = invoked_skills[0].name
+            skill_meta["skill_path"] = invoked_skills[0].path
+        db.create_message(ChatMessageCreate(
+            session_id=child_session.id,
+            role="user",
+            content=skills_prompt,
+            metadata=skill_meta
+        ))
+
+    if not assistant_msg_id:
+        temp_assistant_msg = db.create_message(ChatMessageCreate(
+            session_id=child_session.id,
+            role="assistant",
+            content=""
+        ))
+        assistant_msg_id = temp_assistant_msg.id
+
     request_overrides: Dict[str, Any] = {
         "_debug": {"session_id": child_session.id, "message_id": assistant_msg_id},
         "work_path": getattr(child_session, "work_path", None),
-        "prompt_truncation": {
-            "enabled": bool(context_config.get("truncate_long_data", True)),
-            "threshold": int(context_config.get("long_data_threshold", 4000) or 4000),
-            "head_chars": int(context_config.get("long_data_head_chars", 1200) or 1200),
-            "tail_chars": int(context_config.get("long_data_tail_chars", 800) or 800)
-        },
+        "prompt_truncation": prompt_truncation_cfg,
         "_context_state": {
             "summary": "",
             "last_call_id": None,
@@ -290,15 +375,8 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
     }
     if code_map_prompt:
         request_overrides["_code_map_prompt"] = code_map_prompt
-
-    history_for_llm = build_history_for_llm(
-        child_session.id,
-        None,
-        user_msg_id,
-        "",
-        code_map_prompt,
-        request_overrides.get("prompt_truncation")
-    )
+    if skills_prompt:
+        request_overrides["_post_user_messages"] = [{"role": "user", "content": skills_prompt}]
 
     sequence = 0
     final_answer = None
@@ -409,10 +487,11 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
 async def run_subagent_task(
     task: str,
     parent_session_id: str,
-    title: Optional[str] = None
+    title: Optional[str] = None,
+    profile_id: Optional[str] = None
 ) -> Dict[str, Any]:
     try:
-        context = prepare_subagent_session(task, parent_session_id, title)
+        context = prepare_subagent_session(task, parent_session_id, title, profile_id)
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
     return await execute_subagent_context(context)

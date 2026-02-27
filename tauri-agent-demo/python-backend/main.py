@@ -55,7 +55,9 @@ from skills import (
     list_skills,
     get_enabled_skills,
     extract_skill_invocations,
-    build_skill_prompt_sections
+    build_skill_prompt_sections,
+    initialize_skill_cache,
+    set_empty_skill_cache
 )
 
 app = FastAPI(title="Tauri Agent Chat Backend")
@@ -69,6 +71,14 @@ async def on_startup():
         WS_HUB.set_loop(asyncio.get_running_loop())
     except Exception:
         pass
+    try:
+        asyncio.create_task(_init_skills_background())
+    except Exception as exc:
+        print(f"[Skills] failed to start background load: {exc}")
+    try:
+        asyncio.create_task(_init_mcp_tools_background())
+    except Exception as exc:
+        print(f"[MCP] Failed to start background registration: {exc}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -79,10 +89,23 @@ app.add_middleware(
 )
 
 register_builtin_tools()
-try:
-    register_mcp_tools_from_config()
-except Exception as exc:
-    print(f"[MCP] Failed to register MCP tools: {exc}")
+
+async def _init_mcp_tools_background() -> None:
+    try:
+        await asyncio.to_thread(register_mcp_tools_from_config)
+        print("[MCP] Tools registered.")
+    except Exception as exc:
+        print(f"[MCP] Failed to register MCP tools: {exc}")
+
+
+async def _init_skills_background() -> None:
+    try:
+        cached_skills = await asyncio.to_thread(initialize_skill_cache)
+        skill_names = [skill.name for skill in cached_skills if skill.name]
+        print(f"[Skills] loaded {len(skill_names)} skill(s): {', '.join(skill_names) if skill_names else 'none'}")
+    except Exception as exc:
+        print(f"[Skills] failed to load skills: {exc}")
+        set_empty_skill_cache()
 
 def _close_all_ptys() -> None:
     try:
@@ -1279,7 +1302,7 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
             exclude_ability_ids=["code_map"]
         )
         enabled_skills = get_enabled_skills()
-        invoked_skill_names = extract_skill_invocations(processed_message)
+        invoked_skill_names = extract_skill_invocations(processed_message, max_count=1)
         invoked_skills = []
         if enabled_skills and invoked_skill_names:
             skill_map = {skill.name.lower(): skill for skill in enabled_skills}
@@ -1287,9 +1310,7 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
                 skill = skill_map.get(name.lower())
                 if skill:
                     invoked_skills.append(skill)
-        skills_prompt = build_skill_prompt_sections(enabled_skills, invoked_skills)
-        if skills_prompt:
-            system_prompt = f"{system_prompt}\n\n{skills_prompt}" if system_prompt else skills_prompt
+        skills_prompt = build_skill_prompt_sections([], invoked_skills)
         system_prompt = _append_reasoning_summary_prompt(system_prompt, global_reasoning_summary)
         if resolved_profile_id and resolved_profile_id != getattr(session, "agent_profile", None):
             db.update_session(session.id, ChatSessionUpdate(agent_profile=resolved_profile_id))
@@ -1333,6 +1354,59 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
         final_answer = None
         saw_delta = False
 
+        prompt_truncation_cfg = {
+            "enabled": bool(context_config.get("truncate_long_data", True)),
+            "threshold": int(context_config.get("long_data_threshold", 4000) or 4000),
+            "head_chars": int(context_config.get("long_data_head_chars", 1200) or 1200),
+            "tail_chars": int(context_config.get("long_data_tail_chars", 800) or 800)
+        }
+
+        pending_compress_step = None
+        if agent_type != "react":
+            updated_summary, updated_call_id, updated_message_id, did_compress = await maybe_compress_context(
+                session_id=session.id,
+                config=config,
+                app_config=app_config,
+                llm_client=llm_client,
+                current_summary=context_summary,
+                last_compressed_call_id=last_compressed_call_id,
+                current_user_message_id=user_msg.id,
+                current_user_text=processed_message
+            )
+            if did_compress:
+                context_summary = updated_summary
+                last_compressed_call_id = updated_call_id
+                last_compressed_message_id = updated_message_id
+                try:
+                    db.update_session_context(session.id, context_summary, last_compressed_call_id)
+                except Exception as exc:
+                    print(f"[Context Compress] Failed to update session context: {exc}")
+                pending_compress_step = AgentStep(
+                    step_type="observation",
+                    content="正在进行上下文压缩...",
+                    metadata={"context_compress": True}
+                )
+
+        history_for_llm = build_history_for_llm(
+            session.id,
+            last_compressed_message_id,
+            user_msg.id,
+            context_summary,
+            code_map_prompt,
+            prompt_truncation_cfg
+        )
+        if skills_prompt:
+            skill_meta = {"skill_prompt": True}
+            if invoked_skills:
+                skill_meta["skill_name"] = invoked_skills[0].name
+                skill_meta["skill_path"] = invoked_skills[0].path
+            db.create_message(ChatMessageCreate(
+                session_id=session.id,
+                role="user",
+                content=skills_prompt,
+                metadata=skill_meta
+            ))
+
         temp_assistant_msg = db.create_message(ChatMessageCreate(
             session_id=session.id,
             role="assistant",
@@ -1355,12 +1429,7 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
             },
             "work_path": request.work_path or getattr(session, 'work_path', None)
         }
-        request_overrides["prompt_truncation"] = {
-            "enabled": bool(context_config.get("truncate_long_data", True)),
-            "threshold": int(context_config.get("long_data_threshold", 4000) or 4000),
-            "head_chars": int(context_config.get("long_data_head_chars", 1200) or 1200),
-            "tail_chars": int(context_config.get("long_data_tail_chars", 800) or 800)
-        }
+        request_overrides["prompt_truncation"] = prompt_truncation_cfg
         if request.extra_work_paths:
             request_overrides["extra_work_paths"] = [str(p) for p in request.extra_work_paths if p]
         request_overrides["_stop_event"] = stop_event
@@ -1378,55 +1447,19 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
         }
         if code_map_prompt:
             request_overrides["_code_map_prompt"] = code_map_prompt
+        if skills_prompt:
+            request_overrides["_post_user_messages"] = [{"role": "user", "content": skills_prompt}]
 
-        if agent_type != "react":
-            updated_summary, updated_call_id, updated_message_id, did_compress = await maybe_compress_context(
-                session_id=session.id,
-                config=config,
-                app_config=app_config,
-                llm_client=llm_client,
-                current_summary=context_summary,
-                last_compressed_call_id=last_compressed_call_id,
-                current_user_message_id=user_msg.id,
-                current_user_text=processed_message
+        if pending_compress_step:
+            db.save_agent_step(
+                message_id=assistant_msg_id,
+                step_type=pending_compress_step.step_type,
+                content=pending_compress_step.content,
+                sequence=sequence,
+                metadata=pending_compress_step.metadata
             )
-            if did_compress:
-                context_summary = updated_summary
-                last_compressed_call_id = updated_call_id
-                last_compressed_message_id = updated_message_id
-                request_overrides["_context_state"].update({
-                    "summary": context_summary,
-                    "last_call_id": last_compressed_call_id,
-                    "last_message_id": last_compressed_message_id
-                })
-                try:
-                    db.update_session_context(session.id, context_summary, last_compressed_call_id)
-                except Exception as exc:
-                    print(f"[Context Compress] Failed to update session context: {exc}")
-
-                compress_step = AgentStep(
-                    step_type="observation",
-                    content="正在进行上下文压缩...",
-                    metadata={"context_compress": True}
-                )
-                db.save_agent_step(
-                    message_id=assistant_msg_id,
-                    step_type=compress_step.step_type,
-                    content=compress_step.content,
-                    sequence=sequence,
-                    metadata=compress_step.metadata
-                )
-                await state.emit(compress_step.to_dict())
-                sequence += 1
-
-        history_for_llm = build_history_for_llm(
-            session.id,
-            last_compressed_message_id,
-            user_msg.id,
-            context_summary,
-            code_map_prompt,
-            request_overrides.get("prompt_truncation")
-        )
+            await state.emit(pending_compress_step.to_dict())
+            sequence += 1
 
         step_iter = executor.run(
             user_input=processed_message,
@@ -1602,6 +1635,49 @@ def set_app_config(payload: Dict[str, Any]):
     except Exception as exc:
         print(f"[MCP] Failed to refresh MCP tools: {exc}")
     return updated
+
+
+@app.get("/agent/prompt")
+def get_agent_prompt_route(
+    profile_id: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
+    include_tools: Optional[bool] = Query(None),
+    agent_type: Optional[str] = Query(None)
+):
+    app_config = get_app_config()
+    agent_cfg = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
+    llm_app_config = app_config.get("llm", {}) if isinstance(app_config, dict) else {}
+    global_reasoning_summary = llm_app_config.get("reasoning_summary")
+
+    include = True if include_tools is None else bool(include_tools)
+    if agent_type is not None:
+        include = str(agent_type).lower() != "simple"
+
+    pty_prompt = _build_live_pty_prompt(session_id)
+    system_prompt, tools, resolved_profile_id, _ = build_agent_prompt_and_tools(
+        profile_id,
+        ToolRegistry.get_all(),
+        include_tools=include,
+        extra_context={"pty_sessions": pty_prompt},
+        exclude_ability_ids=["code_map"]
+    )
+    system_prompt = _append_reasoning_summary_prompt(system_prompt, global_reasoning_summary)
+
+    profile_name = None
+    profiles = agent_cfg.get("profiles") if isinstance(agent_cfg, dict) else None
+    if isinstance(profiles, list) and resolved_profile_id:
+        for profile in profiles:
+            if isinstance(profile, dict) and profile.get("id") == resolved_profile_id:
+                profile_name = profile.get("name") or resolved_profile_id
+                break
+
+    return {
+        "prompt": system_prompt,
+        "profile_id": resolved_profile_id,
+        "profile_name": profile_name,
+        "include_tools": include,
+        "tool_names": [tool.name for tool in tools]
+    }
 
 @app.post("/mcp/refresh")
 def refresh_mcp_tools_route():

@@ -1,4 +1,5 @@
 use std::{
+    net::TcpListener,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::Mutex,
@@ -13,6 +14,20 @@ fn greet(name: &str) -> String {
 }
 
 struct BackendChild(Mutex<Option<Child>>);
+struct BackendState {
+    port: u16,
+}
+
+#[tauri::command]
+fn get_backend_base_url(state: tauri::State<BackendState>) -> String {
+    if let Ok(value) = std::env::var("VITE_API_BASE_URL") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    format!("http://127.0.0.1:{}", state.port)
+}
 
 fn log_sandbox_status() {
     #[cfg(target_os = "macos")]
@@ -56,7 +71,21 @@ fn resolve_backend_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<
     ))
 }
 
-fn spawn_backend<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Child, String> {
+fn pick_backend_port() -> Result<u16, String> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|err| format!("Failed to bind to an ephemeral port: {err}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|err| format!("Failed to read ephemeral port: {err}"))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+fn spawn_backend<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    port: u16,
+) -> Result<Child, String> {
     if std::env::var("TAURI_AGENT_EXTERNAL_BACKEND")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -91,7 +120,11 @@ fn spawn_backend<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Child, 
     let backend_path = resolve_backend_path(app)?;
 
     let mut command = Command::new(backend_path);
-    command.arg("--host").arg("127.0.0.1").arg("--port").arg("8000");
+    command
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string());
     command.env("TAURI_AGENT_DATA_DIR", &app_data_dir);
     command.env("TAURI_AGENT_DB_PATH", &db_path);
     command.env("APP_CONFIG_PATH", &app_config_path);
@@ -116,10 +149,19 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![greet, get_backend_base_url])
         .setup(|app| {
             log_sandbox_status();
-            match spawn_backend(&app.handle()) {
+            let mut backend_port = 8000;
+            let external_backend = std::env::var("TAURI_AGENT_EXTERNAL_BACKEND")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !external_backend {
+                if let Ok(selected) = pick_backend_port() {
+                    backend_port = selected;
+                }
+            }
+            match spawn_backend(&app.handle(), backend_port) {
                 Ok(child) => {
                     app.manage(BackendChild(Mutex::new(Some(child))));
                 }
@@ -132,6 +174,7 @@ pub fn run() {
                     }
                 }
             }
+            app.manage(BackendState { port: backend_port });
             Ok(())
         })
         .on_window_event(|window, event| {

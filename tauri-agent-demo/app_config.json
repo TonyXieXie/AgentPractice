@@ -6,8 +6,8 @@
   },
   "agent": {
     "react_max_iterations": 200,
-    "base_system_prompt": "You are a helpful AI assistant.",
-    "subagent_profile": "subagent",
+    "base_system_prompt": "",
+    "subagent_profile": "",
     "mcp": {
       "servers": [
         {
@@ -34,7 +34,14 @@
         "name": "All Tools",
         "type": "tooling",
         "tools": [
-          "*"
+          "rg",
+          "write_file",
+          "list_files",
+          "apply_patch",
+          "spawn_subagent",
+          "run_shell",
+          "search",
+          "read_file"
         ],
         "prompt": ""
       },
@@ -94,6 +101,60 @@
         "tools": [
           "search"
         ]
+      },
+      {
+        "id": "tool-read-file",
+        "name": "Read File",
+        "type": "tooling",
+        "tools": [
+          "read_file"
+        ],
+        "prompt": ""
+      },
+      {
+        "id": "tool-write-file",
+        "name": "Write File",
+        "type": "tooling",
+        "tools": [
+          "write_file"
+        ],
+        "prompt": ""
+      },
+      {
+        "id": "tool-list-files",
+        "name": "List Files",
+        "type": "tooling",
+        "tools": [
+          "list_files"
+        ],
+        "prompt": ""
+      },
+      {
+        "id": "tool-run-shell",
+        "name": "Run Shell",
+        "type": "tooling",
+        "tools": [
+          "run_shell"
+        ],
+        "prompt": ""
+      },
+      {
+        "id": "tool-code-ast",
+        "name": "Code Ast",
+        "type": "tooling",
+        "tools": [
+          "code_ast"
+        ],
+        "prompt": ""
+      },
+      {
+        "id": "tool-spawn-subagent",
+        "name": "Spawn Subagent",
+        "type": "tooling",
+        "tools": [
+          "spawn_subagent"
+        ],
+        "prompt": ""
       }
     ],
     "profiles": [
@@ -101,29 +162,42 @@
         "id": "default",
         "name": "Default",
         "abilities": [
-          "tools_all",
           "rg_search",
           "apply_patch",
           "tool_json",
-          "output_concise"
+          "output_concise",
+          "tool-read-file",
+          "websear",
+          "tool-list-files",
+          "tool-run-shell",
+          "tool-spawn-subagent",
+          "file_references",
+          "pty_status"
         ],
-        "spawnable": false
+        "spawnable": false,
+        "description": "You are a helpful AI assistant."
       },
       {
         "id": "subagent",
         "name": "Subagent-Search",
         "abilities": [
-          "websear"
+          "websear",
+          "output_concise"
         ],
-        "spawnable": true
+        "spawnable": true,
+        "description": "A subagent can websearch."
       },
       {
-        "id": "search",
-        "name": "Search",
+        "id": "subagent-find",
+        "name": "subagent_Find",
+        "description": "A subagent can list/rg/read files",
         "abilities": [
-          "websear"
+          "file_references",
+          "rg_search",
+          "tool-read-file",
+          "tool-list-files"
         ],
-        "spawnable": false
+        "spawnable": true
       }
     ],
     "default_profile": "default",

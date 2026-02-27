@@ -10,7 +10,6 @@ import locale
 import select
 import threading
 import time
-from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional, List, Set
 
@@ -2885,16 +2884,8 @@ class ReadFileTool(Tool):
         if config_max_bytes <= 0:
             raise ValueError("Invalid max_bytes configuration.")
 
-        raw, err = _read_file_bytes(file_path, config_max_bytes)
-        if err:
-            raise ValueError(err)
-        if raw is None:
-            return "No content."
-
-        text = raw.decode(encoding, errors="replace")
-        lines = text.splitlines()
-        if not lines:
-            return "No content."
+        if mode not in ("lines", "smart"):
+            raise ValueError("Invalid mode. Use 'lines' or 'smart'.")
 
         def _count_indent_width(line: str) -> int:
             width = 0
@@ -2911,83 +2902,92 @@ class ReadFileTool(Tool):
             stripped = line.lstrip()
             return stripped.startswith("//") or stripped.startswith("#")
 
-        indent_widths: List[int] = []
-        last_indent = 0
-        for line in lines:
-            if not line.strip():
-                indent = last_indent
-            else:
-                indent = _count_indent_width(line)
-            indent_widths.append(indent)
-            last_indent = indent
+        def _iter_lines():
+            with open(file_path, "r", encoding=encoding, errors="replace") as f:
+                for idx, raw_line in enumerate(f, start=1):
+                    yield idx, raw_line.rstrip("\r\n")
 
-        if mode not in ("lines", "smart"):
-            raise ValueError("Invalid mode. Use 'lines' or 'smart'.")
-
+        selected: List[Tuple[int, str]] = []
         if mode == "lines":
             if start_line <= 0:
                 raise ValueError("start_line must be >= 1.")
             if line_count <= 0:
                 raise ValueError("line_count must be positive.")
-            start_idx = start_line - 1
-            if start_idx >= len(lines):
+            end_line = start_line + line_count - 1
+            for idx, line in _iter_lines():
+                if idx < start_line:
+                    continue
+                if idx > end_line:
+                    break
+                selected.append((idx, line))
+            if not selected:
                 return "No content."
-            end_idx = min(len(lines) - 1, start_idx + line_count - 1)
-            indices = range(start_idx, end_idx + 1)
         else:
             if anchor_line is None or anchor_line <= 0:
                 raise ValueError("anchor_line must be provided for smart mode.")
-            if anchor_line > len(lines):
-                raise ValueError("anchor_line exceeds total lines.")
             if indent_level < 0:
                 indent_level = 0
+
+            lines: List[str] = []
+            indent_widths: List[int] = []
+            last_indent = 0
             anchor_idx = anchor_line - 1
-            anchor_indent = indent_widths[anchor_idx]
-            threshold = anchor_indent - (indent_level * 4)
-            if threshold < 0:
-                threshold = 0
+            anchor_indent = None
+            threshold = None
+            start_idx = None
+            end_idx = None
+            anchor_reached = False
 
-            start_idx = anchor_idx
-            i = anchor_idx - 1
-            while i >= 0:
-                indent = indent_widths[i]
-                line = lines[i]
-                is_comment = _is_comment_line(line)
-                if indent > threshold:
-                    start_idx = i
-                    i -= 1
-                    continue
-                if is_comment:
-                    start_idx = i
-                    i -= 1
-                    continue
-                break
+            for idx, line in _iter_lines():
+                if not line.strip():
+                    indent = last_indent
+                else:
+                    indent = _count_indent_width(line)
+                indent_widths.append(indent)
+                lines.append(line)
+                last_indent = indent
 
-            end_idx = anchor_idx
-            i = anchor_idx + 1
-            while i < len(lines):
-                indent = indent_widths[i]
-                line = lines[i]
-                is_comment = _is_comment_line(line)
-                if indent > threshold:
-                    end_idx = i
-                    i += 1
+                if not anchor_reached and idx == anchor_line:
+                    anchor_reached = True
+                    anchor_indent = indent
+                    threshold = anchor_indent - (indent_level * 4)
+                    if threshold < 0:
+                        threshold = 0
+                    start_idx = anchor_idx
+                    i = anchor_idx - 1
+                    while i >= 0:
+                        prev_indent = indent_widths[i]
+                        prev_line = lines[i]
+                        is_comment = _is_comment_line(prev_line)
+                        if prev_indent > threshold or is_comment:
+                            start_idx = i
+                            i -= 1
+                            continue
+                        break
+                    end_idx = anchor_idx
                     continue
-                if is_comment:
-                    end_idx = i
-                    i += 1
-                    continue
-                break
 
-            indices = range(start_idx, end_idx + 1)
+                if anchor_reached:
+                    is_comment = _is_comment_line(line)
+                    if indent > threshold or is_comment:
+                        end_idx = idx - 1
+                        continue
+                    break
+
+            if not anchor_reached:
+                raise ValueError("anchor_line exceeds total lines.")
+            if start_idx is None or end_idx is None:
+                return "No content."
+
+            for idx in range(start_idx, end_idx + 1):
+                selected.append((idx + 1, lines[idx]))
 
         output_parts: List[str] = []
         total_chars = 0
-        for idx in indices:
-            line = lines[idx]
+        for line_no, line in selected:
             if not line.strip():
                 continue
-            formatted = f"{idx + 1}: {line}"
+            formatted = f"{line_no}: {line}"
             prefix = "\n" if output_parts else ""
             chunk = f"{prefix}{formatted}"
             if total_chars + len(chunk) > max_chars:
@@ -3007,7 +3007,7 @@ class ListFilesTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "list_files"
-        self.description = "List files in a directory using BFS with a tree-like display."
+        self.description = "List files in a directory using a tree-like display (depth-first)."
         self.parameters = [
             ToolParameter(
                 name="path",
@@ -3060,46 +3060,80 @@ class ListFilesTool(Tool):
             raise ValueError(f"Path must be a directory: {root}")
 
         output_lines: List[str] = [f"Absolute path: {root}"]
-        queue = deque([(root, 0)])
         entries = 0
         truncated = False
 
-        while queue and not truncated:
-            current_dir, depth = queue.popleft()
+        def format_prefix(depth: int) -> str:
+            if depth <= 0:
+                return ""
+            return ("|  " * (depth - 1)) + "|-- "
+
+        def list_dir(current_dir: Path, depth: int) -> None:
+            nonlocal entries, truncated
+            if truncated:
+                return
             try:
                 children = list(current_dir.iterdir())
             except Exception as exc:
                 raise ValueError(f"Failed to list directory: {exc}")
 
-            children_sorted = sorted(children, key=lambda p: p.name.lower())
-            for child in children_sorted:
-                if entries >= max_entries:
-                    truncated = True
-                    break
-
+            file_entries = []
+            dir_entries = []
+            for child in children:
                 try:
                     is_symlink = child.is_symlink()
                 except Exception:
                     is_symlink = False
-                try:
-                    is_dir = child.is_dir()
-                except Exception:
-                    is_dir = False
 
                 suffix = ""
-                enqueue = False
+                is_dir = False
                 if is_symlink:
                     suffix = "@"
-                elif is_dir:
-                    suffix = "/"
-                    enqueue = True
+                else:
+                    try:
+                        is_dir = child.is_dir()
+                    except Exception:
+                        is_dir = False
+                    if is_dir:
+                        suffix = "/"
 
-                indent = "  " * depth
-                output_lines.append(f"{indent}{child.name}{suffix}")
+                entry = (child, suffix, is_dir)
+                if is_dir:
+                    dir_entries.append(entry)
+                else:
+                    file_entries.append(entry)
+
+            file_entries.sort(key=lambda e: e[0].name.lower())
+            dir_entries.sort(key=lambda e: e[0].name.lower())
+
+            for child, suffix, _ in file_entries:
+                if entries >= max_entries:
+                    truncated = True
+                    return
+                prefix = format_prefix(depth)
+                output_lines.append(f"{prefix}{child.name}{suffix}")
                 entries += 1
 
-                if enqueue and depth < max_depth:
-                    queue.append((child, depth + 1))
+            if depth == 0 and file_entries and dir_entries:
+                output_lines.append("")
+
+            for idx, (child, suffix, _) in enumerate(dir_entries):
+                if entries >= max_entries:
+                    truncated = True
+                    return
+                prefix = format_prefix(depth)
+                output_lines.append(f"{prefix}{child.name}{suffix}")
+                entries += 1
+
+                if depth < max_depth:
+                    list_dir(child, depth + 1)
+                    if truncated:
+                        return
+
+                if depth == 0 and idx < len(dir_entries) - 1:
+                    output_lines.append("")
+
+        list_dir(root, 0)
 
         if truncated:
             output_lines.append(f"More than {max_entries} entries found")

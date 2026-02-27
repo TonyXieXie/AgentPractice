@@ -76,6 +76,7 @@ const MAX_CONCURRENT_STREAMS = 10;
 const WORK_PATH_MAX_LENGTH = 200;
 const MAIN_WINDOW_BOUNDS_KEY = 'mainWindowBounds';
 const WORKDIR_BOUNDS_KEY = 'workdirWindowBounds';
+const SIDEBAR_OPEN_KEY = 'sessionSidebarOpen';
 const MAIN_DEFAULT_WIDTH = 1200;
 const MAIN_DEFAULT_HEIGHT = 950;
 const WORKDIR_DEFAULT_WIDTH = 1200;
@@ -322,16 +323,56 @@ const parseFileLocation = (rawValue: string) => {
   return { path: '' };
 };
 
-const SKILL_TRIGGER_PATTERN = /(^|\s)\\([A-Za-z0-9_-]*)$/;
+const COMMAND_TRIGGER_PATTERN = /(^|\s)\/([A-Za-z0-9_-]*)$/;
 
-const findSkillTrigger = (value: string, cursor: number | null) => {
+const findCommandTrigger = (value: string, cursor: number | null) => {
   if (cursor == null || cursor < 0) return null;
   const slice = value.slice(0, cursor);
-  const match = slice.match(SKILL_TRIGGER_PATTERN);
+  const match = slice.match(COMMAND_TRIGGER_PATTERN);
   if (!match || match.index == null) return null;
   const start = match.index + match[1].length;
   return { start, end: cursor, query: match[2] || '' };
 };
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const buildSkillCommandPattern = (items: SkillSummary[]) => {
+  if (!items.length) return null;
+  const names = items.map((item) => item.name).filter(Boolean);
+  if (!names.length) return null;
+  const alternation = names.map(escapeRegExp).sort((a, b) => b.length - a.length).join('|');
+  if (!alternation) return null;
+  return new RegExp(`(^|\\s)[\\\\/$](${alternation})(?=\\s|$)`, 'gi');
+};
+
+const buildSkillInvocationPattern = (items: SkillSummary[]) => {
+  if (!items.length) return null;
+  const names = items.map((item) => item.name).filter(Boolean);
+  if (!names.length) return null;
+  const alternation = names.map(escapeRegExp).sort((a, b) => b.length - a.length).join('|');
+  if (!alternation) return null;
+  return new RegExp(`(^|\\s)([\\\\/$])(${alternation})(?=\\s|$)`, 'i');
+};
+
+const findSkillInvocation = (value: string, pattern: RegExp | null) => {
+  if (!value || !pattern) return null;
+  const match = pattern.exec(value);
+  if (!match || match.index == null) return null;
+  const leading = match[1] || '';
+  const prefix = match[2] || '';
+  const name = match[3] || '';
+  const start = match.index + leading.length;
+  const end = start + prefix.length + name.length;
+  return { name, start, end };
+};
+
+const stripExistingSkillCommands = (value: string, pattern: RegExp | null) => {
+  if (!value || !pattern) return value;
+  return value
+    .replace(pattern, (match, leading) => (leading ? String(leading) : ''))
+    .replace(/[ \t]{2,}/g, ' ');
+};
+
 
 const joinPath = (base: string, child: string) => {
   if (!base) return child;
@@ -666,14 +707,23 @@ type PendingContextEstimate = {
   payload: Record<string, any>;
 };
 
+type CommandItem = {
+  kind: 'skill';
+  id: string;
+  label: string;
+  description?: string;
+  insertText: string;
+};
+
 function App() {
   const [inputMsg, setInputMsg] = useState('');
   const [skills, setSkills] = useState<SkillSummary[]>([]);
-  const [skillSuggestions, setSkillSuggestions] = useState<SkillSummary[]>([]);
-  const [showSkillSuggestions, setShowSkillSuggestions] = useState(false);
-  const [skillActiveIndex, setSkillActiveIndex] = useState(0);
-  const skillTriggerRef = useRef<{ start: number; end: number; query: string } | null>(null);
-  const skillQueryRef = useRef('');
+  const [activeSkill, setActiveSkill] = useState<SkillSummary | null>(null);
+  const [commandSuggestions, setCommandSuggestions] = useState<CommandItem[]>([]);
+  const [showCommandSuggestions, setShowCommandSuggestions] = useState(false);
+  const [commandActiveIndex, setCommandActiveIndex] = useState(0);
+  const commandTriggerRef = useRef<{ start: number; end: number; query: string } | null>(null);
+  const commandQueryRef = useRef('');
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [dragActive, setDragActive] = useState(false);
   const [imagePreview, setImagePreview] = useState<{ src: string; name?: string } | null>(null);
@@ -684,7 +734,17 @@ function App() {
   const [currentWorkPath, setCurrentWorkPath] = useState('');
   const [showConfigManager, setShowConfigManager] = useState(false);
   const [sessionRefreshTrigger, setSessionRefreshTrigger] = useState(0);
-  const [showSidebar] = useState(true);
+  const [showSidebar, setShowSidebar] = useState(() => {
+    try {
+      const raw = localStorage.getItem(SIDEBAR_OPEN_KEY);
+      if (raw !== null) {
+        return raw === '1' || raw.toLowerCase() === 'true';
+      }
+    } catch {
+      // ignore
+    }
+    return true;
+  });
   const [allConfigs, setAllConfigs] = useState<LLMConfig[]>([]);
   const [showConfigSelector, setShowConfigSelector] = useState(false);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
@@ -704,6 +764,29 @@ function App() {
   const [agentMode, setAgentMode] = useState<AgentMode>('default');
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null);
   const [currentAgentProfileId, setCurrentAgentProfileId] = useState<string | null>(null);
+
+  const commandItems = useMemo<CommandItem[]>(
+    () =>
+      skills.map((skill) => ({
+        kind: 'skill',
+        id: skill.name,
+        label: skill.name,
+        description: skill.description,
+        insertText: `$${skill.name}`,
+      })),
+    [skills]
+  );
+  const skillCommandPattern = useMemo(() => buildSkillCommandPattern(skills), [skills]);
+  const skillInvocationPattern = useMemo(() => buildSkillInvocationPattern(skills), [skills]);
+  const skillLookup = useMemo(() => {
+    const map = new Map<string, SkillSummary>();
+    skills.forEach((skill) => {
+      if (skill?.name) {
+        map.set(skill.name.toLowerCase(), skill);
+      }
+    });
+    return map;
+  }, [skills]);
 
   const astEnabled = agentConfig?.ast_enabled ?? true;
   const [showProfileSelector, setShowProfileSelector] = useState(false);
@@ -760,6 +843,18 @@ function App() {
   const astNotifyRef = useRef<{ timer: number | null; paths: Set<string> }>({ timer: null, paths: new Set() });
   const appWindow = useMemo(() => getCurrentWindow(), []);
   const wsSessionRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_OPEN_KEY, showSidebar ? '1' : '0');
+    } catch {
+      // ignore
+    }
+  }, [showSidebar]);
+
+  const toggleSidebar = useCallback(() => {
+    setShowSidebar((prev) => !prev);
+  }, []);
 
   const adjustWindowWidth = useCallback(async (delta: number) => {
     if (!delta) return;
@@ -1557,53 +1652,128 @@ function App() {
     }
   };
 
-  const closeSkillSuggestions = useCallback(() => {
-    setShowSkillSuggestions(false);
-    setSkillSuggestions([]);
-    setSkillActiveIndex(0);
-    skillTriggerRef.current = null;
-    skillQueryRef.current = '';
+  const closeCommandSuggestions = useCallback(() => {
+    setShowCommandSuggestions(false);
+    setCommandSuggestions([]);
+    setCommandActiveIndex(0);
+    commandTriggerRef.current = null;
+    commandQueryRef.current = '';
   }, []);
 
-  const updateSkillSuggestions = useCallback((value: string, cursor: number | null) => {
-    if (!skills.length) {
-      closeSkillSuggestions();
-      return;
-    }
-    const trigger = findSkillTrigger(value, cursor);
+  const updateCommandSuggestions = useCallback((value: string, cursor: number | null) => {
+    const trigger = findCommandTrigger(value, cursor);
     if (!trigger) {
-      closeSkillSuggestions();
+      closeCommandSuggestions();
       return;
     }
     const query = trigger.query.toLowerCase();
-    const matches = skills.filter((skill) => skill.name.toLowerCase().startsWith(query));
-    skillTriggerRef.current = trigger;
-    if (!matches.length) {
-      setShowSkillSuggestions(false);
-      setSkillSuggestions([]);
-      skillQueryRef.current = query;
+    commandTriggerRef.current = trigger;
+
+    if (!commandItems.length) {
+      commandQueryRef.current = query;
+      setCommandSuggestions([]);
+      setShowCommandSuggestions(true);
+      setCommandActiveIndex(0);
       return;
     }
-    const queryChanged = skillQueryRef.current !== query;
-    skillQueryRef.current = query;
-    setSkillSuggestions(matches);
-    setShowSkillSuggestions(true);
-    setSkillActiveIndex((prev) => {
+
+    const matches = commandItems.filter((item) => {
+      if (!query) return true;
+      const label = item.label.toLowerCase();
+      const desc = item.description?.toLowerCase() || '';
+      return label.includes(query) || desc.includes(query);
+    });
+    const queryChanged = commandQueryRef.current !== query;
+    commandQueryRef.current = query;
+    setCommandSuggestions(matches);
+    setShowCommandSuggestions(true);
+    setCommandActiveIndex((prev) => {
       if (queryChanged) return 0;
       return prev >= matches.length ? 0 : prev;
     });
-  }, [skills, closeSkillSuggestions]);
+  }, [commandItems, closeCommandSuggestions]);
 
-  const applySkillSuggestion = useCallback((skillName: string) => {
-    const trigger = skillTriggerRef.current;
+  const applyInputValue = useCallback(
+    (rawValue: string, cursor: number | null, options?: { normalizeSkill?: boolean }) => {
+      let nextValue = rawValue;
+      let nextCursor = cursor;
+      let matchedSkill: SkillSummary | null = null;
+      let changed = false;
+      const shouldNormalize = options?.normalizeSkill !== false;
+
+      if (shouldNormalize && skillInvocationPattern && skillCommandPattern) {
+        const match = findSkillInvocation(rawValue, skillInvocationPattern);
+        if (match) {
+          matchedSkill = skillLookup.get(match.name.toLowerCase()) ?? null;
+          nextValue = stripExistingSkillCommands(rawValue, skillCommandPattern).replace(/^\s+/, '');
+          if (cursor != null) {
+            const before = rawValue.slice(0, cursor);
+            const nextBefore = stripExistingSkillCommands(before, skillCommandPattern);
+            nextCursor = nextBefore.length;
+          }
+          changed = nextValue !== rawValue;
+        }
+      }
+
+      if (matchedSkill) {
+        setActiveSkill(matchedSkill);
+      }
+      setInputMsg(nextValue);
+      autoScrollRef.current = true;
+      updateCommandSuggestions(nextValue, nextCursor);
+
+      if (changed) {
+        requestAnimationFrame(() => {
+          const input = inputRef.current;
+          if (!input) return;
+          const caret = nextCursor ?? nextValue.length;
+          input.setSelectionRange(caret, caret);
+        });
+      }
+    },
+    [skillInvocationPattern, skillCommandPattern, skillLookup, updateCommandSuggestions]
+  );
+
+  useEffect(() => {
+    if (!inputMsg || !skillInvocationPattern) return;
+    const match = findSkillInvocation(inputMsg, skillInvocationPattern);
+    if (!match) return;
+    applyInputValue(inputMsg, inputRef.current?.selectionStart ?? null);
+  }, [applyInputValue, inputMsg, skillInvocationPattern]);
+
+  const applyCommandSuggestion = useCallback((command: CommandItem) => {
+    const trigger = commandTriggerRef.current;
     const currentValue = inputRef.current?.value ?? inputMsg;
     if (!trigger) return;
-    const before = currentValue.slice(0, trigger.start);
-    const after = currentValue.slice(trigger.end);
-    const insertion = `\\${skillName} `;
+    const beforeRaw = currentValue.slice(0, trigger.start);
+    const afterRaw = currentValue.slice(trigger.end);
+
+    if (command.kind === 'skill') {
+      const withoutTrigger = `${beforeRaw}${afterRaw}`;
+      const nextValue = stripExistingSkillCommands(withoutTrigger, skillCommandPattern).replace(/^\s+/, '');
+      const skill = skillLookup.get(command.id.toLowerCase()) ?? null;
+      if (skill) {
+        setActiveSkill(skill);
+      }
+      setInputMsg(nextValue);
+      closeCommandSuggestions();
+      requestAnimationFrame(() => {
+        const input = inputRef.current;
+        if (!input) return;
+        const before = withoutTrigger.slice(0, trigger.start);
+        const caret = stripExistingSkillCommands(before, skillCommandPattern).length;
+        input.focus();
+        input.setSelectionRange(caret, caret);
+      });
+      return;
+    }
+
+    const before = stripExistingSkillCommands(beforeRaw, skillCommandPattern);
+    const after = stripExistingSkillCommands(afterRaw, skillCommandPattern);
+    const insertion = `${command.insertText} `;
     const nextValue = `${before}${insertion}${after}`;
     setInputMsg(nextValue);
-    closeSkillSuggestions();
+    closeCommandSuggestions();
     requestAnimationFrame(() => {
       const input = inputRef.current;
       if (!input) return;
@@ -1611,7 +1781,20 @@ function App() {
       input.focus();
       input.setSelectionRange(caret, caret);
     });
-  }, [inputMsg, closeSkillSuggestions]);
+  }, [inputMsg, closeCommandSuggestions, skillCommandPattern, skillLookup]);
+
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    if (document.activeElement !== input) return;
+    const value = input.value ?? '';
+    if (!value) {
+      closeCommandSuggestions();
+      return;
+    }
+    const cursor = Number.isFinite(input.selectionStart) ? input.selectionStart : value.length;
+    updateCommandSuggestions(value, cursor);
+  }, [commandItems, closeCommandSuggestions, updateCommandSuggestions]);
 
   const getSessionKey = (sessionId: string | null) => sessionId ?? DRAFT_SESSION_KEY;
 
@@ -2916,13 +3099,22 @@ function App() {
       alert('子agent会话为只读，无法发送消息。');
       return;
     }
-    const userMessage = inputMsg.trim();
+    const baseMessage = inputMsg.trim();
     const hasAttachments = pendingAttachments.length > 0;
+    const alreadyHasSkill = skillInvocationPattern
+      ? Boolean(findSkillInvocation(baseMessage, skillInvocationPattern))
+      : false;
+    let userMessage = baseMessage;
+    if (activeSkill && !alreadyHasSkill) {
+      const token = `$${activeSkill.name}`;
+      userMessage = baseMessage ? `${token} ${baseMessage}` : token;
+    }
     if (!userMessage && !hasAttachments) return;
     const attachments = hasAttachments ? [...pendingAttachments] : [];
     setInputMsg('');
     setPendingAttachments([]);
-    closeSkillSuggestions();
+    setActiveSkill(null);
+    closeCommandSuggestions();
     await enqueueMessage(userMessage, currentSessionIdRef.current, attachments);
   };
 
@@ -3272,10 +3464,12 @@ function App() {
         });
       });
       if (options?.keepInput) {
-        setInputMsg(result.input_message || '');
+        const restored = result.input_message || '';
+        applyInputValue(restored, restored.length);
         inputRef.current?.focus();
       } else {
         setInputMsg('');
+        setActiveSkill(null);
       }
       setSessionRefreshTrigger((prev) => prev + 1);
       await refreshSessionDebug(currentSessionId);
@@ -3325,10 +3519,15 @@ function App() {
     () => Boolean(inFlightBySessionRef.current[currentSessionKey]),
     [currentSessionKey, inFlightTick]
   );
+  const displayMessages = useMemo(
+    () => messages.filter((msg) => !(msg as any)?.metadata?.skill_prompt),
+    [messages]
+  );
+
   const renderMessages = useMemo(() => {
-    if (!isStreamingCurrent) return messages;
+    if (!isStreamingCurrent) return displayMessages;
     return [
-      ...messages,
+      ...displayMessages,
       {
         id: -1,
         session_id: currentSessionId || '',
@@ -3338,7 +3537,7 @@ function App() {
         metadata: { streaming_placeholder: true }
       } as Message
     ];
-  }, [messages, isStreamingCurrent, currentSessionId]);
+  }, [displayMessages, isStreamingCurrent, currentSessionId]);
 
   const offsets = useMemo(() => {
     const list = renderMessages;
@@ -3719,6 +3918,19 @@ function App() {
         </div>
       </div>
       <div className="app-body">
+      {!showSidebar && (
+        <button
+          type="button"
+          className="sidebar-float-toggle"
+          onClick={toggleSidebar}
+          aria-label="展开侧边栏"
+          title="展开侧边栏"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+        </button>
+      )}
       <div className="app-container">
       {showSidebar && (
         <SessionList
@@ -3727,6 +3939,7 @@ function App() {
           onNewChat={handleNewChat}
           onOpenConfig={() => setShowConfigManager(true)}
           onToggleDebug={toggleDebugPanel}
+          onToggleSidebar={toggleSidebar}
           debugActive={showDebugPanel}
           refreshTrigger={sessionRefreshTrigger}
           inFlightBySession={inFlightBySession}
@@ -3956,31 +4169,65 @@ function App() {
               <div className="input-readonly-hint">子agent会话仅供查看</div>
             )}
 
-            {showSkillSuggestions && skillSuggestions.length > 0 && (
-              <div className="skill-suggestions">
-                {skillSuggestions.map((skill, index) => (
+            {showCommandSuggestions && (
+              <div className="command-suggestions">
+                <div className="command-suggestions-header">Skills</div>
+                {commandSuggestions.length > 0 ? (
+                  commandSuggestions.map((command, index) => (
+                    <button
+                      key={`${command.kind}:${command.id}`}
+                      type="button"
+                      className={`command-suggestion${index === commandActiveIndex ? ' active' : ''}`}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        applyCommandSuggestion(command);
+                      }}
+                    >
+                      <div className="command-name">{command.label}</div>
+                      {command.description && <div className="command-desc">{command.description}</div>}
+                    </button>
+                  ))
+                ) : (
+                  <div className="command-empty">
+                    {commandItems.length === 0
+                      ? 'No skills available'
+                      : commandQueryRef.current
+                        ? 'No matching skills'
+                        : 'No skills available'}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {activeSkill && (
+              <div className="input-skill-bar">
+                <div className="input-skill-chip" title={activeSkill.description || activeSkill.name}>
+                  <span className="input-skill-icon">{'\u2737'}</span>
+                  <span className="input-skill-label">{`${activeSkill.name} Skill`}</span>
                   <button
-                    key={skill.name}
                     type="button"
-                    className={`skill-suggestion${index === skillActiveIndex ? ' active' : ''}`}
-                    onMouseDown={(event) => {
-                      event.preventDefault();
-                      applySkillSuggestion(skill.name);
-                    }}
+                    className="input-skill-clear"
+                    onClick={() => setActiveSkill(null)}
+                    aria-label="Remove skill"
+                    title="Remove skill"
                   >
-                    <div className="skill-name">{skill.name}</div>
-                    {skill.description && <div className="skill-desc">{skill.description}</div>}
+                    ×
                   </button>
-                ))}
+                </div>
               </div>
             )}
 
             <textarea
               onChange={(e) => {
                 const value = e.currentTarget.value;
-                setInputMsg(value);
-                autoScrollRef.current = true;
-                updateSkillSuggestions(value, e.currentTarget.selectionStart);
+                const cursor = e.currentTarget.selectionStart;
+                if (composingRef.current) {
+                  setInputMsg(value);
+                  autoScrollRef.current = true;
+                  updateCommandSuggestions(value, cursor);
+                  return;
+                }
+                applyInputValue(value, cursor);
               }}
               onPaste={handlePaste}
               onCompositionStart={() => {
@@ -3988,43 +4235,48 @@ function App() {
               }}
               onCompositionEnd={() => {
                 composingRef.current = false;
+                const input = inputRef.current;
+                if (!input) return;
+                applyInputValue(input.value, input.selectionStart);
               }}
               onClick={(e) => {
-                updateSkillSuggestions(e.currentTarget.value, e.currentTarget.selectionStart);
+                updateCommandSuggestions(e.currentTarget.value, e.currentTarget.selectionStart);
               }}
               onKeyUp={(e) => {
-                if (showSkillSuggestions && ['ArrowUp', 'ArrowDown', 'Enter', 'Tab', 'Escape'].includes(e.key)) {
+                if (showCommandSuggestions && ['ArrowUp', 'ArrowDown', 'Enter', 'Tab', 'Escape'].includes(e.key)) {
                   return;
                 }
-                updateSkillSuggestions(e.currentTarget.value, e.currentTarget.selectionStart);
+                updateCommandSuggestions(e.currentTarget.value, e.currentTarget.selectionStart);
               }}
               onBlur={() => {
-                closeSkillSuggestions();
+                closeCommandSuggestions();
               }}
               onKeyDown={(e) => {
-                if (showSkillSuggestions && skillSuggestions.length > 0) {
-                  if (e.key === 'ArrowDown') {
-                    e.preventDefault();
-                    setSkillActiveIndex((prev) => (prev + 1) % skillSuggestions.length);
-                    return;
-                  }
-                  if (e.key === 'ArrowUp') {
-                    e.preventDefault();
-                    setSkillActiveIndex((prev) => (prev - 1 + skillSuggestions.length) % skillSuggestions.length);
-                    return;
-                  }
-                  if (e.key === 'Enter' || e.key === 'Tab') {
-                    e.preventDefault();
-                    const target = skillSuggestions[skillActiveIndex];
-                    if (target) {
-                      applySkillSuggestion(target.name);
-                    }
-                    return;
-                  }
+                if (showCommandSuggestions) {
                   if (e.key === 'Escape') {
                     e.preventDefault();
-                    closeSkillSuggestions();
+                    closeCommandSuggestions();
                     return;
+                  }
+                  if (commandSuggestions.length > 0) {
+                    if (e.key === 'ArrowDown') {
+                      e.preventDefault();
+                      setCommandActiveIndex((prev) => (prev + 1) % commandSuggestions.length);
+                      return;
+                    }
+                    if (e.key === 'ArrowUp') {
+                      e.preventDefault();
+                      setCommandActiveIndex((prev) => (prev - 1 + commandSuggestions.length) % commandSuggestions.length);
+                      return;
+                    }
+                    if (e.key === 'Enter' || e.key === 'Tab') {
+                      e.preventDefault();
+                      const target = commandSuggestions[commandActiveIndex];
+                      if (target) {
+                        applyCommandSuggestion(target);
+                      }
+                      return;
+                    }
                   }
                 }
                 if (e.key === 'Enter' && !e.shiftKey) {
@@ -4419,6 +4671,7 @@ function App() {
             loadAllConfigs();
             loadAgentConfig();
           }}
+          currentSessionId={currentSessionId}
         />
       )}
 

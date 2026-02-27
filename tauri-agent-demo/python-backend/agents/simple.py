@@ -85,13 +85,28 @@ class SimpleAgent(AgentStrategy):
         user_content = None
         if request_overrides and request_overrides.get("user_content") is not None:
             user_content = request_overrides.get("user_content")
+        pre_history: List[Dict[str, Any]] = []
+        post_history: List[Dict[str, Any]] = []
+        for msg in history or []:
+            if isinstance(msg, dict) and msg.get("_after_user"):
+                cleaned = {k: v for k, v in msg.items() if k != "_after_user"}
+                post_history.append(cleaned)
+            else:
+                pre_history.append(msg)
+
         messages = message_processor.build_messages_for_llm(
             user_message=user_content if user_content is not None else user_input,
-            history=history,
+            history=pre_history,
             system_prompt=self.system_prompt,
             max_history=self.max_history,
             system_role=system_role
         )
+        if post_history:
+            messages.extend(post_history)
+        if request_overrides and isinstance(request_overrides.get("_post_user_messages"), list):
+            for item in request_overrides.get("_post_user_messages") or []:
+                if isinstance(item, dict) and item.get("role") and item.get("content") is not None:
+                    messages.append({"role": item.get("role"), "content": item.get("content")})
 
         try:
             llm_overrides = dict(request_overrides) if request_overrides else {}

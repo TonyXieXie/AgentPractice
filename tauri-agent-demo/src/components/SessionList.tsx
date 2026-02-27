@@ -10,6 +10,7 @@ interface SessionListProps {
     onNewChat: () => void;
     onOpenConfig: () => void;
     onToggleDebug: () => void;
+    onToggleSidebar?: () => void;
     debugActive: boolean;
     refreshTrigger?: number;
     inFlightBySession?: Record<string, boolean>;
@@ -23,6 +24,7 @@ export default function SessionList({
     onNewChat,
     onOpenConfig,
     onToggleDebug,
+    onToggleSidebar,
     debugActive,
     refreshTrigger,
     inFlightBySession,
@@ -274,6 +276,27 @@ export default function SessionList({
                     </svg>
                 </button>
                 <div className="session-header-actions">
+                    {onToggleSidebar && (
+                        <button
+                            className="header-btn"
+                            onClick={onToggleSidebar}
+                            title="收起侧边栏"
+                            aria-label="收起侧边栏"
+                        >
+                            <svg
+                                className="header-icon"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                aria-hidden="true"
+                            >
+                                <path d="M15 18l-6-6 6-6" />
+                            </svg>
+                        </button>
+                    )}
                     <button
                         className="header-btn"
                         onClick={onOpenConfig}

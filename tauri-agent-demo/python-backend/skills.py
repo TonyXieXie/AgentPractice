@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import re
+import threading
 
 
 @dataclass
@@ -16,7 +17,10 @@ class Skill:
     enabled: bool = True
 
 
-_INVOCATION_PATTERN = re.compile(r"(^|\s)\\([A-Za-z0-9_-]+)")
+_INVOCATION_PATTERN = re.compile(r"(^|\s)[\\/$]([A-Za-z0-9_-]+)")
+_SKILL_CACHE: Optional[List["Skill"]] = None
+_SKILL_INIT_LOCK = threading.Lock()
+_SKILL_INIT_EVENT = threading.Event()
 
 
 def _get_project_root() -> Path:
@@ -127,7 +131,7 @@ def dedupe_skills(skills: List[Skill]) -> List[Skill]:
     return list(deduped.values())
 
 
-def discover_skills() -> List[Skill]:
+def _scan_skills() -> List[Skill]:
     root = _get_project_root()
     discovered: List[Skill] = []
     discovered.extend(_discover_in_dir(root / "Skill", "Skill"))
@@ -135,12 +139,43 @@ def discover_skills() -> List[Skill]:
     return dedupe_skills(discovered)
 
 
+def initialize_skill_cache() -> List[Skill]:
+    global _SKILL_CACHE
+    with _SKILL_INIT_LOCK:
+        _SKILL_CACHE = _scan_skills()
+        _SKILL_INIT_EVENT.set()
+        return _SKILL_CACHE
+
+
+def set_empty_skill_cache() -> None:
+    global _SKILL_CACHE
+    with _SKILL_INIT_LOCK:
+        if _SKILL_CACHE is None:
+            _SKILL_CACHE = []
+        _SKILL_INIT_EVENT.set()
+
+
+def ensure_skill_cache(timeout: float = 0.0) -> bool:
+    if _SKILL_CACHE is not None:
+        return True
+    if timeout and not _SKILL_INIT_EVENT.is_set():
+        _SKILL_INIT_EVENT.wait(timeout)
+    return _SKILL_CACHE is not None
+
+
+def discover_skills(wait_timeout: float = 0.0) -> List[Skill]:
+    ensure_skill_cache(wait_timeout)
+    if _SKILL_CACHE is None:
+        return []
+    return list(_SKILL_CACHE)
+
+
 def get_enabled_skills() -> List[Skill]:
-    return [skill for skill in discover_skills() if skill.enabled]
+    return [skill for skill in discover_skills(wait_timeout=2.0) if skill.enabled]
 
 
 def list_skills(enabled_only: bool = True) -> List[Dict[str, Any]]:
-    skills = discover_skills()
+    skills = discover_skills(wait_timeout=2.0)
     if enabled_only:
         skills = [skill for skill in skills if skill.enabled]
     skills.sort(key=lambda item: item.name.lower())
@@ -167,7 +202,7 @@ def get_skill_by_name(name: str, enabled_only: bool = True) -> Optional[Skill]:
     return None
 
 
-def extract_skill_invocations(text: str) -> List[str]:
+def extract_skill_invocations(text: str, max_count: Optional[int] = None) -> List[str]:
     if not text:
         return []
     matches = _INVOCATION_PATTERN.finditer(text)
@@ -180,29 +215,26 @@ def extract_skill_invocations(text: str) -> List[str]:
             continue
         seen.add(key)
         ordered.append(name)
+        if max_count is not None and len(ordered) >= max_count:
+            break
     return ordered
 
 
 def build_skill_prompt_sections(enabled_skills: List[Skill], invoked_skills: List[Skill]) -> str:
-    sections: List[str] = []
-    if enabled_skills:
-        skill_lines = ["## Skills"]
-        for skill in sorted(enabled_skills, key=lambda item: item.name.lower()):
-            desc = skill.description.strip()
-            if desc:
-                skill_lines.append(f"- {skill.name}: {desc}")
-            else:
-                skill_lines.append(f"- {skill.name}")
-        sections.append("\n".join(skill_lines))
+    if not invoked_skills:
+        return ""
 
-    if invoked_skills:
-        active_blocks: List[str] = []
-        for skill in invoked_skills:
-            content = skill.content.strip()
-            if content:
-                active_blocks.append(f"### {skill.name}\n{content}")
-            else:
-                active_blocks.append(f"### {skill.name}")
-        sections.append("## Active Skills\n" + "\n\n".join(active_blocks))
+    blocks: List[str] = []
+    for skill in invoked_skills:
+        content = skill.content.strip()
+        lines = [
+            "<skill>",
+            f"<name>{skill.name}</name>",
+            f"<path>{skill.path}</path>",
+        ]
+        if content:
+            lines.append(content)
+        lines.append("</skill>")
+        blocks.append("\n".join(lines))
 
-    return "\n\n".join([section for section in sections if section]).strip()
+    return "\n\n".join(blocks).strip()

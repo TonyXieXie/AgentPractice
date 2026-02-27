@@ -1,10 +1,12 @@
 import asyncio
+import asyncio
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from ..base import Tool, ToolParameter
 from ..context import get_tool_context
-from subagent_runner import prepare_subagent_session, execute_subagent_context
+from app_config import get_app_config
+from subagent_runner import prepare_subagent_session, execute_subagent_context, list_spawnable_profiles
 
 
 _PENDING_TASKS = set()
@@ -23,11 +25,44 @@ def _parse_json_input(input_data: str) -> Dict[str, Any]:
         return {}
 
 
+def _format_spawnable_profiles(profiles: List[Dict[str, Any]]) -> str:
+    if not profiles:
+        return "- (none configured)"
+    lines: List[str] = []
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        profile_id = str(profile.get("id") or "").strip()
+        if not profile_id:
+            continue
+        name = str(profile.get("name") or "").strip()
+        description = str(profile.get("description") or "").strip()
+        label = f"{profile_id} ({name})" if name and name != profile_id else profile_id
+        if description:
+            lines.append(f"- {label}: {description}")
+        else:
+            lines.append(f"- {label}: (no description)")
+    return "\n".join(lines) if lines else "- (none configured)"
+
+
+def _build_subagent_description() -> str:
+    base = (
+        "Spawn a subagent to run a small task. Returns immediately with a child session id. "
+        "Use profile_id to select a spawnable profile; if multiple profiles are spawnable and profile_id is omitted, "
+        "the call will fail."
+    )
+    app_config = get_app_config()
+    agent_cfg = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
+    spawnable_profiles = list_spawnable_profiles(agent_cfg)
+    profile_lines = _format_spawnable_profiles(spawnable_profiles)
+    return f"{base}\nSpawnable profiles:\n{profile_lines}"
+
+
 class SpawnSubagentTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "spawn_subagent"
-        self.description = "Spawn a subagent to run a small task. Returns immediately with a child session id."
+        self.description = _build_subagent_description()
         self.parameters = [
             ToolParameter(
                 name="task",
@@ -40,8 +75,17 @@ class SpawnSubagentTool(Tool):
                 type="string",
                 description="Optional title for the subagent session",
                 required=False
+            ),
+            ToolParameter(
+                name="profile_id",
+                type="string",
+                description="Optional spawnable profile id to use for the subagent",
+                required=False
             )
         ]
+
+    def refresh_metadata(self) -> None:
+        self.description = _build_subagent_description()
 
     async def execute(self, input_data: str) -> str:
         try:
@@ -50,6 +94,9 @@ class SpawnSubagentTool(Tool):
             if not task:
                 task = input_data
             title = data.get("title") if isinstance(data, dict) else None
+            profile_id = None
+            if isinstance(data, dict):
+                profile_id = data.get("profile_id") or data.get("profile") or data.get("agent_profile")
 
             tool_ctx = get_tool_context()
             parent_session_id = tool_ctx.get("session_id")
@@ -62,7 +109,8 @@ class SpawnSubagentTool(Tool):
             context = prepare_subagent_session(
                 task=str(task),
                 parent_session_id=str(parent_session_id),
-                title=title if isinstance(title, str) else None
+                title=title if isinstance(title, str) else None,
+                profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None
             )
 
             async def _run_subagent():

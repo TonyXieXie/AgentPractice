@@ -18,7 +18,24 @@ echo ========================================
 echo   Backend Server (FastAPI)
 echo ========================================
 echo.
-echo Starting FastAPI server on port 8000 (auto-reload)...
+set "BACKEND_PORT=8000"
+set "PORT_IN_USE="
+:CHECK_PORT
+for /f "tokens=1" %%A in ('netstat -ano ^| findstr /R /C:":%BACKEND_PORT% .*LISTENING"') do set "PORT_IN_USE=1"
+if defined PORT_IN_USE (
+  set "PORT_IN_USE="
+  set /a BACKEND_PORT+=1
+  if !BACKEND_PORT! GTR 8100 (
+    echo [Error] No free port found in range 8000-8100.
+    pause
+    exit /b 1
+  )
+  goto CHECK_PORT
+)
+set "PORT_FILE=%~dp0backend_port.txt"
+> "%PORT_FILE%" echo %BACKEND_PORT%
+echo [Info] Backend port: %BACKEND_PORT% (saved to %PORT_FILE%)
+echo Starting FastAPI server on port %BACKEND_PORT% (auto-reload)...
 echo Press Ctrl+C to stop the server
 echo.
 echo ========================================
@@ -36,7 +53,7 @@ if not exist "%PY%" (
   "!SYS_PY!" -m venv "%~dp0python-backend\venv"
   "%~dp0python-backend\venv\Scripts\python.exe" -m pip install -r "%~dp0python-backend\requirements.txt"
 )
-"%PY%" -m uvicorn main:app --reload --port 8000 --no-use-colors
+"%PY%" -m uvicorn main:app --reload --port %BACKEND_PORT% --no-use-colors
 pause
 goto :eof
 
