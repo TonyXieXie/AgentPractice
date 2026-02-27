@@ -6,7 +6,12 @@ from typing import Any, Dict, Optional, List
 from ..base import Tool, ToolParameter
 from ..context import get_tool_context
 from app_config import get_app_config
-from subagent_runner import prepare_subagent_session, execute_subagent_context, list_spawnable_profiles
+from subagent_runner import (
+    prepare_subagent_session,
+    execute_subagent_context,
+    list_spawnable_profiles,
+    run_subagent_task
+)
 
 
 _PENDING_TASKS = set()
@@ -23,6 +28,20 @@ def _parse_json_input(input_data: str) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "y", "on"):
+            return True
+        if text in ("false", "0", "no", "n", "off"):
+            return False
+    return False
 
 
 def _format_spawnable_profiles(profiles: List[Dict[str, Any]]) -> str:
@@ -49,7 +68,7 @@ def _build_subagent_description() -> str:
     base = (
         "Spawn a subagent to run a small task. Returns immediately with a child session id. "
         "Use profile_id to select a spawnable profile; if multiple profiles are spawnable and profile_id is omitted, "
-        "the call will fail."
+        "the call will fail. Set wait=true to block until the subagent finishes."
     )
     app_config = get_app_config()
     agent_cfg = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
@@ -81,6 +100,12 @@ class SpawnSubagentTool(Tool):
                 type="string",
                 description="Optional spawnable profile id to use for the subagent",
                 required=False
+            ),
+            ToolParameter(
+                name="wait",
+                type="boolean",
+                description="Wait for the subagent to complete and return its result",
+                required=False
             )
         ]
 
@@ -95,8 +120,10 @@ class SpawnSubagentTool(Tool):
                 task = input_data
             title = data.get("title") if isinstance(data, dict) else None
             profile_id = None
+            wait = False
             if isinstance(data, dict):
                 profile_id = data.get("profile_id") or data.get("profile") or data.get("agent_profile")
+                wait = _parse_bool(data.get("wait")) if "wait" in data else False
 
             tool_ctx = get_tool_context()
             parent_session_id = tool_ctx.get("session_id")
@@ -106,11 +133,22 @@ class SpawnSubagentTool(Tool):
                     ensure_ascii=False
                 )
 
+            if wait:
+                result = await run_subagent_task(
+                    task=str(task),
+                    parent_session_id=str(parent_session_id),
+                    title=title if isinstance(title, str) else None,
+                    profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None,
+                    suppress_parent_notify=True
+                )
+                return json.dumps(result, ensure_ascii=False)
+
             context = prepare_subagent_session(
                 task=str(task),
                 parent_session_id=str(parent_session_id),
                 title=title if isinstance(title, str) else None,
-                profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None
+                profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None,
+                suppress_parent_notify=False
             )
 
             async def _run_subagent():

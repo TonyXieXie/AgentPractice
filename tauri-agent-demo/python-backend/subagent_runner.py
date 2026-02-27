@@ -109,7 +109,8 @@ def prepare_subagent_session(
     task: str,
     parent_session_id: str,
     title: Optional[str] = None,
-    profile_id: Optional[str] = None
+    profile_id: Optional[str] = None,
+    suppress_parent_notify: bool = False
 ) -> Dict[str, Any]:
     if not task or not str(task).strip():
         raise ValueError("Missing task")
@@ -151,7 +152,8 @@ def prepare_subagent_session(
         "processed_message": processed_message,
         "user_message_id": user_msg.id,
         "assistant_message_id": None,
-        "subagent_profile_id": subagent_profile_id
+        "subagent_profile_id": subagent_profile_id,
+        "suppress_parent_notify": bool(suppress_parent_notify)
     }
 
 
@@ -214,6 +216,7 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
                 conn.close()
             except Exception:
                 pass
+    if not context.get("suppress_parent_notify"):
         await _notify_parent_subagent_done(
             parent_session_id=context.get("parent_session_id", ""),
             child_session_id=context.get("child_session_id", ""),
@@ -258,13 +261,14 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
                 ))
             except Exception:
                 pass
-        await _notify_parent_subagent_done(
-            parent_session_id=parent_session_id,
-            child_session_id=child_session.id,
-            child_title=child_title,
-            final_answer=final_answer,
-            status="error"
-        )
+        if not context.get("suppress_parent_notify"):
+            await _notify_parent_subagent_done(
+                parent_session_id=parent_session_id,
+                child_session_id=child_session.id,
+                child_title=child_title,
+                final_answer=final_answer,
+                status="error"
+            )
         return {"status": "error", "error": "Parent config not found"}
 
     app_config = get_app_config()
@@ -468,13 +472,14 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
     conn.close()
 
     status = "error" if had_error else "ok"
-    await _notify_parent_subagent_done(
-        parent_session_id=parent_session_id,
-        child_session_id=child_session.id,
-        child_title=child_title,
-        final_answer=final_answer,
-        status=status
-    )
+    if not context.get("suppress_parent_notify"):
+        await _notify_parent_subagent_done(
+            parent_session_id=parent_session_id,
+            child_session_id=child_session.id,
+            child_title=child_title,
+            final_answer=final_answer,
+            status=status
+        )
 
     return {
         "status": status,
@@ -488,10 +493,17 @@ async def run_subagent_task(
     task: str,
     parent_session_id: str,
     title: Optional[str] = None,
-    profile_id: Optional[str] = None
+    profile_id: Optional[str] = None,
+    suppress_parent_notify: bool = False
 ) -> Dict[str, Any]:
     try:
-        context = prepare_subagent_session(task, parent_session_id, title, profile_id)
+        context = prepare_subagent_session(
+            task,
+            parent_session_id,
+            title,
+            profile_id,
+            suppress_parent_notify=suppress_parent_notify
+        )
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
     return await execute_subagent_context(context)
