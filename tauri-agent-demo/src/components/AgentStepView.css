@@ -521,6 +521,12 @@
     color: #fde68a;
 }
 
+.shell-badge.waiting {
+    border-color: rgba(45, 212, 191, 0.4);
+    background: rgba(45, 212, 191, 0.12);
+    color: #99f6e4;
+}
+
 .shell-card-meta {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -545,6 +551,15 @@
 .shell-meta-value {
     font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
     color: #e2e8f0;
+}
+
+.shell-waiting-hint {
+    border-radius: 8px;
+    border: 1px solid rgba(45, 212, 191, 0.25);
+    background: rgba(45, 212, 191, 0.08);
+    color: #99f6e4;
+    padding: 6px 8px;
+    font-size: 0.72rem;
 }
 
 .shell-card-output {

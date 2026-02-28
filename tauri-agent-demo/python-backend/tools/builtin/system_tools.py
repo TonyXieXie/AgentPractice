@@ -31,6 +31,17 @@ try:
 except Exception:
     posix_pty = None
 
+_ANSI_ESCAPE_RE = re.compile(r"[\u001b\u009b][\\[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]")
+_INTERACTIVE_PROMPT_PATTERNS = [
+    re.compile(r"use\s+arrow\s+keys", re.IGNORECASE),
+    re.compile(r"\bselect\b", re.IGNORECASE),
+    re.compile(r"\bchoose\b", re.IGNORECASE),
+    re.compile(r"\bpassword\b", re.IGNORECASE),
+    re.compile(r"\(y\/n\)|\(y\/N\)|\[y\/n\]|\[Y\/n\]", re.IGNORECASE),
+    re.compile(r"请选择"),
+    re.compile(r"请输入"),
+]
+
 
 def _get_root_path() -> Path:
     tool_ctx = get_tool_context()
@@ -1205,6 +1216,54 @@ def _append_completion_marker_command(stdin_value: Optional[str], completion_key
     if payload and not payload.endswith("\n"):
         payload += "\n"
     return f"{payload}{marker_command}\n"
+
+
+def _strip_ansi(text: str) -> str:
+    if not text:
+        return ""
+    output = _ANSI_ESCAPE_RE.sub("", text)
+    output = output.replace("\x07", "")
+    return output
+
+
+def _detect_wait_reason_from_output(text: str) -> Optional[str]:
+    if not text:
+        return None
+    normalized = _strip_ansi(str(text)).replace("\r\n", "\n").replace("\r", "\n")
+    trimmed = normalized.strip()
+    if not trimmed:
+        return None
+
+    for pattern in _INTERACTIVE_PROMPT_PATTERNS:
+        if pattern.search(trimmed):
+            return "prompt_detected"
+
+    lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+    if lines:
+        tail = lines[-1]
+        if len(tail) <= 160 and re.search(r"[:?]\s*$", tail):
+            return "stdin_needed"
+    return None
+
+
+def _set_waiting_state(proc: PtyProcess, waiting: bool, reason: Optional[str] = None) -> None:
+    proc.waiting_input = bool(waiting)
+    proc.wait_reason = str(reason or "").strip() if waiting and reason else None
+
+
+def _update_waiting_state_from_chunk(proc: PtyProcess, chunk: str) -> Tuple[bool, Optional[str]]:
+    if proc.status != "running":
+        _set_waiting_state(proc, False, None)
+        return proc.waiting_input, proc.wait_reason
+
+    text = str(chunk or "")
+    if text.strip():
+        reason = _detect_wait_reason_from_output(text)
+        if reason:
+            _set_waiting_state(proc, True, reason)
+        else:
+            _set_waiting_state(proc, False, None)
+    return proc.waiting_input, proc.wait_reason
 
 
 def _build_posix_command(command: str, use_sandbox: bool = True) -> List[str]:
@@ -3235,7 +3294,7 @@ class RunShellTool(Tool):
         self.name = "run_shell"
         self.description = (
             "Run a shell command within the work path. "
-            "Supports mode=oneshot|persistent. "
+            "Supports mode=auto|oneshot|persistent. "
             "Persistent mode returns a pty_id and supports action=send|read|close|list. "
             "Optional args: stdin, track_completion, completion_key, timeout_sec (s), idle_timeout (ms), "
             "max_output (chars), buffer_size (bytes)."
@@ -3250,7 +3309,7 @@ class RunShellTool(Tool):
             ToolParameter(
                 name="mode",
                 type="string",
-                description="oneshot or persistent (default oneshot).",
+                description="auto, oneshot, or persistent (default auto).",
                 required=False
             ),
             ToolParameter(
@@ -3422,6 +3481,7 @@ class RunShellTool(Tool):
                         f"tail_hex={_tail_bytes_hex(stdin_bytes)}"
                     )
                 written = proc.write(stdin_bytes)
+                _set_waiting_state(proc, False, None)
                 header = f"[pty_id={proc.id} status={proc.status} bytes_written={written}]"
                 if completion_key:
                     header = f"{header} completion_key={completion_key}"
@@ -3459,14 +3519,17 @@ class RunShellTool(Tool):
                         f"pty_id={proc.id} elapsed={elapsed:.3f}s chunk_len={len(chunk or '')} "
                         f"new_cursor={new_cursor} reset={str(reset).lower()} status={proc.status}"
                     )
+                waiting_input, wait_reason = _update_waiting_state_from_chunk(proc, chunk or "")
                 completion_reached: Optional[bool] = None
                 if completion_key:
                     completion_reached = proc.is_completion_reached(completion_key)
                 header = (
                     f"[pty_id={proc.id} status={proc.status} pty={str(proc.pty_enabled).lower()} "
                     f"cursor={new_cursor} reset={str(reset).lower()} idle_timeout={proc.idle_timeout_ms} "
-                    f"buffer_size={proc.buffer_size}]"
+                    f"buffer_size={proc.buffer_size}] waiting_input={str(waiting_input).lower()}"
                 )
+                if wait_reason:
+                    header = f"{header} wait_reason={wait_reason}"
                 if proc.status == "exited":
                     header = f"{header} exit_code={proc.exit_code}"
                 if completion_reached is not None:
@@ -3508,11 +3571,11 @@ class RunShellTool(Tool):
             return f"Unknown action: {action}"
 
         command = data.get("command")
-        mode = str(data.get("mode") or "oneshot").strip().lower()
+        mode = str(data.get("mode") or "auto").strip().lower()
         if mode_override:
             mode = mode_override
-        if mode not in ("oneshot", "persistent"):
-            mode = "oneshot"
+        if mode not in ("auto", "oneshot", "persistent"):
+            mode = "auto"
         if command is None:
             if mode == "persistent":
                 command = ""
@@ -3553,8 +3616,8 @@ class RunShellTool(Tool):
             except Exception:
                 request_id = None
 
-            timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
-            status = await _wait_for_permission(request_id, timeout_sec)
+            permission_timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
+            status = await _wait_for_permission(request_id, permission_timeout_sec)
             if status not in ("approved", "approved_once"):
                 if status == "denied":
                     return "Permission denied."
@@ -3568,7 +3631,7 @@ class RunShellTool(Tool):
         cwd = data.get("cwd")
         workdir = _resolve_path(cwd, self.name, "execute") if cwd else root
 
-        timeout_sec = None
+        timeout_sec: Optional[float] = None
         timeout_ms = data.get("timeout")
         if timeout_ms is not None:
             try:
@@ -3579,7 +3642,18 @@ class RunShellTool(Tool):
             timeout_sec = timeout_ms / 1000.0
         else:
             timeout_value = data.get("timeout_sec")
-            timeout_sec = float(timeout_value) if timeout_value is not None else float(get_tool_config().get("shell", {}).get("timeout_sec", 30))
+            if timeout_value is not None:
+                try:
+                    timeout_sec = float(timeout_value)
+                except (TypeError, ValueError):
+                    timeout_sec = None
+        if timeout_sec is not None and timeout_sec <= 0:
+            timeout_sec = None
+        if timeout_sec is None and mode != "persistent":
+            try:
+                timeout_sec = float(get_tool_config().get("shell", {}).get("timeout_sec", 120))
+            except (TypeError, ValueError):
+                timeout_sec = 120.0
         idle_timeout_ms = _resolve_idle_timeout_ms(mode, data.get("idle_timeout"))
         buffer_size = _resolve_buffer_size(data.get("buffer_size"))
         max_output = data.get("max_output")
@@ -3590,23 +3664,42 @@ class RunShellTool(Tool):
             stdin_value = _normalize_windows_stdin(stdin_value)
         stdin_bytes = _encode_stdin(stdin_value)
         pty_requested = data.get("pty")
+        pty_policy = "auto"
+        if pty_requested is not None:
+            pty_policy = "force_pty" if _coerce_bool(pty_requested, False) else "force_pipe"
         pty_supported = _supports_pty()
-        if pty_requested is None:
-            if mode == "oneshot":
-                pty_enabled = False
-                pty_fallback = False
-            else:
-                pty_enabled = pty_supported
-                pty_fallback = False
+        if pty_policy == "force_pty":
+            if not pty_supported:
+                return "PTY requested but not available on this platform."
+            pty_enabled = True
+            pty_fallback = False
+        elif pty_policy == "force_pipe":
+            pty_enabled = False
+            pty_fallback = False
         else:
-            pty_enabled = bool(pty_requested) and pty_supported
-            pty_fallback = bool(pty_requested) and not pty_supported
+            pty_enabled = pty_supported
+            pty_fallback = False
         if _pty_debug_enabled():
             _pty_debug(
                 "run_shell pty_resolve "
-                f"mode={mode} pty_requested={pty_requested} "
+                f"mode={mode} pty_requested={pty_requested} pty_policy={pty_policy} "
                 f"pty_supported={pty_supported} pty_enabled={pty_enabled}"
             )
+
+        def _maybe_auto_fallback(stage: str, exc: Exception) -> bool:
+            nonlocal pty_enabled, pty_fallback
+            if pty_policy != "auto" or not pty_enabled:
+                return False
+            if isinstance(exc, subprocess.TimeoutExpired):
+                return False
+            pty_enabled = False
+            pty_fallback = True
+            if _pty_debug_enabled():
+                _pty_debug(
+                    "run_shell auto_pty_fallback "
+                    f"stage={stage} error={type(exc).__name__}: {exc}"
+                )
+            return True
 
         def _run_unsandboxed() -> Tuple[int, str]:
             completed = subprocess.run(
@@ -3623,16 +3716,20 @@ class RunShellTool(Tool):
 
         def _run_oneshot(use_sandbox: bool) -> Tuple[int, str]:
             if pty_enabled:
-                if _is_windows():
-                    return _run_windows_pty_oneshot(
-                        command,
-                        workdir,
-                        timeout_sec,
-                        idle_timeout_ms,
-                        stdin_bytes,
-                        use_restricted_token=_use_restricted_conpty(use_sandbox)
-                    )
-                return _run_posix_pty_oneshot(command, workdir, timeout_sec, idle_timeout_ms, stdin_bytes, use_sandbox)
+                try:
+                    if _is_windows():
+                        return _run_windows_pty_oneshot(
+                            command,
+                            workdir,
+                            timeout_sec,
+                            idle_timeout_ms,
+                            stdin_bytes,
+                            use_restricted_token=_use_restricted_conpty(use_sandbox)
+                        )
+                    return _run_posix_pty_oneshot(command, workdir, timeout_sec, idle_timeout_ms, stdin_bytes, use_sandbox)
+                except Exception as exc:
+                    if not _maybe_auto_fallback("oneshot", exc):
+                        raise
             if use_sandbox:
                 return _run_sandboxed_command(command, workdir, timeout_sec)
             return _run_unsandboxed()
@@ -3645,19 +3742,27 @@ class RunShellTool(Tool):
             )
             if _is_windows():
                 if pty_enabled:
-                    return _start_windows_pty_persistent(
-                        command,
-                        workdir,
-                        stdin_bytes,
-                        idle_timeout_ms,
-                        buffer_size,
-                        use_restricted_token=_use_restricted_conpty(use_sandbox)
-                    )
+                    try:
+                        return _start_windows_pty_persistent(
+                            command,
+                            workdir,
+                            stdin_bytes,
+                            idle_timeout_ms,
+                            buffer_size,
+                            use_restricted_token=_use_restricted_conpty(use_sandbox)
+                        )
+                    except Exception as exc:
+                        if not _maybe_auto_fallback("persistent_start", exc):
+                            raise
                 if use_sandbox:
                     return _start_windows_pipe_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size)
                 return _start_windows_unrestricted_pipe_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size)
             if pty_enabled:
-                return _start_posix_pty_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size, use_sandbox)
+                try:
+                    return _start_posix_pty_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size, use_sandbox)
+                except Exception as exc:
+                    if not _maybe_auto_fallback("persistent_start", exc):
+                        raise
             return _start_posix_pipe_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size, use_sandbox)
 
         ran_sandbox = False
@@ -3673,11 +3778,15 @@ class RunShellTool(Tool):
                 manager = get_pty_manager()
                 manager.register(pty_proc)
                 chunk, cursor, _ = pty_proc.read(None, max_output)
+                waiting_input, wait_reason = _update_waiting_state_from_chunk(pty_proc, chunk or "")
                 _pty_debug(f"run_shell persistent started pty_id={pty_proc.id} initial_chunk_len={len(chunk or '')}")
                 header = (
                     f"[pty_id={pty_proc.id} status={pty_proc.status} pty={str(pty_proc.pty_enabled).lower()} "
-                    f"idle_timeout={pty_proc.idle_timeout_ms} buffer_size={pty_proc.buffer_size}]"
+                    f"idle_timeout={pty_proc.idle_timeout_ms} buffer_size={pty_proc.buffer_size}] "
+                    f"waiting_input={str(waiting_input).lower()}"
                 )
+                if wait_reason:
+                    header = f"{header} wait_reason={wait_reason}"
                 if pty_fallback:
                     header = f"{header} pty_fallback=true"
                 return f"{header}\n{chunk or ''}"
@@ -3724,8 +3833,8 @@ class RunShellTool(Tool):
             except Exception:
                 request_id = None
 
-            timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
-            status = await _wait_for_permission(request_id, timeout_sec)
+            permission_timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
+            status = await _wait_for_permission(request_id, permission_timeout_sec)
             if status not in ("approved", "approved_once"):
                 if status == "denied":
                     return "Permission denied."
@@ -3741,10 +3850,14 @@ class RunShellTool(Tool):
                 manager = get_pty_manager()
                 manager.register(pty_proc)
                 chunk, cursor, _ = pty_proc.read(None, max_output)
+                waiting_input, wait_reason = _update_waiting_state_from_chunk(pty_proc, chunk or "")
                 header = (
                     f"[pty_id={pty_proc.id} status={pty_proc.status} pty={str(pty_proc.pty_enabled).lower()} "
-                    f"idle_timeout={pty_proc.idle_timeout_ms} buffer_size={pty_proc.buffer_size}]"
+                    f"idle_timeout={pty_proc.idle_timeout_ms} buffer_size={pty_proc.buffer_size}] "
+                    f"waiting_input={str(waiting_input).lower()}"
                 )
+                if wait_reason:
+                    header = f"{header} wait_reason={wait_reason}"
                 if pty_fallback:
                     header = f"{header} pty_fallback=true"
                 return f"{header}\n{chunk or ''}"
@@ -3768,8 +3881,8 @@ class RunShellTool(Tool):
             except Exception:
                 request_id = None
 
-            timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
-            status = await _wait_for_permission(request_id, timeout_sec)
+            permission_timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
+            status = await _wait_for_permission(request_id, permission_timeout_sec)
             if status not in ("approved", "approved_once"):
                 if status == "denied":
                     return f"[exit_code={returncode}]\n{output}"

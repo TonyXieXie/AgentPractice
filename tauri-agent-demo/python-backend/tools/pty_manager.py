@@ -98,6 +98,8 @@ class PtyProcess:
         self._last_output_at = time.monotonic()
         self.status = "running"
         self.exit_code: Optional[int] = None
+        self.waiting_input: bool = False
+        self.wait_reason: Optional[str] = None
         self.created_at = time.time()
         self.reader_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()

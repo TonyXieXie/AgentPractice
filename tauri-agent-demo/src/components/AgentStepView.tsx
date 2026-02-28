@@ -195,6 +195,8 @@ type ShellHeader = {
     reset?: boolean;
     pty_fallback?: boolean;
     command?: string;
+    waiting_input?: boolean;
+    wait_reason?: string;
 };
 
 function parseShellHeaderLine(line: string) {
@@ -246,6 +248,12 @@ function parseShellHeaderLine(line: string) {
                 return true;
             case 'command':
                 header.command = value;
+                return true;
+            case 'waiting_input':
+                header.waiting_input = lower === 'true';
+                return true;
+            case 'wait_reason':
+                header.wait_reason = value;
                 return true;
             default:
                 return false;
@@ -1895,6 +1903,20 @@ function AgentStepView({
                 let shellBody = '';
                 let shellPreview = '';
                 const shellCommandFromMeta = typeof step.metadata?.command === 'string' ? step.metadata.command : '';
+                const shellWaitingFromMeta = (() => {
+                    const raw = step.metadata?.waiting_input;
+                    if (typeof raw === 'boolean') return raw;
+                    if (typeof raw === 'string') {
+                        const normalized = raw.trim().toLowerCase();
+                        if (normalized === 'true') return true;
+                        if (normalized === 'false') return false;
+                    }
+                    return undefined;
+                })();
+                const shellWaitReasonFromMeta =
+                    typeof step.metadata?.wait_reason === 'string' && step.metadata.wait_reason.trim()
+                        ? step.metadata.wait_reason.trim()
+                        : undefined;
                 if (isObservation) {
                     observationTextRaw = rawContent.replace(/\r\n/g, '\n');
                     const exitCode = parseExitCode(observationTextRaw);
@@ -1915,6 +1937,12 @@ function AgentStepView({
                         if (shellPayload) {
                             if (shellCommandFromMeta && !shellPayload.header.command) {
                                 shellPayload.header.command = shellCommandFromMeta;
+                            }
+                            if (typeof shellWaitingFromMeta === 'boolean') {
+                                shellPayload.header.waiting_input = shellWaitingFromMeta;
+                            }
+                            if (shellWaitReasonFromMeta) {
+                                shellPayload.header.wait_reason = shellWaitReasonFromMeta;
                             }
                             shellBody = stripAnsi(shellPayload.body || '');
                             const commandText = shellPayload.header.command || '';
@@ -2014,8 +2042,13 @@ function AgentStepView({
                                                     <span className={`shell-badge ${shellPayload.header.pty ? 'ok' : ''}`}>
                                                         {shellPayload.header.pty ? 'PTY' : 'PIPE'}
                                                     </span>
-                                                    {shellPayload.header.status && (
+                                                    {shellPayload.header.waiting_input ? (
+                                                        <span className="shell-badge waiting">waiting input</span>
+                                                    ) : shellPayload.header.status && (
                                                         <span className="shell-badge">status: {shellPayload.header.status}</span>
+                                                    )}
+                                                    {shellPayload.header.waiting_input && shellPayload.header.wait_reason && (
+                                                        <span className="shell-badge warn">reason: {shellPayload.header.wait_reason}</span>
                                                     )}
                                                     {typeof shellPayload.header.exit_code === 'number' && (
                                                         <span
@@ -2061,6 +2094,9 @@ function AgentStepView({
                                                     </div>
                                                 )}
                                             </div>
+                                            {shellPayload.header.waiting_input && (
+                                                <div className="shell-waiting-hint">命令正在等待交互输入，可继续发送 stdin。</div>
+                                            )}
                                             <div className={`shell-card-output${isObservationExpanded ? ' expanded' : ''}`}>
                                                 {(() => {
                                                     const text = isObservationExpanded ? shellBody : shellPreview;

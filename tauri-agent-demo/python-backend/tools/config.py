@@ -34,7 +34,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
             "rg"
         ],
         "unrestricted_allowlist": [],
-        "timeout_sec": 30,
+        "timeout_sec": 120,
         "buffer_size": 2097152,
         "max_output": 20000,
         "permission_timeout_sec": 300,

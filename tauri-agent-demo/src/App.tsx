@@ -2410,16 +2410,30 @@ function App() {
                 (s) => s.step_type === 'observation' && s.metadata?.streaming && s.metadata?.stream_key === streamKey
               );
               if (streamingIndex >= 0) {
+                  const mergedMetadata = {
+                    ...(nextSteps[streamingIndex].metadata || {}),
+                    ...(step.metadata || {}),
+                    stream_key: streamKey,
+                    streaming: true,
+                    tool: toolName,
+                    tool_display: toolDisplay
+                  };
                   nextSteps[streamingIndex] = {
                     ...nextSteps[streamingIndex],
                     content: buffer,
-                    metadata: { ...(nextSteps[streamingIndex].metadata || {}), stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay }
+                    metadata: mergedMetadata
                   };
                 } else {
                   nextSteps.push({
                     step_type: 'observation',
                     content: buffer,
-                    metadata: { stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay }
+                    metadata: {
+                      ...(step.metadata || {}),
+                      stream_key: streamKey,
+                      streaming: true,
+                      tool: toolName,
+                      tool_display: toolDisplay
+                    }
                   });
                 }
 
