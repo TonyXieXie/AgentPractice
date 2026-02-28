@@ -20,7 +20,9 @@
     AstRequest,
     AstPathSettings,
     AstSettingsResponse,
-    AstSettingsAllResponse
+    AstSettingsAllResponse,
+    AgentTask,
+    AgentTaskEvent
 } from './types';
 
 export const DEFAULT_API_BASE_URL = 'http://127.0.0.1:8000';
@@ -68,7 +70,14 @@ async function buildApiError(response: Response, baseMessage: string): Promise<E
     if (text) {
         try {
             const data = JSON.parse(text);
-            if (data?.detail) {
+            if (typeof data?.message === 'string' && data?.code) {
+                detail = `${data.code}: ${data.message}`;
+                if (data?.details && Object.keys(data.details).length) {
+                    detail += ` | ${JSON.stringify(data.details)}`;
+                }
+            } else if (data?.detail && typeof data.detail === 'object' && data.detail?.message) {
+                detail = String(data.detail.message);
+            } else if (data?.detail) {
                 detail = String(data.detail);
             }
         } catch {
@@ -395,6 +404,116 @@ export async function getSessionAgentSteps(
     return response.json();
 }
 
+// ==================== Task Center API ====================
+
+export interface AgentTaskCreatePayload {
+    session_id: string;
+    title?: string;
+    input: string;
+    target_instance_id?: string;
+    target_profile_id?: string;
+    required_abilities?: string[];
+    parent_task_id?: string;
+    root_task_id?: string;
+    source_task_id?: string;
+    loop_group_id?: string;
+    loop_iteration?: number;
+    idempotency_key?: string;
+    max_retries?: number;
+    metadata?: Record<string, any>;
+}
+
+export interface AgentTaskHandoffPayload {
+    title?: string;
+    input?: string;
+    target_instance_id?: string;
+    target_profile_id?: string;
+    required_abilities?: string[];
+    loop_group_id?: string;
+    loop_iteration?: number;
+    metadata?: Record<string, any>;
+}
+
+export interface AgentTaskCancelPayload {
+    reason?: string;
+    propagate?: boolean;
+}
+
+export async function createTask(payload: AgentTaskCreatePayload): Promise<AgentTask> {
+    const response = await fetch(`${API_BASE_URL}/tasks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to create task');
+    }
+    return response.json();
+}
+
+export async function getTask(taskId: string): Promise<AgentTask> {
+    const response = await fetch(`${API_BASE_URL}/tasks/${encodeURIComponent(taskId)}`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to get task');
+    }
+    return response.json();
+}
+
+export async function listTasks(params?: {
+    sessionId?: string;
+    status?: string;
+    instanceId?: string;
+    limit?: number;
+}): Promise<AgentTask[]> {
+    const query = new URLSearchParams();
+    if (params?.sessionId) query.set('session_id', params.sessionId);
+    if (params?.status) query.set('status', params.status);
+    if (params?.instanceId) query.set('instance_id', params.instanceId);
+    if (params?.limit) query.set('limit', String(params.limit));
+    const suffix = query.toString();
+    const response = await fetch(`${API_BASE_URL}/tasks${suffix ? `?${suffix}` : ''}`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to list tasks');
+    }
+    return response.json();
+}
+
+export async function getTaskEvents(taskId: string, afterSeq = 0, limit = 500): Promise<AgentTaskEvent[]> {
+    const query = new URLSearchParams();
+    if (afterSeq > 0) query.set('after_seq', String(afterSeq));
+    if (limit) query.set('limit', String(limit));
+    const suffix = query.toString();
+    const response = await fetch(`${API_BASE_URL}/tasks/${encodeURIComponent(taskId)}/events${suffix ? `?${suffix}` : ''}`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to get task events');
+    }
+    return response.json();
+}
+
+export async function handoffTask(taskId: string, payload: AgentTaskHandoffPayload): Promise<AgentTask> {
+    const response = await fetch(`${API_BASE_URL}/tasks/${encodeURIComponent(taskId)}/handoff`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to handoff task');
+    }
+    return response.json();
+}
+
+export async function cancelTask(taskId: string, payload?: AgentTaskCancelPayload): Promise<AgentTask> {
+    const response = await fetch(`${API_BASE_URL}/tasks/${encodeURIComponent(taskId)}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || { reason: 'Cancelled by user', propagate: true }),
+    });
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to cancel task');
+    }
+    return response.json();
+}
+
 // ==================== Chat API ====================
 
 export async function sendMessage(request: ChatRequest): Promise<ChatResponse> {
@@ -407,7 +526,7 @@ export async function sendMessage(request: ChatRequest): Promise<ChatResponse> {
     return response.json();
 }
 
-export async function* sendMessageStream(request: ChatRequest): AsyncGenerator<string, void, unknown> {
+export async function* sendMessageStream(request: ChatRequest): AsyncGenerator<any, void, unknown> {
     const response = await fetch(`${API_BASE_URL}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

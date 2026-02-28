@@ -308,6 +308,25 @@ def build_history_for_llm(
     if code_map:
         insert_index = 1 if summary else 0
         history.insert(insert_index, {"role": "assistant", "content": code_map})
+    try:
+        recent_tasks = db.list_agent_tasks(session_id=session_id, limit=5)
+    except Exception:
+        recent_tasks = []
+    if recent_tasks:
+        lines: List[str] = []
+        for task in sorted(recent_tasks, key=lambda item: item.created_at or "", reverse=True)[:5]:
+            status = getattr(task.status, "value", task.status)
+            title = (task.title or "Task").strip()
+            result = (task.result or "").strip()
+            if len(result) > 200:
+                result = result[:200].rstrip() + "...(truncated)"
+            line = f"- [{status}] {title} (task_id={task.id})"
+            if result:
+                line += f": {result}"
+            lines.append(line)
+        if lines:
+            insert_index = 2 if (summary and code_map) else (1 if (summary or code_map) else 0)
+            history.insert(insert_index, {"role": "assistant", "content": "[Task Summary]\n" + "\n".join(lines)})
     return history
 
 

@@ -4,7 +4,22 @@ import os
 from datetime import datetime
 import sqlite3
 import uuid
-from models import LLMConfig, LLMConfigCreate, LLMConfigUpdate, ChatMessage, ChatMessageCreate, ChatSession, ChatSessionCreate, ChatSessionUpdate
+from models import (
+    LLMConfig,
+    LLMConfigCreate,
+    LLMConfigUpdate,
+    ChatMessage,
+    ChatMessageCreate,
+    ChatSession,
+    ChatSessionCreate,
+    ChatSessionUpdate,
+    AgentInstance,
+    AgentTask,
+    AgentTaskEvent,
+    AgentArtifact,
+    TaskStatus,
+    TaskErrorCode
+)
 
 DATABASE_PATH = os.getenv("TAURI_AGENT_DB_PATH", "chat_app.db")
 
@@ -326,7 +341,143 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_message ON file_snapshots(session_id, message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_history_session ON session_tool_call_history(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_history_session_tool ON session_tool_call_history(session_id, tool_name)')
+        self.migrate_agent_tasks_up(cursor)
         
+        conn.commit()
+        conn.close()
+
+    def migrate_agent_tasks_up(self, cursor: Optional[sqlite3.Cursor] = None) -> None:
+        own_connection = False
+        conn: Optional[sqlite3.Connection] = None
+        if cursor is None:
+            own_connection = True
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS agent_instances (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                name TEXT,
+                abilities TEXT,
+                metadata TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(session_id, profile_id)
+            )
+            '''
+        )
+
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS agent_tasks (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                title TEXT,
+                input TEXT NOT NULL,
+                status TEXT NOT NULL,
+                assigned_instance_id TEXT,
+                created_by_instance_id TEXT,
+                target_profile_id TEXT,
+                required_abilities TEXT,
+                parent_task_id TEXT,
+                root_task_id TEXT,
+                source_task_id TEXT,
+                loop_group_id TEXT,
+                loop_iteration INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 2,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                idempotency_key TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                result TEXT,
+                metadata TEXT,
+                legacy_child_session_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                UNIQUE(session_id, idempotency_key)
+            )
+            '''
+        )
+
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS agent_task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                status TEXT,
+                message TEXT,
+                payload TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(task_id, seq)
+            )
+            '''
+        )
+
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS agent_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                artifact_type TEXT NOT NULL,
+                path TEXT,
+                uri TEXT,
+                tree_hash TEXT,
+                checksum TEXT,
+                metadata TEXT,
+                created_at TEXT NOT NULL
+            )
+            '''
+        )
+
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS agent_task_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_task_id TEXT NOT NULL,
+                to_task_id TEXT NOT NULL,
+                edge_type TEXT NOT NULL,
+                metadata TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(from_task_id, to_task_id, edge_type)
+            )
+            '''
+        )
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_instances_session ON agent_instances(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_instances_profile ON agent_instances(profile_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_tasks_session_status_created ON agent_tasks(session_id, status, created_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_tasks_instance_status_created ON agent_tasks(assigned_instance_id, status, created_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_tasks_parent ON agent_tasks(parent_task_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_tasks_root ON agent_tasks(root_task_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_tasks_source ON agent_tasks(source_task_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_task_events_task_seq ON agent_task_events(task_id, seq)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_artifacts_task ON agent_artifacts(task_id, created_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_edges_from ON agent_task_edges(from_task_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_edges_to ON agent_task_edges(to_task_id)')
+
+        if own_connection and conn is not None:
+            conn.commit()
+            conn.close()
+
+    def migrate_agent_tasks_down(self) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DROP TABLE IF EXISTS agent_task_edges')
+        cursor.execute('DROP TABLE IF EXISTS agent_artifacts')
+        cursor.execute('DROP TABLE IF EXISTS agent_task_events')
+        cursor.execute('DROP TABLE IF EXISTS agent_tasks')
+        cursor.execute('DROP TABLE IF EXISTS agent_instances')
         conn.commit()
         conn.close()
     
@@ -1882,6 +2033,620 @@ class Database:
             "input_message": input_message,
             "remaining_messages": remaining
         }
+
+    # ==================== Agent Instances ====================
+
+    def _parse_json_field(self, value: Optional[str], fallback: Any) -> Any:
+        if not value:
+            return fallback
+        try:
+            return json.loads(value)
+        except Exception:
+            return fallback
+
+    def upsert_agent_instance(
+        self,
+        session_id: str,
+        profile_id: str,
+        name: Optional[str] = None,
+        abilities: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        instance_id: Optional[str] = None,
+        status: str = "active"
+    ) -> AgentInstance:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute(
+            '''
+            SELECT id FROM agent_instances
+            WHERE session_id = ? AND profile_id = ?
+            LIMIT 1
+            ''',
+            (session_id, profile_id)
+        )
+        row = cursor.fetchone()
+        if row:
+            existing_id = row["id"]
+            cursor.execute(
+                '''
+                UPDATE agent_instances
+                SET name = ?, abilities = ?, metadata = ?, status = ?, updated_at = ?
+                WHERE id = ?
+                ''',
+                (
+                    name,
+                    json.dumps(abilities or [], ensure_ascii=False),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    status,
+                    now,
+                    existing_id
+                )
+            )
+            result_id = existing_id
+        else:
+            result_id = instance_id or str(uuid.uuid4())
+            cursor.execute(
+                '''
+                INSERT INTO agent_instances (id, session_id, profile_id, name, abilities, metadata, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    result_id,
+                    session_id,
+                    profile_id,
+                    name,
+                    json.dumps(abilities or [], ensure_ascii=False),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    status,
+                    now,
+                    now
+                )
+            )
+        conn.commit()
+        conn.close()
+        instance = self.get_agent_instance(result_id)
+        if not instance:
+            raise RuntimeError("Failed to upsert agent instance")
+        return instance
+
+    def get_agent_instance(self, instance_id: str) -> Optional[AgentInstance]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT * FROM agent_instances
+            WHERE id = ?
+            LIMIT 1
+            ''',
+            (instance_id,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        data = dict(row)
+        return AgentInstance(
+            id=data["id"],
+            session_id=data["session_id"],
+            profile_id=data["profile_id"],
+            name=data.get("name"),
+            abilities=self._parse_json_field(data.get("abilities"), []),
+            metadata=self._parse_json_field(data.get("metadata"), {}),
+            status=data.get("status") or "active",
+            created_at=data.get("created_at"),
+            updated_at=data.get("updated_at")
+        )
+
+    def list_agent_instances(
+        self,
+        session_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        status: Optional[str] = None
+    ) -> List[AgentInstance]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        where: List[str] = []
+        values: List[Any] = []
+        if session_id:
+            where.append("session_id = ?")
+            values.append(session_id)
+        if profile_id:
+            where.append("profile_id = ?")
+            values.append(profile_id)
+        if status:
+            where.append("status = ?")
+            values.append(status)
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        cursor.execute(
+            f'''
+            SELECT * FROM agent_instances
+            {where_sql}
+            ORDER BY created_at ASC
+            ''',
+            values
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        results: List[AgentInstance] = []
+        for row in rows:
+            data = dict(row)
+            results.append(
+                AgentInstance(
+                    id=data["id"],
+                    session_id=data["session_id"],
+                    profile_id=data["profile_id"],
+                    name=data.get("name"),
+                    abilities=self._parse_json_field(data.get("abilities"), []),
+                    metadata=self._parse_json_field(data.get("metadata"), {}),
+                    status=data.get("status") or "active",
+                    created_at=data.get("created_at"),
+                    updated_at=data.get("updated_at")
+                )
+            )
+        return results
+
+    # ==================== Agent Tasks ====================
+
+    def _task_from_row(self, row: sqlite3.Row) -> AgentTask:
+        data = dict(row)
+        return AgentTask(
+            id=data["id"],
+            session_id=data["session_id"],
+            title=data.get("title"),
+            input=data.get("input") or "",
+            status=TaskStatus(data.get("status") or TaskStatus.pending.value),
+            assigned_instance_id=data.get("assigned_instance_id"),
+            created_by_instance_id=data.get("created_by_instance_id"),
+            target_profile_id=data.get("target_profile_id"),
+            required_abilities=self._parse_json_field(data.get("required_abilities"), []),
+            parent_task_id=data.get("parent_task_id"),
+            root_task_id=data.get("root_task_id"),
+            source_task_id=data.get("source_task_id"),
+            loop_group_id=data.get("loop_group_id"),
+            loop_iteration=int(data.get("loop_iteration") or 0),
+            max_retries=int(data.get("max_retries") or 0),
+            retry_count=int(data.get("retry_count") or 0),
+            idempotency_key=data.get("idempotency_key"),
+            error_code=TaskErrorCode(data["error_code"]) if data.get("error_code") else None,
+            error_message=data.get("error_message"),
+            result=data.get("result"),
+            metadata=self._parse_json_field(data.get("metadata"), {}),
+            legacy_child_session_id=data.get("legacy_child_session_id"),
+            created_at=data.get("created_at"),
+            updated_at=data.get("updated_at"),
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at")
+        )
+
+    def _task_event_from_row(self, row: sqlite3.Row) -> AgentTaskEvent:
+        data = dict(row)
+        return AgentTaskEvent(
+            id=data.get("id"),
+            task_id=data["task_id"],
+            seq=int(data["seq"]),
+            event_type=data["event_type"],
+            status=TaskStatus(data["status"]) if data.get("status") else None,
+            message=data.get("message"),
+            payload=self._parse_json_field(data.get("payload"), {}),
+            error_code=TaskErrorCode(data["error_code"]) if data.get("error_code") else None,
+            error_message=data.get("error_message"),
+            created_at=data.get("created_at")
+        )
+
+    def _artifact_from_row(self, row: sqlite3.Row) -> AgentArtifact:
+        data = dict(row)
+        return AgentArtifact(
+            id=data.get("id"),
+            task_id=data["task_id"],
+            session_id=data["session_id"],
+            artifact_type=data["artifact_type"],
+            path=data.get("path"),
+            uri=data.get("uri"),
+            tree_hash=data.get("tree_hash"),
+            checksum=data.get("checksum"),
+            metadata=self._parse_json_field(data.get("metadata"), {}),
+            created_at=data.get("created_at")
+        )
+
+    def get_agent_task_by_idempotency(self, session_id: str, idempotency_key: str) -> Optional[AgentTask]:
+        if not session_id or not idempotency_key:
+            return None
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT *
+            FROM agent_tasks
+            WHERE session_id = ? AND idempotency_key = ?
+            LIMIT 1
+            ''',
+            (session_id, idempotency_key)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return self._task_from_row(row) if row else None
+
+    def create_agent_task(
+        self,
+        *,
+        session_id: str,
+        title: Optional[str],
+        input_text: str,
+        status: TaskStatus,
+        assigned_instance_id: Optional[str] = None,
+        created_by_instance_id: Optional[str] = None,
+        target_profile_id: Optional[str] = None,
+        required_abilities: Optional[List[str]] = None,
+        parent_task_id: Optional[str] = None,
+        root_task_id: Optional[str] = None,
+        source_task_id: Optional[str] = None,
+        loop_group_id: Optional[str] = None,
+        loop_iteration: int = 0,
+        max_retries: int = 2,
+        retry_count: int = 0,
+        idempotency_key: Optional[str] = None,
+        error_code: Optional[TaskErrorCode] = None,
+        error_message: Optional[str] = None,
+        result: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        legacy_child_session_id: Optional[str] = None,
+        initial_event: Optional[Dict[str, Any]] = None
+    ) -> AgentTask:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        task_id = str(uuid.uuid4())
+        cursor.execute(
+            '''
+            INSERT INTO agent_tasks (
+                id, session_id, title, input, status, assigned_instance_id, created_by_instance_id, target_profile_id,
+                required_abilities, parent_task_id, root_task_id, source_task_id, loop_group_id, loop_iteration,
+                max_retries, retry_count, idempotency_key, error_code, error_message, result, metadata, legacy_child_session_id,
+                created_at, updated_at, started_at, finished_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                task_id,
+                session_id,
+                title,
+                input_text,
+                status.value if isinstance(status, TaskStatus) else str(status),
+                assigned_instance_id,
+                created_by_instance_id,
+                target_profile_id,
+                json.dumps(required_abilities or [], ensure_ascii=False),
+                parent_task_id,
+                root_task_id,
+                source_task_id,
+                loop_group_id,
+                int(loop_iteration or 0),
+                int(max_retries or 0),
+                int(retry_count or 0),
+                idempotency_key,
+                error_code.value if isinstance(error_code, TaskErrorCode) else error_code,
+                error_message,
+                result,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                legacy_child_session_id,
+                now,
+                now,
+                now if status == TaskStatus.running else None,
+                now if status in (TaskStatus.succeeded, TaskStatus.failed, TaskStatus.cancelled) else None
+            )
+        )
+        if initial_event:
+            self.append_agent_task_event(
+                task_id=task_id,
+                event_type=str(initial_event.get("event_type") or "task_progress"),
+                status=initial_event.get("status") or status,
+                message=initial_event.get("message"),
+                payload=initial_event.get("payload") or {},
+                error_code=initial_event.get("error_code"),
+                error_message=initial_event.get("error_message"),
+                conn=conn
+            )
+        conn.commit()
+        conn.close()
+        task = self.get_agent_task(task_id)
+        if not task:
+            raise RuntimeError("Failed to create agent task")
+        return task
+
+    def get_agent_task(self, task_id: str) -> Optional[AgentTask]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT *
+            FROM agent_tasks
+            WHERE id = ?
+            LIMIT 1
+            ''',
+            (task_id,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return self._task_from_row(row) if row else None
+
+    def list_agent_tasks(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        status: Optional[str] = None,
+        instance_id: Optional[str] = None,
+        limit: int = 200
+    ) -> List[AgentTask]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        where: List[str] = []
+        values: List[Any] = []
+        if session_id:
+            where.append("session_id = ?")
+            values.append(session_id)
+        if status:
+            where.append("status = ?")
+            values.append(status)
+        if instance_id:
+            where.append("assigned_instance_id = ?")
+            values.append(instance_id)
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        values.append(int(limit))
+        cursor.execute(
+            f'''
+            SELECT *
+            FROM agent_tasks
+            {where_sql}
+            ORDER BY datetime(created_at) DESC
+            LIMIT ?
+            ''',
+            values
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [self._task_from_row(row) for row in rows]
+
+    def update_agent_task(
+        self,
+        task_id: str,
+        **fields: Any
+    ) -> Optional[AgentTask]:
+        if not fields:
+            return self.get_agent_task(task_id)
+
+        serialized: Dict[str, Any] = {}
+        for key, value in fields.items():
+            if key in ("required_abilities", "metadata") and value is not None:
+                serialized[key] = json.dumps(value, ensure_ascii=False)
+            elif isinstance(value, TaskStatus):
+                serialized[key] = value.value
+            elif isinstance(value, TaskErrorCode):
+                serialized[key] = value.value
+            else:
+                serialized[key] = value
+
+        if "status" in serialized:
+            status = serialized["status"]
+            now = datetime.now().isoformat()
+            if status == TaskStatus.running.value:
+                serialized.setdefault("started_at", now)
+            if status in (TaskStatus.succeeded.value, TaskStatus.failed.value, TaskStatus.cancelled.value):
+                serialized.setdefault("finished_at", now)
+
+        serialized["updated_at"] = datetime.now().isoformat()
+        assignments = ", ".join([f"{key} = ?" for key in serialized.keys()])
+        values = list(serialized.values()) + [task_id]
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE agent_tasks SET {assignments} WHERE id = ?", values)
+        conn.commit()
+        conn.close()
+        return self.get_agent_task(task_id)
+
+    def append_agent_task_event(
+        self,
+        *,
+        task_id: str,
+        event_type: str,
+        status: Optional[Any] = None,
+        message: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        error_code: Optional[Any] = None,
+        error_message: Optional[str] = None,
+        conn: Optional[sqlite3.Connection] = None
+    ) -> AgentTaskEvent:
+        own_connection = conn is None
+        if own_connection:
+            conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT COALESCE(MAX(seq), 0) AS max_seq
+            FROM agent_task_events
+            WHERE task_id = ?
+            ''',
+            (task_id,)
+        )
+        row = cursor.fetchone()
+        next_seq = int((row["max_seq"] if row and row["max_seq"] is not None else 0) or 0) + 1
+        now = datetime.now().isoformat()
+        normalized_status = status.value if isinstance(status, TaskStatus) else status
+        normalized_code = error_code.value if isinstance(error_code, TaskErrorCode) else error_code
+        cursor.execute(
+            '''
+            INSERT INTO agent_task_events (
+                task_id, seq, event_type, status, message, payload, error_code, error_message, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                task_id,
+                next_seq,
+                event_type,
+                normalized_status,
+                message,
+                json.dumps(payload or {}, ensure_ascii=False),
+                normalized_code,
+                error_message,
+                now
+            )
+        )
+        event_id = cursor.lastrowid
+        if own_connection:
+            conn.commit()
+            conn.close()
+        return AgentTaskEvent(
+            id=event_id,
+            task_id=task_id,
+            seq=next_seq,
+            event_type=event_type,
+            status=TaskStatus(normalized_status) if normalized_status else None,
+            message=message,
+            payload=payload or {},
+            error_code=TaskErrorCode(normalized_code) if normalized_code else None,
+            error_message=error_message,
+            created_at=now
+        )
+
+    def list_agent_task_events(
+        self,
+        task_id: str,
+        after_seq: int = 0,
+        limit: int = 500
+    ) -> List[AgentTaskEvent]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT *
+            FROM agent_task_events
+            WHERE task_id = ? AND seq > ?
+            ORDER BY seq ASC
+            LIMIT ?
+            ''',
+            (task_id, int(after_seq or 0), int(limit))
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [self._task_event_from_row(row) for row in rows]
+
+    def add_agent_task_edge(
+        self,
+        from_task_id: str,
+        to_task_id: str,
+        edge_type: str = "handoff",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT OR IGNORE INTO agent_task_edges (from_task_id, to_task_id, edge_type, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ''',
+            (
+                from_task_id,
+                to_task_id,
+                edge_type,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                datetime.now().isoformat()
+            )
+        )
+        conn.commit()
+        conn.close()
+
+    def list_downstream_task_ids(self, task_id: str) -> List[str]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT to_task_id
+            FROM agent_task_edges
+            WHERE from_task_id = ?
+            ORDER BY id ASC
+            ''',
+            (task_id,)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [str(row["to_task_id"]) for row in rows if row["to_task_id"]]
+
+    def save_agent_artifact(
+        self,
+        *,
+        task_id: str,
+        session_id: str,
+        artifact_type: str,
+        path: Optional[str] = None,
+        uri: Optional[str] = None,
+        tree_hash: Optional[str] = None,
+        checksum: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> AgentArtifact:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute(
+            '''
+            INSERT INTO agent_artifacts (
+                task_id, session_id, artifact_type, path, uri, tree_hash, checksum, metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                task_id,
+                session_id,
+                artifact_type,
+                path,
+                uri,
+                tree_hash,
+                checksum,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                now
+            )
+        )
+        artifact_id = cursor.lastrowid
+        conn.commit()
+        cursor.execute('SELECT * FROM agent_artifacts WHERE id = ?', (artifact_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            raise RuntimeError("Failed to save agent artifact")
+        return self._artifact_from_row(row)
+
+    def list_agent_artifacts(self, task_id: str) -> List[AgentArtifact]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT *
+            FROM agent_artifacts
+            WHERE task_id = ?
+            ORDER BY created_at ASC
+            ''',
+            (task_id,)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [self._artifact_from_row(row) for row in rows]
+
+    def get_latest_file_snapshot_for_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT *
+            FROM file_snapshots
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            ''',
+            (session_id,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
 
 # Create global database instance
 

@@ -9,7 +9,14 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "dev:backend": "set TAURI_AGENT_DEV=1 && python-backend\\venv\\Scripts\\python -m uvicorn python-backend.main:app --reload --port 8000",
-    "dev:all": "concurrently \"npm run dev:backend\" \"npm run tauri dev\""
+    "dev:all": "concurrently \"npm run dev:backend\" \"npm run tauri dev\"",
+    "test:m0": "python-backend\\venv\\Scripts\\python -m pytest tests/m0_schema -q",
+    "test:m1": "python-backend\\venv\\Scripts\\python -m pytest tests/m1_db -q",
+    "test:m2": "python-backend\\venv\\Scripts\\python -m pytest tests/m2_orchestrator -q",
+    "test:m3": "python-backend\\venv\\Scripts\\python -m pytest tests/m3_api_ws -q",
+    "test:m4": "npx playwright test tests/e2e/tasks-ui.spec.ts",
+    "test:m5": "python-backend\\venv\\Scripts\\python -m pytest tests/m5_compat -q",
+    "test:core": "npm run test:m0 && npm run test:m1 && npm run test:m2 && npm run test:m3 && npm run test:m5"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.1",

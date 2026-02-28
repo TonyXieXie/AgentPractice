@@ -1848,3 +1848,25 @@ body[data-platform="mac"] .app-titlebar {
   background: rgba(255, 255, 255, 0.12);
   border: 1px solid rgba(255, 255, 255, 0.2);
 }
+
+.workspace-mode-bar {
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px 0;
+}
+
+.workspace-mode-btn {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(20, 26, 34, 0.9);
+  color: #d8e6f6;
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.workspace-mode-btn.active {
+  border-color: rgba(110, 182, 255, 0.85);
+  background: rgba(22, 49, 77, 0.9);
+  color: #ffffff;
+}

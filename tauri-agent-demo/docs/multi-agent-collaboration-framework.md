@@ -190,3 +190,11 @@
 ## 8. 一句话结论
 
 你定义的“平级 Agent + 任务图编排”是正确方向；`subagent` 可以保留兼容，但不应继续作为核心语义。
+
+---
+
+## 9. 配套实施计划
+
+完整里程碑计划见：
+
+- `docs/multi-agent-implementation-plan.md`

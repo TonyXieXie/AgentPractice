@@ -53,6 +53,7 @@ import DebugPanel from './components/DebugPanel';
 import PtyPanel from './components/PtyPanel';
 import AgentStepView from './components/AgentStepView';
 import ConfirmDialog from './components/ConfirmDialog';
+import TaskWorkbench from './components/TaskWorkbench';
 import { loadExtraWorkPaths, migrateExtraWorkPaths, saveExtraWorkPaths } from './workdirStorage';
 import { wsClient } from './wsClient';
 import type { SubagentDoneEvent, SubagentStartedEvent } from './wsTypes';
@@ -767,6 +768,10 @@ function App() {
   const [agentMode, setAgentMode] = useState<AgentMode>('default');
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null);
   const [currentAgentProfileId, setCurrentAgentProfileId] = useState<string | null>(null);
+  const [taskCenterEnabled, setTaskCenterEnabled] = useState(false);
+  const [taskUiEnabled, setTaskUiEnabled] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<'task' | 'legacy'>('legacy');
+  const workspaceModeInitializedRef = useRef(false);
 
   const commandItems = useMemo<CommandItem[]>(
     () =>
@@ -1640,6 +1645,14 @@ function App() {
       const agent = (appConfig?.agent || null) as AgentConfig | null;
       setAgentConfig(agent);
       setCurrentAgentProfileId((prev) => resolveAgentProfileId(agent, prev));
+      const taskCenter = Boolean(agent?.task_center_enabled);
+      const taskUi = Boolean(agent?.task_ui_enabled);
+      setTaskCenterEnabled(taskCenter);
+      setTaskUiEnabled(taskUi);
+      if (!workspaceModeInitializedRef.current) {
+        setWorkspaceMode(taskUi ? 'task' : 'legacy');
+        workspaceModeInitializedRef.current = true;
+      }
     } catch (error) {
       console.error('Failed to load agent config:', error);
     }
@@ -2630,6 +2643,12 @@ function App() {
       console.error('Failed to load tool stats:', toolResult.reason);
     }
   };
+
+  useEffect(() => {
+    if (!taskUiEnabled && workspaceMode !== 'legacy') {
+      setWorkspaceMode('legacy');
+    }
+  }, [taskUiEnabled, workspaceMode]);
 
   const scheduleDebugRefresh = (sessionId: string | null | undefined) => {
     if (!showDebugPanelRef.current || !sessionId) return;
@@ -3944,6 +3963,28 @@ function App() {
         </div>
       </div>
       <div className="app-body">
+      {taskUiEnabled && (
+        <div className="workspace-mode-bar">
+          <button
+            type="button"
+            className={`workspace-mode-btn ${workspaceMode === 'task' ? 'active' : ''}`}
+            onClick={() => setWorkspaceMode('task')}
+          >
+            Task Workbench
+          </button>
+          <button
+            type="button"
+            className={`workspace-mode-btn ${workspaceMode === 'legacy' ? 'active' : ''}`}
+            onClick={() => setWorkspaceMode('legacy')}
+          >
+            Legacy Chat
+          </button>
+        </div>
+      )}
+      {taskUiEnabled && workspaceMode === 'task' ? (
+        <TaskWorkbench sessionId={currentSessionId} enabled={taskCenterEnabled} />
+      ) : (
+      <>
       {!showSidebar && (
         <button
           type="button"
@@ -4871,6 +4912,8 @@ function App() {
         </div>
       )}
 
+      </>
+      )}
     </div>
     </div>
   );

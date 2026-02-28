@@ -1,19 +1,11 @@
 import asyncio
-import asyncio
 import json
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, List
 
 from ..base import Tool, ToolParameter
 from ..context import get_tool_context
 from app_config import get_app_config
-from subagent_runner import (
-    prepare_subagent_session,
-    execute_subagent_context,
-    list_spawnable_profiles,
-    run_subagent_task,
-    register_subagent_task,
-    notify_parent_subagent_started
-)
+from models import AgentTaskCreateRequest, TaskStatus
 
 
 _PENDING_TASKS = set()
@@ -67,6 +59,8 @@ def _format_spawnable_profiles(profiles: List[Dict[str, Any]]) -> str:
 
 
 def _build_subagent_description() -> str:
+    from subagent_runner import list_spawnable_profiles
+
     base = (
         "Spawn a subagent to run a small task. Returns immediately with a child session id. "
         "Use profile_id to select a spawnable profile; if multiple profiles are spawnable and profile_id is omitted, "
@@ -77,6 +71,30 @@ def _build_subagent_description() -> str:
     spawnable_profiles = list_spawnable_profiles(agent_cfg)
     profile_lines = _format_spawnable_profiles(spawnable_profiles)
     return f"{base}\nSpawnable profiles:\n{profile_lines}"
+
+
+def _task_center_enabled() -> bool:
+    app_config = get_app_config()
+    agent_cfg = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
+    return bool(agent_cfg.get("task_center_enabled", False))
+
+
+def _sanitize_context(raw: Dict[str, Any]) -> Dict[str, Any]:
+    context = dict(raw)
+    context.pop("child_session", None)
+    # Ensure the payload can be serialized into task metadata.
+    for key in list(context.keys()):
+        value = context.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            continue
+        if isinstance(value, dict):
+            try:
+                json.dumps(value, ensure_ascii=False)
+            except Exception:
+                context[key] = str(value)
+            continue
+        context[key] = str(value)
+    return context
 
 
 class SpawnSubagentTool(Tool):
@@ -114,6 +132,156 @@ class SpawnSubagentTool(Tool):
     def refresh_metadata(self) -> None:
         self.description = _build_subagent_description()
 
+    async def _execute_legacy(
+        self,
+        *,
+        task: str,
+        title: str,
+        profile_id: str,
+        wait: bool,
+        parent_session_id: str,
+    ) -> str:
+        from subagent_runner import (
+            prepare_subagent_session,
+            execute_subagent_context,
+            register_subagent_task,
+            notify_parent_subagent_started,
+        )
+
+        if wait:
+            context = prepare_subagent_session(
+                task=str(task),
+                parent_session_id=str(parent_session_id),
+                title=title if isinstance(title, str) else None,
+                profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None,
+                suppress_parent_notify=True
+            )
+            await notify_parent_subagent_started(
+                str(parent_session_id),
+                str(context.get("child_session_id", "")),
+                str(context.get("child_title", "Subagent Task"))
+            )
+            result = await execute_subagent_context(context)
+            return json.dumps(result, ensure_ascii=False)
+
+        context = prepare_subagent_session(
+            task=str(task),
+            parent_session_id=str(parent_session_id),
+            title=title if isinstance(title, str) else None,
+            profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None,
+            suppress_parent_notify=False
+        )
+        await notify_parent_subagent_started(
+            str(parent_session_id),
+            str(context.get("child_session_id", "")),
+            str(context.get("child_title", "Subagent Task"))
+        )
+
+        async def _run_subagent():
+            await execute_subagent_context(context)
+
+        def _on_done(fut: asyncio.Task) -> None:
+            _PENDING_TASKS.discard(fut)
+            try:
+                fut.result()
+            except asyncio.CancelledError:
+                print("[Subagent] Background task cancelled")
+            except Exception as exc:
+                print(f"[Subagent] Background task failed: {exc}")
+
+        task_handle = asyncio.create_task(_run_subagent())
+        _PENDING_TASKS.add(task_handle)
+        register_subagent_task(context.get("child_session_id"), task_handle)
+        task_handle.add_done_callback(_on_done)
+
+        return json.dumps(
+            {
+                "status": "started",
+                "child_session_id": context["child_session_id"],
+                "title": context["child_title"]
+            },
+            ensure_ascii=False
+        )
+
+    async def _execute_task_center(
+        self,
+        *,
+        task: str,
+        title: str,
+        profile_id: str,
+        wait: bool,
+        parent_session_id: str,
+        parent_task_id: str,
+    ) -> str:
+        from subagent_runner import (
+            prepare_subagent_session,
+        )
+
+        context = prepare_subagent_session(
+            task=str(task),
+            parent_session_id=str(parent_session_id),
+            title=title if isinstance(title, str) else None,
+            profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None,
+            suppress_parent_notify=True,
+        )
+
+        metadata = {
+            "kind": "subagent",
+            "bridge_subagent_events": not wait,
+            "prepared_subagent_context": _sanitize_context(context),
+        }
+
+        create_request = AgentTaskCreateRequest(
+            session_id=str(parent_session_id),
+            title=str(context.get("child_title") or "Subagent Task"),
+            input=str(task),
+            target_profile_id=str(context.get("subagent_profile_id") or "") or None,
+            parent_task_id=str(parent_task_id) if parent_task_id else None,
+            source_task_id=str(parent_task_id) if parent_task_id else None,
+            metadata=metadata,
+        )
+
+        from task_orchestrator import get_task_orchestrator
+
+        orchestrator = get_task_orchestrator()
+        created = await orchestrator.create_task(create_request)
+
+        if wait:
+            done = await orchestrator.wait_task_terminal(created.id)
+            if done.status == TaskStatus.succeeded:
+                status = "ok"
+                result = done.result or ""
+                error = None
+            elif done.status == TaskStatus.cancelled:
+                status = "error"
+                result = done.error_message or "Task cancelled"
+                error = done.error_message or "Task cancelled"
+            else:
+                status = "error"
+                result = done.error_message or "Task failed"
+                error = done.error_message or "Task failed"
+            return json.dumps(
+                {
+                    "status": status,
+                    "task_id": done.id,
+                    "child_session_id": done.legacy_child_session_id or context.get("child_session_id"),
+                    "title": context.get("child_title"),
+                    "result": result,
+                    "error": error,
+                },
+                ensure_ascii=False,
+            )
+
+        return json.dumps(
+            {
+                "status": "started",
+                "task_id": created.id,
+                "child_session_id": context.get("child_session_id"),
+                "title": context.get("child_title"),
+            },
+            ensure_ascii=False,
+        )
+
     async def execute(self, input_data: str) -> str:
         try:
             data = _parse_json_input(input_data)
@@ -135,59 +303,35 @@ class SpawnSubagentTool(Tool):
                     ensure_ascii=False
                 )
 
-            if wait:
-                context = prepare_subagent_session(
-                    task=str(task),
-                    parent_session_id=str(parent_session_id),
-                    title=title if isinstance(title, str) else None,
-                    profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None,
-                    suppress_parent_notify=True
-                )
-                await notify_parent_subagent_started(
-                    str(parent_session_id),
-                    str(context.get("child_session_id", "")),
-                    str(context.get("child_title", "Subagent Task"))
-                )
-                result = await execute_subagent_context(context)
-                return json.dumps(result, ensure_ascii=False)
+            if _task_center_enabled():
+                try:
+                    return await self._execute_task_center(
+                        task=str(task),
+                        title=title if isinstance(title, str) else None,
+                        profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None,
+                        wait=wait,
+                        parent_session_id=str(parent_session_id),
+                        parent_task_id=str(tool_ctx.get("task_id") or "").strip(),
+                    )
+                except Exception as exc:
+                    code = getattr(getattr(exc, "code", None), "value", None) or str(getattr(exc, "code", "internal_error"))
+                    details = getattr(exc, "details", {}) or {}
+                    return json.dumps(
+                        {
+                            "status": "error",
+                            "error": str(getattr(exc, "message", str(exc))),
+                            "code": code,
+                            "details": details,
+                        },
+                        ensure_ascii=False,
+                    )
 
-            context = prepare_subagent_session(
+            return await self._execute_legacy(
                 task=str(task),
-                parent_session_id=str(parent_session_id),
                 title=title if isinstance(title, str) else None,
                 profile_id=str(profile_id).strip() if isinstance(profile_id, str) and profile_id.strip() else None,
-                suppress_parent_notify=False
-            )
-            await notify_parent_subagent_started(
-                str(parent_session_id),
-                str(context.get("child_session_id", "")),
-                str(context.get("child_title", "Subagent Task"))
-            )
-
-            async def _run_subagent():
-                await execute_subagent_context(context)
-
-            def _on_done(fut: asyncio.Task) -> None:
-                _PENDING_TASKS.discard(fut)
-                try:
-                    fut.result()
-                except asyncio.CancelledError:
-                    print("[Subagent] Background task cancelled")
-                except Exception as exc:
-                    print(f"[Subagent] Background task failed: {exc}")
-
-            task_handle = asyncio.create_task(_run_subagent())
-            _PENDING_TASKS.add(task_handle)
-            register_subagent_task(context.get("child_session_id"), task_handle)
-            task_handle.add_done_callback(_on_done)
-
-            return json.dumps(
-                {
-                    "status": "started",
-                    "child_session_id": context["child_session_id"],
-                    "title": context["child_title"]
-                },
-                ensure_ascii=False
+                wait=wait,
+                parent_session_id=str(parent_session_id),
             )
         except Exception as exc:
             return json.dumps(

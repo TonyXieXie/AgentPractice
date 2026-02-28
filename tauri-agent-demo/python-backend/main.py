@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Response, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
@@ -28,7 +29,9 @@ from models import (
     ChatSession, ChatSessionCreate, ChatSessionUpdate,
     ChatRequest, ChatResponse, ExportRequest,
     ToolPermissionRequest, ToolPermissionRequestUpdate,
-    ChatStopRequest, RollbackRequest, PatchRevertRequest, AstRequest, AstNotifyRequest, AstSettingsRequest
+    ChatStopRequest, RollbackRequest, PatchRevertRequest, AstRequest, AstNotifyRequest, AstSettingsRequest,
+    AgentInstance, AgentTask, AgentTaskCreateRequest, AgentTaskHandoffRequest, AgentTaskCancelRequest, AgentTaskEvent,
+    TaskStatus, TaskErrorCode
 )
 from database import db
 from llm_client import create_llm_client
@@ -54,6 +57,7 @@ from ast_index import get_ast_index
 from ast_settings import get_ast_settings, update_ast_settings, get_all_ast_settings
 from context_compress import build_history_for_llm, maybe_compress_context
 from subagent_runner import cancel_subagent_task, suppress_subagent_parent_notify
+from task_orchestrator import get_task_orchestrator, TaskOrchestratorError
 from skills import (
     list_skills,
     get_enabled_skills,
@@ -66,6 +70,8 @@ from skills import (
 app = FastAPI(title="Tauri Agent Chat Backend")
 STREAM_REGISTRY = get_stream_registry()
 WS_HUB = get_ws_hub()
+TASK_ORCHESTRATOR = get_task_orchestrator()
+TASK_BY_MESSAGE_ID: Dict[int, str] = {}
 
 
 # ==================== Subagent Cleanup ====================
@@ -100,6 +106,10 @@ async def on_startup():
         WS_HUB.set_loop(asyncio.get_running_loop())
     except Exception:
         pass
+    try:
+        await TASK_ORCHESTRATOR.start()
+    except Exception as exc:
+        print(f"[Task Orchestrator] failed to start: {exc}")
     try:
         asyncio.create_task(_init_skills_background())
     except Exception as exc:
@@ -152,11 +162,15 @@ except Exception:
     pass
 
 @app.on_event("shutdown")
-def _shutdown_cleanup():
+async def _shutdown_cleanup():
     try:
         count = get_pty_manager().close_all()
         if count:
             print(f"[PTY] closed {count} sessions on shutdown")
+    except Exception:
+        pass
+    try:
+        await TASK_ORCHESTRATOR.stop()
     except Exception:
         pass
 
@@ -357,6 +371,36 @@ def _extract_command_name(command: str) -> str:
     if base.endswith(".exe") or base.endswith(".cmd") or base.endswith(".bat"):
         base = os.path.splitext(base)[0]
     return base
+
+
+def _agent_config() -> Dict[str, Any]:
+    config = get_app_config()
+    agent_cfg = config.get("agent") if isinstance(config, dict) else {}
+    return agent_cfg if isinstance(agent_cfg, dict) else {}
+
+
+def _task_center_enabled() -> bool:
+    return bool(_agent_config().get("task_center_enabled", False))
+
+
+def _task_ui_enabled() -> bool:
+    return bool(_agent_config().get("task_ui_enabled", False))
+
+
+def _task_error_response(
+    status_code: int,
+    code: TaskErrorCode,
+    message: str,
+    details: Optional[Dict[str, Any]] = None
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "code": code.value if isinstance(code, TaskErrorCode) else str(code),
+            "message": message,
+            "details": details or {}
+        }
+    )
 
 
 def _looks_like_title(raw: str) -> bool:
@@ -916,6 +960,103 @@ async def rollback_session(session_id: str, request: RollbackRequest):
         pass
 
     return result
+
+
+def _task_error_from_exception(exc: TaskOrchestratorError) -> JSONResponse:
+    return _task_error_response(exc.status_code, exc.code, exc.message, exc.details)
+
+
+@app.post("/tasks", response_model=AgentTask)
+async def create_task_route(request: AgentTaskCreateRequest):
+    try:
+        created = await TASK_ORCHESTRATOR.create_task(request)
+        return created
+    except TaskOrchestratorError as exc:
+        return _task_error_from_exception(exc)
+    except Exception as exc:
+        return _task_error_response(
+            500,
+            TaskErrorCode.internal_error,
+            "Failed to create task",
+            {"error": str(exc)}
+        )
+
+
+@app.get("/tasks/{task_id}", response_model=AgentTask)
+def get_task_route(task_id: str):
+    task = db.get_agent_task(task_id)
+    if not task:
+        return _task_error_response(
+            404,
+            TaskErrorCode.task_not_found,
+            "Task not found",
+            {"task_id": task_id}
+        )
+    return task
+
+
+@app.get("/tasks", response_model=List[AgentTask])
+def list_tasks_route(
+    session_id: Optional[str] = None,
+    status: Optional[str] = None,
+    instance_id: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=1000),
+):
+    if not session_id:
+        return []
+    return db.list_agent_tasks(
+        session_id=session_id,
+        status=status,
+        instance_id=instance_id,
+        limit=limit
+    )
+
+
+@app.get("/tasks/{task_id}/events", response_model=List[AgentTaskEvent])
+def list_task_events_route(
+    task_id: str,
+    after_seq: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=5000),
+):
+    task = db.get_agent_task(task_id)
+    if not task:
+        return _task_error_response(
+            404,
+            TaskErrorCode.task_not_found,
+            "Task not found",
+            {"task_id": task_id}
+        )
+    return db.list_agent_task_events(task_id, after_seq=after_seq, limit=limit)
+
+
+@app.post("/tasks/{task_id}/handoff", response_model=AgentTask)
+async def handoff_task_route(task_id: str, request: AgentTaskHandoffRequest):
+    try:
+        return await TASK_ORCHESTRATOR.handoff_task(task_id, request)
+    except TaskOrchestratorError as exc:
+        return _task_error_from_exception(exc)
+    except Exception as exc:
+        return _task_error_response(
+            500,
+            TaskErrorCode.internal_error,
+            "Failed to handoff task",
+            {"task_id": task_id, "error": str(exc)}
+        )
+
+
+@app.post("/tasks/{task_id}/cancel", response_model=AgentTask)
+async def cancel_task_route(task_id: str, request: AgentTaskCancelRequest):
+    try:
+        return await TASK_ORCHESTRATOR.cancel_task(task_id, request)
+    except TaskOrchestratorError as exc:
+        return _task_error_from_exception(exc)
+    except Exception as exc:
+        return _task_error_response(
+            500,
+            TaskErrorCode.internal_error,
+            "Failed to cancel task",
+            {"task_id": task_id, "error": str(exc)}
+        )
 
 # ==================== Attachments ====================
 
@@ -1647,6 +1788,244 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
         except Exception:
             pass
 
+
+def _task_event_to_agent_step(event: AgentTaskEvent, task: AgentTask) -> AgentStep:
+    payload = event.payload or {}
+    if event.event_type == "task_started":
+        return AgentStep(
+            step_type="observation",
+            content=event.message or "Task started",
+            metadata={"task_event": event.event_type, "task_id": task.id, "instance_id": payload.get("instance_id")}
+        )
+    if event.event_type == "task_progress":
+        return AgentStep(
+            step_type="observation",
+            content=event.message or "Task progress",
+            metadata={"task_event": event.event_type, "task_id": task.id, "payload": payload}
+        )
+    if event.event_type == "task_handoff":
+        return AgentStep(
+            step_type="action",
+            content=event.message or "Task handoff",
+            metadata={
+                "task_event": event.event_type,
+                "task_id": task.id,
+                "tool": "spawn_subagent",
+                "input": json.dumps(payload, ensure_ascii=False)
+            }
+        )
+    if event.event_type == "task_completed":
+        return AgentStep(
+            step_type="answer",
+            content=str(payload.get("result") or task.result or event.message or ""),
+            metadata={"task_event": event.event_type, "task_id": task.id, "payload": payload}
+        )
+    if event.event_type == "task_cancelled":
+        return AgentStep(
+            step_type="error",
+            content=event.message or event.error_message or "Task cancelled",
+            metadata={"task_event": event.event_type, "task_id": task.id}
+        )
+    return AgentStep(
+        step_type="error",
+        content=event.error_message or event.message or "Task failed",
+        metadata={"task_event": event.event_type, "task_id": task.id}
+    )
+
+
+async def _run_task_center_stream(request: ChatRequest, state) -> None:
+    assistant_msg_id: Optional[int] = None
+    stop_event = None
+    task_id: Optional[str] = None
+    try:
+        await state.emit({"stream_id": state.stream_id})
+
+        new_session_created = False
+        if request.session_id:
+            session = db.get_session(request.session_id)
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if request.agent_profile is not None and request.agent_profile != getattr(session, "agent_profile", None):
+                session = db.update_session(session.id, ChatSessionUpdate(agent_profile=request.agent_profile)) or session
+        else:
+            config_id = request.config_id
+            if not config_id:
+                default_config = db.get_default_config()
+                if not default_config:
+                    configs = db.get_all_configs()
+                    if not configs:
+                        raise HTTPException(status_code=400, detail="No config available")
+                    config_id = configs[0].id
+                else:
+                    config_id = default_config.id
+            session = db.create_session(ChatSessionCreate(
+                title="New Chat",
+                config_id=config_id,
+                work_path=request.work_path,
+                agent_profile=request.agent_profile
+            ))
+            new_session_created = True
+            _schedule_ast_scan(session.work_path)
+
+        is_first_turn = (session.message_count or 0) == 0
+        config = db.get_config(session.config_id)
+        if not config:
+            raise HTTPException(status_code=404, detail="Config not found")
+
+        processed_message = message_processor.preprocess_user_message(request.message)
+        if new_session_created:
+            provisional_title = _fallback_title(processed_message)
+            if provisional_title and provisional_title != session.title:
+                db.update_session(session.id, ChatSessionUpdate(title=provisional_title))
+
+        prepared_attachments, _llm_image_urls = _collect_prepared_attachments(request.attachments)
+        user_msg = db.create_message(ChatMessageCreate(
+            session_id=session.id,
+            role="user",
+            content=processed_message
+        ))
+        saved_attachments = _save_prepared_attachments(user_msg.id, prepared_attachments)
+
+        temp_assistant_msg = db.create_message(ChatMessageCreate(
+            session_id=session.id,
+            role="assistant",
+            content=""
+        ))
+        assistant_msg_id = temp_assistant_msg.id
+        stop_event = stream_stop_registry.create(assistant_msg_id)
+
+        init_payload = {
+            "session_id": session.id,
+            "user_message_id": user_msg.id,
+            "assistant_message_id": assistant_msg_id,
+            "user_attachments": saved_attachments
+        }
+        await state.set_init_payload(init_payload)
+        await state.emit(init_payload)
+
+        task_request = AgentTaskCreateRequest(
+            session_id=session.id,
+            title=f"Agent Task: {session.title}",
+            input=processed_message,
+            target_profile_id=request.agent_profile or getattr(session, "agent_profile", None),
+            metadata={
+                "bridge_subagent_events": False,
+                "origin": "chat_agent_stream",
+                "work_path": request.work_path or getattr(session, "work_path", None),
+            }
+        )
+        task = await TASK_ORCHESTRATOR.create_task(task_request)
+        task_id = task.id
+        TASK_BY_MESSAGE_ID[assistant_msg_id] = task.id
+
+        seq = 0
+        step_sequence = 0
+        final_answer = ""
+        terminal_reached = False
+
+        while not terminal_reached:
+            if stop_event and stop_event.is_set() and task_id:
+                try:
+                    await TASK_ORCHESTRATOR.cancel_task(
+                        task_id,
+                        AgentTaskCancelRequest(reason="Stopped by user", propagate=True)
+                    )
+                except Exception:
+                    pass
+
+            events = db.list_agent_task_events(task.id, after_seq=seq, limit=200)
+            if not events:
+                current = db.get_agent_task(task.id)
+                if current and current.status in (TaskStatus.succeeded, TaskStatus.failed, TaskStatus.cancelled):
+                    terminal_reached = True
+                    if current.result:
+                        final_answer = current.result
+                    break
+                await asyncio.sleep(0.2)
+                continue
+
+            for event in events:
+                seq = event.seq
+                step = _task_event_to_agent_step(event, task)
+
+                db.save_agent_step(
+                    message_id=assistant_msg_id,
+                    step_type=step.step_type,
+                    content=step.content,
+                    sequence=step_sequence,
+                    metadata=step.metadata
+                )
+                if step.step_type == "action" and isinstance(step.metadata, dict) and step.metadata.get("tool"):
+                    db.save_tool_call(
+                        message_id=assistant_msg_id,
+                        tool_name=step.metadata["tool"],
+                        tool_input=step.metadata.get("input", ""),
+                        tool_output=""
+                    )
+
+                await state.emit(step.to_dict())
+                step_sequence += 1
+
+                if event.event_type == "task_completed":
+                    final_answer = step.content
+                    terminal_reached = True
+                elif event.event_type in ("task_failed", "task_cancelled"):
+                    final_answer = step.content
+                    terminal_reached = True
+
+                if terminal_reached:
+                    break
+
+        if assistant_msg_id:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                UPDATE chat_messages
+                SET content = ?
+                WHERE id = ?
+                ''',
+                (final_answer, assistant_msg_id)
+            )
+            conn.commit()
+            conn.close()
+
+        await _maybe_update_session_title(
+            session_id=session.id,
+            config=config,
+            user_message=processed_message,
+            assistant_message=final_answer,
+            is_first_turn=is_first_turn,
+            assistant_message_id=assistant_msg_id
+        )
+
+        await state.emit({"done": True, "session_id": session.id})
+    except Exception as exc:
+        error_step = AgentStep(
+            step_type="error",
+            content=f"Agent failed: {exc}",
+            metadata={"error": str(exc), "traceback": traceback.format_exc()}
+        )
+        try:
+            await state.emit(error_step.to_dict())
+        except Exception:
+            pass
+    finally:
+        if assistant_msg_id:
+            stream_stop_registry.clear(assistant_msg_id)
+            TASK_BY_MESSAGE_ID.pop(assistant_msg_id, None)
+        if task_id:
+            current = db.get_agent_task(task_id)
+            if current and current.status == TaskStatus.running:
+                try:
+                    await TASK_ORCHESTRATOR.cancel_task(task_id, AgentTaskCancelRequest(reason="Stream closed"))
+                except Exception:
+                    pass
+        try:
+            await state.mark_done()
+        except Exception:
+            pass
+
 @app.post("/chat/agent/stream")
 async def chat_agent_stream(request: ChatRequest):
     try:
@@ -1667,7 +2046,8 @@ async def chat_agent_stream(request: ChatRequest):
 
         keepalive_sec = _resolve_stream_keepalive_sec()
         state = await STREAM_REGISTRY.create(keepalive_sec)
-        asyncio.create_task(_run_agent_stream(request, state))
+        runner = _run_task_center_stream if _task_center_enabled() else _run_agent_stream
+        asyncio.create_task(runner(request, state))
         last_seq = request.last_seq or 0
         return StreamingResponse(
             state.stream(last_seq),
@@ -2247,13 +2627,19 @@ def get_code_map(session_id: str = Query(...), root: str = Query(...)):
     return {"ok": True, "prompt": prompt or ""}
 
 @app.post("/chat/stop")
-def stop_chat(request: ChatStopRequest):
+async def stop_chat(request: ChatStopRequest):
     message_id = request.message_id
     if message_id is None and request.session_id:
         message_id = db.get_latest_assistant_message_id(request.session_id)
     if message_id is None:
         raise HTTPException(status_code=400, detail="Missing message_id or session_id")
     stopped = stream_stop_registry.stop(int(message_id))
+    task_id = TASK_BY_MESSAGE_ID.get(int(message_id))
+    if task_id:
+        try:
+            await TASK_ORCHESTRATOR.cancel_task(task_id, AgentTaskCancelRequest(reason="Stopped by user"))
+        except Exception:
+            pass
     print(f"[STREAM STOP] message_id={message_id} stopped={stopped}")
     return {"stopped": stopped, "message_id": message_id}
 

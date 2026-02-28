@@ -26,6 +26,14 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
         "base_system_prompt": "You are a helpful AI assistant.",
         "react_max_iterations": 50,
         "ast_enabled": True,
+        "task_center_enabled": False,
+        "task_ui_enabled": False,
+        "max_loop_iterations": 5,
+        "task_concurrency": {
+            "global": 8,
+            "per_session": 3,
+            "per_instance": 1
+        },
         "subagent_profile": "subagent",
         "code_map": {
             "enabled": True,
@@ -478,6 +486,25 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         agent["react_max_iterations"] = _coerce_react_max_iterations(agent["react_max_iterations"])
     if "ast_enabled" in agent:
         agent["ast_enabled"] = _coerce_bool(agent["ast_enabled"], "agent.ast_enabled")
+    if "task_center_enabled" in agent:
+        agent["task_center_enabled"] = _coerce_bool(agent["task_center_enabled"], "agent.task_center_enabled")
+    if "task_ui_enabled" in agent:
+        agent["task_ui_enabled"] = _coerce_bool(agent["task_ui_enabled"], "agent.task_ui_enabled")
+    if "max_loop_iterations" in agent:
+        agent["max_loop_iterations"] = _coerce_int_range(
+            agent["max_loop_iterations"], "agent.max_loop_iterations", 1, 50
+        )
+    if "task_concurrency" in agent:
+        concurrency = agent.get("task_concurrency")
+        if not isinstance(concurrency, dict):
+            raise ValueError("agent.task_concurrency must be an object")
+        normalized = dict(concurrency)
+        for key, maximum in (("global", 128), ("per_session", 32), ("per_instance", 8)):
+            if key in normalized:
+                normalized[key] = _coerce_int_range(
+                    normalized[key], f"agent.task_concurrency.{key}", 1, maximum
+                )
+        agent["task_concurrency"] = normalized
     if "subagent_profile" in agent:
         if not isinstance(agent["subagent_profile"], str):
             raise ValueError("agent.subagent_profile must be a string")

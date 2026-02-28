@@ -29,7 +29,7 @@ class WsHub:
         conn = WsConnection(
             id=uuid.uuid4().hex[:12],
             websocket=websocket,
-            session_ids={ALL_SESSIONS_TOKEN}
+            session_ids=set()
         )
         async with self._lock:
             self._connections[conn.id] = conn
@@ -51,6 +51,9 @@ class WsHub:
             existing = self._connections.get(conn.id)
             if not existing:
                 return
+            if ALL_SESSIONS_TOKEN in clean:
+                existing.session_ids = {ALL_SESSIONS_TOKEN}
+                return
             if ALL_SESSIONS_TOKEN in existing.session_ids:
                 return
             existing.session_ids.update(clean)
@@ -65,7 +68,9 @@ class WsHub:
             existing = self._connections.get(conn.id)
             if not existing:
                 return
-            if ALL_SESSIONS_TOKEN in existing.session_ids:
+            if ALL_SESSIONS_TOKEN in clean:
+                existing.session_ids.discard(ALL_SESSIONS_TOKEN)
+            if ALL_SESSIONS_TOKEN in existing.session_ids and ALL_SESSIONS_TOKEN not in clean:
                 return
             existing.session_ids.difference_update(clean)
 

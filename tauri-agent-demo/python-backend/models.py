@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, Literal, List
+from enum import Enum
 
 # LLM API format and profile
 LLMApiFormat = Literal["openai_chat_completions", "openai_responses"]
@@ -217,3 +218,132 @@ class AstSettingsRequest(BaseModel):
     force_include_paths: Optional[List[str]] = None
     include_languages: Optional[List[str]] = None
     max_files: Optional[int] = None
+
+
+class TaskStatus(str, Enum):
+    pending = "pending"
+    running = "running"
+    blocked = "blocked"
+    succeeded = "succeeded"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class TaskErrorCode(str, Enum):
+    invalid_request = "invalid_request"
+    task_not_found = "task_not_found"
+    instance_not_found = "instance_not_found"
+    route_not_resolved = "route_not_resolved"
+    invalid_transition = "invalid_transition"
+    loop_iteration_exceeded = "loop_iteration_exceeded"
+    task_already_terminal = "task_already_terminal"
+    cancelled_by_parent = "cancelled_by_parent"
+    transient_retry_exhausted = "transient_retry_exhausted"
+    internal_error = "internal_error"
+
+
+class AgentInstance(BaseModel):
+    id: str
+    session_id: str
+    profile_id: str
+    name: Optional[str] = None
+    abilities: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    status: Literal["active", "disabled"] = "active"
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class AgentTask(BaseModel):
+    id: str
+    session_id: str
+    title: Optional[str] = None
+    input: str
+    status: TaskStatus = TaskStatus.pending
+    assigned_instance_id: Optional[str] = None
+    created_by_instance_id: Optional[str] = None
+    target_profile_id: Optional[str] = None
+    required_abilities: List[str] = Field(default_factory=list)
+    parent_task_id: Optional[str] = None
+    root_task_id: Optional[str] = None
+    source_task_id: Optional[str] = None
+    loop_group_id: Optional[str] = None
+    loop_iteration: int = 0
+    max_retries: int = 2
+    retry_count: int = 0
+    idempotency_key: Optional[str] = None
+    error_code: Optional[TaskErrorCode] = None
+    error_message: Optional[str] = None
+    result: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    legacy_child_session_id: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+
+
+class AgentTaskCreateRequest(BaseModel):
+    session_id: str
+    title: Optional[str] = None
+    input: str
+    target_instance_id: Optional[str] = None
+    target_profile_id: Optional[str] = None
+    required_abilities: List[str] = Field(default_factory=list)
+    parent_task_id: Optional[str] = None
+    root_task_id: Optional[str] = None
+    source_task_id: Optional[str] = None
+    loop_group_id: Optional[str] = None
+    loop_iteration: Optional[int] = None
+    idempotency_key: Optional[str] = None
+    max_retries: Optional[int] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentTaskHandoffRequest(BaseModel):
+    title: Optional[str] = None
+    input: Optional[str] = None
+    target_instance_id: Optional[str] = None
+    target_profile_id: Optional[str] = None
+    required_abilities: List[str] = Field(default_factory=list)
+    loop_group_id: Optional[str] = None
+    loop_iteration: Optional[int] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentTaskCancelRequest(BaseModel):
+    reason: Optional[str] = None
+    propagate: bool = True
+
+
+class AgentTaskEvent(BaseModel):
+    id: Optional[int] = None
+    task_id: str
+    seq: int
+    event_type: Literal[
+        "task_started",
+        "task_progress",
+        "task_handoff",
+        "task_completed",
+        "task_failed",
+        "task_cancelled"
+    ]
+    status: Optional[TaskStatus] = None
+    message: Optional[str] = None
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    error_code: Optional[TaskErrorCode] = None
+    error_message: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class AgentArtifact(BaseModel):
+    id: Optional[int] = None
+    task_id: str
+    session_id: str
+    artifact_type: str
+    path: Optional[str] = None
+    uri: Optional[str] = None
+    tree_hash: Optional[str] = None
+    checksum: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None

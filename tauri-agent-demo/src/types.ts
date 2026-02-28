@@ -72,6 +72,93 @@ export interface AgentProfile {
     spawnable?: boolean;
 }
 
+export type TaskStatus = 'pending' | 'running' | 'blocked' | 'succeeded' | 'failed' | 'cancelled';
+
+export type TaskErrorCode =
+    | 'invalid_request'
+    | 'task_not_found'
+    | 'instance_not_found'
+    | 'route_not_resolved'
+    | 'invalid_transition'
+    | 'loop_iteration_exceeded'
+    | 'task_already_terminal'
+    | 'cancelled_by_parent'
+    | 'transient_retry_exhausted'
+    | 'internal_error';
+
+export interface AgentInstance {
+    id: string;
+    session_id: string;
+    profile_id: string;
+    name?: string | null;
+    abilities: string[];
+    metadata?: Record<string, any>;
+    status: 'active' | 'disabled';
+    created_at?: string | null;
+    updated_at?: string | null;
+}
+
+export interface AgentTask {
+    id: string;
+    session_id: string;
+    title?: string | null;
+    input: string;
+    status: TaskStatus;
+    assigned_instance_id?: string | null;
+    created_by_instance_id?: string | null;
+    target_profile_id?: string | null;
+    required_abilities: string[];
+    parent_task_id?: string | null;
+    root_task_id?: string | null;
+    source_task_id?: string | null;
+    loop_group_id?: string | null;
+    loop_iteration: number;
+    max_retries: number;
+    retry_count: number;
+    idempotency_key?: string | null;
+    error_code?: TaskErrorCode | null;
+    error_message?: string | null;
+    result?: string | null;
+    metadata?: Record<string, any>;
+    legacy_child_session_id?: string | null;
+    created_at?: string | null;
+    updated_at?: string | null;
+    started_at?: string | null;
+    finished_at?: string | null;
+}
+
+export interface AgentTaskEvent {
+    id?: number;
+    task_id: string;
+    seq: number;
+    event_type:
+        | 'task_started'
+        | 'task_progress'
+        | 'task_handoff'
+        | 'task_completed'
+        | 'task_failed'
+        | 'task_cancelled';
+    status?: TaskStatus | null;
+    message?: string | null;
+    payload?: Record<string, any>;
+    error_code?: TaskErrorCode | null;
+    error_message?: string | null;
+    created_at?: string | null;
+}
+
+export interface AgentArtifact {
+    id?: number;
+    task_id: string;
+    session_id: string;
+    artifact_type: string;
+    path?: string | null;
+    uri?: string | null;
+    tree_hash?: string | null;
+    checksum?: string | null;
+    metadata?: Record<string, any>;
+    created_at?: string | null;
+}
+
 export interface CodeMapConfig {
     enabled?: boolean;
     max_symbols?: number;
@@ -85,6 +172,14 @@ export interface AgentConfig {
     base_system_prompt?: string;
     react_max_iterations?: number;
     ast_enabled?: boolean;
+    task_center_enabled?: boolean;
+    task_ui_enabled?: boolean;
+    max_loop_iterations?: number;
+    task_concurrency?: {
+        global?: number;
+        per_session?: number;
+        per_instance?: number;
+    };
     code_map?: CodeMapConfig;
     mcp?: MCPConfig;
     abilities?: AgentAbility[];
