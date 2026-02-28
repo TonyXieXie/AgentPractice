@@ -280,6 +280,20 @@ class Database:
             )
         ''')
 
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS session_tool_call_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                message_id INTEGER,
+                agent_type TEXT,
+                iteration INTEGER,
+                tool_name TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                failure_reason TEXT,
+                created_at TEXT NOT NULL
+            )
+        ''')
+
         try:
             cursor.execute('ALTER TABLE tool_permission_requests ADD COLUMN session_id TEXT')
         except sqlite3.OperationalError:
@@ -310,6 +324,8 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_permission_status ON tool_permission_requests(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_session ON file_snapshots(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_message ON file_snapshots(session_id, message_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_history_session ON session_tool_call_history(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_history_session_tool ON session_tool_call_history(session_id, tool_name)')
         
         conn.commit()
         conn.close()
@@ -812,6 +828,37 @@ class Database:
                     )
                 )
 
+            cursor.execute(
+                '''
+                SELECT message_id, agent_type, iteration, tool_name, success, failure_reason, created_at
+                FROM session_tool_call_history
+                WHERE session_id = ?
+                ORDER BY id ASC
+                ''',
+                (session_id,)
+            )
+            for row in cursor.fetchall():
+                old_message_id = row['message_id']
+                new_message_id = message_id_map.get(old_message_id) if old_message_id is not None else None
+                cursor.execute(
+                    '''
+                    INSERT INTO session_tool_call_history (
+                        session_id, message_id, agent_type, iteration, tool_name, success, failure_reason, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        new_session_id,
+                        new_message_id,
+                        row['agent_type'],
+                        row['iteration'],
+                        row['tool_name'],
+                        row['success'],
+                        row['failure_reason'],
+                        row['created_at'],
+                    )
+                )
+
             conn.commit()
             return self.get_session(new_session_id)
         except Exception:
@@ -878,6 +925,7 @@ class Database:
                 SELECT id FROM chat_messages WHERE session_id = ?
             )
         ''', (session_id,))
+        cursor.execute('DELETE FROM session_tool_call_history WHERE session_id = ?', (session_id,))
         cursor.execute('DELETE FROM chat_messages WHERE session_id = ?', (session_id,))
         cursor.execute('DELETE FROM chat_sessions WHERE id = ?', (session_id,))
         deleted = cursor.rowcount > 0
@@ -1609,6 +1657,92 @@ class Database:
                 "created_at": row["created_at"],
             })
         return results
+
+    def save_session_tool_call_history(
+        self,
+        session_id: str,
+        tool_name: str,
+        success: bool,
+        message_id: Optional[int] = None,
+        agent_type: Optional[str] = None,
+        iteration: Optional[int] = None,
+        failure_reason: Optional[str] = None
+    ) -> int:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        timestamp = datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO session_tool_call_history (
+                session_id, message_id, agent_type, iteration, tool_name, success, failure_reason, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            session_id,
+            message_id,
+            agent_type,
+            iteration,
+            tool_name,
+            1 if success else 0,
+            failure_reason,
+            timestamp
+        ))
+        row_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return row_id
+
+    def get_session_tool_stats(self, session_id: str) -> Dict[str, Any]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT
+                COUNT(*) AS total_calls,
+                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success_calls
+            FROM session_tool_call_history
+            WHERE session_id = ?
+        ''', (session_id,))
+        total_row = cursor.fetchone()
+
+        total_calls = int(total_row["total_calls"]) if total_row and total_row["total_calls"] is not None else 0
+        success_calls = int(total_row["success_calls"]) if total_row and total_row["success_calls"] is not None else 0
+        failed_calls = max(0, total_calls - success_calls)
+        success_rate = (success_calls / total_calls) if total_calls > 0 else 0.0
+
+        cursor.execute('''
+            SELECT
+                tool_name,
+                COUNT(*) AS total_calls,
+                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success_calls
+            FROM session_tool_call_history
+            WHERE session_id = ?
+            GROUP BY tool_name
+            ORDER BY total_calls DESC, tool_name ASC
+        ''', (session_id,))
+        rows = cursor.fetchall()
+        conn.close()
+
+        tools: List[Dict[str, Any]] = []
+        for row in rows:
+            item_total = int(row["total_calls"]) if row["total_calls"] is not None else 0
+            item_success = int(row["success_calls"]) if row["success_calls"] is not None else 0
+            item_failed = max(0, item_total - item_success)
+            item_rate = (item_success / item_total) if item_total > 0 else 0.0
+            tools.append({
+                "tool_name": row["tool_name"],
+                "total_calls": item_total,
+                "success_calls": item_success,
+                "failed_calls": item_failed,
+                "success_rate": item_rate,
+            })
+
+        return {
+            "session_id": session_id,
+            "total_calls": total_calls,
+            "success_calls": success_calls,
+            "failed_calls": failed_calls,
+            "success_rate": success_rate,
+            "tools": tools
+        }
 
     def get_llm_call_metas_after(self, session_id: str, after_id: int = 0) -> List[Dict[str, Any]]:
         conn = self.get_connection()

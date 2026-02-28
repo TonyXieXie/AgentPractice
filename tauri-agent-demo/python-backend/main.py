@@ -9,9 +9,11 @@ import os
 import argparse
 import shlex
 import base64
+import re
 import time
 import atexit
 import signal
+import uuid
 from io import BytesIO
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
@@ -820,6 +822,28 @@ def get_session_llm_calls(session_id: str):
         )
     )
     return calls
+
+@app.get("/sessions/{session_id}/tool_stats")
+def get_session_tool_stats(session_id: str):
+    t0 = time.perf_counter()
+    session = db.get_session(session_id)
+    t1 = time.perf_counter()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    stats = db.get_session_tool_stats(session_id)
+    t2 = time.perf_counter()
+    print(
+        "[Session Fetch] tool_stats session=%s lookup=%.1fms db=%.1fms total=%.1fms total_calls=%s tools=%s"
+        % (
+            session_id,
+            (t1 - t0) * 1000,
+            (t2 - t1) * 1000,
+            (t2 - t0) * 1000,
+            stats.get("total_calls", 0),
+            len(stats.get("tools", []) or []),
+        )
+    )
+    return stats
 
 @app.get("/sessions/{session_id}/agent_steps")
 def get_session_agent_steps(session_id: str, message_ids: Optional[str] = None):
@@ -1868,12 +1892,15 @@ class PtyReadRequest(BaseModel):
     pty_id: str
     cursor: Optional[int] = None
     max_output: Optional[int] = None
+    completion_key: Optional[str] = None
 
 
 class PtySendRequest(BaseModel):
     session_id: str
     pty_id: str
     input: str
+    track_completion: Optional[bool] = False
+    completion_key: Optional[str] = None
 
 
 class PtyCloseRequest(BaseModel):
@@ -1918,6 +1945,47 @@ def _normalize_windows_pty_input(text: str) -> str:
     if not normalized.endswith("\n"):
         normalized += "\n"
     return normalized.replace("\n", "\r\n")
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _pty_completion_marker_enabled() -> bool:
+    shell_cfg = get_tool_config().get("shell", {}) or {}
+    return _coerce_bool(shell_cfg.get("pty_completion_marker_enabled"), True)
+
+
+def _build_completion_key(raw_key: Optional[str]) -> str:
+    text = str(raw_key or "").strip()
+    if text:
+        text = re.sub(r"[^A-Za-z0-9_.:-]+", "", text)
+        if text:
+            return text[:160]
+    return f"__PTY_COMPLETION_{uuid.uuid4().hex}__"
+
+
+def _append_completion_marker_command(payload: Optional[str], completion_key: str, windows: bool) -> str:
+    text = "" if payload is None else str(payload)
+    marker_command = f"echo {completion_key}"
+    if windows:
+        if text:
+            text = _normalize_windows_pty_input(text)
+        return f"{text}{marker_command}\r\n"
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return f"{text}{marker_command}\n"
 
 
 @app.get("/pty/list")
@@ -1977,7 +2045,7 @@ def read_pty(request: PtyReadRequest):
     except (TypeError, ValueError):
         max_output = 20000
     chunk, cursor, reset = proc.read(request.cursor, max_output)
-    return {
+    response = {
         "ok": True,
         "pty_id": proc.id,
         "status": proc.status,
@@ -1988,6 +2056,10 @@ def read_pty(request: PtyReadRequest):
         "reset": reset,
         "chunk": chunk
     }
+    completion_key = str(request.completion_key or "").strip()
+    if completion_key:
+        response["completion_reached"] = proc.is_completion_reached(completion_key)
+    return response
 
 
 @app.post("/pty/send")
@@ -1997,7 +2069,13 @@ def send_pty(request: PtySendRequest):
     if not proc:
         raise HTTPException(status_code=404, detail="PTY not found")
     payload = request.input or ""
-    if os.name == "nt" and payload:
+    completion_key: Optional[str] = None
+    track_completion = _coerce_bool(request.track_completion, False)
+    marker_enabled = _pty_completion_marker_enabled()
+    if track_completion and marker_enabled:
+        completion_key = proc.register_completion_key(_build_completion_key(request.completion_key))
+        payload = _append_completion_marker_command(payload, completion_key, os.name == "nt")
+    elif os.name == "nt" and payload:
         payload = _normalize_windows_pty_input(payload)
     data = payload.encode("utf-8", errors="replace")
     written = proc.write(data)
@@ -2006,9 +2084,13 @@ def send_pty(request: PtySendRequest):
         print(
             "[PTY DEBUG] api send "
             f"pty_id={proc.id} bytes_written={written} input_len={len(payload)} "
-            f"endswith_crlf={endswith_crlf} tail_hex={_tail_bytes_hex(data)}"
+            f"endswith_crlf={endswith_crlf} track_completion={str(track_completion).lower()} "
+            f"marker_enabled={str(marker_enabled).lower()} tail_hex={_tail_bytes_hex(data)}"
         )
-    return {"ok": True, "pty_id": proc.id, "bytes_written": written}
+    response = {"ok": True, "pty_id": proc.id, "bytes_written": written}
+    if completion_key:
+        response["completion_key"] = completion_key
+    return response
 
 
 @app.post("/pty/close")

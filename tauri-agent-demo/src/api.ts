@@ -11,6 +11,7 @@
     ChatRequest,
     ChatResponse,
     LLMCall,
+    SessionToolStats,
     ToolPermissionRequest,
     PatchRevertResponse,
     ToolDefinition,
@@ -371,6 +372,12 @@ export async function getSessionLLMCalls(sessionId: string): Promise<LLMCall[]> 
     return response.json();
 }
 
+export async function getSessionToolStats(sessionId: string): Promise<SessionToolStats> {
+    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/tool_stats`);
+    if (!response.ok) throw new Error('Failed to fetch tool stats');
+    return response.json();
+}
+
 export async function getSessionAgentSteps(
     sessionId: string,
     messageIds?: number[]
@@ -483,6 +490,7 @@ export interface PtyReadResponse {
     cursor: number;
     reset: boolean;
     chunk: string;
+    completion_reached?: boolean;
 }
 
 export interface AgentStreamKeepalive {
@@ -684,6 +692,7 @@ export async function readPty(payload: {
     pty_id: string;
     cursor?: number;
     max_output?: number;
+    completion_key?: string;
 }): Promise<PtyReadResponse> {
     const response = await fetch(`${API_BASE_URL}/pty/read`, {
         method: 'POST',
@@ -698,7 +707,9 @@ export async function sendPty(payload: {
     session_id: string;
     pty_id: string;
     input: string;
-}): Promise<{ ok: boolean; pty_id: string; bytes_written: number }> {
+    track_completion?: boolean;
+    completion_key?: string;
+}): Promise<{ ok: boolean; pty_id: string; bytes_written: number; completion_key?: string }> {
     const response = await fetch(`${API_BASE_URL}/pty/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

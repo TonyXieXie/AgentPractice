@@ -37,7 +37,9 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "timeout_sec": 30,
         "buffer_size": 2097152,
         "max_output": 20000,
-        "permission_timeout_sec": 300
+        "permission_timeout_sec": 300,
+        "oneshot_status_interval_sec": 1.0,
+        "pty_completion_marker_enabled": True
     },
     "search": {
         "provider": "tavily",

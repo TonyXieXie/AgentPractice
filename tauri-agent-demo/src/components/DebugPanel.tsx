@@ -1,12 +1,13 @@
 ﻿import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { runAstTool, getAstCache, getAstCacheFile, getCodeMap } from '../api';
-import { Message, LLMCall, AstPayload, AstRequest, AgentMode, AstCacheResponse, AstCacheFile, CodeMapResponse } from '../types';
+import { Message, LLMCall, AstPayload, AstRequest, AgentMode, AstCacheResponse, AstCacheFile, CodeMapResponse, SessionToolStats } from '../types';
 import AstViewer from './AstViewer';
 import './DebugPanel.css';
 
 interface DebugPanelProps {
     messages: Message[];
     llmCalls: LLMCall[];
+    toolStats?: SessionToolStats | null;
     onClose: () => void;
     onWidthChange?: (width: number) => void;
     initialWidth?: number;
@@ -21,6 +22,7 @@ interface DebugPanelProps {
 function DebugPanel({
     messages,
     llmCalls,
+    toolStats,
     onClose,
     onWidthChange,
     initialWidth,
@@ -37,7 +39,7 @@ function DebugPanel({
     const [panelWidth, setPanelWidth] = useState(() => Math.max(320, initialWidth ?? 400));
     const [focusedCallId, setFocusedCallId] = useState<number | null>(null);
     const [suppressedFocusKey, setSuppressedFocusKey] = useState<string | null>(null);
-    const [activeTab, setActiveTab] = useState<'llm' | 'ast' | 'cache'>('llm');
+    const [activeTab, setActiveTab] = useState<'llm' | 'ast' | 'tools' | 'cache'>('llm');
     const [astForm, setAstForm] = useState({
         path: '',
         mode: 'outline',
@@ -131,6 +133,12 @@ function DebugPanel({
         if (value == null || !Number.isFinite(value)) return '';
         if (value >= 1000) return `${(value / 1000).toFixed(2)}s`;
         return `${Math.round(value)}ms`;
+    };
+
+    const formatPercent = (value?: number | null) => {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return '0.0%';
+        return `${(numeric * 100).toFixed(1)}%`;
     };
 
     const buildAstRequest = (): AstRequest | null => {
@@ -517,6 +525,13 @@ function DebugPanel({
                         </button>
                         <button
                             type="button"
+                            className={`debug-tab${activeTab === 'tools' ? ' active' : ''}`}
+                            onClick={() => setActiveTab('tools')}
+                        >
+                            Tools
+                        </button>
+                        <button
+                            type="button"
                             className={`debug-tab${activeTab === 'cache' ? ' active' : ''}`}
                             onClick={() => setActiveTab('cache')}
                         >
@@ -530,7 +545,61 @@ function DebugPanel({
             </div>
 
             <div className="debug-content">
-                {activeTab === 'cache' ? (
+                {activeTab === 'tools' ? (
+                    <div className="tools-debug">
+                        <div className="tools-summary-grid">
+                            <div className="tools-summary-card">
+                                <div className="tools-summary-label">Tools Used</div>
+                                <div className="tools-summary-value">{toolStats?.tools?.length || 0}</div>
+                            </div>
+                            <div className="tools-summary-card">
+                                <div className="tools-summary-label">Total Calls</div>
+                                <div className="tools-summary-value">{toolStats?.total_calls || 0}</div>
+                            </div>
+                            <div className="tools-summary-card">
+                                <div className="tools-summary-label">Success</div>
+                                <div className="tools-summary-value success">{toolStats?.success_calls || 0}</div>
+                            </div>
+                            <div className="tools-summary-card">
+                                <div className="tools-summary-label">Failed</div>
+                                <div className="tools-summary-value failed">{toolStats?.failed_calls || 0}</div>
+                            </div>
+                            <div className="tools-summary-card">
+                                <div className="tools-summary-label">Success Rate</div>
+                                <div className="tools-summary-value">{formatPercent(toolStats?.success_rate)}</div>
+                            </div>
+                        </div>
+
+                        {!toolStats?.tools || toolStats.tools.length === 0 ? (
+                            <div className="tools-empty">No tool calls recorded for this session.</div>
+                        ) : (
+                            <div className="tools-table-wrap">
+                                <table className="tools-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Tool</th>
+                                            <th>Calls</th>
+                                            <th>Success</th>
+                                            <th>Failed</th>
+                                            <th>Success Rate</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {toolStats.tools.map((item) => (
+                                            <tr key={item.tool_name}>
+                                                <td className="tool-name-cell">{item.tool_name}</td>
+                                                <td>{item.total_calls}</td>
+                                                <td className="tools-success">{item.success_calls}</td>
+                                                <td className="tools-failed">{item.failed_calls}</td>
+                                                <td>{formatPercent(item.success_rate)}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                    </div>
+                ) : activeTab === 'cache' ? (
                     <div className="ast-cache">
                         <div className="ast-debug-form">
                             <div className="ast-debug-row">

@@ -84,8 +84,9 @@ def _truncate_text_middle(text: str, cfg: Optional[Dict[str, Any]]) -> str:
     head_text = text_value[:head] if head > 0 else ""
     tail_text = text_value[-tail:] if tail > 0 else ""
     return (
-        f"{head_text}\n{TRUNCATION_MARKER_START}({omitted} chars omitted)\n"
-        f"{TRUNCATION_MARKER_END}\n{tail_text}"
+        f"{head_text}"
+        f"{TRUNCATION_MARKER_START}({omitted} chars omitted){TRUNCATION_MARKER_END}"
+        f"{tail_text}"
     )
 
 

@@ -2,7 +2,7 @@ import os
 import threading
 import time
 import uuid
-from typing import Dict, Optional, Tuple, List, Callable
+from typing import Dict, Optional, Tuple, List, Callable, Set
 
 
 DEFAULT_BUFFER_SIZE = 2 * 1024 * 1024
@@ -89,6 +89,10 @@ class PtyProcess:
         self._on_output = on_output
         self._buffer = bytearray()
         self._buffer_lock = threading.Lock()
+        self._completion_lock = threading.Lock()
+        self._completion_keys: Set[str] = set()
+        self._completion_reached: Set[str] = set()
+        self._completion_tail = b""
         self._cursor = 0
         self._total_bytes = 0
         self._last_output_at = time.monotonic()
@@ -105,7 +109,24 @@ class PtyProcess:
     def touch_output(self) -> None:
         self._last_output_at = time.monotonic()
 
-    def append_output(self, data: bytes) -> None:
+    def register_completion_key(self, key: Optional[str]) -> str:
+        token = str(key or "").strip()
+        if not token:
+            token = uuid.uuid4().hex
+        with self._completion_lock:
+            self._completion_keys.add(token)
+        return token
+
+    def is_completion_reached(self, key: Optional[str]) -> bool:
+        token = str(key or "").strip()
+        if not token:
+            return self.status in ("exited", "closed")
+        with self._completion_lock:
+            if token in self._completion_reached:
+                return True
+        return self.status in ("exited", "closed")
+
+    def _append_raw_output(self, data: bytes) -> None:
         if not data:
             return
         callback = self._on_output
@@ -124,6 +145,73 @@ class PtyProcess:
                 callback(data, total_bytes)
             except Exception:
                 pass
+
+    def _consume_completion_markers(self, data: bytes, final: bool = False) -> bytes:
+        with self._completion_lock:
+            keys = [key for key in self._completion_keys if key]
+            tail = self._completion_tail
+            self._completion_tail = b""
+
+        if not keys:
+            if tail:
+                return tail + (data or b"")
+            return data or b""
+
+        merged = (tail or b"") + (data or b"")
+        if not merged:
+            return b""
+
+        text = merged.decode("latin-1", errors="ignore")
+        lines = text.splitlines(keepends=True)
+        tail_text = ""
+        if not final and lines:
+            last_line = lines[-1]
+            if not last_line.endswith("\n") and not last_line.endswith("\r"):
+                tail_text = last_line
+                lines = lines[:-1]
+
+        tracked = [(key, key.lower()) for key in keys]
+        reached: Set[str] = set()
+        kept_lines: List[str] = []
+
+        for line in lines:
+            lower_line = line.lower()
+            hit = False
+            for key, lower_key in tracked:
+                if lower_key and lower_key in lower_line:
+                    reached.add(key)
+                    hit = True
+            if not hit:
+                kept_lines.append(line)
+
+        if final and tail_text:
+            lower_tail = tail_text.lower()
+            hit = False
+            for key, lower_key in tracked:
+                if lower_key and lower_key in lower_tail:
+                    reached.add(key)
+                    hit = True
+            if not hit:
+                kept_lines.append(tail_text)
+            tail_text = ""
+
+        with self._completion_lock:
+            if tail_text:
+                self._completion_tail = tail_text.encode("latin-1", errors="ignore")
+            if reached:
+                self._completion_reached.update(reached)
+
+        return "".join(kept_lines).encode("latin-1", errors="ignore")
+
+    def _flush_completion_tail(self) -> None:
+        flushed = self._consume_completion_markers(b"", final=True)
+        if flushed:
+            self._append_raw_output(flushed)
+
+    def append_output(self, data: bytes) -> None:
+        filtered = self._consume_completion_markers(data, final=False)
+        if filtered:
+            self._append_raw_output(filtered)
 
     def set_on_output(self, callback: Optional[Callable[[bytes, int], None]]) -> None:
         self._on_output = callback
@@ -158,12 +246,14 @@ class PtyProcess:
     def mark_exited(self, exit_code: Optional[int]) -> None:
         if self.status == "closed":
             return
+        self._flush_completion_tail()
         self.status = "exited"
         self.exit_code = exit_code
 
     def close(self) -> None:
         if self.status == "closed":
             return
+        self._flush_completion_tail()
         self.status = "closed"
         self.stop_event.set()
         # Run terminator in a background thread to avoid blocking

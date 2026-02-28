@@ -13,6 +13,7 @@ import {
   MessageAttachment,
   LLMConfig,
   LLMCall,
+  SessionToolStats,
   ToolPermissionRequest,
   ReasoningEffort,
   AgentMode,
@@ -30,6 +31,7 @@ import {
   getSession,
   getSessionMessages,
   getSessionLLMCalls,
+  getSessionToolStats,
   getSessionAgentSteps,
   stopAgentStream,
   rollbackSession,
@@ -755,6 +757,7 @@ function App() {
   const panelAppliedRef = useRef({ pty: 0, debug: 0 });
   const [debugFocus, setDebugFocus] = useState<{ key: string; messageId: number; iteration: number; callId?: number } | null>(null);
   const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
+  const [toolStats, setToolStats] = useState<SessionToolStats | null>(null);
   const [pendingContextEstimate, setPendingContextEstimate] = useState<PendingContextEstimate | null>(null);
   const [contextEstimateBySession, setContextEstimateBySession] = useState<Record<string, ContextEstimate>>({});
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
@@ -2606,11 +2609,25 @@ function App() {
   };
 
   const refreshSessionDebug = async (sessionId: string) => {
-    try {
-      const calls = await getSessionLLMCalls(sessionId);
-      setLlmCalls(calls);
-    } catch (error) {
-      console.error('Failed to load LLM calls:', error);
+    const [llmResult, toolResult] = await Promise.allSettled([
+      getSessionLLMCalls(sessionId),
+      getSessionToolStats(sessionId),
+    ]);
+
+    if (!showDebugPanelRef.current) return;
+    if (!sessionId) return;
+    if (currentSessionIdRef.current !== sessionId) return;
+
+    if (llmResult.status === 'fulfilled') {
+      setLlmCalls(llmResult.value);
+    } else {
+      console.error('Failed to load LLM calls:', llmResult.reason);
+    }
+
+    if (toolResult.status === 'fulfilled') {
+      setToolStats(toolResult.value);
+    } else {
+      console.error('Failed to load tool stats:', toolResult.reason);
     }
   };
 
@@ -3322,6 +3339,7 @@ function App() {
       mark('cache-check');
 
       setLlmCalls([]);
+      setToolStats(null);
       const sessionFetchStart = perfEnabled ? performance.now() : 0;
       const session = await getSession(sessionId, { includeCount: false });
       if (perfEnabled) {
@@ -3428,6 +3446,7 @@ function App() {
     setCurrentSessionParentId(null);
     setSessionMessages(DRAFT_SESSION_KEY, []);
     setLlmCalls([]);
+    setToolStats(null);
     messagePagingRef.current[DRAFT_SESSION_KEY] = { loading: false, hasMore: true, oldestId: null };
     autoScrollRef.current = true;
 
@@ -4652,6 +4671,7 @@ function App() {
         <DebugPanel
           messages={messages}
           llmCalls={llmCalls}
+          toolStats={toolStats}
           currentSessionId={currentSessionId}
           workPath={currentWorkPath}
           extraWorkPaths={debugExtraWorkPaths}

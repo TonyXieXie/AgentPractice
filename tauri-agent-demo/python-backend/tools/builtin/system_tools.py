@@ -3,6 +3,7 @@ import ast as py_ast
 import difflib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import locale
 import select
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional, List, Set
 
@@ -1028,13 +1030,14 @@ def _run_windows_restricted(command: str, workdir: Path, timeout_sec: float) -> 
             remaining = max(0.0, timeout_sec - (time.monotonic() - start_time))
             wait_ms = int(min(50.0, remaining) * 1000)
             if remaining <= 0:
+                timeout_output = _decode_output_bytes(b"".join(output_chunks))
                 kernel32.TerminateProcess(proc_info.hProcess, 1)
                 kernel32.CloseHandle(proc_info.hThread)
                 kernel32.CloseHandle(proc_info.hProcess)
                 kernel32.CloseHandle(stdout_read)
                 if job_handle:
                     kernel32.CloseHandle(job_handle)
-                raise subprocess.TimeoutExpired(command, timeout_sec)
+                raise subprocess.TimeoutExpired(command, timeout_sec, output=timeout_output)
         else:
             wait_ms = 50
 
@@ -1163,6 +1166,47 @@ def _normalize_windows_stdin(text: str) -> str:
     return normalized.replace("\n", "\r\n")
 
 
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _shell_completion_marker_enabled() -> bool:
+    shell_cfg = get_tool_config().get("shell", {}) or {}
+    return _coerce_bool(shell_cfg.get("pty_completion_marker_enabled"), True)
+
+
+def _build_completion_key(raw_key: Optional[str]) -> str:
+    text = str(raw_key or "").strip()
+    if text:
+        text = re.sub(r"[^A-Za-z0-9_.:-]+", "", text)
+        if text:
+            return text[:160]
+    return f"__PTY_COMPLETION_{uuid.uuid4().hex}__"
+
+
+def _append_completion_marker_command(stdin_value: Optional[str], completion_key: str, windows: bool) -> str:
+    payload = "" if stdin_value is None else str(stdin_value)
+    marker_command = f"echo {completion_key}"
+    if windows:
+        if payload:
+            payload = _normalize_windows_stdin(payload)
+        return f"{payload}{marker_command}\r\n"
+    if payload and not payload.endswith("\n"):
+        payload += "\n"
+    return f"{payload}{marker_command}\n"
+
+
 def _build_posix_command(command: str, use_sandbox: bool = True) -> List[str]:
     if _is_macos() and use_sandbox:
         sandbox_exec = "/usr/bin/sandbox-exec"
@@ -1256,7 +1300,8 @@ def _run_posix_pty_oneshot(
     except Exception:
         pass
     if timed_out:
-        raise subprocess.TimeoutExpired(command, timeout_sec)
+        timeout_output = _decode_output_bytes(b"".join(output_chunks))
+        raise subprocess.TimeoutExpired(command, timeout_sec, output=timeout_output)
     return int(exit_code or 0), _decode_output_bytes(b"".join(output_chunks))
 
 
@@ -2057,7 +2102,7 @@ def _run_windows_pty_oneshot(
 
     output = _decode_output_bytes(b"".join(output_chunks))
     if timed_out:
-        raise subprocess.TimeoutExpired(command, timeout_sec)
+        raise subprocess.TimeoutExpired(command, timeout_sec, output=output)
     return int(exit_code.value), output
 
 
@@ -3192,7 +3237,7 @@ class RunShellTool(Tool):
             "Run a shell command within the work path. "
             "Supports mode=oneshot|persistent. "
             "Persistent mode returns a pty_id and supports action=send|read|close|list. "
-            "Optional args: stdin, timeout_sec (s), idle_timeout (ms), "
+            "Optional args: stdin, track_completion, completion_key, timeout_sec (s), idle_timeout (ms), "
             "max_output (chars), buffer_size (bytes)."
         )
         self.parameters = [
@@ -3224,6 +3269,18 @@ class RunShellTool(Tool):
                 name="stdin",
                 type="string",
                 description="Stdin content to write (one-shot or send).",
+                required=False
+            ),
+            ToolParameter(
+                name="track_completion",
+                type="boolean",
+                description="When action=send, append hidden completion marker and return completion_key.",
+                required=False
+            ),
+            ToolParameter(
+                name="completion_key",
+                type="string",
+                description="Completion key for action=send/read. If omitted for tracked send, backend generates one.",
                 required=False
             ),
             ToolParameter(
@@ -3332,6 +3389,14 @@ class RunShellTool(Tool):
                 return "PTY not found."
             if action == "send":
                 stdin_value = data.get("stdin")
+                track_completion = _coerce_bool(data.get("track_completion"), False)
+                completion_key: Optional[str] = None
+                completion_marker_enabled = _shell_completion_marker_enabled()
+                if track_completion and completion_marker_enabled:
+                    completion_key = proc.register_completion_key(_build_completion_key(data.get("completion_key")))
+                    stdin_value = _append_completion_marker_command(stdin_value, completion_key, _is_windows())
+                elif _is_windows() and isinstance(stdin_value, str) and stdin_value:
+                    stdin_value = _normalize_windows_stdin(stdin_value)
                 if _pty_debug_enabled():
                     if isinstance(stdin_value, str):
                         endswith_lf = stdin_value.endswith("\n")
@@ -3339,17 +3404,14 @@ class RunShellTool(Tool):
                         _pty_debug(
                             "run_shell send stdin "
                             f"type=str len={len(stdin_value)} "
-                            f"endswith_lf={endswith_lf} endswith_crlf={endswith_crlf}"
+                            f"endswith_lf={endswith_lf} endswith_crlf={endswith_crlf} "
+                            f"track_completion={str(track_completion).lower()} marker_enabled={str(completion_marker_enabled).lower()}"
                         )
                     else:
-                        _pty_debug(f"run_shell send stdin type={type(stdin_value).__name__}")
-                if _is_windows() and isinstance(stdin_value, str) and stdin_value:
-                    stdin_value = _normalize_windows_stdin(stdin_value)
-                    if _pty_debug_enabled():
-                        endswith_crlf = stdin_value.endswith("\r\n")
                         _pty_debug(
-                            "run_shell send normalized "
-                            f"len={len(stdin_value)} endswith_crlf={endswith_crlf}"
+                            "run_shell send stdin "
+                            f"type={type(stdin_value).__name__} "
+                            f"track_completion={str(track_completion).lower()} marker_enabled={str(completion_marker_enabled).lower()}"
                         )
                 stdin_bytes = _encode_stdin(stdin_value)
                 if _pty_debug_enabled():
@@ -3360,7 +3422,10 @@ class RunShellTool(Tool):
                         f"tail_hex={_tail_bytes_hex(stdin_bytes)}"
                     )
                 written = proc.write(stdin_bytes)
-                return f"[pty_id={proc.id} status={proc.status} bytes_written={written}]"
+                header = f"[pty_id={proc.id} status={proc.status} bytes_written={written}]"
+                if completion_key:
+                    header = f"{header} completion_key={completion_key}"
+                return header
             if action == "read":
                 max_output = data.get("max_output")
                 if max_output is None:
@@ -3373,10 +3438,12 @@ class RunShellTool(Tool):
                         cursor = int(cursor)
                     except (TypeError, ValueError):
                         cursor = None
+                completion_key = str(data.get("completion_key") or "").strip() or None
                 if _pty_debug_enabled():
                     _pty_debug(
                         "run_shell read enter "
-                        f"pty_id={proc.id} cursor={cursor} max_output={max_output} status={proc.status}"
+                        f"pty_id={proc.id} cursor={cursor} max_output={max_output} status={proc.status} "
+                        f"completion_key={completion_key}"
                     )
                 read_start = time.monotonic()
                 try:
@@ -3392,6 +3459,9 @@ class RunShellTool(Tool):
                         f"pty_id={proc.id} elapsed={elapsed:.3f}s chunk_len={len(chunk or '')} "
                         f"new_cursor={new_cursor} reset={str(reset).lower()} status={proc.status}"
                     )
+                completion_reached: Optional[bool] = None
+                if completion_key:
+                    completion_reached = proc.is_completion_reached(completion_key)
                 header = (
                     f"[pty_id={proc.id} status={proc.status} pty={str(proc.pty_enabled).lower()} "
                     f"cursor={new_cursor} reset={str(reset).lower()} idle_timeout={proc.idle_timeout_ms} "
@@ -3399,6 +3469,8 @@ class RunShellTool(Tool):
                 )
                 if proc.status == "exited":
                     header = f"{header} exit_code={proc.exit_code}"
+                if completion_reached is not None:
+                    header = f"{header} completion_reached={str(completion_reached).lower()}"
                 return f"{header}\n{chunk or ''}"
             if action == "close":
                 if _pty_debug_enabled():
@@ -3448,8 +3520,10 @@ class RunShellTool(Tool):
                 command = input_data
         if command is None:
             raise ValueError("Missing command.")
+        command_text = str(command)
+        persistent_bootstrap = mode == "persistent" and not command_text.strip()
 
-        cmd_name = _extract_command_name(command)
+        cmd_name = _extract_command_name(command_text)
         root = _get_root_path()
         if cmd_name == "rg":
             command = _rewrite_rg_command(command, root)
@@ -3463,7 +3537,7 @@ class RunShellTool(Tool):
 
         reasons = []
         if agent_mode != "super":
-            if not shell_unrestricted and cmd_name not in allowset:
+            if not shell_unrestricted and not persistent_bootstrap and cmd_name not in allowset:
                 reasons.append("Command not in allowlist.")
         if reasons:
             request_id = None
@@ -3488,7 +3562,7 @@ class RunShellTool(Tool):
                     return "Permission request timed out."
                 return "Permission required."
 
-            if status == "approved" and agent_mode == "default" and not shell_unrestricted and cmd_name not in allowset:
+            if status == "approved" and agent_mode == "default" and not shell_unrestricted and not persistent_bootstrap and cmd_name not in allowset:
                 _ensure_shell_allowlist_entry(cmd_name)
 
         cwd = data.get("cwd")
@@ -3618,8 +3692,24 @@ class RunShellTool(Tool):
                 returncode, output = await asyncio.to_thread(_run_oneshot, True)
             elapsed_ms = int((time.monotonic() - exec_start) * 1000)
             output = _append_idle_timeout_info(output, elapsed_ms)
-        except subprocess.TimeoutExpired:
-            return "Command timed out."
+        except subprocess.TimeoutExpired as exc:
+            partial_output = ""
+            raw_output = getattr(exc, "output", None)
+            if raw_output is None:
+                stdout_value = getattr(exc, "stdout", None)
+                stderr_value = getattr(exc, "stderr", None)
+                if stdout_value is not None or stderr_value is not None:
+                    raw_output = (stdout_value or b"") + (stderr_value or b"")
+            if raw_output is not None:
+                if isinstance(raw_output, (bytes, bytearray)):
+                    partial_output = _decode_output_bytes(bytes(raw_output))
+                else:
+                    partial_output = str(raw_output)
+            partial_output = (partial_output or "").strip()
+            timeout_body = partial_output if partial_output else "(no output)"
+            timeout_output = f"[exit_code=124]\n{timeout_body}\n[timeout]"
+            timeout_output = _apply_max_output(timeout_output, max_output)
+            return timeout_output
         except Exception as exc:
             request_id = None
             try:
@@ -3643,7 +3733,7 @@ class RunShellTool(Tool):
                     return "Permission request timed out."
                 return "Permission required."
 
-            if status == "approved" and agent_mode == "default" and not shell_unrestricted and cmd_name not in unrestricted_allowset:
+            if status == "approved" and agent_mode == "default" and not shell_unrestricted and not persistent_bootstrap and cmd_name not in unrestricted_allowset:
                 _ensure_shell_unrestricted_allowlist_entry(cmd_name)
 
             if mode == "persistent":
@@ -3687,7 +3777,7 @@ class RunShellTool(Tool):
                     return "Permission request timed out."
                 return "Permission required."
 
-            if status == "approved" and agent_mode == "default" and not shell_unrestricted and cmd_name not in unrestricted_allowset:
+            if status == "approved" and agent_mode == "default" and not shell_unrestricted and not persistent_bootstrap and cmd_name not in unrestricted_allowset:
                 _ensure_shell_unrestricted_allowlist_entry(cmd_name)
 
             exec_start = time.monotonic()

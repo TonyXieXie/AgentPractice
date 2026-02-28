@@ -251,6 +251,23 @@ export interface LLMCall {
     created_at: string;
 }
 
+export interface SessionToolStatsItem {
+    tool_name: string;
+    total_calls: number;
+    success_calls: number;
+    failed_calls: number;
+    success_rate: number;
+}
+
+export interface SessionToolStats {
+    session_id: string;
+    total_calls: number;
+    success_calls: number;
+    failed_calls: number;
+    success_rate: number;
+    tools: SessionToolStatsItem[];
+}
+
 export interface ToolPermissionRequest {
     id: number;
     tool_name: string;

@@ -140,9 +140,36 @@ def _truncate_text_middle(text: str, cfg: Dict[str, Any]) -> str:
     head_text = text_value[:head] if head > 0 else ""
     tail_text = text_value[-tail:] if tail > 0 else ""
     return (
-        f"{head_text}\n{TRUNCATION_MARKER_START}({omitted} chars omitted)\n"
-        f"{TRUNCATION_MARKER_END}\n{tail_text}"
+        f"{head_text}"
+        f"{TRUNCATION_MARKER_START}({omitted} chars omitted){TRUNCATION_MARKER_END}"
+        f"{tail_text}"
     )
+
+
+def _truncate_json_values(value: Any, cfg: Dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        return _truncate_text_middle(value, cfg)
+    if isinstance(value, list):
+        return [_truncate_json_values(item, cfg) for item in value]
+    if isinstance(value, dict):
+        return {key: _truncate_json_values(item, cfg) for key, item in value.items()}
+    return value
+
+
+def _truncate_json_text(text: Any, cfg: Dict[str, Any], fallback: str = "{}") -> str:
+    raw = "" if text is None else str(text)
+    raw_stripped = raw.strip()
+    if not raw_stripped:
+        return fallback
+    try:
+        parsed = json.loads(raw_stripped)
+    except Exception:
+        return fallback
+    try:
+        parsed = _truncate_json_values(parsed, cfg)
+        return json.dumps(parsed, ensure_ascii=False)
+    except Exception:
+        return fallback
 
 
 def _sanitize_tool_call_arguments(call: Dict[str, Any], current_call_seq: int, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -150,11 +177,11 @@ def _sanitize_tool_call_arguments(call: Dict[str, Any], current_call_seq: int, c
     origin = new_call.pop("__origin_call_seq", None)
     if _should_truncate(origin, current_call_seq, cfg):
         if "arguments" in new_call:
-            new_call["arguments"] = _truncate_text_middle(new_call.get("arguments", ""), cfg)
+            new_call["arguments"] = _truncate_json_text(new_call.get("arguments", ""), cfg, fallback="{}")
         if "function" in new_call and isinstance(new_call["function"], dict):
             func = dict(new_call["function"])
             if "arguments" in func:
-                func["arguments"] = _truncate_text_middle(func.get("arguments", ""), cfg)
+                func["arguments"] = _truncate_json_text(func.get("arguments", ""), cfg, fallback="{}")
             new_call["function"] = func
     if "name" in new_call:
         new_call["name"] = _normalize_tool_name_for_llm(new_call.get("name"))
@@ -201,7 +228,7 @@ def _sanitize_response_input(
         if _should_truncate(origin, current_call_seq, cfg):
             item_type = str(new_item.get("type", "") or "")
             if item_type == "function_call":
-                new_item["arguments"] = _truncate_text_middle(new_item.get("arguments", ""), cfg)
+                new_item["arguments"] = _truncate_json_text(new_item.get("arguments", ""), cfg, fallback="{}")
             elif item_type == "function_call_output":
                 new_item["output"] = _truncate_text_middle(new_item.get("output", ""), cfg)
         item_type = str(new_item.get("type", "") or "")
@@ -706,6 +733,10 @@ class ReActAgent(AgentStrategy):
                 debug_ctx = self._merge_debug_context(session_id, request_overrides, "react", iteration)
                 if debug_ctx:
                     llm_overrides["_debug"] = debug_ctx
+                debug_message_id = debug_ctx.get("message_id") if isinstance(debug_ctx, dict) else None
+                debug_message_id = debug_message_id if isinstance(debug_message_id, int) else None
+                debug_agent_type = debug_ctx.get("agent_type") if isinstance(debug_ctx, dict) else None
+                debug_agent_type = str(debug_agent_type or "react")
 
                 if openai_format == "openai_responses":
                     base_overrides = dict(llm_overrides)
@@ -997,6 +1028,23 @@ class ReActAgent(AgentStrategy):
                                 content=output_text,
                                 metadata={"tool": safe_label, "tool_display": display_label, "iteration": iteration, "mcp": True}
                             )
+                            success, failure_reason = self._classify_tool_call_result(
+                                safe_label,
+                                output_text,
+                                extra={
+                                    "status": mcp_call.get("status"),
+                                    "error": mcp_call.get("error")
+                                }
+                            )
+                            self._record_tool_call_history(
+                                session_id=session_id,
+                                message_id=debug_message_id,
+                                agent_type=debug_agent_type,
+                                iteration=iteration,
+                                tool_name=safe_label,
+                                success=success,
+                                failure_reason=failure_reason
+                            )
 
                     if tool_calls:
                         if output_items:
@@ -1085,6 +1133,21 @@ class ReActAgent(AgentStrategy):
                                     content=tool_output,
                                     metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                                 )
+
+                            success, failure_reason = self._classify_tool_call_result(
+                                tool_meta_name,
+                                tool_output,
+                                error_msg=error_msg
+                            )
+                            self._record_tool_call_history(
+                                session_id=session_id,
+                                message_id=debug_message_id,
+                                agent_type=debug_agent_type,
+                                iteration=iteration,
+                                tool_name=tool_meta_name,
+                                success=success,
+                                failure_reason=failure_reason
+                            )
 
                             dynamic_response_items.append({
                                 "type": "function_call_output",
@@ -1380,6 +1443,21 @@ class ReActAgent(AgentStrategy):
                                 metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                             )
 
+                        success, failure_reason = self._classify_tool_call_result(
+                            tool_meta_name,
+                            tool_output,
+                            error_msg=error_msg
+                        )
+                        self._record_tool_call_history(
+                            session_id=session_id,
+                            message_id=debug_message_id,
+                            agent_type=debug_agent_type,
+                            iteration=iteration,
+                            tool_name=tool_meta_name,
+                            success=success,
+                            failure_reason=failure_reason
+                        )
+
                     dynamic_messages.append({
                         "role": "tool",
                         "tool_call_id": call_id,
@@ -1566,6 +1644,10 @@ class ReActAgent(AgentStrategy):
                 debug_ctx = self._merge_debug_context(session_id, request_overrides, "react", iteration)
                 if debug_ctx:
                     llm_overrides["_debug"] = debug_ctx
+                debug_message_id = debug_ctx.get("message_id") if isinstance(debug_ctx, dict) else None
+                debug_message_id = debug_message_id if isinstance(debug_message_id, int) else None
+                debug_agent_type = debug_ctx.get("agent_type") if isinstance(debug_ctx, dict) else None
+                debug_agent_type = str(debug_agent_type or "react")
 
                 max_tokens = getattr(llm_client.config, "max_context_tokens", 0) or 0
                 estimate = build_context_estimate(
@@ -1660,6 +1742,19 @@ class ReActAgent(AgentStrategy):
                                 metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                             )
                         scratchpad.append({"text": f"Observation: {observation}", "origin_call_seq": current_call_seq})
+                        success, failure_reason = self._classify_tool_call_result(
+                            tool_meta_name,
+                            observation
+                        )
+                        self._record_tool_call_history(
+                            session_id=session_id,
+                            message_id=debug_message_id,
+                            agent_type=debug_agent_type,
+                            iteration=iteration,
+                            tool_name=tool_meta_name,
+                            success=success,
+                            failure_reason=failure_reason
+                        )
                     except Exception as e:
                         error_msg = f"Tool execution failed: {str(e)}"
                         yield AgentStep(
@@ -1668,6 +1763,20 @@ class ReActAgent(AgentStrategy):
                             metadata={"tool": tool_meta_name, "tool_display": tool_label, "error": str(e), "iteration": iteration}
                         )
                         scratchpad.append({"text": f"Observation: {error_msg}", "origin_call_seq": current_call_seq})
+                        success, failure_reason = self._classify_tool_call_result(
+                            tool_meta_name,
+                            error_msg,
+                            error_msg=error_msg
+                        )
+                        self._record_tool_call_history(
+                            session_id=session_id,
+                            message_id=debug_message_id,
+                            agent_type=debug_agent_type,
+                            iteration=iteration,
+                            tool_name=tool_meta_name,
+                            success=success,
+                            failure_reason=failure_reason
+                        )
                 else:
                     error_msg = f"Tool not found: '{action}'"
                     yield AgentStep(
@@ -1676,6 +1785,20 @@ class ReActAgent(AgentStrategy):
                         metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
                     )
                     scratchpad.append({"text": f"Observation: {error_msg}", "origin_call_seq": current_call_seq})
+                    success, failure_reason = self._classify_tool_call_result(
+                        tool_meta_name,
+                        error_msg,
+                        error_msg=error_msg
+                    )
+                    self._record_tool_call_history(
+                        session_id=session_id,
+                        message_id=debug_message_id,
+                        agent_type=debug_agent_type,
+                        iteration=iteration,
+                        tool_name=tool_meta_name,
+                        success=success,
+                        failure_reason=failure_reason
+                    )
             else:
                 yield AgentStep(
                     step_type="thought",
@@ -1895,6 +2018,116 @@ class ReActAgent(AgentStrategy):
         except json.JSONDecodeError as e:
             return None, f"Invalid JSON arguments: {e}"
 
+    def _short_failure_reason(self, value: Optional[str], fallback: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return fallback
+        first_line = text.splitlines()[0].strip() if "\n" in text else text
+        if not first_line:
+            first_line = fallback
+        if len(first_line) > 200:
+            return f"{first_line[:197]}..."
+        return first_line
+
+    def _extract_last_exit_code(self, output_text: str) -> Optional[int]:
+        if not output_text:
+            return None
+        matches = re.findall(r"exit_code\s*=\s*(-?\d+)", output_text)
+        if not matches:
+            return None
+        try:
+            return int(matches[-1])
+        except (TypeError, ValueError):
+            return None
+
+    def _classify_tool_call_result(
+        self,
+        tool_name: Optional[str],
+        tool_output: Optional[str],
+        error_msg: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, Optional[str]]:
+        failed_statuses = {"failed", "error", "denied", "cancelled", "timeout"}
+        extra_payload = extra or {}
+        output_text = str(tool_output or "")
+        output_stripped = output_text.strip()
+        normalized_tool_name = str(tool_name or "").strip().lower()
+
+        if error_msg:
+            return False, self._short_failure_reason(error_msg, "tool_error")
+
+        mcp_error = extra_payload.get("error")
+        if mcp_error:
+            return False, self._short_failure_reason(str(mcp_error), "mcp_error")
+
+        mcp_status = str(extra_payload.get("status") or "").strip().lower()
+        if mcp_status in failed_statuses:
+            return False, f"mcp_status={mcp_status}"
+
+        if output_stripped.startswith("Tool execution failed:"):
+            return False, self._short_failure_reason(output_stripped, "tool_execution_failed")
+        if output_stripped.startswith("Tool not found:"):
+            return False, self._short_failure_reason(output_stripped, "tool_not_found")
+        if output_stripped.startswith("Invalid JSON arguments:"):
+            return False, "invalid_json_arguments"
+        if output_stripped.startswith("Tool arguments must be a JSON object."):
+            return False, "tool_arguments_not_object"
+
+        if output_stripped.startswith("Permission denied."):
+            return False, "permission_denied"
+        if output_stripped.startswith("Permission request timed out."):
+            return False, "permission_request_timed_out"
+        if output_stripped.startswith("Permission required."):
+            return False, "permission_required"
+
+        if "[用户主动停止输出]" in output_stripped:
+            return False, "stopped_by_user"
+
+        if normalized_tool_name == "run_shell":
+            exit_code = self._extract_last_exit_code(output_text)
+            if exit_code is not None and exit_code != 0:
+                return False, f"exit_code={exit_code}"
+
+        if normalized_tool_name == "apply_patch":
+            try:
+                payload = json.loads(output_stripped) if output_stripped else None
+            except Exception:
+                payload = None
+            if isinstance(payload, dict) and payload.get("ok") is False:
+                reason = payload.get("error")
+                if reason:
+                    return False, self._short_failure_reason(str(reason), "apply_patch_ok_false")
+                return False, "apply_patch_ok_false"
+
+        return True, None
+
+    def _record_tool_call_history(
+        self,
+        session_id: Optional[str],
+        message_id: Optional[int],
+        agent_type: Optional[str],
+        iteration: Optional[int],
+        tool_name: Optional[str],
+        success: bool,
+        failure_reason: Optional[str] = None
+    ) -> None:
+        if not session_id:
+            return
+        normalized_tool_name = str(tool_name or "").strip() or "unknown"
+        normalized_reason = self._short_failure_reason(failure_reason, "failed") if not success else None
+        try:
+            db.save_session_tool_call_history(
+                session_id=session_id,
+                message_id=message_id,
+                agent_type=agent_type,
+                iteration=iteration,
+                tool_name=normalized_tool_name,
+                success=success,
+                failure_reason=normalized_reason
+            )
+        except Exception:
+            pass
+
     def _split_shell_output(self, output: str) -> Tuple[str, str]:
         if not output:
             return "", ""
@@ -2060,12 +2293,76 @@ class ReActAgent(AgentStrategy):
         explicit_oneshot = mode == "oneshot" or pty_requested is False
 
         if explicit_oneshot or not explicit_persistent:
-            tool_output = await self._execute_tool(tool, tool_input)
+            shell_cfg = get_tool_config().get("shell", {}) or {}
+            heartbeat_interval = shell_cfg.get("oneshot_status_interval_sec", 1.0)
+            try:
+                heartbeat_interval = float(heartbeat_interval)
+            except (TypeError, ValueError):
+                heartbeat_interval = 1.0
+            if heartbeat_interval <= 0:
+                heartbeat_interval = 1.0
+            command_text = str(args.get("command") or "")
+            heartbeat_prefix = "[run_shell status=running]"
+            if command_text:
+                heartbeat_prefix = f"{heartbeat_prefix}\n$ {command_text}"
+            yield AgentStep(
+                step_type="observation",
+                content=heartbeat_prefix,
+                metadata={
+                    "tool": tool_name,
+                    "iteration": iteration,
+                    "stream_key": stream_key,
+                    "streaming": True,
+                    "command": command_text
+                }
+            )
+            start_time = time.monotonic()
+            task = asyncio.create_task(self._execute_tool(tool, tool_input))
+            while True:
+                if _stop_requested():
+                    if not task.done():
+                        task.cancel()
+                        task.add_done_callback(lambda _: None)
+                    stopped_output = self._append_stop_note("")
+                    output_holder["output"] = stopped_output
+                    yield AgentStep(
+                        step_type="observation",
+                        content=stopped_output,
+                        metadata={
+                            "tool": tool_name,
+                            "iteration": iteration,
+                            "stream_key": stream_key,
+                            "command": command_text,
+                            "stopped_by_user": True
+                        }
+                    )
+                    return
+                try:
+                    tool_output = await asyncio.wait_for(asyncio.shield(task), timeout=heartbeat_interval)
+                    break
+                except asyncio.TimeoutError:
+                    elapsed_sec = int(max(0, time.monotonic() - start_time))
+                    yield AgentStep(
+                        step_type="observation_delta",
+                        content=f"\n[run_shell status=running elapsed={elapsed_sec}s]",
+                        metadata={
+                            "tool": tool_name,
+                            "iteration": iteration,
+                            "stream_key": stream_key,
+                            "command": command_text,
+                            "heartbeat": True
+                        }
+                    )
             output_holder["output"] = tool_output
             yield AgentStep(
                 step_type="observation",
                 content=tool_output,
-                metadata={"tool": tool_name, "iteration": iteration}
+                metadata={
+                    "tool": tool_name,
+                    "iteration": iteration,
+                    "stream_key": stream_key,
+                    "command": command_text
+                }
             )
             return
 
@@ -2081,15 +2378,25 @@ class ReActAgent(AgentStrategy):
             return
 
         command_text = str(command)
+        shell_cfg = get_tool_config().get("shell", {}) or {}
+        marker_cfg = shell_cfg.get("pty_completion_marker_enabled", True)
+        if isinstance(marker_cfg, str):
+            marker_enabled = marker_cfg.strip().lower() not in ("0", "false", "no", "off")
+        else:
+            marker_enabled = bool(marker_cfg)
+        # Windows-first rollout: keep non-Windows behavior unchanged.
+        marker_enabled = marker_enabled and os.name == "nt"
 
         start_args = dict(args)
         start_args["mode"] = "persistent"
         start_args.pop("action", None)
         start_args.pop("pty_id", None)
         start_args.pop("cursor", None)
+        start_args.pop("track_completion", None)
+        start_args.pop("completion_key", None)
         if "idle_timeout" not in start_args:
             start_args["idle_timeout"] = 120000
-        start_args["command"] = command_text
+        start_args["command"] = "" if marker_enabled else command_text
 
         if _stop_requested():
             stopped_output = self._append_stop_note("")
@@ -2129,6 +2436,32 @@ class ReActAgent(AgentStrategy):
                 f"start_failed stream_key={stream_key} output={start_output[:120] if start_output else ''}"
             )
             return
+        completion_key: Optional[str] = None
+        if marker_enabled and status != "exited":
+            send_payload: Dict[str, Any] = {
+                "action": "send",
+                "pty_id": pty_id,
+                "stdin": command_text,
+                "track_completion": True
+            }
+            send_output = await self._execute_tool(tool, json.dumps(send_payload))
+            send_header, _ = self._split_shell_output(send_output)
+            if not send_header or not send_header.startswith("["):
+                await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+                output_holder["output"] = send_output
+                yield AgentStep(
+                    step_type="observation",
+                    content=send_output,
+                    metadata={"tool": tool_name, "iteration": iteration, "stream_key": stream_key, "command": command_text}
+                )
+                return
+            send_header_data = self._parse_shell_header(send_header)
+            completion_key = send_header_data.get("completion_key")
+            if not completion_key:
+                marker_enabled = False
+                _pty_stream_log(
+                    f"completion_key_missing stream_key={stream_key} pty_id={pty_id}, fallback=status"
+                )
 
         if body.strip() == "(no output)" and status != "exited":
             body = ""
@@ -2196,6 +2529,7 @@ class ReActAgent(AgentStrategy):
         error_output: Optional[str] = None
         last_header_line = header_line
         idle_timed_out = False
+        completion_reached = False
         total_reads = 0
         total_bytes = 0
         last_chunk_at = time.monotonic()
@@ -2231,6 +2565,8 @@ class ReActAgent(AgentStrategy):
                 read_args["cursor"] = cursor
             if max_output is not None:
                 read_args["max_output"] = max_output
+            if marker_enabled and completion_key:
+                read_args["completion_key"] = completion_key
 
             read_start = time.monotonic()
             _pty_stream_log(
@@ -2313,6 +2649,8 @@ class ReActAgent(AgentStrategy):
                         cursor = int(header_data.get("cursor"))
                     except (TypeError, ValueError):
                         cursor = cursor
+                if header_data.get("completion_reached") is not None:
+                    completion_reached = header_data.get("completion_reached") == "true"
                 reset = header_data.get("reset") == "true"
             else:
                 reset = False
@@ -2384,6 +2722,11 @@ class ReActAgent(AgentStrategy):
                     )
                     last_log_at = now
 
+            if completion_reached:
+                if not chunk:
+                    break
+                continue
+
             if status == "exited":
                 if not chunk:
                     break
@@ -2404,7 +2747,12 @@ class ReActAgent(AgentStrategy):
 
         if timed_out:
             await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
-            final_output = "[exit_code=124]\nCommand timed out."
+            final_body = body_buffer if body_buffer else "(no output)"
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+            timeout_marker = f"[timeout elapsed_ms={elapsed_ms} timeout_sec={timeout_sec}]"
+            if timeout_marker not in final_body:
+                final_body = f"{final_body}\n{timeout_marker}"
+            final_output = f"[exit_code=124]\n{final_body}"
             output_holder["output"] = final_output
             yield AgentStep(
                 step_type="observation",

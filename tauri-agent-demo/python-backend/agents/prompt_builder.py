@@ -112,6 +112,11 @@ def _resolve_tool_list(abilities: List[Dict[str, Any]], all_tools: List[Tool], i
 
     include_all = False
     tool_names: List[str] = []
+    # MCP tools are injected dynamically and should be available once registered.
+    mcp_tool_names = {
+        tool.name for tool in all_tools
+        if isinstance(getattr(tool, "name", None), str) and tool.name.startswith("mcp__")
+    }
 
     for ability in abilities:
         tools = ability.get("tools")
@@ -132,11 +137,12 @@ def _resolve_tool_list(abilities: List[Dict[str, Any]], all_tools: List[Tool], i
     if include_all:
         return list(all_tools)
 
-    if not tool_names:
+    selected_names = set(tool_names)
+    selected_names.update(mcp_tool_names)
+    if not selected_names:
         return []
 
-    tool_map = {tool.name: tool for tool in all_tools}
-    return [tool_map[name] for name in tool_names if name in tool_map]
+    return [tool for tool in all_tools if tool.name in selected_names]
 
 
 def _build_tool_lines(tools: List[Tool]) -> List[str]:
