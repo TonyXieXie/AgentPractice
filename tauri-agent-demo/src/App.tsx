@@ -23,6 +23,7 @@ import {
 } from './types';
 import {
   sendMessageAgentStream,
+  sendPtyStream,
   getDefaultConfig,
   getAppConfig,
   getConfig,
@@ -34,6 +35,10 @@ import {
   getSessionToolStats,
   getSessionAgentSteps,
   stopAgentStream,
+  sendPty,
+  closePty,
+  listPtys,
+  readPty,
   rollbackSession,
   revertPatch,
   getToolPermissions,
@@ -42,6 +47,11 @@ import {
   updateSession,
   AgentStep,
   AgentStepWithMessage,
+  PtySseEvent,
+  PtyDeltaEvent,
+  PtyStateEvent,
+  PtyMessageUpsertSseEvent,
+  PtyResyncRequiredEvent,
   getAttachmentUrl,
   getAstSettings,
   updateAstSettings,
@@ -56,6 +66,7 @@ import ConfirmDialog from './components/ConfirmDialog';
 import { loadExtraWorkPaths, migrateExtraWorkPaths, saveExtraWorkPaths } from './workdirStorage';
 import { wsClient } from './wsClient';
 import type { SubagentDoneEvent, SubagentStartedEvent } from './wsTypes';
+import { ptyStore } from './ptyStore';
 
 const DRAFT_SESSION_KEY = '__draft__';
 
@@ -90,6 +101,7 @@ const CONTEXT_RING_RADIUS = 10;
 const AST_DEFAULT_MAX_FILES = 500;
 const STREAM_STALL_MS = 90_000;
 const STREAM_STALL_CHECK_MS = 5_000;
+const PTY_RESYNC_READ_MAX_OUTPUT = 8000;
 const AST_LANGUAGE_OPTIONS = [
   { id: 'python', label: 'Python (.py)' },
   { id: 'javascript', label: 'JavaScript (.js/.jsx/.mjs/.cjs)' },
@@ -130,6 +142,30 @@ const extractRunShellCommand = (raw?: string): string => {
   } catch {
     return match[1];
   }
+};
+
+const parseBooleanMeta = (value: unknown): boolean | undefined => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+  }
+  return undefined;
+};
+
+const parseRunShellPtyIdFromContent = (content?: string): string => {
+  const text = String(content || '').replace(/\r\n/g, '\n');
+  const firstLine = (text.split('\n')[0] || '').trim();
+  if (!firstLine) return '';
+  const match = firstLine.match(/\bpty_id=([^\s\]]+)/);
+  return match?.[1] || '';
+};
+
+const normalizeWaitReason = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') return undefined;
+  const text = value.trim();
+  return text || undefined;
 };
 
 type WorkdirBounds = {
@@ -371,7 +407,7 @@ const findSkillInvocation = (value: string, pattern: RegExp | null) => {
 const stripExistingSkillCommands = (value: string, pattern: RegExp | null) => {
   if (!value || !pattern) return value;
   return value
-    .replace(pattern, (match, leading) => (leading ? String(leading) : ''))
+    .replace(pattern, (_match, leading) => (leading ? String(leading) : ''))
     .replace(/[ \t]{2,}/g, ' ');
 };
 
@@ -703,6 +739,19 @@ type InFlightState = {
   stalled?: boolean;
 };
 
+type ShellInputPromptState = {
+  sessionId: string;
+  sessionKey: string;
+  messageId: number;
+  streamKey: string;
+  ptyId: string;
+  command: string;
+  waitReason?: string;
+  draft: string;
+  sending: boolean;
+  error: string | null;
+};
+
 type PendingContextEstimate = {
   sessionKey: string;
   queueId: string;
@@ -760,6 +809,7 @@ function App() {
   const [toolStats, setToolStats] = useState<SessionToolStats | null>(null);
   const [pendingContextEstimate, setPendingContextEstimate] = useState<PendingContextEstimate | null>(null);
   const [contextEstimateBySession, setContextEstimateBySession] = useState<Record<string, ContextEstimate>>({});
+  const [shellInputPrompt, setShellInputPrompt] = useState<ShellInputPromptState | null>(null);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [heightTick, setHeightTick] = useState(0);
   const [virtualRange, setVirtualRange] = useState({ start: 0, end: 0 });
@@ -839,6 +889,7 @@ function App() {
   const inFlightBySessionRef = useRef<Record<string, InFlightState>>({});
   const pendingPermissionBySessionRef = useRef<Record<string, ToolPermissionRequest | null>>({});
   const permissionBusyBySessionRef = useRef<Record<string, boolean>>({});
+  const shellInputPromptRef = useRef<ShellInputPromptState | null>(null);
   const processingQueueRef = useRef(false);
   const pendingQueueRunRef = useRef(false);
   const lastWorkFileOpenRef = useRef<{ key: string; at: number } | null>(null);
@@ -846,6 +897,9 @@ function App() {
   const astNotifyRef = useRef<{ timer: number | null; paths: Set<string> }>({ timer: null, paths: new Set() });
   const appWindow = useMemo(() => getCurrentWindow(), []);
   const wsSessionRef = useRef<string | null>(null);
+  const ptyStreamAbortRef = useRef<AbortController | null>(null);
+  const ptyStreamSessionRef = useRef<string | null>(null);
+  const ptyResyncInFlightRef = useRef<Record<string, boolean>>({});
 
   useEffect(() => {
     try {
@@ -892,6 +946,14 @@ function App() {
       inflight.lastEventAt = Date.now();
     }
   }, []);
+
+  const handlePtyPanelActivity = useCallback(() => {
+    markStreamActivity(currentSessionIdRef.current);
+  }, [markStreamActivity]);
+
+  const handlePtyPanelWidthChange = useCallback((width: number) => {
+    handlePanelWidthChange('pty', width);
+  }, [handlePanelWidthChange]);
 
   const openPtyPanel = useCallback(() => {
     if (panelOpenRef.current.pty) return;
@@ -965,6 +1027,19 @@ function App() {
 
   useEffect(() => {
     currentSessionIdRef.current = currentSessionId;
+  }, [currentSessionId]);
+
+  useEffect(() => {
+    shellInputPromptRef.current = shellInputPrompt;
+  }, [shellInputPrompt]);
+
+  useEffect(() => {
+    const activeSessionKey = currentSessionId ?? DRAFT_SESSION_KEY;
+    setShellInputPrompt((prev) => {
+      if (!prev) return prev;
+      if (prev.sessionKey === activeSessionKey) return prev;
+      return null;
+    });
   }, [currentSessionId]);
 
   const isImageFile = (file: File) => {
@@ -1803,6 +1878,69 @@ function App() {
 
   const getCurrentSessionKey = () => getSessionKey(currentSessionIdRef.current);
 
+  const clearShellInputPromptForSession = useCallback((sessionKey: string, streamKey?: string) => {
+    setShellInputPrompt((prev) => {
+      if (!prev) return prev;
+      if (prev.sessionKey !== sessionKey) return prev;
+      if (streamKey && prev.streamKey && prev.streamKey !== streamKey) return prev;
+      return null;
+    });
+  }, []);
+
+  const syncShellInputPromptFromStep = useCallback((params: {
+    step: AgentStep;
+    sessionId: string | null;
+    sessionKey: string;
+    messageId: number;
+  }) => {
+    const { step, sessionId, sessionKey, messageId } = params;
+    if (sessionKey !== getCurrentSessionKey()) return;
+    if (!step || (step.step_type !== 'observation' && step.step_type !== 'observation_delta')) return;
+    const meta = (step.metadata || {}) as Record<string, any>;
+    const toolName = String(meta.tool || '').toLowerCase();
+    if (toolName !== 'run_shell') return;
+    const waitingInput = parseBooleanMeta(meta.waiting_input);
+    if (waitingInput !== true && waitingInput !== false) return;
+    const streamKey = String(meta.stream_key || '');
+    if (waitingInput === false) {
+      clearShellInputPromptForSession(sessionKey, streamKey || undefined);
+      return;
+    }
+    const ptyFromMeta = typeof meta.pty_id === 'string' ? meta.pty_id.trim() : '';
+    const ptyId = ptyFromMeta || parseRunShellPtyIdFromContent(step.content);
+    if (!ptyId || !sessionId) return;
+    const command = typeof meta.command === 'string' ? meta.command : '';
+    const waitReason = normalizeWaitReason(meta.wait_reason);
+    setShellInputPrompt((prev) => {
+      if (
+        prev &&
+        prev.sessionKey === sessionKey &&
+        prev.streamKey === streamKey &&
+        prev.ptyId === ptyId
+      ) {
+        return {
+          ...prev,
+          sessionId,
+          messageId,
+          command: command || prev.command,
+          waitReason: waitReason || prev.waitReason
+        };
+      }
+      return {
+        sessionId,
+        sessionKey,
+        messageId,
+        streamKey,
+        ptyId,
+        command,
+        waitReason,
+        draft: '',
+        sending: false,
+        error: null
+      };
+    });
+  }, [clearShellInputPromptForSession]);
+
   const getSessionWorkPath = (sessionKey: string) => workPathBySessionRef.current[sessionKey] || '';
 
   const setSessionWorkPath = (sessionKey: string, nextPath: string) => {
@@ -1986,6 +2124,9 @@ function App() {
   const clearSessionCache = (sessionKey: string) => {
     delete messagesCacheRef.current[sessionKey];
     delete messagePagingRef.current[sessionKey];
+    if (sessionKey !== DRAFT_SESSION_KEY) {
+      ptyStore.clearSession(sessionKey);
+    }
   };
 
   useEffect(() => {
@@ -2027,6 +2168,142 @@ function App() {
     }
     wsSessionRef.current = currentSessionId;
   }, [currentSessionId]);
+
+  useEffect(() => {
+    const previous = ptyStreamAbortRef.current;
+    if (previous) {
+      previous.abort();
+      ptyStreamAbortRef.current = null;
+    }
+
+    if (!currentSessionId) {
+      ptyStreamSessionRef.current = null;
+      ptyResyncInFlightRef.current = {};
+      return;
+    }
+
+    const sessionId = currentSessionId;
+    const abortController = new AbortController();
+    ptyStreamAbortRef.current = abortController;
+    ptyStreamSessionRef.current = sessionId;
+
+    const run = async () => {
+      try {
+        const initialSeq = ptyStore.getSessionLastSeq(sessionId);
+        const streamGenerator = sendPtyStream(
+          {
+            session_id: sessionId,
+            last_seq: initialSeq > 0 ? initialSeq : undefined
+          },
+          abortController.signal
+        );
+
+        for await (const event of streamGenerator) {
+          if (abortController.signal.aborted) break;
+          if ((event as any).keepalive) continue;
+
+          const payload = event as PtySseEvent;
+          if (payload.event === 'pty_delta' || payload.event === 'pty_state') {
+            ptyStore.applySseOutput(payload as PtyDeltaEvent | PtyStateEvent);
+            markStreamActivity(payload.session_id);
+            continue;
+          }
+          if (payload.event === 'pty_message_upsert') {
+            ptyStore.applyMessageUpsertSse(payload as PtyMessageUpsertSseEvent);
+            continue;
+          }
+          if (payload.event === 'pty_resync_required') {
+            const resyncEvent = payload as PtyResyncRequiredEvent;
+            ptyStore.applyResyncRequired(resyncEvent);
+            const targetPtyId =
+              typeof resyncEvent.pty_id === 'string' ? resyncEvent.pty_id.trim() : '';
+            const pendingTargets = ptyStore.consumeResyncTargets(
+              resyncEvent.session_id,
+              targetPtyId ? [targetPtyId] : undefined
+            );
+            const key = `${resyncEvent.session_id}:${targetPtyId || '*'}`;
+            if (ptyResyncInFlightRef.current[key]) {
+              continue;
+            }
+            ptyResyncInFlightRef.current[key] = true;
+            void (async () => {
+              try {
+                const snapshot = ptyStore.getSessionSnapshot(resyncEvent.session_id);
+                const targets = (targetPtyId ? [targetPtyId] : pendingTargets).filter((ptyId) => {
+                  if (!ptyId) return false;
+                  const status = String(snapshot[ptyId]?.status || '').toLowerCase();
+                  if (!status) return true;
+                  return status === 'running' || status === 'waiting_input';
+                });
+                if (targets.length > 0) {
+                  await Promise.all(
+                    targets.map(async (ptyId) => {
+                      try {
+                        const cursor = snapshot[ptyId]?.cursor;
+                        const response = await readPty({
+                          session_id: resyncEvent.session_id,
+                          pty_id: ptyId,
+                          cursor: typeof cursor === 'number' ? cursor : undefined,
+                          max_output: PTY_RESYNC_READ_MAX_OUTPUT
+                        });
+                        ptyStore.applyReadResponse(resyncEvent.session_id, response);
+                      } catch {
+                        // ignore per-pty resync errors
+                      }
+                    })
+                  );
+                } else {
+                  const list = await listPtys(resyncEvent.session_id, { includeExited: false, maxExited: 0 });
+                  const nextSnapshot = ptyStore.getSessionSnapshot(resyncEvent.session_id);
+                  await Promise.all(
+                    list.map(async (item) => {
+                      try {
+                        const cursor = nextSnapshot[item.pty_id]?.cursor;
+                        const response = await readPty({
+                          session_id: resyncEvent.session_id,
+                          pty_id: item.pty_id,
+                          cursor: typeof cursor === 'number' ? cursor : undefined,
+                          max_output: PTY_RESYNC_READ_MAX_OUTPUT
+                        });
+                        ptyStore.applyReadResponse(resyncEvent.session_id, response);
+                      } catch {
+                        // ignore per-pty resync errors
+                      }
+                    })
+                  );
+                }
+              } catch {
+                // ignore resync errors
+              } finally {
+                delete ptyResyncInFlightRef.current[key];
+              }
+            })();
+            continue;
+          }
+        }
+      } catch (error) {
+        if (abortController.signal.aborted) return;
+        console.warn('PTY SSE stream stopped:', error);
+      }
+    };
+
+    void run();
+
+    return () => {
+      abortController.abort();
+      if (ptyStreamAbortRef.current === abortController) {
+        ptyStreamAbortRef.current = null;
+      }
+      if (ptyStreamSessionRef.current === sessionId) {
+        ptyStreamSessionRef.current = null;
+      }
+      Object.keys(ptyResyncInFlightRef.current).forEach((key) => {
+        if (key.startsWith(`${sessionId}:`)) {
+          delete ptyResyncInFlightRef.current[key];
+        }
+      });
+    };
+  }, [currentSessionId, markStreamActivity]);
 
   const migrateSessionKey = (fromKey: string, toKey: string) => {
     if (!fromKey || !toKey || fromKey === toKey) return;
@@ -2224,6 +2501,7 @@ function App() {
         }
 
         if ('done' in chunk) {
+          clearShellInputPromptForSession(activeSessionKey);
           break;
         }
 
@@ -2248,8 +2526,17 @@ function App() {
           }
         }
 
-        updateSessionMessages(activeSessionKey, (prev) =>
-          prev.map((msg) => {
+        const stepMetaRaw = (step.metadata || {}) as Record<string, any>;
+        const isRunShellKeepaliveDelta =
+          step.step_type === 'observation_delta' &&
+          String(stepMetaRaw.tool || '').toLowerCase() === 'run_shell' &&
+          !String(step.content || '') &&
+          parseBooleanMeta(stepMetaRaw.keepalive) === true &&
+          parseBooleanMeta(stepMetaRaw.reset) !== true;
+
+        if (!isRunShellKeepaliveDelta) {
+          updateSessionMessages(activeSessionKey, (prev) =>
+            prev.map((msg) => {
             if (msg.id !== currentAssistantId) return msg;
 
             const existingSteps = (msg.metadata?.agent_steps || []) as AgentStep[];
@@ -2496,12 +2783,30 @@ function App() {
             nextMetadata.agent_steps = nextSteps;
             nextMetadata.agent_streaming = true;
             return { ...msg, metadata: nextMetadata };
-          })
-        );
+            })
+          );
+        }
+
+        const resolvedStreamSessionId =
+          newSessionId || targetSessionId || (activeSessionKey === DRAFT_SESSION_KEY ? null : activeSessionKey);
+        if (resolvedStreamSessionId) {
+          ptyStore.applyRunShellStep(resolvedStreamSessionId, step);
+        }
+        syncShellInputPromptFromStep({
+          step,
+          sessionId: resolvedStreamSessionId,
+          sessionKey: activeSessionKey,
+          messageId: currentAssistantId
+        });
+        if (step.step_type === 'answer' || step.step_type === 'error') {
+          clearShellInputPromptForSession(activeSessionKey);
+        }
 
         const debugSessionId = activeSessionKey === DRAFT_SESSION_KEY ? null : activeSessionKey;
         scheduleDebugRefresh(debugSessionId);
       }
+
+      clearShellInputPromptForSession(activeSessionKey);
 
       updateSessionMessages(activeSessionKey, (prev) =>
         prev.map((msg) =>
@@ -2559,6 +2864,7 @@ function App() {
         markSessionUnread(activeSessionKey);
       }
     } finally {
+      clearShellInputPromptForSession(activeSessionKey);
       delete inFlightBySessionRef.current[activeSessionKey];
       bumpInFlight();
       processQueues();
@@ -3156,6 +3462,80 @@ function App() {
     await enqueueMessage(userMessage, currentSessionIdRef.current, attachments);
   };
 
+  const handleShellPromptDraftChange = (value: string) => {
+    setShellInputPrompt((prev) => (prev ? { ...prev, draft: value, error: null } : prev));
+  };
+
+  const handleShellPromptSend = async () => {
+    const prompt = shellInputPromptRef.current;
+    if (!prompt || prompt.sending) return;
+    if (!prompt.sessionId || !prompt.ptyId) return;
+    const payload = prompt.draft.endsWith('\n') ? prompt.draft : `${prompt.draft}\n`;
+    setShellInputPrompt((prev) => {
+      if (!prev) return prev;
+      if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
+        return prev;
+      }
+      return { ...prev, sending: true, error: null };
+    });
+    try {
+      await sendPty({ session_id: prompt.sessionId, pty_id: prompt.ptyId, input: payload });
+      markStreamActivity(prompt.sessionId);
+      setShellInputPrompt((prev) => {
+        if (!prev) return prev;
+        if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
+          return prev;
+        }
+        return null;
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to send input to PTY.';
+      setShellInputPrompt((prev) => {
+        if (!prev) return prev;
+        if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
+          return prev;
+        }
+        return { ...prev, sending: false, error: message };
+      });
+    }
+  };
+
+  const handleShellPromptContinue = async () => {
+    const prompt = shellInputPromptRef.current;
+    if (!prompt || prompt.sending) return;
+    if (!prompt.sessionId || !prompt.ptyId) {
+      setShellInputPrompt(null);
+      return;
+    }
+    setShellInputPrompt((prev) => {
+      if (!prev) return prev;
+      if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
+        return prev;
+      }
+      return { ...prev, sending: true, error: null };
+    });
+    try {
+      await closePty({ session_id: prompt.sessionId, pty_id: prompt.ptyId });
+      markStreamActivity(prompt.sessionId);
+      setShellInputPrompt((prev) => {
+        if (!prev) return prev;
+        if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
+          return prev;
+        }
+        return null;
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to close PTY.';
+      setShellInputPrompt((prev) => {
+        if (!prev) return prev;
+        if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
+          return prev;
+        }
+        return { ...prev, sending: false, error: message };
+      });
+    }
+  };
+
   const handleRetryMessage = async (messageId: number | null, message: string) => {
     if (!message) return;
     if (isStreamingCurrent) {
@@ -3244,6 +3624,7 @@ function App() {
     const sessionKey = getCurrentSessionKey();
     const inflight = inFlightBySessionRef.current[sessionKey];
     if (!inflight) return;
+    clearShellInputPromptForSession(sessionKey);
     if (pendingPermissionBySessionRef.current[sessionKey]) {
       await resolvePendingPermission(sessionKey, 'denied', { silent: true });
     }
@@ -3560,7 +3941,17 @@ function App() {
     [currentSessionKey, inFlightTick]
   );
   const displayMessages = useMemo(
-    () => messages.filter((msg) => !(msg as any)?.metadata?.skill_prompt),
+    () =>
+      messages.filter((msg) => {
+        const metadata = ((msg as any)?.metadata || {}) as Record<string, unknown>;
+        if (metadata?.skill_prompt) return false;
+        const isPersistentPtyMessage =
+          msg.role === 'assistant' &&
+          typeof metadata?.pty_id === 'string' &&
+          metadata.pty_id.trim().length > 0 &&
+          parseBooleanMeta(metadata?.persistent) === true;
+        return !isPersistentPtyMessage;
+      }),
     [messages]
   );
 
@@ -4050,6 +4441,7 @@ function App() {
                           {msg.role === 'assistant' && (steps.length > 0 || showPermission) ? (
                             <AgentStepView
                               steps={steps}
+                              sessionId={msg.session_id || currentSessionId || undefined}
                               messageId={msg.id}
                               streaming={streaming}
                               pendingPermission={showPermission ? currentPendingPermission : null}
@@ -4677,8 +5069,8 @@ function App() {
           sessionId={currentSessionId}
           onClose={closePtyPanel}
           initialWidth={panelWidthRef.current.pty}
-          onWidthChange={(width) => handlePanelWidthChange('pty', width)}
-          onActivity={() => markStreamActivity(currentSessionId)}
+          onWidthChange={handlePtyPanelWidthChange}
+          onActivity={handlePtyPanelActivity}
         />
       )}
       {showDebugPanel && (
@@ -4851,6 +5243,63 @@ function App() {
                 disabled={astSettingsSaving || astSettingsLoading}
               >
                 {astSettingsSaving ? '保存中...' : '保存'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {shellInputPrompt && (
+        <div
+          className="shell-input-overlay"
+          onClick={() => {
+            if (shellInputPrompt.sending) return;
+            void handleShellPromptContinue();
+          }}
+        >
+          <div className="shell-input-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="shell-input-title">Shell waiting for input</div>
+            {shellInputPrompt.command && (
+              <div className="shell-input-command" title={shellInputPrompt.command}>
+                {shellInputPrompt.command}
+              </div>
+            )}
+            {shellInputPrompt.waitReason && (
+              <div className="shell-input-reason">Reason: {shellInputPrompt.waitReason}</div>
+            )}
+            <textarea
+              className="shell-input-textarea"
+              value={shellInputPrompt.draft}
+              onChange={(event) => handleShellPromptDraftChange(event.currentTarget.value)}
+              placeholder="Type stdin input..."
+              disabled={shellInputPrompt.sending}
+              rows={4}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  void handleShellPromptSend();
+                }
+              }}
+            />
+            {shellInputPrompt.error && (
+              <div className="shell-input-error">{shellInputPrompt.error}</div>
+            )}
+            <div className="shell-input-actions">
+              <button
+                type="button"
+                className="shell-input-btn ghost"
+                onClick={() => void handleShellPromptContinue()}
+                disabled={shellInputPrompt.sending}
+              >
+                Continue without input
+              </button>
+              <button
+                type="button"
+                className="shell-input-btn primary"
+                onClick={() => void handleShellPromptSend()}
+                disabled={shellInputPrompt.sending}
+              >
+                {shellInputPrompt.sending ? 'Sending...' : 'Send input'}
               </button>
             </div>
           </div>

@@ -20,18 +20,24 @@ import httpx
 from ..base import Tool, ToolParameter
 from ..config import get_tool_config, update_tool_config
 from ..context import get_tool_context
-from ..pty_manager import get_pty_manager, PtyProcess, DEFAULT_BUFFER_SIZE, _decode_output_bytes
+from ..pty_manager import (
+    get_pty_manager,
+    PtyProcess,
+    DEFAULT_BUFFER_SIZE,
+    _decode_output_bytes,
+    sanitize_pty_screen_text,
+)
 from app_config import get_app_config
 from ast_settings import get_ast_settings
 from ast_file_filter import collect_ast_files
-from ws_hub import get_ws_hub
+from pty_stream_registry import get_pty_stream_registry
 
 try:
     import pty as posix_pty
 except Exception:
     posix_pty = None
 
-_ANSI_ESCAPE_RE = re.compile(r"[\u001b\u009b][\\[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]")
+_ANSI_ESCAPE_RE = re.compile(r"[\u001b\u009b][\\[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[@-~]")
 _INTERACTIVE_PROMPT_PATTERNS = [
     re.compile(r"use\s+arrow\s+keys", re.IGNORECASE),
     re.compile(r"\bselect\b", re.IGNORECASE),
@@ -624,26 +630,151 @@ def _use_restricted_conpty(use_sandbox: bool) -> bool:
     return bool(use_sandbox)
 
 
-def _attach_pty_ws_emitter(pty_proc: PtyProcess) -> None:
+def _emit_pty_message_upsert(
+    session_id: str,
+    pty_proc: PtyProcess,
+    *,
+    final: bool = False,
+    content_override: Optional[str] = None
+) -> None:
+    if not session_id or not getattr(pty_proc, "pty_message_id", None):
+        return
+    stream_registry = get_pty_stream_registry()
+    content = content_override if content_override is not None else pty_proc.get_screen_text()
+    content = sanitize_pty_screen_text(content)
+    payload = {
+        "event": "pty_message_upsert",
+        "session_id": session_id,
+        "pty_id": pty_proc.id,
+        "message_id": int(pty_proc.pty_message_id),
+        "content": str(content or ""),
+        "status": str(pty_proc.status or ""),
+        "final": bool(final)
+    }
+    stream_registry.emit_threadsafe(session_id, payload)
+
+
+def _create_persistent_pty_message(pty_proc: PtyProcess) -> Optional[int]:
+    if not pty_proc or getattr(pty_proc, "pty_message_id", None):
+        return getattr(pty_proc, "pty_message_id", None)
+    session_id = getattr(pty_proc, "session_id", "")
+    if not session_id:
+        return None
+    try:
+        from database import db
+        from models import ChatMessageCreate
+        message = db.create_message(ChatMessageCreate(
+            session_id=session_id,
+            role="assistant",
+            content="",
+            metadata={
+                "pty_live": True,
+                "persistent": True,
+                "pty_id": pty_proc.id
+            }
+        ))
+        message_id = int(message.id or 0) if message and getattr(message, "id", None) is not None else 0
+        if message_id <= 0:
+            return None
+        pty_proc.pty_message_id = message_id
+        pty_proc.pty_live = True
+        pty_proc._pty_message_finalized = False
+        _emit_pty_message_upsert(session_id, pty_proc, final=False, content_override="")
+        return message_id
+    except Exception as exc:
+        _pty_debug(f"pty_message create failed pty_id={getattr(pty_proc, 'id', '')} error={exc}")
+        return None
+
+
+def _persist_persistent_pty_message_final(pty_proc: PtyProcess) -> None:
+    if not pty_proc:
+        return
+    message_id = getattr(pty_proc, "pty_message_id", None)
+    if not message_id:
+        return
+    if getattr(pty_proc, "_pty_message_finalized", False):
+        return
     session_id = getattr(pty_proc, "session_id", "")
     if not session_id:
         return
-    hub = get_ws_hub()
+    final_content = sanitize_pty_screen_text(pty_proc.get_screen_text() or "")
+    try:
+        from database import db
+        conn = db.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT metadata FROM chat_messages WHERE id = ? AND session_id = ?",
+            (int(message_id), session_id)
+        )
+        row = cursor.fetchone()
+        metadata: Dict[str, Any] = {}
+        if row and row["metadata"]:
+            try:
+                metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            except Exception:
+                metadata = {}
+        metadata.update({
+            "pty_live": False,
+            "persistent": True,
+            "pty_id": pty_proc.id,
+            "final": True,
+            "status": str(pty_proc.status or "")
+        })
+        cursor.execute(
+            """
+            UPDATE chat_messages
+            SET content = ?, metadata = ?
+            WHERE id = ? AND session_id = ?
+            """,
+            (final_content, json.dumps(metadata, ensure_ascii=False), int(message_id), session_id)
+        )
+        conn.commit()
+        conn.close()
+        pty_proc._pty_message_finalized = True
+        pty_proc.pty_live = False
+    except Exception as exc:
+        _pty_debug(f"pty_message finalize failed pty_id={pty_proc.id} error={exc}")
+    _emit_pty_message_upsert(session_id, pty_proc, final=True, content_override=final_content)
+
+
+def _attach_pty_sse_emitter(pty_proc: PtyProcess) -> None:
+    session_id = getattr(pty_proc, "session_id", "")
+    if not session_id:
+        return
+    stream_registry = get_pty_stream_registry()
 
     def _emit(chunk: bytes, cursor: int) -> None:
         text = _decode_output_bytes(chunk)
+        state_payload = pty_proc.build_state_payload(cursor=cursor)
+        state_payload.pop("screen_text", None)
         payload = {
-            "type": "pty_output",
+            "event": "pty_delta",
             "session_id": session_id,
-            "pty_id": pty_proc.id,
             "chunk": text,
-            "cursor": cursor,
-            "status": pty_proc.status,
-            "exit_code": pty_proc.exit_code
+            **state_payload
         }
-        hub.emit_threadsafe(session_id, payload)
+        stream_registry.emit_threadsafe(session_id, payload)
+        if getattr(pty_proc, "pty_message_id", None):
+            _emit_pty_message_upsert(session_id, pty_proc, final=False)
+
+    def _emit_state(_status: str) -> None:
+        state_payload = pty_proc.build_state_payload()
+        state_payload.pop("screen_text", None)
+        payload = {
+            "event": "pty_state",
+            "session_id": session_id,
+            "chunk": "",
+            **state_payload
+        }
+        stream_registry.emit_threadsafe(session_id, payload)
+        if getattr(pty_proc, "pty_message_id", None):
+            if pty_proc.status in ("exited", "closed"):
+                _persist_persistent_pty_message_final(pty_proc)
+            else:
+                _emit_pty_message_upsert(session_id, pty_proc, final=False)
 
     pty_proc.set_on_output(_emit)
+    pty_proc.set_on_state_change(_emit_state)
 
 
 def _safe_close_pseudo_console(kernel32_dll, h_pc_handle, label: str = "conpty") -> None:
@@ -1247,6 +1378,9 @@ def _detect_wait_reason_from_output(text: str) -> Optional[str]:
 
 
 def _set_waiting_state(proc: PtyProcess, waiting: bool, reason: Optional[str] = None) -> None:
+    if hasattr(proc, "update_waiting_state"):
+        proc.update_waiting_state(waiting, reason)
+        return
     proc.waiting_input = bool(waiting)
     proc.wait_reason = str(reason or "").strip() if waiting and reason else None
 
@@ -1264,6 +1398,57 @@ def _update_waiting_state_from_chunk(proc: PtyProcess, chunk: str) -> Tuple[bool
         else:
             _set_waiting_state(proc, False, None)
     return proc.waiting_input, proc.wait_reason
+
+
+def _format_pty_header(
+    proc: PtyProcess,
+    *,
+    cursor: Optional[int] = None,
+    reset: Optional[bool] = None,
+    bytes_written: Optional[int] = None,
+    completion_reached: Optional[bool] = None
+) -> str:
+    state_payload: Dict[str, Any]
+    if hasattr(proc, "build_state_payload"):
+        state_payload = proc.build_state_payload(cursor=cursor)
+    else:
+        state_payload = {
+            "pty_id": proc.id,
+            "status": proc.status,
+            "cursor": cursor,
+            "waiting_input": bool(getattr(proc, "waiting_input", False)),
+            "wait_reason": getattr(proc, "wait_reason", None),
+            "pty_mode": getattr(proc, "pty_mode", "ephemeral"),
+            "pty_live": bool(getattr(proc, "pty_live", False))
+        }
+    tokens = [
+        f"pty_id={state_payload.get('pty_id') or proc.id}",
+        f"status={state_payload.get('status') or proc.status}",
+        f"pty={str(proc.pty_enabled).lower()}",
+        f"cursor={state_payload.get('cursor')}",
+        f"idle_timeout={proc.idle_timeout_ms}",
+        f"buffer_size={proc.buffer_size}",
+        f"pty_mode={state_payload.get('pty_mode') or getattr(proc, 'pty_mode', 'ephemeral')}",
+        f"seq={state_payload.get('seq') if state_payload.get('seq') is not None else 0}",
+        f"pty_live={str(bool(state_payload.get('pty_live'))).lower()}",
+    ]
+    if state_payload.get("screen_hash"):
+        tokens.append(f"screen_hash={state_payload.get('screen_hash')}")
+    if state_payload.get("waiting_input") is not None:
+        tokens.append(f"waiting_input={str(bool(state_payload.get('waiting_input'))).lower()}")
+    if state_payload.get("wait_reason"):
+        tokens.append(f"wait_reason={state_payload.get('wait_reason')}")
+    if reset is not None:
+        tokens.append(f"reset={str(bool(reset)).lower()}")
+    if proc.status in ("exited", "closed"):
+        tokens.append(f"exit_code={proc.exit_code}")
+    if bytes_written is not None:
+        tokens.append(f"bytes_written={int(bytes_written)}")
+    if completion_reached is not None:
+        tokens.append(f"completion_reached={str(bool(completion_reached)).lower()}")
+    if getattr(proc, "pty_message_id", None) is not None:
+        tokens.append(f"pty_message_id={int(proc.pty_message_id)}")
+    return f"[{' '.join(tokens)}]"
 
 
 def _build_posix_command(command: str, use_sandbox: bool = True) -> List[str]:
@@ -1414,9 +1599,10 @@ def _start_posix_pty_persistent(
         buffer_size=buffer_size,
         idle_timeout_ms=idle_timeout_ms,
         writer=_writer,
-        terminator=_terminator
+        terminator=_terminator,
+        pty_mode="persistent"
     )
-    _attach_pty_ws_emitter(pty_proc)
+    _attach_pty_sse_emitter(pty_proc)
 
     def _reader_loop() -> None:
         last_output = time.monotonic()
@@ -1507,9 +1693,10 @@ def _start_posix_pipe_persistent(
         buffer_size=buffer_size,
         idle_timeout_ms=idle_timeout_ms,
         writer=_writer,
-        terminator=_terminator
+        terminator=_terminator,
+        pty_mode="persistent"
     )
-    _attach_pty_ws_emitter(pty_proc)
+    _attach_pty_sse_emitter(pty_proc)
 
     def _reader_loop() -> None:
         last_output = time.monotonic()
@@ -2315,9 +2502,10 @@ def _start_windows_pty_persistent(
         buffer_size=buffer_size,
         idle_timeout_ms=idle_timeout_ms,
         writer=_writer,
-        terminator=_terminator
+        terminator=_terminator,
+        pty_mode="persistent"
     )
-    _attach_pty_ws_emitter(pty_proc)
+    _attach_pty_sse_emitter(pty_proc)
 
     def _reader_loop() -> None:
         buffer = ctypes.create_string_buffer(4096)
@@ -2635,9 +2823,10 @@ def _start_windows_pipe_persistent(
         buffer_size=buffer_size,
         idle_timeout_ms=idle_timeout_ms,
         writer=_writer,
-        terminator=_terminator
+        terminator=_terminator,
+        pty_mode="persistent"
     )
-    _attach_pty_ws_emitter(pty_proc)
+    _attach_pty_sse_emitter(pty_proc)
 
     def _reader_loop() -> None:
         buffer = ctypes.create_string_buffer(4096)
@@ -2749,9 +2938,10 @@ def _start_windows_unrestricted_pipe_persistent(
         buffer_size=buffer_size,
         idle_timeout_ms=idle_timeout_ms,
         writer=_writer,
-        terminator=_terminator
+        terminator=_terminator,
+        pty_mode="persistent"
     )
-    _attach_pty_ws_emitter(pty_proc)
+    _attach_pty_sse_emitter(pty_proc)
 
     def _reader_loop() -> None:
         buffer = ctypes.create_string_buffer(4096)
@@ -3294,7 +3484,7 @@ class RunShellTool(Tool):
         self.name = "run_shell"
         self.description = (
             "Run a shell command within the work path. "
-            "Supports mode=auto|oneshot|persistent. "
+            "Supports mode=auto|oneshot|ephemeral|persistent. "
             "Persistent mode returns a pty_id and supports action=send|read|close|list. "
             "Optional args: stdin, track_completion, completion_key, timeout_sec (s), idle_timeout (ms), "
             "max_output (chars), buffer_size (bytes)."
@@ -3309,7 +3499,7 @@ class RunShellTool(Tool):
             ToolParameter(
                 name="mode",
                 type="string",
-                description="auto, oneshot, or persistent (default auto).",
+                description="auto, oneshot, ephemeral, or persistent (default auto).",
                 required=False
             ),
             ToolParameter(
@@ -3482,7 +3672,7 @@ class RunShellTool(Tool):
                     )
                 written = proc.write(stdin_bytes)
                 _set_waiting_state(proc, False, None)
-                header = f"[pty_id={proc.id} status={proc.status} bytes_written={written}]"
+                header = _format_pty_header(proc, bytes_written=written)
                 if completion_key:
                     header = f"{header} completion_key={completion_key}"
                 return header
@@ -3523,17 +3713,14 @@ class RunShellTool(Tool):
                 completion_reached: Optional[bool] = None
                 if completion_key:
                     completion_reached = proc.is_completion_reached(completion_key)
-                header = (
-                    f"[pty_id={proc.id} status={proc.status} pty={str(proc.pty_enabled).lower()} "
-                    f"cursor={new_cursor} reset={str(reset).lower()} idle_timeout={proc.idle_timeout_ms} "
-                    f"buffer_size={proc.buffer_size}] waiting_input={str(waiting_input).lower()}"
+                header = _format_pty_header(
+                    proc,
+                    cursor=new_cursor,
+                    reset=reset,
+                    completion_reached=completion_reached
                 )
-                if wait_reason:
+                if wait_reason and "wait_reason=" not in header:
                     header = f"{header} wait_reason={wait_reason}"
-                if proc.status == "exited":
-                    header = f"{header} exit_code={proc.exit_code}"
-                if completion_reached is not None:
-                    header = f"{header} completion_reached={str(completion_reached).lower()}"
                 return f"{header}\n{chunk or ''}"
             if action == "close":
                 if _pty_debug_enabled():
@@ -3574,17 +3761,19 @@ class RunShellTool(Tool):
         mode = str(data.get("mode") or "auto").strip().lower()
         if mode_override:
             mode = mode_override
-        if mode not in ("auto", "oneshot", "persistent"):
+        if mode not in ("auto", "oneshot", "persistent", "ephemeral"):
             mode = "auto"
+        if mode in ("auto", "oneshot"):
+            mode = "ephemeral"
         if command is None:
-            if mode == "persistent":
+            if mode in ("persistent", "ephemeral"):
                 command = ""
             else:
                 command = input_data
         if command is None:
             raise ValueError("Missing command.")
         command_text = str(command)
-        persistent_bootstrap = mode == "persistent" and not command_text.strip()
+        persistent_bootstrap = mode in ("persistent", "ephemeral") and not command_text.strip()
 
         cmd_name = _extract_command_name(command_text)
         root = _get_root_path()
@@ -3767,7 +3956,7 @@ class RunShellTool(Tool):
 
         ran_sandbox = False
         try:
-            if mode == "persistent":
+            if mode in ("persistent", "ephemeral"):
                 if agent_mode == "super":
                     pty_proc = _start_persistent(use_sandbox=False)
                 elif cmd_name in unrestricted_allowset:
@@ -3775,20 +3964,31 @@ class RunShellTool(Tool):
                 else:
                     ran_sandbox = True
                     pty_proc = _start_persistent(use_sandbox=True)
+                pty_proc.pty_mode = mode
                 manager = get_pty_manager()
                 manager.register(pty_proc)
                 chunk, cursor, _ = pty_proc.read(None, max_output)
                 waiting_input, wait_reason = _update_waiting_state_from_chunk(pty_proc, chunk or "")
+                snapshot = pty_proc.get_snapshot()
+                seq = int(snapshot.get("seq") or 0)
+                screen_hash = str(snapshot.get("screen_hash") or "")
                 _pty_debug(f"run_shell persistent started pty_id={pty_proc.id} initial_chunk_len={len(chunk or '')}")
-                header = (
-                    f"[pty_id={pty_proc.id} status={pty_proc.status} pty={str(pty_proc.pty_enabled).lower()} "
-                    f"idle_timeout={pty_proc.idle_timeout_ms} buffer_size={pty_proc.buffer_size}] "
-                    f"waiting_input={str(waiting_input).lower()}"
-                )
-                if wait_reason:
+                header = _format_pty_header(pty_proc, cursor=cursor)
+                if waiting_input and "waiting_input=true" not in header:
+                    header = f"{header} waiting_input=true"
+                if wait_reason and "wait_reason=" not in header:
                     header = f"{header} wait_reason={wait_reason}"
+                if screen_hash and "screen_hash=" not in header:
+                    header = f"{header} screen_hash={screen_hash}"
+                if seq and "seq=" not in header:
+                    header = f"{header} seq={seq}"
                 if pty_fallback:
                     header = f"{header} pty_fallback=true"
+                if mode == "persistent":
+                    message_id = _create_persistent_pty_message(pty_proc)
+                    if message_id:
+                        header = f"{header} pty_message_id={message_id} pty_live=true"
+                    return header
                 return f"{header}\n{chunk or ''}"
 
             exec_start = time.monotonic()
@@ -3845,21 +4045,32 @@ class RunShellTool(Tool):
             if status == "approved" and agent_mode == "default" and not shell_unrestricted and not persistent_bootstrap and cmd_name not in unrestricted_allowset:
                 _ensure_shell_unrestricted_allowlist_entry(cmd_name)
 
-            if mode == "persistent":
+            if mode in ("persistent", "ephemeral"):
                 pty_proc = _start_persistent(use_sandbox=False)
+                pty_proc.pty_mode = mode
                 manager = get_pty_manager()
                 manager.register(pty_proc)
                 chunk, cursor, _ = pty_proc.read(None, max_output)
                 waiting_input, wait_reason = _update_waiting_state_from_chunk(pty_proc, chunk or "")
-                header = (
-                    f"[pty_id={pty_proc.id} status={pty_proc.status} pty={str(pty_proc.pty_enabled).lower()} "
-                    f"idle_timeout={pty_proc.idle_timeout_ms} buffer_size={pty_proc.buffer_size}] "
-                    f"waiting_input={str(waiting_input).lower()}"
-                )
-                if wait_reason:
+                snapshot = pty_proc.get_snapshot()
+                seq = int(snapshot.get("seq") or 0)
+                screen_hash = str(snapshot.get("screen_hash") or "")
+                header = _format_pty_header(pty_proc, cursor=cursor)
+                if waiting_input and "waiting_input=true" not in header:
+                    header = f"{header} waiting_input=true"
+                if wait_reason and "wait_reason=" not in header:
                     header = f"{header} wait_reason={wait_reason}"
+                if screen_hash and "screen_hash=" not in header:
+                    header = f"{header} screen_hash={screen_hash}"
+                if seq and "seq=" not in header:
+                    header = f"{header} seq={seq}"
                 if pty_fallback:
                     header = f"{header} pty_fallback=true"
+                if mode == "persistent":
+                    message_id = _create_persistent_pty_message(pty_proc)
+                    if message_id:
+                        header = f"{header} pty_message_id={message_id} pty_live=true"
+                    return header
                 return f"{header}\n{chunk or ''}"
 
             exec_start = time.monotonic()

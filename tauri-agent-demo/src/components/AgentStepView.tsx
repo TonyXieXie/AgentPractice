@@ -16,6 +16,8 @@ import 'katex/dist/katex.min.css';
 import { openPath, openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { API_BASE_URL, AgentStep } from '../api';
 import { ToolPermissionRequest, AstPayload } from '../types';
+import { usePtySessionSnapshot } from '../ptyStore';
+import { stripAnsiForDisplay } from '../ptyAnsi';
 import DiffView from './DiffView';
 import AstViewer from './AstViewer';
 import './AgentStepView.css';
@@ -24,6 +26,7 @@ type Category = 'thought' | 'tool' | 'final' | 'error' | 'other';
 
 interface AgentStepViewProps {
     steps: AgentStep[];
+    sessionId?: string;
     messageId?: number;
     streaming?: boolean;
     pendingPermission?: ToolPermissionRequest | null;
@@ -188,15 +191,21 @@ type ShellHeader = {
     pty_id?: string;
     status?: string;
     pty?: boolean;
+    pty_mode?: string;
     exit_code?: number;
     idle_timeout?: number;
     buffer_size?: number;
     cursor?: number;
+    seq?: number;
+    screen_hash?: string;
     reset?: boolean;
     pty_fallback?: boolean;
     command?: string;
     waiting_input?: boolean;
     wait_reason?: string;
+    completion_reached?: boolean;
+    pty_message_id?: number;
+    pty_live?: boolean;
 };
 
 function parseShellHeaderLine(line: string) {
@@ -220,6 +229,9 @@ function parseShellHeaderLine(line: string) {
             case 'pty':
                 header.pty = lower === 'true';
                 return true;
+            case 'pty_mode':
+                header.pty_mode = value;
+                return true;
             case 'exit_code': {
                 const num = Number(value);
                 if (Number.isFinite(num)) header.exit_code = num;
@@ -240,6 +252,14 @@ function parseShellHeaderLine(line: string) {
                 if (Number.isFinite(num)) header.cursor = num;
                 return true;
             }
+            case 'seq': {
+                const num = Number(value);
+                if (Number.isFinite(num)) header.seq = num;
+                return true;
+            }
+            case 'screen_hash':
+                header.screen_hash = value;
+                return true;
             case 'reset':
                 header.reset = lower === 'true';
                 return true;
@@ -254,6 +274,17 @@ function parseShellHeaderLine(line: string) {
                 return true;
             case 'wait_reason':
                 header.wait_reason = value;
+                return true;
+            case 'completion_reached':
+                header.completion_reached = lower === 'true';
+                return true;
+            case 'pty_message_id': {
+                const num = Number(value);
+                if (Number.isFinite(num)) header.pty_message_id = num;
+                return true;
+            }
+            case 'pty_live':
+                header.pty_live = lower === 'true';
                 return true;
             default:
                 return false;
@@ -286,17 +317,6 @@ function parseShellOutput(raw: string) {
         header,
         body: rest.join('\n')
     };
-}
-
-function stripAnsi(input: string) {
-    if (!input) return '';
-    // Strip OSC sequences like \x1b]...(\x07 or \x1b\\)
-    let output = input.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '');
-    // Strip CSI and other ANSI escape sequences (covers ESC= / ESC> too)
-    output = output.replace(/[\u001B\u009B][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
-    // Remove stray bell characters
-    output = output.replace(/\x07/g, '');
-    return output;
 }
 
 type ApplyPatchResult = {
@@ -521,7 +541,6 @@ type LinkToken =
     | { type: 'file'; value: string };
 type FileCheckStatus = 'exists' | 'missing' | 'error';
 type FileCheckEntry = { status: FileCheckStatus; checkedAt: number };
-type FileLinkStatus = FileCheckStatus | 'pending' | 'unknown';
 
 const LINK_PATTERN =
     /((?:https?|file):\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+|[a-zA-Z]:\\[^\s<>"'`]+|\\\\[^\s<>"'`]+|\/[^\s<>"'`]+|[^\s<>"'`]+[\\/][^\s<>"'`]+\.[A-Za-z0-9]{1,10}(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)?|[^\s<>"'`]+\.[A-Za-z0-9]{1,10}(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)?)/g;
@@ -691,6 +710,7 @@ const normalizeFileHref = (value: string) => {
 
 function AgentStepView({
     steps,
+    sessionId,
     messageId,
     streaming,
     pendingPermission,
@@ -705,6 +725,7 @@ function AgentStepView({
     debugActive,
     onOpenDebugCall
 }: AgentStepViewProps) {
+    const ptySnapshot = usePtySessionSnapshot(sessionId);
     const [expandedObservations, setExpandedObservations] = useState<Record<string, boolean>>({});
     const [translatedSearchSteps, setTranslatedSearchSteps] = useState<Record<string, boolean>>({});
     const [expandedErrors, setExpandedErrors] = useState<Record<string, boolean>>({});
@@ -1407,7 +1428,7 @@ function AgentStepView({
                 container,
                 NodeFilter.SHOW_TEXT,
                 {
-                    acceptNode: (node) => {
+                    acceptNode: (node: Node) => {
                         const text = node.nodeValue || '';
                         if (!text.trim()) return NodeFilter.FILTER_REJECT;
                         const parent = (node as Text).parentElement;
@@ -1903,6 +1924,15 @@ function AgentStepView({
                 let shellBody = '';
                 let shellPreview = '';
                 const shellCommandFromMeta = typeof step.metadata?.command === 'string' ? step.metadata.command : '';
+                const shellPtyIdFromMeta = typeof step.metadata?.pty_id === 'string' ? step.metadata.pty_id.trim() : '';
+                const shellStatusFromMeta =
+                    typeof step.metadata?.status === 'string' && step.metadata.status.trim()
+                        ? step.metadata.status.trim()
+                        : undefined;
+                const shellModeFromMeta =
+                    typeof step.metadata?.pty_mode === 'string' && step.metadata.pty_mode.trim()
+                        ? step.metadata.pty_mode.trim()
+                        : undefined;
                 const shellWaitingFromMeta = (() => {
                     const raw = step.metadata?.waiting_input;
                     if (typeof raw === 'boolean') return raw;
@@ -1934,9 +1964,26 @@ function AgentStepView({
                         astPayload = parseAstPayload(observationTextRaw);
                     } else if (isRunShell) {
                         shellPayload = parseShellOutput(observationTextRaw);
+                        const shellPtyId = shellPtyIdFromMeta || shellPayload?.header.pty_id || '';
+                        const livePty = shellPtyId ? ptySnapshot[shellPtyId] : undefined;
+                        if (!shellPayload && shellPtyId) {
+                            shellPayload = {
+                                header: { pty_id: shellPtyId },
+                                body: livePty?.rendered_content || ''
+                            };
+                        }
                         if (shellPayload) {
+                            if (shellPtyId && !shellPayload.header.pty_id) {
+                                shellPayload.header.pty_id = shellPtyId;
+                            }
                             if (shellCommandFromMeta && !shellPayload.header.command) {
                                 shellPayload.header.command = shellCommandFromMeta;
+                            }
+                            if (shellStatusFromMeta) {
+                                shellPayload.header.status = shellStatusFromMeta;
+                            }
+                            if (shellModeFromMeta) {
+                                shellPayload.header.pty_mode = shellModeFromMeta;
                             }
                             if (typeof shellWaitingFromMeta === 'boolean') {
                                 shellPayload.header.waiting_input = shellWaitingFromMeta;
@@ -1944,14 +1991,27 @@ function AgentStepView({
                             if (shellWaitReasonFromMeta) {
                                 shellPayload.header.wait_reason = shellWaitReasonFromMeta;
                             }
-                            shellBody = stripAnsi(shellPayload.body || '');
-                            const commandText = shellPayload.header.command || '';
-                            if (commandText) {
-                                const prefix = `$ ${commandText}`;
-                                if (!shellBody.startsWith(prefix)) {
-                                    shellBody = shellBody ? `${prefix}\n${shellBody}` : prefix;
+                            if (livePty) {
+                                if (livePty.status) shellPayload.header.status = livePty.status;
+                                shellPayload.header.waiting_input = livePty.waiting_input;
+                                if (livePty.wait_reason) shellPayload.header.wait_reason = livePty.wait_reason;
+                                if (livePty.pty_mode) shellPayload.header.pty_mode = livePty.pty_mode;
+                                if (typeof livePty.cursor === 'number') shellPayload.header.cursor = livePty.cursor;
+                                if (typeof livePty.exit_code === 'number') shellPayload.header.exit_code = livePty.exit_code;
+                                if (typeof livePty.pty_message_id === 'number') {
+                                    shellPayload.header.pty_message_id = livePty.pty_message_id;
+                                }
+                                if (typeof livePty.pty_live === 'boolean') {
+                                    shellPayload.header.pty_live = livePty.pty_live;
+                                }
+                                if (typeof livePty.seq === 'number') {
+                                    shellPayload.header.seq = livePty.seq;
+                                }
+                                if (livePty.screen_hash) {
+                                    shellPayload.header.screen_hash = livePty.screen_hash;
                                 }
                             }
+                            shellBody = stripAnsiForDisplay(livePty?.rendered_content || shellPayload.body || '');
                             const bodyLines = shellBody.split('\n');
                             observationHasMore = bodyLines.length > 1;
                             shellPreview = observationHasMore ? `${bodyLines[0]} ...` : bodyLines[0] || '';
@@ -2067,6 +2127,12 @@ function AgentStepView({
                                                     <div className="shell-meta-item">
                                                         <span className="shell-meta-label">pty_id</span>
                                                         <span className="shell-meta-value">{shellPayload.header.pty_id}</span>
+                                                    </div>
+                                                )}
+                                                {shellPayload.header.pty_mode && (
+                                                    <div className="shell-meta-item">
+                                                        <span className="shell-meta-label">mode</span>
+                                                        <span className="shell-meta-value">{shellPayload.header.pty_mode}</span>
                                                     </div>
                                                 )}
                                                 {typeof shellPayload.header.cursor === 'number' && (

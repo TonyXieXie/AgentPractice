@@ -176,6 +176,58 @@ def _build_context_summary_request(summary: str, dialogue_text: str) -> List[Dic
     ]
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value or "").strip().lower()
+    return text in ("1", "true", "yes", "on")
+
+
+def _format_persistent_pty_history_content(pty_id: str, status: str, content: str) -> str:
+    header = f"pty_id={pty_id} status={status} content:"
+    body = str(content or "").replace("\r\n", "\n").strip("\n")
+    if body:
+        return f"{header}\n{body}"
+    return f"{header}\n(no output)"
+
+
+def _resolve_persistent_pty_content(session_id: str, msg: Dict[str, Any]) -> Optional[str]:
+    metadata = msg.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if not _as_bool(metadata.get("persistent")):
+        return None
+    pty_id = str(metadata.get("pty_id") or "").strip()
+    if not pty_id:
+        return None
+    status = str(metadata.get("status") or "").strip() or ("running" if _as_bool(metadata.get("pty_live")) else "unknown")
+
+    if _as_bool(metadata.get("pty_live")):
+        try:
+            from tools.pty_manager import get_pty_manager, sanitize_pty_screen_text
+            proc = get_pty_manager().get(session_id, pty_id)
+            if proc:
+                live_text = sanitize_pty_screen_text(proc.get_screen_text() or "")
+                live_status = str(getattr(proc, "status", "") or "").strip() or status
+                if live_text.strip():
+                    return _format_persistent_pty_history_content(pty_id, live_status, live_text)
+        except Exception:
+            pass
+
+    stored = str(msg.get("content") or "")
+    try:
+        from tools.pty_manager import sanitize_pty_screen_text
+        stored = sanitize_pty_screen_text(stored)
+    except Exception:
+        stored = stored
+    if stored.strip():
+        return _format_persistent_pty_history_content(pty_id, status, stored)
+
+    return _format_persistent_pty_history_content(pty_id, status, "")
+
+
 async def _run_context_summary(
     llm_client: Any,
     summary: str,
@@ -213,13 +265,17 @@ def build_history_for_llm(
     messages = db.get_dialogue_messages_after(session_id, after_message_id)
     filtered = []
     for msg in messages:
+        msg_for_history = dict(msg)
         if current_user_message_id and msg.get("id") == current_user_message_id:
             continue
-        if msg.get("role") == "assistant":
-            content_text = str(msg.get("content") or "")
+        if msg_for_history.get("role") == "assistant":
+            content_text = str(msg_for_history.get("content") or "")
             if not content_text.strip():
-                continue
-        filtered.append(msg)
+                persistent_content = _resolve_persistent_pty_content(session_id, msg_for_history)
+                if persistent_content is None:
+                    continue
+                msg_for_history["content"] = persistent_content
+        filtered.append(msg_for_history)
     assistant_ids = [msg.get("id") for msg in filtered if msg.get("role") == "assistant"]
     steps_by_message: Dict[int, List[Dict[str, Any]]] = {}
     if assistant_ids:
@@ -377,13 +433,17 @@ async def maybe_compress_context(
         messages = db.get_dialogue_messages_after(session_id, after_id)
         filtered = []
         for msg in messages:
+            msg_for_history = dict(msg)
             if msg.get("id") == current_user_message_id:
                 continue
-            if msg.get("role") == "assistant":
-                content_text = str(msg.get("content") or "")
+            if msg_for_history.get("role") == "assistant":
+                content_text = str(msg_for_history.get("content") or "")
                 if not content_text.strip():
-                    continue
-            filtered.append(msg)
+                    persistent_content = _resolve_persistent_pty_content(session_id, msg_for_history)
+                    if persistent_content is None:
+                        continue
+                    msg_for_history["content"] = persistent_content
+            filtered.append(msg_for_history)
         return filtered
 
     history_for_llm = build_history_for_llm(
