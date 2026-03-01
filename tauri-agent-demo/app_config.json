@@ -169,7 +169,7 @@
           "file_references",
           "pty_status"
         ],
-        "spawnable": false,
+        "spawnable": true,
         "description": "You are a helpful AI assistant."
       },
       {
@@ -194,10 +194,49 @@
           "output_concise"
         ],
         "spawnable": true
+      },
+      {
+        "id": "data-analyst",
+        "name": "资料分析 Agent",
+        "description": "专注资料检索、阅读与分析，不执行写入修改。",
+        "abilities": [
+          "file_references",
+          "rg_search",
+          "tool-read-file",
+          "tool-list-files",
+          "websear",
+          "tool_json",
+          "output_concise"
+        ],
+        "spawnable": true
+      },
+      {
+        "id": "data-organizer",
+        "name": "资料整理 Agent",
+        "description": "专注资料归类、结构化整理与文档改写输出。",
+        "abilities": [
+          "file_references",
+          "rg_search",
+          "tool-read-file",
+          "tool-list-files",
+          "tool-write-file",
+          "apply_patch",
+          "tool_json",
+          "output_concise"
+        ],
+        "spawnable": true
       }
     ],
     "default_profile": "default",
     "ast_enabled": true,
+    "task_center_enabled": true,
+    "task_ui_enabled": true,
+    "max_loop_iterations": 5,
+    "task_concurrency": {
+      "global": 8,
+      "per_session": 3,
+      "per_instance": 1
+    },
     "code_map": {
       "enabled": true,
       "max_symbols": 40,

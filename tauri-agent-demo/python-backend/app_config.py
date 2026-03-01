@@ -1,5 +1,6 @@
 import json
 import os
+import copy
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -498,13 +499,13 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         concurrency = agent.get("task_concurrency")
         if not isinstance(concurrency, dict):
             raise ValueError("agent.task_concurrency must be an object")
-        normalized = dict(concurrency)
+        concurrency_normalized = dict(concurrency)
         for key, maximum in (("global", 128), ("per_session", 32), ("per_instance", 8)):
-            if key in normalized:
-                normalized[key] = _coerce_int_range(
-                    normalized[key], f"agent.task_concurrency.{key}", 1, maximum
+            if key in concurrency_normalized:
+                concurrency_normalized[key] = _coerce_int_range(
+                    concurrency_normalized[key], f"agent.task_concurrency.{key}", 1, maximum
                 )
-        agent["task_concurrency"] = normalized
+        agent["task_concurrency"] = concurrency_normalized
     if "subagent_profile" in agent:
         if not isinstance(agent["subagent_profile"], str):
             raise ValueError("agent.subagent_profile must be a string")
@@ -526,7 +527,8 @@ _APP_CONFIG = _load_config()
 
 
 def get_app_config() -> Dict[str, Any]:
-    return _APP_CONFIG
+    # Return a defensive copy so callers can't mutate the in-memory singleton.
+    return copy.deepcopy(_APP_CONFIG)
 
 
 def update_app_config(patch: Dict[str, Any]) -> Dict[str, Any]:
