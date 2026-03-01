@@ -177,6 +177,10 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
       const ptyId = item.pty_id;
       const entry = ptySnapshot[ptyId];
       if (!entry) return;
+      const waitingInput = entry?.waiting_input ?? item.waiting_input ?? false;
+      const status = waitingInput ? 'waiting_input' : (entry?.status || item.status);
+      const isRunning = status === 'running' || status === 'waiting_input';
+      if (!isRunning) return;
       const terminalEntry = terminalsRef.current[ptyId];
       if (!terminalEntry) return;
       const renderState =
@@ -370,7 +374,11 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
               </div>
               {command ? <div className="pty-command">{command}</div> : null}
               <div className="pty-output">
-                <div className="pty-terminal" ref={getTerminalRef(item.pty_id)} />
+                {isRunning ? (
+                  <div className="pty-terminal" ref={getTerminalRef(item.pty_id)} />
+                ) : (
+                  <pre className="pty-output-static">{entry?.rendered_content || entry?.ansi_log || ''}</pre>
+                )}
               </div>
               {isInteractive && (
                 <div className="pty-input-row">
