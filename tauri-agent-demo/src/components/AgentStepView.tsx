@@ -203,7 +203,6 @@ type ShellHeader = {
     command?: string;
     waiting_input?: boolean;
     wait_reason?: string;
-    completion_reached?: boolean;
     pty_message_id?: number;
     pty_live?: boolean;
 };
@@ -274,9 +273,6 @@ function parseShellHeaderLine(line: string) {
                 return true;
             case 'wait_reason':
                 header.wait_reason = value;
-                return true;
-            case 'completion_reached':
-                header.completion_reached = lower === 'true';
                 return true;
             case 'pty_message_id': {
                 const num = Number(value);

@@ -13,7 +13,6 @@ import re
 import time
 import atexit
 import signal
-import uuid
 from io import BytesIO
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
@@ -221,7 +220,6 @@ PTY_PROMPT_MAX_VISIBLE_PTYS = 64
 _PTY_PROMPT_ANSI_RE = re.compile(r"[\u001b\u009b][\\[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[@-~]")
 _PTY_PROMPT_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 _PTY_PROMPT_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_PTY_COMPLETION_MARKER_RE = re.compile(r"__PTY_COMPLETION_[A-Za-z0-9_.:-]+__")
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -244,7 +242,6 @@ def _strip_pty_prompt_controls(text: str) -> str:
     value = str(text or "")
     if not value:
         return ""
-    value = _PTY_COMPLETION_MARKER_RE.sub("", value)
     value = _PTY_PROMPT_OSC_RE.sub("", value)
     value = _PTY_PROMPT_ANSI_RE.sub("", value)
     value = value.replace("\r\n", "\n").replace("\r", "\n")
@@ -1984,15 +1981,12 @@ class PtyReadRequest(BaseModel):
     pty_id: str
     cursor: Optional[int] = None
     max_output: Optional[int] = None
-    completion_key: Optional[str] = None
 
 
 class PtySendRequest(BaseModel):
     session_id: str
     pty_id: str
     input: str
-    track_completion: Optional[bool] = False
-    completion_key: Optional[str] = None
 
 
 class PtyCloseRequest(BaseModel):
@@ -2051,47 +2045,6 @@ def _normalize_windows_pty_input(text: str) -> str:
     if not normalized.endswith("\n"):
         normalized += "\n"
     return normalized.replace("\n", "\r\n")
-
-
-def _coerce_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return value != 0
-    text = str(value).strip().lower()
-    if text in ("1", "true", "yes", "on"):
-        return True
-    if text in ("0", "false", "no", "off"):
-        return False
-    return default
-
-
-def _pty_completion_marker_enabled() -> bool:
-    shell_cfg = get_tool_config().get("shell", {}) or {}
-    return _coerce_bool(shell_cfg.get("pty_completion_marker_enabled"), True)
-
-
-def _build_completion_key(raw_key: Optional[str]) -> str:
-    text = str(raw_key or "").strip()
-    if text:
-        text = re.sub(r"[^A-Za-z0-9_.:-]+", "", text)
-        if text:
-            return text[:160]
-    return f"__PTY_COMPLETION_{uuid.uuid4().hex}__"
-
-
-def _append_completion_marker_command(payload: Optional[str], completion_key: str, windows: bool) -> str:
-    text = "" if payload is None else str(payload)
-    marker_command = f"echo {completion_key}"
-    if windows:
-        if text:
-            text = _normalize_windows_pty_input(text)
-        return f"{text}{marker_command}\r\n"
-    if text and not text.endswith("\n"):
-        text += "\n"
-    return f"{text}{marker_command}\n"
 
 
 @app.post("/pty/stream")
@@ -2207,9 +2160,6 @@ def read_pty(request: PtyReadRequest):
     }
     if getattr(proc, "pty_message_id", None) is not None:
         response["pty_message_id"] = proc.pty_message_id
-    completion_key = str(request.completion_key or "").strip()
-    if completion_key:
-        response["completion_reached"] = proc.is_completion_reached(completion_key)
     return response
 
 
@@ -2220,13 +2170,7 @@ def send_pty(request: PtySendRequest):
     if not proc:
         raise HTTPException(status_code=404, detail="PTY not found")
     payload = request.input or ""
-    completion_key: Optional[str] = None
-    track_completion = _coerce_bool(request.track_completion, False)
-    marker_enabled = _pty_completion_marker_enabled()
-    if track_completion and marker_enabled:
-        completion_key = proc.register_completion_key(_build_completion_key(request.completion_key))
-        payload = _append_completion_marker_command(payload, completion_key, os.name == "nt")
-    elif os.name == "nt" and payload:
+    if os.name == "nt" and payload:
         payload = _normalize_windows_pty_input(payload)
     data = payload.encode("utf-8", errors="replace")
     written = proc.write(data)
@@ -2235,10 +2179,7 @@ def send_pty(request: PtySendRequest):
     else:
         proc.waiting_input = False
         proc.wait_reason = None
-    response = {"ok": True, "pty_id": proc.id, "bytes_written": written}
-    if completion_key:
-        response["completion_key"] = completion_key
-    return response
+    return {"ok": True, "pty_id": proc.id, "bytes_written": written}
 
 
 @app.post("/pty/close")

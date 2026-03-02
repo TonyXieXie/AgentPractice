@@ -501,7 +501,6 @@ export interface PtyReadResponse {
     pty_mode?: 'ephemeral' | 'persistent' | string;
     pty_message_id?: number;
     pty_live?: boolean;
-    completion_reached?: boolean;
 }
 
 export interface AgentStreamKeepalive {
@@ -917,7 +916,6 @@ export async function readPty(payload: {
     pty_id: string;
     cursor?: number;
     max_output?: number;
-    completion_key?: string;
 }): Promise<PtyReadResponse> {
     const response = await fetch(`${API_BASE_URL}/pty/read`, {
         method: 'POST',
@@ -932,9 +930,7 @@ export async function sendPty(payload: {
     session_id: string;
     pty_id: string;
     input: string;
-    track_completion?: boolean;
-    completion_key?: string;
-}): Promise<{ ok: boolean; pty_id: string; bytes_written: number; completion_key?: string }> {
+}): Promise<{ ok: boolean; pty_id: string; bytes_written: number }> {
     const response = await fetch(`${API_BASE_URL}/pty/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

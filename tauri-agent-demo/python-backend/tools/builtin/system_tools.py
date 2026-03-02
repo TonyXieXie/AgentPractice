@@ -11,7 +11,6 @@ import locale
 import select
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional, List, Set
 
@@ -1245,17 +1244,6 @@ def _apply_max_output(output: str, max_output: int) -> str:
     return output
 
 
-def _append_idle_timeout_info(output: str, elapsed_ms: Optional[int]) -> str:
-    if not output or "[idle_timeout]" not in output:
-        return output
-    if elapsed_ms is None or elapsed_ms < 0:
-        return output
-    marker = f"[idle_timeout elapsed_ms={int(elapsed_ms)}]"
-    if marker in output:
-        return output
-    return f"{output}\n{marker}"
-
-
 def _resolve_idle_timeout_ms(mode: str, idle_timeout_ms: Optional[int]) -> int:
     if idle_timeout_ms is not None:
         try:
@@ -1309,32 +1297,6 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
     if text in ("0", "false", "no", "off"):
         return False
     return default
-
-
-def _shell_completion_marker_enabled() -> bool:
-    shell_cfg = get_tool_config().get("shell", {}) or {}
-    return _coerce_bool(shell_cfg.get("pty_completion_marker_enabled"), True)
-
-
-def _build_completion_key(raw_key: Optional[str]) -> str:
-    text = str(raw_key or "").strip()
-    if text:
-        text = re.sub(r"[^A-Za-z0-9_.:-]+", "", text)
-        if text:
-            return text[:160]
-    return f"__PTY_COMPLETION_{uuid.uuid4().hex}__"
-
-
-def _append_completion_marker_command(stdin_value: Optional[str], completion_key: str, windows: bool) -> str:
-    payload = "" if stdin_value is None else str(stdin_value)
-    marker_command = f"echo {completion_key}"
-    if windows:
-        if payload:
-            payload = _normalize_windows_stdin(payload)
-        return f"{payload}{marker_command}\r\n"
-    if payload and not payload.endswith("\n"):
-        payload += "\n"
-    return f"{payload}{marker_command}\n"
 
 
 def _strip_ansi(text: str) -> str:
@@ -1393,8 +1355,7 @@ def _format_pty_header(
     *,
     cursor: Optional[int] = None,
     reset: Optional[bool] = None,
-    bytes_written: Optional[int] = None,
-    completion_reached: Optional[bool] = None
+    bytes_written: Optional[int] = None
 ) -> str:
     state_payload: Dict[str, Any]
     if hasattr(proc, "build_state_payload"):
@@ -1432,8 +1393,6 @@ def _format_pty_header(
         tokens.append(f"exit_code={proc.exit_code}")
     if bytes_written is not None:
         tokens.append(f"bytes_written={int(bytes_written)}")
-    if completion_reached is not None:
-        tokens.append(f"completion_reached={str(bool(completion_reached)).lower()}")
     if getattr(proc, "pty_message_id", None) is not None:
         tokens.append(f"pty_message_id={int(proc.pty_message_id)}")
     return f"[{' '.join(tokens)}]"
@@ -3001,28 +2960,6 @@ def _ensure_shell_unrestricted_allowlist_entry(command_name: str) -> None:
         pass
 
 
-def _looks_like_permission_denied(message: str) -> bool:
-    if not message:
-        return False
-    text = str(message)
-    lower = text.lower()
-    patterns = [
-        "access is denied",
-        "permission denied",
-        "permissiondenied",
-        "unauthorizedaccessexception",
-        "not authorized",
-        "accessdenied",
-        "eacces",
-        "eperm",
-        "\u6743\u9650\u4e0d\u8db3",
-        "\u62d2\u7edd\u8bbf\u95ee",
-        "\u6ca1\u6709\u6743\u9650",
-        "\u65e0\u6743\u9650"
-    ]
-    return any(pattern in lower for pattern in patterns)
-
-
 async def _wait_for_permission(request_id: Optional[int], timeout_sec: float) -> str:
     if not request_id:
         return "denied"
@@ -3474,7 +3411,7 @@ class RunShellTool(Tool):
             "Run a shell command within the work path. "
             "Supports mode=auto|oneshot|ephemeral|persistent. "
             "Persistent mode returns a pty_id and supports action=send|read|close|list. "
-            "Optional args: stdin, track_completion, completion_key, timeout_sec (s), idle_timeout (ms), "
+            "Optional args: stdin, timeout_sec (s), idle_timeout (ms), "
             "max_output (chars), buffer_size (bytes)."
         )
         self.parameters = [
@@ -3505,19 +3442,7 @@ class RunShellTool(Tool):
             ToolParameter(
                 name="stdin",
                 type="string",
-                description="Stdin content to write (one-shot or send).",
-                required=False
-            ),
-            ToolParameter(
-                name="track_completion",
-                type="boolean",
-                description="When action=send, append hidden completion marker and return completion_key.",
-                required=False
-            ),
-            ToolParameter(
-                name="completion_key",
-                type="string",
-                description="Completion key for action=send/read. If omitted for tracked send, backend generates one.",
+                description="Stdin content to write (ephemeral bootstrap or send).",
                 required=False
             ),
             ToolParameter(
@@ -3535,7 +3460,7 @@ class RunShellTool(Tool):
             ToolParameter(
                 name="idle_timeout",
                 type="number",
-                description="Idle timeout in milliseconds (default 120000 for oneshot, 0 for persistent).",
+                description="Idle timeout in milliseconds (default 120000 for ephemeral, 0 for persistent).",
                 required=False
             ),
             ToolParameter(
@@ -3598,7 +3523,7 @@ class RunShellTool(Tool):
             if action != "list" and not data.get("pty_id"):
                 # If action is set but no pty_id is provided:
                 # - For send with a command, auto-start a persistent session.
-                # - Otherwise, fall back to oneshot when a command exists.
+                # - Otherwise, fall back to ephemeral when a command exists.
                 if action == "send" and data.get("command"):
                     mode_override = "persistent"
                     action = ""
@@ -3626,13 +3551,7 @@ class RunShellTool(Tool):
                 return "PTY not found."
             if action == "send":
                 stdin_value = data.get("stdin")
-                track_completion = _coerce_bool(data.get("track_completion"), False)
-                completion_key: Optional[str] = None
-                completion_marker_enabled = _shell_completion_marker_enabled()
-                if track_completion and completion_marker_enabled:
-                    completion_key = proc.register_completion_key(_build_completion_key(data.get("completion_key")))
-                    stdin_value = _append_completion_marker_command(stdin_value, completion_key, _is_windows())
-                elif _is_windows() and isinstance(stdin_value, str) and stdin_value:
+                if _is_windows() and isinstance(stdin_value, str) and stdin_value:
                     stdin_value = _normalize_windows_stdin(stdin_value)
                 if _pty_debug_enabled():
                     if isinstance(stdin_value, str):
@@ -3642,13 +3561,13 @@ class RunShellTool(Tool):
                             "run_shell send stdin "
                             f"type=str len={len(stdin_value)} "
                             f"endswith_lf={endswith_lf} endswith_crlf={endswith_crlf} "
-                            f"track_completion={str(track_completion).lower()} marker_enabled={str(completion_marker_enabled).lower()}"
+                            "completion_tracking=false"
                         )
                     else:
                         _pty_debug(
                             "run_shell send stdin "
                             f"type={type(stdin_value).__name__} "
-                            f"track_completion={str(track_completion).lower()} marker_enabled={str(completion_marker_enabled).lower()}"
+                            "completion_tracking=false"
                         )
                 stdin_bytes = _encode_stdin(stdin_value)
                 if _pty_debug_enabled():
@@ -3661,8 +3580,6 @@ class RunShellTool(Tool):
                 written = proc.write(stdin_bytes)
                 _set_waiting_state(proc, False, None)
                 header = _format_pty_header(proc, bytes_written=written)
-                if completion_key:
-                    header = f"{header} completion_key={completion_key}"
                 return header
             if action == "read":
                 max_output = data.get("max_output")
@@ -3676,12 +3593,11 @@ class RunShellTool(Tool):
                         cursor = int(cursor)
                     except (TypeError, ValueError):
                         cursor = None
-                completion_key = str(data.get("completion_key") or "").strip() or None
                 if _pty_debug_enabled():
                     _pty_debug(
                         "run_shell read enter "
                         f"pty_id={proc.id} cursor={cursor} max_output={max_output} status={proc.status} "
-                        f"completion_key={completion_key}"
+                        "completion_tracking=false"
                     )
                 read_start = time.monotonic()
                 try:
@@ -3698,14 +3614,10 @@ class RunShellTool(Tool):
                         f"new_cursor={new_cursor} reset={str(reset).lower()} status={proc.status}"
                     )
                 waiting_input, wait_reason = _update_waiting_state_from_chunk(proc, chunk or "")
-                completion_reached: Optional[bool] = None
-                if completion_key:
-                    completion_reached = proc.is_completion_reached(completion_key)
                 header = _format_pty_header(
                     proc,
                     cursor=new_cursor,
-                    reset=reset,
-                    completion_reached=completion_reached
+                    reset=reset
                 )
                 if wait_reason and "wait_reason=" not in header:
                     header = f"{header} wait_reason={wait_reason}"
@@ -3878,39 +3790,6 @@ class RunShellTool(Tool):
                 )
             return True
 
-        def _run_unsandboxed() -> Tuple[int, str]:
-            completed = subprocess.run(
-                command,
-                cwd=str(workdir),
-                shell=True,
-                capture_output=True,
-                timeout=timeout_sec
-            )
-            stdout = completed.stdout or b""
-            stderr = completed.stderr or b""
-            output_text = _decode_output_bytes(stdout + stderr)
-            return completed.returncode, output_text
-
-        def _run_oneshot(use_sandbox: bool) -> Tuple[int, str]:
-            if pty_enabled:
-                try:
-                    if _is_windows():
-                        return _run_windows_pty_oneshot(
-                            command,
-                            workdir,
-                            timeout_sec,
-                            idle_timeout_ms,
-                            stdin_bytes,
-                            use_restricted_token=_use_restricted_conpty(use_sandbox)
-                        )
-                    return _run_posix_pty_oneshot(command, workdir, timeout_sec, idle_timeout_ms, stdin_bytes, use_sandbox)
-                except Exception as exc:
-                    if not _maybe_auto_fallback("oneshot", exc):
-                        raise
-            if use_sandbox:
-                return _run_sandboxed_command(command, workdir, timeout_sec)
-            return _run_unsandboxed()
-
         def _start_persistent(use_sandbox: bool) -> PtyProcess:
             _pty_debug(
                 "run_shell start_persistent "
@@ -3942,71 +3821,39 @@ class RunShellTool(Tool):
                         raise
             return _start_posix_pipe_persistent(command, workdir, stdin_bytes, idle_timeout_ms, buffer_size, use_sandbox)
 
-        ran_sandbox = False
         try:
-            if mode in ("persistent", "ephemeral"):
-                if agent_mode == "super":
-                    pty_proc = _start_persistent(use_sandbox=False)
-                elif cmd_name in unrestricted_allowset:
-                    pty_proc = _start_persistent(use_sandbox=False)
-                else:
-                    ran_sandbox = True
-                    pty_proc = _start_persistent(use_sandbox=True)
-                pty_proc.pty_mode = mode
-                manager = get_pty_manager()
-                manager.register(pty_proc)
-                chunk, cursor, _ = pty_proc.read(None, max_output)
-                waiting_input, wait_reason = _update_waiting_state_from_chunk(pty_proc, chunk or "")
-                snapshot = pty_proc.get_snapshot()
-                seq = int(snapshot.get("seq") or 0)
-                screen_hash = str(snapshot.get("screen_hash") or "")
-                _pty_debug(f"run_shell persistent started pty_id={pty_proc.id} initial_chunk_len={len(chunk or '')}")
-                header = _format_pty_header(pty_proc, cursor=cursor)
-                if waiting_input and "waiting_input=true" not in header:
-                    header = f"{header} waiting_input=true"
-                if wait_reason and "wait_reason=" not in header:
-                    header = f"{header} wait_reason={wait_reason}"
-                if screen_hash and "screen_hash=" not in header:
-                    header = f"{header} screen_hash={screen_hash}"
-                if seq and "seq=" not in header:
-                    header = f"{header} seq={seq}"
-                if pty_fallback:
-                    header = f"{header} pty_fallback=true"
-                if mode == "persistent":
-                    message_id = _create_persistent_pty_message(pty_proc)
-                    if message_id:
-                        header = f"{header} pty_message_id={message_id} pty_live=true"
-                    return header
-                return f"{header}\n{chunk or ''}"
-
-            exec_start = time.monotonic()
             if agent_mode == "super":
-                returncode, output = await asyncio.to_thread(_run_oneshot, False)
+                pty_proc = _start_persistent(use_sandbox=False)
             elif cmd_name in unrestricted_allowset:
-                returncode, output = await asyncio.to_thread(_run_oneshot, False)
+                pty_proc = _start_persistent(use_sandbox=False)
             else:
-                ran_sandbox = True
-                returncode, output = await asyncio.to_thread(_run_oneshot, True)
-            elapsed_ms = int((time.monotonic() - exec_start) * 1000)
-            output = _append_idle_timeout_info(output, elapsed_ms)
-        except subprocess.TimeoutExpired as exc:
-            partial_output = ""
-            raw_output = getattr(exc, "output", None)
-            if raw_output is None:
-                stdout_value = getattr(exc, "stdout", None)
-                stderr_value = getattr(exc, "stderr", None)
-                if stdout_value is not None or stderr_value is not None:
-                    raw_output = (stdout_value or b"") + (stderr_value or b"")
-            if raw_output is not None:
-                if isinstance(raw_output, (bytes, bytearray)):
-                    partial_output = _decode_output_bytes(bytes(raw_output))
-                else:
-                    partial_output = str(raw_output)
-            partial_output = (partial_output or "").strip()
-            timeout_body = partial_output if partial_output else "(no output)"
-            timeout_output = f"[exit_code=124]\n{timeout_body}\n[timeout]"
-            timeout_output = _apply_max_output(timeout_output, max_output)
-            return timeout_output
+                pty_proc = _start_persistent(use_sandbox=True)
+            pty_proc.pty_mode = mode
+            manager = get_pty_manager()
+            manager.register(pty_proc)
+            chunk, cursor, _ = pty_proc.read(None, max_output)
+            waiting_input, wait_reason = _update_waiting_state_from_chunk(pty_proc, chunk or "")
+            snapshot = pty_proc.get_snapshot()
+            seq = int(snapshot.get("seq") or 0)
+            screen_hash = str(snapshot.get("screen_hash") or "")
+            _pty_debug(f"run_shell persistent started pty_id={pty_proc.id} initial_chunk_len={len(chunk or '')}")
+            header = _format_pty_header(pty_proc, cursor=cursor)
+            if waiting_input and "waiting_input=true" not in header:
+                header = f"{header} waiting_input=true"
+            if wait_reason and "wait_reason=" not in header:
+                header = f"{header} wait_reason={wait_reason}"
+            if screen_hash and "screen_hash=" not in header:
+                header = f"{header} screen_hash={screen_hash}"
+            if seq and "seq=" not in header:
+                header = f"{header} seq={seq}"
+            if pty_fallback:
+                header = f"{header} pty_fallback=true"
+            if mode == "persistent":
+                message_id = _create_persistent_pty_message(pty_proc)
+                if message_id:
+                    header = f"{header} pty_message_id={message_id} pty_live=true"
+                return header
+            return f"{header}\n{chunk or ''}"
         except Exception as exc:
             request_id = None
             try:
@@ -4033,76 +3880,32 @@ class RunShellTool(Tool):
             if status == "approved" and agent_mode == "default" and not shell_unrestricted and not persistent_bootstrap and cmd_name not in unrestricted_allowset:
                 _ensure_shell_unrestricted_allowlist_entry(cmd_name)
 
-            if mode in ("persistent", "ephemeral"):
-                pty_proc = _start_persistent(use_sandbox=False)
-                pty_proc.pty_mode = mode
-                manager = get_pty_manager()
-                manager.register(pty_proc)
-                chunk, cursor, _ = pty_proc.read(None, max_output)
-                waiting_input, wait_reason = _update_waiting_state_from_chunk(pty_proc, chunk or "")
-                snapshot = pty_proc.get_snapshot()
-                seq = int(snapshot.get("seq") or 0)
-                screen_hash = str(snapshot.get("screen_hash") or "")
-                header = _format_pty_header(pty_proc, cursor=cursor)
-                if waiting_input and "waiting_input=true" not in header:
-                    header = f"{header} waiting_input=true"
-                if wait_reason and "wait_reason=" not in header:
-                    header = f"{header} wait_reason={wait_reason}"
-                if screen_hash and "screen_hash=" not in header:
-                    header = f"{header} screen_hash={screen_hash}"
-                if seq and "seq=" not in header:
-                    header = f"{header} seq={seq}"
-                if pty_fallback:
-                    header = f"{header} pty_fallback=true"
-                if mode == "persistent":
-                    message_id = _create_persistent_pty_message(pty_proc)
-                    if message_id:
-                        header = f"{header} pty_message_id={message_id} pty_live=true"
-                    return header
-                return f"{header}\n{chunk or ''}"
-
-            exec_start = time.monotonic()
-            returncode, output = await asyncio.to_thread(_run_oneshot, False)
-            elapsed_ms = int((time.monotonic() - exec_start) * 1000)
-            output = _append_idle_timeout_info(output, elapsed_ms)
-
-        if ran_sandbox and returncode != 0 and _looks_like_permission_denied(output):
-            request_id = None
-            try:
-                from database import db
-                request_id = db.create_permission_request(
-                    tool_name=self.name,
-                    action="execute_unrestricted",
-                    path=str(command),
-                    reason="Sandbox permission denied. Allow unrestricted execution?",
-                    session_id=tool_ctx.get("session_id")
-                )
-            except Exception:
-                request_id = None
-
-            permission_timeout_sec = float(get_tool_config().get("shell", {}).get("permission_timeout_sec", 300))
-            status = await _wait_for_permission(request_id, permission_timeout_sec)
-            if status not in ("approved", "approved_once"):
-                if status == "denied":
-                    return f"[exit_code={returncode}]\n{output}"
-                if status == "timeout":
-                    return "Permission request timed out."
-                return "Permission required."
-
-            if status == "approved" and agent_mode == "default" and not shell_unrestricted and not persistent_bootstrap and cmd_name not in unrestricted_allowset:
-                _ensure_shell_unrestricted_allowlist_entry(cmd_name)
-
-            exec_start = time.monotonic()
-            returncode, output = await asyncio.to_thread(_run_oneshot, False)
-            elapsed_ms = int((time.monotonic() - exec_start) * 1000)
-            output = _append_idle_timeout_info(output, elapsed_ms)
-
-        output = output or "(no output)"
-        output = _apply_max_output(output, max_output)
-        header = f"[exit_code={returncode}]"
-        if pty_fallback:
-            header = f"{header} pty_fallback=true"
-        return f"{header}\n{output}"
+            pty_proc = _start_persistent(use_sandbox=False)
+            pty_proc.pty_mode = mode
+            manager = get_pty_manager()
+            manager.register(pty_proc)
+            chunk, cursor, _ = pty_proc.read(None, max_output)
+            waiting_input, wait_reason = _update_waiting_state_from_chunk(pty_proc, chunk or "")
+            snapshot = pty_proc.get_snapshot()
+            seq = int(snapshot.get("seq") or 0)
+            screen_hash = str(snapshot.get("screen_hash") or "")
+            header = _format_pty_header(pty_proc, cursor=cursor)
+            if waiting_input and "waiting_input=true" not in header:
+                header = f"{header} waiting_input=true"
+            if wait_reason and "wait_reason=" not in header:
+                header = f"{header} wait_reason={wait_reason}"
+            if screen_hash and "screen_hash=" not in header:
+                header = f"{header} screen_hash={screen_hash}"
+            if seq and "seq=" not in header:
+                header = f"{header} seq={seq}"
+            if pty_fallback:
+                header = f"{header} pty_fallback=true"
+            if mode == "persistent":
+                message_id = _create_persistent_pty_message(pty_proc)
+                if message_id:
+                    header = f"{header} pty_message_id={message_id} pty_live=true"
+                return header
+            return f"{header}\n{chunk or ''}"
 
 
 class RgTool(Tool):

@@ -2181,7 +2181,6 @@ class ReActAgent(AgentStrategy):
         waiting_input: Optional[bool] = None,
         wait_reason: Optional[str] = None,
         reset: Optional[bool] = None,
-        completion_reached: Optional[bool] = None,
         extra: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         header = header_data or {}
@@ -2230,12 +2229,6 @@ class ReActAgent(AgentStrategy):
         resolved_wait_reason = str(wait_reason or header.get("wait_reason") or "").strip()
         if resolved_wait_reason:
             meta["wait_reason"] = resolved_wait_reason
-
-        parsed_completion = self._parse_shell_bool(header.get("completion_reached"))
-        if completion_reached is not None:
-            meta["completion_reached"] = bool(completion_reached)
-        elif parsed_completion is not None:
-            meta["completion_reached"] = parsed_completion
 
         pty_message_id = self._parse_shell_int(header.get("pty_message_id"))
         if pty_message_id is not None:
@@ -2454,25 +2447,16 @@ class ReActAgent(AgentStrategy):
             return
 
         command_text = str(command)
-        shell_cfg = get_tool_config().get("shell", {}) or {}
-        marker_cfg = shell_cfg.get("pty_completion_marker_enabled", True)
-        if isinstance(marker_cfg, str):
-            marker_enabled = marker_cfg.strip().lower() not in ("0", "false", "no", "off")
-        else:
-            marker_enabled = bool(marker_cfg)
-        # Windows-first rollout: keep non-Windows behavior unchanged.
-        marker_enabled = marker_enabled and os.name == "nt"
+        use_windows_ephemeral_shell = os.name == "nt"
 
         start_args = dict(args)
         start_args["mode"] = "ephemeral"
         start_args.pop("action", None)
         start_args.pop("pty_id", None)
         start_args.pop("cursor", None)
-        start_args.pop("track_completion", None)
-        start_args.pop("completion_key", None)
         if "idle_timeout" not in start_args:
             start_args["idle_timeout"] = 120000
-        start_args["command"] = "" if marker_enabled else command_text
+        start_args["command"] = "" if use_windows_ephemeral_shell else command_text
 
         if _stop_requested():
             stopped_output = self._append_stop_note("")
@@ -2528,13 +2512,15 @@ class ReActAgent(AgentStrategy):
                 f"start_failed stream_key={stream_key} output={start_output[:120] if start_output else ''}"
             )
             return
-        completion_key: Optional[str] = None
-        if marker_enabled and status not in ("exited", "closed"):
+        if use_windows_ephemeral_shell and status not in ("exited", "closed"):
+            send_stdin = command_text.replace("\r\n", "\n").replace("\r", "\n")
+            if not send_stdin.endswith("\n"):
+                send_stdin += "\n"
+            send_stdin = f"{send_stdin}exit\n"
             send_payload: Dict[str, Any] = {
                 "action": "send",
                 "pty_id": pty_id,
-                "stdin": command_text,
-                "track_completion": True
+                "stdin": send_stdin
             }
             send_output = await self._execute_tool(tool, json.dumps(send_payload))
             send_header, _ = self._split_shell_output(send_output)
@@ -2557,13 +2543,6 @@ class ReActAgent(AgentStrategy):
                     )
                 )
                 return
-            send_header_data = self._parse_shell_header(send_header)
-            completion_key = send_header_data.get("completion_key")
-            if not completion_key:
-                marker_enabled = False
-                _pty_stream_log(
-                    f"completion_key_missing stream_key={stream_key} pty_id={pty_id}, fallback=status"
-                )
 
         if body.strip() == "(no output)" and status not in ("exited", "closed"):
             body = ""
@@ -2655,7 +2634,6 @@ class ReActAgent(AgentStrategy):
             return max(0.0, at - start_time - paused)
 
         idle_timed_out = False
-        completion_reached = False
         total_reads = 0
         total_bytes = 0
         last_chunk_at = time.monotonic()
@@ -2698,8 +2676,6 @@ class ReActAgent(AgentStrategy):
                 read_args["cursor"] = cursor
             if max_output is not None:
                 read_args["max_output"] = max_output
-            if marker_enabled and completion_key:
-                read_args["completion_key"] = completion_key
 
             read_start = time.monotonic()
             _pty_stream_log(
@@ -2795,9 +2771,6 @@ class ReActAgent(AgentStrategy):
                         cursor = int(header_data.get("cursor"))
                     except (TypeError, ValueError):
                         cursor = cursor
-                parsed_completion_reached = self._parse_shell_bool(header_data.get("completion_reached"))
-                if parsed_completion_reached is not None:
-                    completion_reached = parsed_completion_reached
                 parsed_reset = self._parse_shell_bool(header_data.get("reset"))
                 reset = bool(parsed_reset) if parsed_reset is not None else False
             else:
@@ -2836,7 +2809,6 @@ class ReActAgent(AgentStrategy):
                         waiting_input=current_waiting_input,
                         wait_reason=current_wait_reason,
                         reset=bool(reset),
-                        completion_reached=completion_reached,
                         extra={"pty_mode": "ephemeral"}
                     )
                 )
@@ -2858,7 +2830,6 @@ class ReActAgent(AgentStrategy):
                             status=status,
                             waiting_input=current_waiting_input,
                             wait_reason=current_wait_reason,
-                            completion_reached=completion_reached,
                             extra={"keepalive": True, "pty_mode": "ephemeral"}
                         )
                     )
@@ -2875,11 +2846,6 @@ class ReActAgent(AgentStrategy):
                         f"since_last_chunk={since_chunk:.1f}s"
                     )
                     last_log_at = now
-
-            if completion_reached and not current_waiting_input:
-                if not chunk:
-                    break
-                continue
 
             if status in ("exited", "closed"):
                 if not chunk:
@@ -2904,7 +2870,6 @@ class ReActAgent(AgentStrategy):
                     status="error",
                     waiting_input=current_waiting_input,
                     wait_reason=current_wait_reason,
-                    completion_reached=completion_reached,
                     extra={"pty_mode": "ephemeral"}
                 )
             )
@@ -2931,7 +2896,6 @@ class ReActAgent(AgentStrategy):
                     status="closed",
                     waiting_input=current_waiting_input,
                     wait_reason=current_wait_reason,
-                    completion_reached=completion_reached,
                     extra={"pty_mode": "ephemeral"}
                 )
             )
@@ -2959,7 +2923,6 @@ class ReActAgent(AgentStrategy):
                 status="closed",
                 waiting_input=current_waiting_input,
                 wait_reason=current_wait_reason,
-                completion_reached=completion_reached,
                 extra={"pty_mode": "ephemeral"}
             )
         )
