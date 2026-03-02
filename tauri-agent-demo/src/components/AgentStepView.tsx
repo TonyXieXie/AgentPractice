@@ -18,8 +18,10 @@ import { API_BASE_URL, AgentStep } from '../api';
 import { ToolPermissionRequest, AstPayload } from '../types';
 import { usePtySessionSnapshot } from '../ptyStore';
 import { stripAnsiForDisplay } from '../ptyAnsi';
+import type { PtyInteractionController, ResolveStepPtyBinding } from './ptyInteraction';
 import DiffView from './DiffView';
 import AstViewer from './AstViewer';
+import PtySessionCard from './PtySessionCard';
 import './AgentStepView.css';
 
 type Category = 'thought' | 'tool' | 'final' | 'error' | 'other';
@@ -40,6 +42,8 @@ interface AgentStepViewProps {
     currentWorkPath?: string;
     debugActive?: boolean;
     onOpenDebugCall?: (iteration: number) => void;
+    ptyInteraction?: PtyInteractionController;
+    resolveStepPtyBinding?: ResolveStepPtyBinding;
 }
 
 const CATEGORY_LABELS: Record<Category, string> = {
@@ -313,6 +317,16 @@ function parseShellOutput(raw: string) {
         header,
         body: rest.join('\n')
     };
+}
+
+function resolveRunShellPtyId(step: AgentStep): string {
+    const metaPtyId =
+        typeof step.metadata?.pty_id === 'string' && step.metadata.pty_id.trim()
+            ? step.metadata.pty_id.trim()
+            : '';
+    if (metaPtyId) return metaPtyId;
+    const payload = parseShellOutput(String(step.content || ''));
+    return payload?.header.pty_id || '';
 }
 
 type ApplyPatchResult = {
@@ -719,7 +733,9 @@ function AgentStepView({
     onOpenWorkFile,
     currentWorkPath,
     debugActive,
-    onOpenDebugCall
+    onOpenDebugCall,
+    ptyInteraction,
+    resolveStepPtyBinding
 }: AgentStepViewProps) {
     const ptySnapshot = usePtySessionSnapshot(sessionId);
     const [expandedObservations, setExpandedObservations] = useState<Record<string, boolean>>({});
@@ -740,6 +756,17 @@ function AgentStepView({
     const MERMAID_MIN_SCALE = 0.2;
     const MERMAID_MAX_SCALE = 4;
     const MERMAID_ZOOM_STEP = 0.15;
+    const latestRunShellIndexByPty = useMemo(() => {
+        const indexByPty = new Map<string, number>();
+        steps.forEach((step, index) => {
+            if (step.step_type !== 'observation') return;
+            if (String(step.metadata?.tool || '').toLowerCase() !== 'run_shell') return;
+            const ptyId = resolveRunShellPtyId(step);
+            if (!ptyId) return;
+            indexByPty.set(ptyId, index);
+        });
+        return indexByPty;
+    }, [steps]);
 
     useEffect(() => {
         steps.forEach((step, index) => {
@@ -1919,6 +1946,11 @@ function AgentStepView({
                 let shellPayload: ReturnType<typeof parseShellOutput> | null = null;
                 let shellBody = '';
                 let shellPreview = '';
+                let shellPtyId = '';
+                let shellOwnerKey = '';
+                let shellIsLatestRunningStep = true;
+                let shellFrozenContent = '';
+                let shellReadOnlyHint: string | undefined;
                 const shellCommandFromMeta = typeof step.metadata?.command === 'string' ? step.metadata.command : '';
                 const shellPtyIdFromMeta = typeof step.metadata?.pty_id === 'string' ? step.metadata.pty_id.trim() : '';
                 const shellStatusFromMeta =
@@ -1960,12 +1992,52 @@ function AgentStepView({
                         astPayload = parseAstPayload(observationTextRaw);
                     } else if (isRunShell) {
                         shellPayload = parseShellOutput(observationTextRaw);
-                        const shellPtyId = shellPtyIdFromMeta || shellPayload?.header.pty_id || '';
+                        const streamKey =
+                            typeof step.metadata?.stream_key === 'string' && step.metadata.stream_key.trim()
+                                ? step.metadata.stream_key.trim()
+                                : `run_shell_${index}`;
+                        const binding = resolveStepPtyBinding?.({
+                            step,
+                            index,
+                            messageId,
+                            sessionId
+                        });
+                        shellPtyId =
+                            binding?.ptyId ||
+                            shellPtyIdFromMeta ||
+                            shellPayload?.header.pty_id ||
+                            '';
+                        shellOwnerKey =
+                            binding?.ownerKey ||
+                            (shellPtyId
+                                ? `step:${String(messageId ?? 'na')}:${streamKey}:${shellPtyId}`
+                                : `step:${String(messageId ?? 'na')}:${streamKey}:shell`);
                         const livePty = shellPtyId ? ptySnapshot[shellPtyId] : undefined;
+                        const liveStatus = livePty?.waiting_input ? 'waiting_input' : (livePty?.status || '');
+                        const liveRunning = liveStatus === 'running' || liveStatus === 'waiting_input';
+                        const latestInMessageForPty = shellPtyId
+                            ? latestRunShellIndexByPty.get(shellPtyId) === index
+                            : false;
+                        const latestByMessageId =
+                            typeof livePty?.pty_message_id === 'number' && typeof messageId === 'number'
+                                ? livePty.pty_message_id === messageId
+                                : true;
+                        const defaultLatestRunning = Boolean(
+                            shellPtyId && liveRunning && latestByMessageId && latestInMessageForPty
+                        );
+                        shellIsLatestRunningStep =
+                            typeof binding?.isLatestRunningStep === 'boolean'
+                                ? binding.isLatestRunningStep
+                                : defaultLatestRunning;
+                        shellReadOnlyHint =
+                            shellPtyId && liveRunning && !shellIsLatestRunningStep
+                                ? '会话仍在运行，请在最新 step 或 PTY 面板继续交互。'
+                                : undefined;
+
                         if (!shellPayload && shellPtyId) {
                             shellPayload = {
                                 header: { pty_id: shellPtyId },
-                                body: livePty?.rendered_content || ''
+                                body: ''
                             };
                         }
                         if (shellPayload) {
@@ -1987,7 +2059,7 @@ function AgentStepView({
                             if (shellWaitReasonFromMeta) {
                                 shellPayload.header.wait_reason = shellWaitReasonFromMeta;
                             }
-                            if (livePty) {
+                            if (livePty && shellIsLatestRunningStep) {
                                 if (livePty.status) shellPayload.header.status = livePty.status;
                                 shellPayload.header.waiting_input = livePty.waiting_input;
                                 if (livePty.wait_reason) shellPayload.header.wait_reason = livePty.wait_reason;
@@ -2007,7 +2079,10 @@ function AgentStepView({
                                     shellPayload.header.screen_hash = livePty.screen_hash;
                                 }
                             }
-                            shellBody = stripAnsiForDisplay(livePty?.rendered_content || shellPayload.body || '');
+                            shellBody = stripAnsiForDisplay(
+                                shellIsLatestRunningStep ? (livePty?.rendered_content || shellPayload.body || '') : (shellPayload.body || '')
+                            );
+                            shellFrozenContent = binding?.frozenContent || stripAnsiForDisplay(shellPayload.body || '');
                             const bodyLines = shellBody.split('\n');
                             observationHasMore = bodyLines.length > 1;
                             shellPreview = observationHasMore ? `${bodyLines[0]} ...` : bodyLines[0] || '';
@@ -2091,82 +2166,39 @@ function AgentStepView({
                             {isObservation ? (
                                 <div className={`agent-step-content observation${isContextCompress ? ' compression' : ''}`}>
                                     {shellPayload && isRunShell ? (
-                                        <div className="shell-card">
-                                            <div className="shell-card-header">
-                                                <span className="shell-card-title">Shell</span>
-                                                <div className="shell-card-badges">
-                                                    <span className={`shell-badge ${shellPayload.header.pty ? 'ok' : ''}`}>
-                                                        {shellPayload.header.pty ? 'PTY' : 'PIPE'}
-                                                    </span>
-                                                    {shellPayload.header.waiting_input ? (
-                                                        <span className="shell-badge waiting">waiting input</span>
-                                                    ) : shellPayload.header.status && (
-                                                        <span className="shell-badge">status: {shellPayload.header.status}</span>
-                                                    )}
-                                                    {shellPayload.header.waiting_input && shellPayload.header.wait_reason && (
-                                                        <span className="shell-badge warn">reason: {shellPayload.header.wait_reason}</span>
-                                                    )}
-                                                    {typeof shellPayload.header.exit_code === 'number' && (
-                                                        <span
-                                                            className={`shell-badge ${shellPayload.header.exit_code === 0 ? 'ok' : 'err'}`}
-                                                        >
-                                                            exit {shellPayload.header.exit_code}
-                                                        </span>
-                                                    )}
-                                                    {shellPayload.header.pty_fallback && (
-                                                        <span className="shell-badge warn">pty fallback</span>
-                                                    )}
+                                        shellPtyId ? (
+                                            isObservationExpanded ? (
+                                                <PtySessionCard
+                                                    variant="step"
+                                                    sessionId={sessionId}
+                                                    ptyId={shellPtyId}
+                                                    entry={ptySnapshot[shellPtyId]}
+                                                    fallbackStatus={shellPayload.header.status}
+                                                    fallbackExitCode={shellPayload.header.exit_code}
+                                                    command={shellPayload.header.command || shellCommandFromMeta}
+                                                    mode={shellPayload.header.pty_mode}
+                                                    ownerKey={shellOwnerKey}
+                                                    ptyInteraction={ptyInteraction}
+                                                    frozen={!shellIsLatestRunningStep}
+                                                    frozenContent={
+                                                        shellIsLatestRunningStep
+                                                            ? undefined
+                                                            : (shellFrozenContent || shellBody || shellPreview)
+                                                    }
+                                                    readOnlyHint={shellReadOnlyHint}
+                                                />
+                                            ) : (
+                                                <div className="shell-card-output">
+                                                    <pre className="shell-output-plain">{shellPreview || shellBody || ''}</pre>
                                                 </div>
+                                            )
+                                        ) : (
+                                            <div className="shell-card-output">
+                                                <pre className="shell-output-plain">
+                                                    {isObservationExpanded ? shellBody : shellPreview}
+                                                </pre>
                                             </div>
-                                            <div className="shell-card-meta">
-                                                {shellPayload.header.pty_id && (
-                                                    <div className="shell-meta-item">
-                                                        <span className="shell-meta-label">pty_id</span>
-                                                        <span className="shell-meta-value">{shellPayload.header.pty_id}</span>
-                                                    </div>
-                                                )}
-                                                {shellPayload.header.pty_mode && (
-                                                    <div className="shell-meta-item">
-                                                        <span className="shell-meta-label">mode</span>
-                                                        <span className="shell-meta-value">{shellPayload.header.pty_mode}</span>
-                                                    </div>
-                                                )}
-                                                {typeof shellPayload.header.cursor === 'number' && (
-                                                    <div className="shell-meta-item">
-                                                        <span className="shell-meta-label">cursor</span>
-                                                        <span className="shell-meta-value">{shellPayload.header.cursor}</span>
-                                                    </div>
-                                                )}
-                                                {typeof shellPayload.header.idle_timeout === 'number' && (
-                                                    <div className="shell-meta-item">
-                                                        <span className="shell-meta-label">idle_timeout</span>
-                                                        <span className="shell-meta-value">{shellPayload.header.idle_timeout}ms</span>
-                                                    </div>
-                                                )}
-                                                {typeof shellPayload.header.buffer_size === 'number' && (
-                                                    <div className="shell-meta-item">
-                                                        <span className="shell-meta-label">buffer</span>
-                                                        <span className="shell-meta-value">{shellPayload.header.buffer_size}</span>
-                                                    </div>
-                                                )}
-                                                {typeof shellPayload.header.reset === 'boolean' && (
-                                                    <div className="shell-meta-item">
-                                                        <span className="shell-meta-label">reset</span>
-                                                        <span className="shell-meta-value">{String(shellPayload.header.reset)}</span>
-                                                    </div>
-                                                )}
-                                            </div>
-                                            {shellPayload.header.waiting_input && (
-                                                <div className="shell-waiting-hint">命令正在等待交互输入，可继续发送 stdin。</div>
-                                            )}
-                                            <div className={`shell-card-output${isObservationExpanded ? ' expanded' : ''}`}>
-                                                {(() => {
-                                                    const text = isObservationExpanded ? shellBody : shellPreview;
-                                                    const display = text || (shellPayload.header.status === 'exited' ? '(no output)' : '');
-                                                    return <pre className="shell-output-plain">{display}</pre>;
-                                                })()}
-                                            </div>
-                                        </div>
+                                        )
                                     ) : isApplyPatch && applyPatchResult ? (
                                         applyPatchResult.ok ? (
                                             <div className="patch-result">

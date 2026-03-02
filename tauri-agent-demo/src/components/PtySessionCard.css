@@ -1,0 +1,69 @@
+.pty-session-card {
+  cursor: default;
+}
+
+.pty-session-card.running {
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.pty-session-card.running:not(.owner) {
+  cursor: pointer;
+}
+
+.pty-session-card.owner {
+  border-color: rgba(45, 212, 191, 0.55);
+  box-shadow: 0 0 0 1px rgba(45, 212, 191, 0.2) inset;
+}
+
+.pty-session-card-step {
+  height: auto;
+  min-height: 220px;
+}
+
+.pty-session-card-step .pty-output {
+  min-height: 150px;
+}
+
+.pty-mode {
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.62rem;
+  color: #bfdbfe;
+  border: 1px solid rgba(147, 197, 253, 0.3);
+  background: rgba(59, 130, 246, 0.12);
+}
+
+.pty-owner-badge {
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 0.62rem;
+  color: #99f6e4;
+  border: 1px solid rgba(45, 212, 191, 0.45);
+  background: rgba(45, 212, 191, 0.14);
+}
+
+.pty-readonly-hint {
+  margin: 6px 8px 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 0.72rem;
+  color: #cbd5e1;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: rgba(15, 23, 42, 0.4);
+}
+
+.pty-waiting-reason {
+  margin: 6px 8px 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 0.72rem;
+  color: #99f6e4;
+  border: 1px solid rgba(45, 212, 191, 0.25);
+  background: rgba(45, 212, 191, 0.08);
+}
+
+.pty-input-error {
+  margin: 0 8px 8px;
+  color: #fca5a5;
+  font-size: 0.7rem;
+}

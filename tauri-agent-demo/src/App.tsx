@@ -63,6 +63,7 @@ import DebugPanel from './components/DebugPanel';
 import PtyPanel from './components/PtyPanel';
 import AgentStepView from './components/AgentStepView';
 import ConfirmDialog from './components/ConfirmDialog';
+import type { PtyInteractionController, ResolveStepPtyBinding } from './components/ptyInteraction';
 import { loadExtraWorkPaths, migrateExtraWorkPaths, saveExtraWorkPaths } from './workdirStorage';
 import { wsClient } from './wsClient';
 import type { SubagentDoneEvent, SubagentStartedEvent } from './wsTypes';
@@ -102,6 +103,7 @@ const AST_DEFAULT_MAX_FILES = 500;
 const STREAM_STALL_MS = 90_000;
 const STREAM_STALL_CHECK_MS = 5_000;
 const PTY_RESYNC_READ_MAX_OUTPUT = 8000;
+const PTY_INPUT_BATCH_MS = 16;
 const AST_LANGUAGE_OPTIONS = [
   { id: 'python', label: 'Python (.py)' },
   { id: 'javascript', label: 'JavaScript (.js/.jsx/.mjs/.cjs)' },
@@ -160,12 +162,6 @@ const parseRunShellPtyIdFromContent = (content?: string): string => {
   if (!firstLine) return '';
   const match = firstLine.match(/\bpty_id=([^\s\]]+)/);
   return match?.[1] || '';
-};
-
-const normalizeWaitReason = (value: unknown): string | undefined => {
-  if (typeof value !== 'string') return undefined;
-  const text = value.trim();
-  return text || undefined;
 };
 
 type WorkdirBounds = {
@@ -739,23 +735,21 @@ type InFlightState = {
   stalled?: boolean;
 };
 
-type ShellInputPromptState = {
-  sessionId: string;
-  sessionKey: string;
-  messageId: number;
-  streamKey: string;
-  ptyId: string;
-  command: string;
-  waitReason?: string;
-  draft: string;
-  sending: boolean;
-  error: string | null;
-};
-
 type PendingContextEstimate = {
   sessionKey: string;
   queueId: string;
   payload: Record<string, any>;
+};
+
+type PtyOwnerMapBySession = Record<string, Record<string, string>>;
+
+type PtyInputQueueItem = {
+  sessionId: string;
+  ptyId: string;
+  buffer: string;
+  timerId: number | null;
+  inFlight: boolean;
+  lastErrorAt?: number;
 };
 
 type CommandItem = {
@@ -809,7 +803,7 @@ function App() {
   const [toolStats, setToolStats] = useState<SessionToolStats | null>(null);
   const [pendingContextEstimate, setPendingContextEstimate] = useState<PendingContextEstimate | null>(null);
   const [contextEstimateBySession, setContextEstimateBySession] = useState<Record<string, ContextEstimate>>({});
-  const [shellInputPrompt, setShellInputPrompt] = useState<ShellInputPromptState | null>(null);
+  const [ptyOwnerBySession, setPtyOwnerBySession] = useState<PtyOwnerMapBySession>({});
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [heightTick, setHeightTick] = useState(0);
   const [virtualRange, setVirtualRange] = useState({ start: 0, end: 0 });
@@ -889,7 +883,7 @@ function App() {
   const inFlightBySessionRef = useRef<Record<string, InFlightState>>({});
   const pendingPermissionBySessionRef = useRef<Record<string, ToolPermissionRequest | null>>({});
   const permissionBusyBySessionRef = useRef<Record<string, boolean>>({});
-  const shellInputPromptRef = useRef<ShellInputPromptState | null>(null);
+  const ptyInputQueuesRef = useRef<Record<string, PtyInputQueueItem>>({});
   const processingQueueRef = useRef(false);
   const pendingQueueRunRef = useRef(false);
   const lastWorkFileOpenRef = useRef<{ key: string; at: number } | null>(null);
@@ -1027,19 +1021,6 @@ function App() {
 
   useEffect(() => {
     currentSessionIdRef.current = currentSessionId;
-  }, [currentSessionId]);
-
-  useEffect(() => {
-    shellInputPromptRef.current = shellInputPrompt;
-  }, [shellInputPrompt]);
-
-  useEffect(() => {
-    const activeSessionKey = currentSessionId ?? DRAFT_SESSION_KEY;
-    setShellInputPrompt((prev) => {
-      if (!prev) return prev;
-      if (prev.sessionKey === activeSessionKey) return prev;
-      return null;
-    });
   }, [currentSessionId]);
 
   const isImageFile = (file: File) => {
@@ -1878,68 +1859,192 @@ function App() {
 
   const getCurrentSessionKey = () => getSessionKey(currentSessionIdRef.current);
 
-  const clearShellInputPromptForSession = useCallback((sessionKey: string, streamKey?: string) => {
-    setShellInputPrompt((prev) => {
-      if (!prev) return prev;
-      if (prev.sessionKey !== sessionKey) return prev;
-      if (streamKey && prev.streamKey && prev.streamKey !== streamKey) return prev;
-      return null;
+  const getPtyQueueKey = useCallback((sessionId: string, ptyId: string) => `${sessionId}:${ptyId}`, []);
+
+  const clearPtyQueueTimer = useCallback((queue: PtyInputQueueItem) => {
+    if (queue.timerId === null) return;
+    window.clearTimeout(queue.timerId);
+    queue.timerId = null;
+  }, []);
+
+  const ensurePtyInputQueue = useCallback((sessionId: string, ptyId: string): PtyInputQueueItem => {
+    const key = getPtyQueueKey(sessionId, ptyId);
+    const existing = ptyInputQueuesRef.current[key];
+    if (existing) return existing;
+    const created: PtyInputQueueItem = {
+      sessionId,
+      ptyId,
+      buffer: '',
+      timerId: null,
+      inFlight: false
+    };
+    ptyInputQueuesRef.current[key] = created;
+    return created;
+  }, [getPtyQueueKey]);
+
+  const flushPtyInputQueue = useCallback(async (params: { sessionId: string; ptyId: string }) => {
+    const { sessionId, ptyId } = params;
+    if (!sessionId || !ptyId) return;
+    const key = getPtyQueueKey(sessionId, ptyId);
+    const queue = ptyInputQueuesRef.current[key];
+    if (!queue) return;
+
+    clearPtyQueueTimer(queue);
+    if (queue.inFlight || !queue.buffer) return;
+
+    const payload = queue.buffer;
+    queue.buffer = '';
+    queue.inFlight = true;
+    try {
+      await sendPty({ session_id: sessionId, pty_id: ptyId, input: payload });
+      markStreamActivity(sessionId);
+      queue.lastErrorAt = undefined;
+    } catch (error) {
+      queue.lastErrorAt = Date.now();
+      queue.buffer = `${payload}${queue.buffer}`;
+      console.warn('[PTY INPUT FLUSH FAILED]', {
+        sessionId,
+        ptyId,
+        error: error instanceof Error ? error.message : String(error || 'unknown')
+      });
+    } finally {
+      queue.inFlight = false;
+    }
+
+    if (queue.buffer) {
+      if (queue.timerId === null) {
+        queue.timerId = window.setTimeout(() => {
+          queue.timerId = null;
+          void flushPtyInputQueue({ sessionId, ptyId });
+        }, 0);
+      }
+      return;
+    }
+
+    if (!queue.inFlight && queue.timerId === null) {
+      delete ptyInputQueuesRef.current[key];
+    }
+  }, [clearPtyQueueTimer, getPtyQueueKey, markStreamActivity]);
+
+  const flushAllPtyInputQueues = useCallback(async () => {
+    const targets = Object.values(ptyInputQueuesRef.current).map((item) => ({
+      sessionId: item.sessionId,
+      ptyId: item.ptyId
+    }));
+    for (const target of targets) {
+      // eslint-disable-next-line no-await-in-loop
+      await flushPtyInputQueue(target);
+    }
+  }, [flushPtyInputQueue]);
+
+  useEffect(() => {
+    void flushAllPtyInputQueues();
+  }, [currentSessionId, flushAllPtyInputQueues]);
+
+  useEffect(() => {
+    return () => {
+      void flushAllPtyInputQueues();
+    };
+  }, [flushAllPtyInputQueues]);
+
+  const releasePtyOwner = useCallback((sessionId: string | null | undefined, ptyId: string) => {
+    const sessionKey = sessionId ?? DRAFT_SESSION_KEY;
+    if (!ptyId) return;
+    setPtyOwnerBySession((prev) => {
+      const sessionOwners = prev[sessionKey];
+      if (!sessionOwners || !sessionOwners[ptyId]) return prev;
+      const nextSessionOwners = { ...sessionOwners };
+      delete nextSessionOwners[ptyId];
+      if (Object.keys(nextSessionOwners).length === 0) {
+        const next = { ...prev };
+        delete next[sessionKey];
+        return next;
+      }
+      return { ...prev, [sessionKey]: nextSessionOwners };
     });
   }, []);
 
-  const syncShellInputPromptFromStep = useCallback((params: {
-    step: AgentStep;
-    sessionId: string | null;
-    sessionKey: string;
-    messageId: number;
-  }) => {
-    const { step, sessionId, sessionKey, messageId } = params;
-    if (sessionKey !== getCurrentSessionKey()) return;
-    if (!step || (step.step_type !== 'observation' && step.step_type !== 'observation_delta')) return;
-    const meta = (step.metadata || {}) as Record<string, any>;
-    const toolName = String(meta.tool || '').toLowerCase();
-    if (toolName !== 'run_shell') return;
-    const waitingInput = parseBooleanMeta(meta.waiting_input);
-    if (waitingInput !== true && waitingInput !== false) return;
-    const streamKey = String(meta.stream_key || '');
-    if (waitingInput === false) {
-      clearShellInputPromptForSession(sessionKey, streamKey || undefined);
-      return;
+  const activatePtyOwner = useCallback((params: { sessionId?: string | null; ptyId: string; ownerKey: string }) => {
+    const sessionKey = params.sessionId ?? DRAFT_SESSION_KEY;
+    const ptyId = params.ptyId || '';
+    const ownerKey = params.ownerKey || '';
+    if (!ptyId || !ownerKey) return;
+    if (params.sessionId) {
+      void flushPtyInputQueue({ sessionId: params.sessionId, ptyId });
     }
-    const ptyFromMeta = typeof meta.pty_id === 'string' ? meta.pty_id.trim() : '';
-    const ptyId = ptyFromMeta || parseRunShellPtyIdFromContent(step.content);
-    if (!ptyId || !sessionId) return;
-    const command = typeof meta.command === 'string' ? meta.command : '';
-    const waitReason = normalizeWaitReason(meta.wait_reason);
-    setShellInputPrompt((prev) => {
-      if (
-        prev &&
-        prev.sessionKey === sessionKey &&
-        prev.streamKey === streamKey &&
-        prev.ptyId === ptyId
-      ) {
-        return {
-          ...prev,
-          sessionId,
-          messageId,
-          command: command || prev.command,
-          waitReason: waitReason || prev.waitReason
-        };
-      }
+    setPtyOwnerBySession((prev) => {
+      const sessionOwners = prev[sessionKey] || {};
+      if (sessionOwners[ptyId] === ownerKey) return prev;
       return {
-        sessionId,
-        sessionKey,
-        messageId,
-        streamKey,
-        ptyId,
-        command,
-        waitReason,
-        draft: '',
-        sending: false,
-        error: null
+        ...prev,
+        [sessionKey]: {
+          ...sessionOwners,
+          [ptyId]: ownerKey
+        }
       };
     });
-  }, [clearShellInputPromptForSession]);
+  }, [flushPtyInputQueue]);
+
+  const sendPtyInput = useCallback(async (params: { sessionId: string; ptyId: string; input: string }) => {
+    if (!params.input) return;
+    const queue = ensurePtyInputQueue(params.sessionId, params.ptyId);
+    queue.buffer += params.input;
+    if (queue.timerId !== null || queue.inFlight) return;
+    queue.timerId = window.setTimeout(() => {
+      queue.timerId = null;
+      void flushPtyInputQueue({ sessionId: params.sessionId, ptyId: params.ptyId });
+    }, PTY_INPUT_BATCH_MS);
+  }, [ensurePtyInputQueue, flushPtyInputQueue]);
+
+  const continuePtyWithoutInput = useCallback(async (params: { sessionId: string; ptyId: string }) => {
+    await flushPtyInputQueue({ sessionId: params.sessionId, ptyId: params.ptyId });
+    await closePty({ session_id: params.sessionId, pty_id: params.ptyId });
+    markStreamActivity(params.sessionId);
+    releasePtyOwner(params.sessionId, params.ptyId);
+  }, [flushPtyInputQueue, markStreamActivity, releasePtyOwner]);
+
+  const closePtySession = useCallback(async (params: { sessionId: string; ptyId: string }) => {
+    await flushPtyInputQueue({ sessionId: params.sessionId, ptyId: params.ptyId });
+    await closePty({ session_id: params.sessionId, pty_id: params.ptyId });
+    markStreamActivity(params.sessionId);
+    releasePtyOwner(params.sessionId, params.ptyId);
+  }, [flushPtyInputQueue, markStreamActivity, releasePtyOwner]);
+
+  const currentPtyOwnerByPtyId = useMemo(() => {
+    const key = getCurrentSessionKey();
+    return ptyOwnerBySession[key] || {};
+  }, [currentSessionId, ptyOwnerBySession]);
+
+  const ptyInteraction = useMemo<PtyInteractionController>(() => ({
+    ownerByPtyId: currentPtyOwnerByPtyId,
+    activateOwner: activatePtyOwner,
+    sendInput: sendPtyInput,
+    flushInput: flushPtyInputQueue,
+    continueWithoutInput: continuePtyWithoutInput,
+    closePty: closePtySession
+  }), [
+    activatePtyOwner,
+    closePtySession,
+    continuePtyWithoutInput,
+    currentPtyOwnerByPtyId,
+    flushPtyInputQueue,
+    sendPtyInput
+  ]);
+
+  const resolveStepPtyBinding = useCallback<ResolveStepPtyBinding>(({ step, index, messageId }) => {
+    const meta = (step.metadata || {}) as Record<string, any>;
+    const ptyFromMeta = typeof meta.pty_id === 'string' ? meta.pty_id.trim() : '';
+    const ptyId = ptyFromMeta || parseRunShellPtyIdFromContent(step.content);
+    const streamKey =
+      typeof meta.stream_key === 'string' && meta.stream_key.trim()
+        ? meta.stream_key.trim()
+        : `run_shell_${index}`;
+    return {
+      ptyId: ptyId || undefined,
+      streamKey,
+      ownerKey: ptyId ? `step:${String(messageId ?? 'na')}:${streamKey}:${ptyId}` : undefined
+    };
+  }, []);
 
   const getSessionWorkPath = (sessionKey: string) => workPathBySessionRef.current[sessionKey] || '';
 
@@ -2501,7 +2606,6 @@ function App() {
         }
 
         if ('done' in chunk) {
-          clearShellInputPromptForSession(activeSessionKey);
           break;
         }
 
@@ -2792,21 +2896,9 @@ function App() {
         if (resolvedStreamSessionId) {
           ptyStore.applyRunShellStep(resolvedStreamSessionId, step);
         }
-        syncShellInputPromptFromStep({
-          step,
-          sessionId: resolvedStreamSessionId,
-          sessionKey: activeSessionKey,
-          messageId: currentAssistantId
-        });
-        if (step.step_type === 'answer' || step.step_type === 'error') {
-          clearShellInputPromptForSession(activeSessionKey);
-        }
-
         const debugSessionId = activeSessionKey === DRAFT_SESSION_KEY ? null : activeSessionKey;
         scheduleDebugRefresh(debugSessionId);
       }
-
-      clearShellInputPromptForSession(activeSessionKey);
 
       updateSessionMessages(activeSessionKey, (prev) =>
         prev.map((msg) =>
@@ -2864,7 +2956,6 @@ function App() {
         markSessionUnread(activeSessionKey);
       }
     } finally {
-      clearShellInputPromptForSession(activeSessionKey);
       delete inFlightBySessionRef.current[activeSessionKey];
       bumpInFlight();
       processQueues();
@@ -3462,80 +3553,6 @@ function App() {
     await enqueueMessage(userMessage, currentSessionIdRef.current, attachments);
   };
 
-  const handleShellPromptDraftChange = (value: string) => {
-    setShellInputPrompt((prev) => (prev ? { ...prev, draft: value, error: null } : prev));
-  };
-
-  const handleShellPromptSend = async () => {
-    const prompt = shellInputPromptRef.current;
-    if (!prompt || prompt.sending) return;
-    if (!prompt.sessionId || !prompt.ptyId) return;
-    const payload = prompt.draft.endsWith('\n') ? prompt.draft : `${prompt.draft}\n`;
-    setShellInputPrompt((prev) => {
-      if (!prev) return prev;
-      if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
-        return prev;
-      }
-      return { ...prev, sending: true, error: null };
-    });
-    try {
-      await sendPty({ session_id: prompt.sessionId, pty_id: prompt.ptyId, input: payload });
-      markStreamActivity(prompt.sessionId);
-      setShellInputPrompt((prev) => {
-        if (!prev) return prev;
-        if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
-          return prev;
-        }
-        return null;
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to send input to PTY.';
-      setShellInputPrompt((prev) => {
-        if (!prev) return prev;
-        if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
-          return prev;
-        }
-        return { ...prev, sending: false, error: message };
-      });
-    }
-  };
-
-  const handleShellPromptContinue = async () => {
-    const prompt = shellInputPromptRef.current;
-    if (!prompt || prompt.sending) return;
-    if (!prompt.sessionId || !prompt.ptyId) {
-      setShellInputPrompt(null);
-      return;
-    }
-    setShellInputPrompt((prev) => {
-      if (!prev) return prev;
-      if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
-        return prev;
-      }
-      return { ...prev, sending: true, error: null };
-    });
-    try {
-      await closePty({ session_id: prompt.sessionId, pty_id: prompt.ptyId });
-      markStreamActivity(prompt.sessionId);
-      setShellInputPrompt((prev) => {
-        if (!prev) return prev;
-        if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
-          return prev;
-        }
-        return null;
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to close PTY.';
-      setShellInputPrompt((prev) => {
-        if (!prev) return prev;
-        if (prev.sessionKey !== prompt.sessionKey || prev.streamKey !== prompt.streamKey || prev.ptyId !== prompt.ptyId) {
-          return prev;
-        }
-        return { ...prev, sending: false, error: message };
-      });
-    }
-  };
-
   const handleRetryMessage = async (messageId: number | null, message: string) => {
     if (!message) return;
     if (isStreamingCurrent) {
@@ -3624,7 +3641,6 @@ function App() {
     const sessionKey = getCurrentSessionKey();
     const inflight = inFlightBySessionRef.current[sessionKey];
     if (!inflight) return;
-    clearShellInputPromptForSession(sessionKey);
     if (pendingPermissionBySessionRef.current[sessionKey]) {
       await resolvePendingPermission(sessionKey, 'denied', { silent: true });
     }
@@ -4461,6 +4477,8 @@ function App() {
                               currentWorkPath={currentWorkPath}
                               debugActive={showDebugPanel}
                               onOpenDebugCall={(iteration) => handleOpenDebugCall(msg.id, iteration)}
+                              ptyInteraction={ptyInteraction}
+                              resolveStepPtyBinding={resolveStepPtyBinding}
                             />
                           ) : msg.role === 'user' ? (
                             <>
@@ -5071,6 +5089,7 @@ function App() {
           initialWidth={panelWidthRef.current.pty}
           onWidthChange={handlePtyPanelWidthChange}
           onActivity={handlePtyPanelActivity}
+          ptyInteraction={ptyInteraction}
         />
       )}
       {showDebugPanel && (
@@ -5243,63 +5262,6 @@ function App() {
                 disabled={astSettingsSaving || astSettingsLoading}
               >
                 {astSettingsSaving ? '保存中...' : '保存'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {shellInputPrompt && (
-        <div
-          className="shell-input-overlay"
-          onClick={() => {
-            if (shellInputPrompt.sending) return;
-            void handleShellPromptContinue();
-          }}
-        >
-          <div className="shell-input-modal" onClick={(event) => event.stopPropagation()}>
-            <div className="shell-input-title">Shell waiting for input</div>
-            {shellInputPrompt.command && (
-              <div className="shell-input-command" title={shellInputPrompt.command}>
-                {shellInputPrompt.command}
-              </div>
-            )}
-            {shellInputPrompt.waitReason && (
-              <div className="shell-input-reason">Reason: {shellInputPrompt.waitReason}</div>
-            )}
-            <textarea
-              className="shell-input-textarea"
-              value={shellInputPrompt.draft}
-              onChange={(event) => handleShellPromptDraftChange(event.currentTarget.value)}
-              placeholder="Type stdin input..."
-              disabled={shellInputPrompt.sending}
-              rows={4}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                  event.preventDefault();
-                  void handleShellPromptSend();
-                }
-              }}
-            />
-            {shellInputPrompt.error && (
-              <div className="shell-input-error">{shellInputPrompt.error}</div>
-            )}
-            <div className="shell-input-actions">
-              <button
-                type="button"
-                className="shell-input-btn ghost"
-                onClick={() => void handleShellPromptContinue()}
-                disabled={shellInputPrompt.sending}
-              >
-                Continue without input
-              </button>
-              <button
-                type="button"
-                className="shell-input-btn primary"
-                onClick={() => void handleShellPromptSend()}
-                disabled={shellInputPrompt.sending}
-              >
-                {shellInputPrompt.sending ? 'Sending...' : 'Send input'}
               </button>
             </div>
           </div>

@@ -2041,10 +2041,11 @@ def _resolve_pty_stream_keepalive_sec() -> int:
 
 
 def _normalize_windows_pty_input(text: str) -> str:
+    # Keep raw interactive semantics: do not append an implicit newline.
+    # Convert any line-ending variant to CR so pasted LF/CRLF behaves like Enter.
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    if not normalized.endswith("\n"):
-        normalized += "\n"
-    return normalized.replace("\n", "\r\n")
+    normalized = normalized.replace("\n", "\r")
+    return normalized
 
 
 @app.post("/pty/stream")
