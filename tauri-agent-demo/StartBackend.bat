@@ -4,9 +4,7 @@ chcp 65001 >nul
 set PYTHONUTF8=1
 title Backend Server - FastAPI
 cd /d "%~dp0python-backend"
-for %%I in ("%~dp0..") do set "WORKTREE_NAME=%%~nI"
-if not defined WORKTREE_NAME set "WORKTREE_NAME=default"
-set "DB_DIR=%LOCALAPPDATA%\TauriAgent\%WORKTREE_NAME%"
+set "DB_DIR=%LOCALAPPDATA%\TauriAgent"
 set "DB_PATH=%DB_DIR%\chat_app.db"
 if not exist "%DB_DIR%" mkdir "%DB_DIR%" >nul 2>&1
 if not exist "%DB_PATH%" if exist "%~dp0python-backend\chat_app.db" copy /y "%~dp0python-backend\chat_app.db" "%DB_PATH%" >nul
@@ -19,8 +17,6 @@ cls
 echo ========================================
 echo   Backend Server (FastAPI)
 echo ========================================
-echo.
-echo [Info] Database path: %TAURI_AGENT_DB_PATH%
 echo.
 set "BACKEND_PORT=8000"
 set "PORT_IN_USE="
