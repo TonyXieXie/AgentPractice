@@ -35,6 +35,17 @@ export interface PtyStoreEntry {
 
 type Listener = () => void;
 
+const isPtyDebugEnabled = () => {
+  if (typeof window === 'undefined') return false;
+  try {
+    const value = window.localStorage.getItem('PTY_XTERM_LIFECYCLE_DEBUG');
+    if (value === '1' || value === 'true') return true;
+  } catch {
+    // ignore
+  }
+  return Boolean((window as any).__PTY_XTERM_LIFECYCLE_DEBUG__);
+};
+
 const parseBool = (value: unknown): boolean | undefined => {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'string') {
@@ -186,6 +197,18 @@ class PtyStore {
     const entry = this.ensureEntry(sessionId, ptyId);
     const incomingSeq = typeof patch.seq === 'number' && Number.isFinite(patch.seq) ? patch.seq : undefined;
     if (incomingSeq !== undefined && incomingSeq <= entry.seq) {
+      if (isPtyDebugEnabled()) {
+        console.info('[PTY STORE DROP BY SEQ]', {
+          sessionId,
+          ptyId,
+          incomingSeq,
+          currentSeq: entry.seq,
+          chunkLen: String(patch.chunk || '').length,
+          reset: Boolean(patch.reset),
+          status: patch.status,
+          waiting_input: patch.waiting_input
+        });
+      }
       return;
     }
 
@@ -322,6 +345,21 @@ class PtyStore {
     if (!event?.session_id || !event?.pty_id) return;
     const ptySeq = parseNumber((event as any).pty_seq) ?? parseNumber(event.seq);
     const streamSeq = parseNumber((event as any).stream_seq) ?? parseNumber(event.seq);
+    if (isPtyDebugEnabled()) {
+      const rawChunk = String(event.chunk || '');
+      const preview = rawChunk.length > 140 ? `${rawChunk.slice(0, 140)}...(truncated)` : rawChunk;
+      console.info('[PTY SSE EVENT]', {
+        event: (event as any).event || (event as any).type || '',
+        sessionId: event.session_id,
+        ptyId: event.pty_id,
+        ptySeq,
+        streamSeq,
+        chunkLen: rawChunk.length,
+        chunkEscaped: JSON.stringify(preview),
+        status: event.status,
+        waiting_input: event.waiting_input
+      });
+    }
     this.updateEntry(event.session_id, event.pty_id, {
       chunk: event.chunk || '',
       status: event.status,

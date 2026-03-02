@@ -1859,6 +1859,17 @@ function App() {
 
   const getCurrentSessionKey = () => getSessionKey(currentSessionIdRef.current);
 
+  const isPtyIoDebugEnabled = useCallback(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      const value = window.localStorage.getItem('PTY_XTERM_LIFECYCLE_DEBUG');
+      if (value === '1' || value === 'true') return true;
+    } catch {
+      // ignore
+    }
+    return Boolean((window as any).__PTY_XTERM_LIFECYCLE_DEBUG__);
+  }, []);
+
   const getPtyQueueKey = useCallback((sessionId: string, ptyId: string) => `${sessionId}:${ptyId}`, []);
 
   const clearPtyQueueTimer = useCallback((queue: PtyInputQueueItem) => {
@@ -1896,6 +1907,14 @@ function App() {
     queue.buffer = '';
     queue.inFlight = true;
     try {
+      if (isPtyIoDebugEnabled()) {
+        console.info('[PTY INPUT SEND]', {
+          sessionId,
+          ptyId,
+          len: payload.length,
+          escaped: JSON.stringify(payload)
+        });
+      }
       await sendPty({ session_id: sessionId, pty_id: ptyId, input: payload });
       markStreamActivity(sessionId);
       queue.lastErrorAt = undefined;
@@ -1924,7 +1943,7 @@ function App() {
     if (!queue.inFlight && queue.timerId === null) {
       delete ptyInputQueuesRef.current[key];
     }
-  }, [clearPtyQueueTimer, getPtyQueueKey, markStreamActivity]);
+  }, [clearPtyQueueTimer, getPtyQueueKey, isPtyIoDebugEnabled, markStreamActivity]);
 
   const flushAllPtyInputQueues = useCallback(async () => {
     const targets = Object.values(ptyInputQueuesRef.current).map((item) => ({
@@ -1989,12 +2008,22 @@ function App() {
     if (!params.input) return;
     const queue = ensurePtyInputQueue(params.sessionId, params.ptyId);
     queue.buffer += params.input;
+    if (isPtyIoDebugEnabled()) {
+      console.info('[PTY INPUT ENQUEUE]', {
+        sessionId: params.sessionId,
+        ptyId: params.ptyId,
+        inputLen: params.input.length,
+        inputEscaped: JSON.stringify(params.input),
+        queuedLen: queue.buffer.length,
+        inFlight: queue.inFlight
+      });
+    }
     if (queue.timerId !== null || queue.inFlight) return;
     queue.timerId = window.setTimeout(() => {
       queue.timerId = null;
       void flushPtyInputQueue({ sessionId: params.sessionId, ptyId: params.ptyId });
     }, PTY_INPUT_BATCH_MS);
-  }, [ensurePtyInputQueue, flushPtyInputQueue]);
+  }, [ensurePtyInputQueue, flushPtyInputQueue, isPtyIoDebugEnabled]);
 
   const continuePtyWithoutInput = useCallback(async (params: { sessionId: string; ptyId: string }) => {
     await flushPtyInputQueue({ sessionId: params.sessionId, ptyId: params.ptyId });

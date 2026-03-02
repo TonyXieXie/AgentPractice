@@ -286,13 +286,32 @@ function PtyTerminalSurface({
     if (entry.reset) {
       const full = nextAnsi || nextRendered;
       const payload = full ? `${TERM_CLEAR_AND_HOME}${full}` : TERM_CLEAR_AND_HOME;
+      logLifecycle('render_apply', {
+        mode: 'reset_full',
+        seq: entry.seq,
+        ansiLen: nextAnsi.length,
+        payloadLen: payload.length
+      });
       safeWrite(payload);
     } else if (shouldAppend) {
       const delta = nextAnsi.slice(renderState.ansiLen);
+      logLifecycle('render_apply', {
+        mode: 'append_delta',
+        seq: entry.seq,
+        ansiLen: nextAnsi.length,
+        deltaLen: delta.length,
+        deltaEscaped: JSON.stringify(delta.length > 120 ? `${delta.slice(0, 120)}...(truncated)` : delta)
+      });
       if (delta) safeWrite(delta);
     } else {
       const full = nextAnsi || nextRendered;
       const payload = full ? `${TERM_CLEAR_AND_HOME}${full}` : TERM_CLEAR_AND_HOME;
+      logLifecycle('render_apply', {
+        mode: 'reconcile_full',
+        seq: entry.seq,
+        ansiLen: nextAnsi.length,
+        payloadLen: payload.length
+      });
       safeWrite(payload);
     }
 
@@ -300,7 +319,7 @@ function PtyTerminalSurface({
       seq: entry.seq,
       ansiLen: nextAnsi.length
     };
-  }, [entry, ptyId, running, safeWrite, writable]);
+  }, [entry, logLifecycle, ptyId, running, safeWrite, writable]);
 
   useEffect(() => {
     if (!writable || !running) return;
