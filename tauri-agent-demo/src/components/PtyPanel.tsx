@@ -12,6 +12,7 @@ const DEFAULT_MAX_EXITED = 6;
 type PtyTerminal = {
   term: Terminal;
   fit: FitAddon;
+  generation: number;
 };
 
 type TerminalRenderState = {
@@ -20,7 +21,61 @@ type TerminalRenderState = {
   renderedContent: string;
 };
 
+type PtyBufferSnapshot = {
+  ptyId: string;
+  isAlternate: boolean;
+  cols: number;
+  rows: number;
+  cursorX: number;
+  cursorY: number;
+  viewportY: number;
+  baseY: number;
+  length: number;
+  activeTailFrom: number;
+  activeTailLines: string[];
+  viewportLines: string[];
+};
+
+type PtyDebugApi = {
+  listTerms: () => string[];
+  dumpActiveBuffer: (ptyId?: string, maxLines?: number) => PtyBufferSnapshot | null;
+};
+
 const TERM_CLEAR_AND_HOME = '\x1b[2J\x1b[H';
+
+const captureBufferSnapshot = (term: Terminal, ptyId: string, maxLines?: number): PtyBufferSnapshot => {
+  const active = term.buffer.active;
+  const safeMaxLines = Number.isFinite(maxLines as number) ? Math.max(1, Math.floor(maxLines as number)) : 120;
+  const tailFrom = Math.max(0, active.length - safeMaxLines);
+  const activeTailLines: string[] = [];
+  for (let i = tailFrom; i < active.length; i += 1) {
+    const line = active.getLine(i);
+    activeTailLines.push(line ? line.translateToString(true) : '');
+  }
+
+  const viewportStart = Math.max(0, active.viewportY);
+  const viewportEnd = Math.min(active.length, viewportStart + term.rows);
+  const viewportLines: string[] = [];
+  for (let i = viewportStart; i < viewportEnd; i += 1) {
+    const line = active.getLine(i);
+    viewportLines.push(line ? line.translateToString(true) : '');
+  }
+
+  return {
+    ptyId,
+    isAlternate: active === term.buffer.alternate,
+    cols: term.cols,
+    rows: term.rows,
+    cursorX: active.cursorX,
+    cursorY: active.cursorY,
+    viewportY: active.viewportY,
+    baseY: active.baseY,
+    length: active.length,
+    activeTailFrom: tailFrom,
+    activeTailLines,
+    viewportLines
+  };
+};
 
 interface PtyPanelProps {
   sessionId?: string | null;
@@ -41,10 +96,67 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
   const terminalsRef = useRef<Record<string, PtyTerminal>>({});
   const terminalRefCallbacks = useRef<Record<string, (node: HTMLDivElement | null) => void>>({});
   const terminalRenderStateRef = useRef<Record<string, TerminalRenderState>>({});
+  const terminalGenerationRef = useRef<Record<string, number>>({});
   const ptySnapshot = usePtySessionSnapshot(sessionId);
   const snapshotRef = useRef<Record<string, PtyStoreEntry>>({});
   const hydratedBySessionRef = useRef<Record<string, boolean>>({});
   const onActivityRef = useRef(onActivity);
+
+  const nextTerminalGeneration = (ptyId: string): number => {
+    const next = (terminalGenerationRef.current[ptyId] || 0) + 1;
+    terminalGenerationRef.current[ptyId] = next;
+    return next;
+  };
+
+  const isTerminalAlive = (ptyId: string, generation: number, term: Terminal): boolean => {
+    const current = terminalsRef.current[ptyId];
+    return Boolean(current && current.generation === generation && current.term === term);
+  };
+
+  const disposeTerminal = (ptyId: string) => {
+    nextTerminalGeneration(ptyId);
+    const existing = terminalsRef.current[ptyId];
+    if (existing) {
+      try {
+        existing.term.dispose();
+      } catch {
+        // ignore dispose errors
+      }
+      delete terminalsRef.current[ptyId];
+    }
+    delete terminalRefCallbacks.current[ptyId];
+    delete terminalRenderStateRef.current[ptyId];
+  };
+
+  const safeFitTerminal = (ptyId: string) => {
+    const entry = terminalsRef.current[ptyId];
+    if (!entry) return;
+    try {
+      entry.fit.fit();
+    } catch {
+      // ignore fit after-dispose races
+    }
+  };
+
+  const safeWriteTerminal = (ptyId: string, payload: string, reason: string): boolean => {
+    if (!payload) return false;
+    const entry = terminalsRef.current[ptyId];
+    if (!entry) return false;
+    const { term, generation } = entry;
+    try {
+      term.write(payload, () => {
+        if (!isTerminalAlive(ptyId, generation, term)) return;
+        try {
+          term.scrollToBottom();
+        } catch {
+          return;
+        }
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   useEffect(() => {
     snapshotRef.current = ptySnapshot;
@@ -55,16 +167,44 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
   }, [onActivity]);
 
   useEffect(() => {
+    const debugApi: PtyDebugApi = {
+      listTerms: () => Object.keys(terminalsRef.current),
+      dumpActiveBuffer: (ptyId?: string, maxLines?: number) => {
+        const ids = Object.keys(terminalsRef.current);
+        const targetId = ptyId && terminalsRef.current[ptyId] ? ptyId : ids[0];
+        if (!targetId) return null;
+        const entry = terminalsRef.current[targetId];
+        if (!entry) return null;
+        try {
+          const snapshot = captureBufferSnapshot(entry.term, targetId, maxLines);
+          console.log('[PTY ACTIVE BUFFER SNAPSHOT]', snapshot);
+          return snapshot;
+        } catch {
+          return null;
+        }
+      }
+    };
+
+    (window as any).__ptyDebug = debugApi;
+    return () => {
+      if ((window as any).__ptyDebug === debugApi) {
+        delete (window as any).__ptyDebug;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     onWidthChange?.(panelWidth);
   }, [panelWidth, onWidthChange]);
 
   useEffect(() => {
     setItems([]);
     setInputById({});
-    Object.values(terminalsRef.current).forEach((entry) => entry.term.dispose());
+    Object.keys(terminalsRef.current).forEach((ptyId) => disposeTerminal(ptyId));
     terminalsRef.current = {};
     terminalRefCallbacks.current = {};
     terminalRenderStateRef.current = {};
+    terminalGenerationRef.current = {};
   }, [sessionId]);
 
   useEffect(() => {
@@ -119,9 +259,7 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
 
   useEffect(() => {
     const handleResize = () => {
-      Object.values(terminalsRef.current).forEach((entry) => {
-        entry.fit.fit();
-      });
+      Object.keys(terminalsRef.current).forEach((ptyId) => safeFitTerminal(ptyId));
     };
     window.addEventListener('resize', handleResize);
     return () => {
@@ -130,9 +268,7 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
   }, []);
 
   useEffect(() => {
-    Object.values(terminalsRef.current).forEach((entry) => {
-      entry.fit.fit();
-    });
+    Object.keys(terminalsRef.current).forEach((ptyId) => safeFitTerminal(ptyId));
   }, [panelWidth, items.length]);
 
   const orderedItems = useMemo(() => {
@@ -173,6 +309,7 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
 
   useEffect(() => {
     let hadActivity = false;
+    const runningPtyIds = new Set<string>();
     orderedItems.forEach((item) => {
       const ptyId = item.pty_id;
       const entry = ptySnapshot[ptyId];
@@ -181,11 +318,28 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
       const status = waitingInput ? 'waiting_input' : (entry?.status || item.status);
       const isRunning = status === 'running' || status === 'waiting_input';
       if (!isRunning) return;
+      runningPtyIds.add(ptyId);
       const terminalEntry = terminalsRef.current[ptyId];
       if (!terminalEntry) return;
       const renderState =
         terminalRenderStateRef.current[ptyId] || { seq: -1, ansiLen: 0, renderedContent: '' };
       if (renderState.seq === entry.seq) return;
+      const activeBeforeRender = terminalEntry.term.buffer.active;
+      if (activeBeforeRender.length === 0) {
+        console.warn('[PTY EMPTY ACTIVE BUFFER BEFORE_RENDER]', {
+          sessionId,
+          ptyId,
+          seq: entry.seq,
+          status: entry.status,
+          baseY: activeBeforeRender.baseY,
+          viewportY: activeBeforeRender.viewportY,
+          cursorX: activeBeforeRender.cursorX,
+          cursorY: activeBeforeRender.cursorY,
+          isAlternate: activeBeforeRender === terminalEntry.term.buffer.alternate,
+          cols: terminalEntry.term.cols,
+          rows: terminalEntry.term.rows
+        });
+      }
 
       const nextAnsi = entry.ansi_log || '';
       const nextRendered = entry.rendered_content || '';
@@ -196,13 +350,11 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
       if (entry.reset) {
         const full = nextAnsi || nextRendered;
         const payload = full ? `${TERM_CLEAR_AND_HOME}${full}` : TERM_CLEAR_AND_HOME;
-        terminalEntry.term.write(payload, () => terminalEntry.term.scrollToBottom());
-        hadActivity = true;
+        if (safeWriteTerminal(ptyId, payload, 'reset')) hadActivity = true;
       } else if (shouldAppend) {
         const delta = nextAnsi.slice(renderState.ansiLen);
         if (delta) {
-          terminalEntry.term.write(delta, () => terminalEntry.term.scrollToBottom());
-          hadActivity = true;
+          if (safeWriteTerminal(ptyId, delta, 'append')) hadActivity = true;
         }
       }
 
@@ -212,6 +364,11 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
         renderedContent: nextRendered
       };
     });
+    Object.keys(terminalsRef.current).forEach((ptyId) => {
+      if (!runningPtyIds.has(ptyId)) {
+        disposeTerminal(ptyId);
+      }
+    });
     if (hadActivity) onActivityRef.current?.();
   }, [orderedItems, ptySnapshot]);
 
@@ -219,16 +376,12 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
     if (!terminalRefCallbacks.current[ptyId]) {
       terminalRefCallbacks.current[ptyId] = (node) => {
         if (!node) {
-          const existing = terminalsRef.current[ptyId];
-          if (existing) {
-            existing.term.dispose();
-            delete terminalsRef.current[ptyId];
-          }
-          delete terminalRefCallbacks.current[ptyId];
-          delete terminalRenderStateRef.current[ptyId];
+          // React strict-mode/dev reconciliation may transiently send null refs.
+          // Disposal is handled by explicit session-change or non-running cleanup.
           return;
         }
         if (terminalsRef.current[ptyId]) return;
+        const generation = nextTerminalGeneration(ptyId);
 
         const term = new Terminal({
           convertEol: true,
@@ -246,19 +399,23 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
         const fit = new FitAddon();
         term.loadAddon(fit);
         term.open(node);
-        fit.fit();
+        try {
+          fit.fit();
+        } catch {
+          // ignore fit errors on unstable mount timing
+        }
+        terminalsRef.current[ptyId] = { term, fit, generation };
 
         const existingEntry = snapshotRef.current[ptyId];
         const initial = existingEntry?.rendered_content || existingEntry?.ansi_log || '';
         if (initial) {
-          term.write(initial, () => term.scrollToBottom());
+          safeWriteTerminal(ptyId, initial, 'initial');
         }
         terminalRenderStateRef.current[ptyId] = {
           seq: existingEntry?.seq ?? 0,
           ansiLen: existingEntry?.ansi_log?.length ?? 0,
           renderedContent: existingEntry?.rendered_content || ''
         };
-        terminalsRef.current[ptyId] = { term, fit };
       };
     }
     return terminalRefCallbacks.current[ptyId];

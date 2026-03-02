@@ -601,23 +601,11 @@ def _is_macos() -> bool:
 
 
 def _pty_debug_enabled() -> bool:
-    raw = os.environ.get("PTY_DEBUG")
-    if raw is not None:
-        value = str(raw).strip().lower()
-        if value in ("0", "false", "no", "off"):
-            return False
-        if value in ("1", "true", "yes", "on"):
-            return True
-    dev_value = str(os.environ.get("TAURI_AGENT_DEV", "")).strip().lower()
-    if dev_value in ("1", "true", "yes", "on"):
-        return True
-    env_value = str(os.environ.get("TAURI_AGENT_ENV", "")).strip().lower()
-    return env_value in ("dev", "development")
+    return False
 
 
 def _pty_debug(message: str) -> None:
-    if _pty_debug_enabled():
-        print(f"[PTY DEBUG] {message}")
+    return
 
 
 def _tail_bytes_hex(data: bytes, max_len: int = 16) -> str:

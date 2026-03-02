@@ -61,28 +61,11 @@ def _get_prompt_truncation_config(request_overrides: Optional[Dict[str, Any]]) -
 
 
 def _pty_stream_debug_enabled() -> bool:
-    raw = os.environ.get("PTY_STREAM_DEBUG")
-    if raw is not None:
-        value = str(raw).strip().lower()
-        if value in ("1", "true", "yes", "on"):
-            return True
-        if value in ("0", "false", "no", "off"):
-            return False
-    raw = os.environ.get("PTY_DEBUG")
-    if raw is not None:
-        value = str(raw).strip().lower()
-        if value in ("1", "true", "yes", "on"):
-            return True
-    dev_value = str(os.environ.get("TAURI_AGENT_DEV", "")).strip().lower()
-    if dev_value in ("1", "true", "yes", "on"):
-        return True
-    env_value = str(os.environ.get("TAURI_AGENT_ENV", "")).strip().lower()
-    return env_value in ("dev", "development")
+    return False
 
 
 def _pty_stream_log(message: str) -> None:
-    if _pty_stream_debug_enabled():
-        print(f"[PTY STREAM] {message}")
+    return
 
 
 async def _wait_for_mcp_permission(

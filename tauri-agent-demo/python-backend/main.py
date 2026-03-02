@@ -2015,11 +2015,7 @@ def _pty_debug_enabled() -> bool:
             return False
         if value in ("1", "true", "yes", "on"):
             return True
-    dev_value = str(os.environ.get("TAURI_AGENT_DEV", "")).strip().lower()
-    if dev_value in ("1", "true", "yes", "on"):
-        return True
-    env_value = str(os.environ.get("TAURI_AGENT_ENV", "")).strip().lower()
-    return env_value in ("dev", "development")
+    return False
 
 
 def _tail_bytes_hex(data: bytes, max_len: int = 16) -> str:
@@ -2239,14 +2235,6 @@ def send_pty(request: PtySendRequest):
     else:
         proc.waiting_input = False
         proc.wait_reason = None
-    if _pty_debug_enabled():
-        endswith_crlf = payload.endswith("\r\n")
-        print(
-            "[PTY DEBUG] api send "
-            f"pty_id={proc.id} bytes_written={written} input_len={len(payload)} "
-            f"endswith_crlf={endswith_crlf} track_completion={str(track_completion).lower()} "
-            f"marker_enabled={str(marker_enabled).lower()} tail_hex={_tail_bytes_hex(data)}"
-        )
     response = {"ok": True, "pty_id": proc.id, "bytes_written": written}
     if completion_key:
         response["completion_key"] = completion_key

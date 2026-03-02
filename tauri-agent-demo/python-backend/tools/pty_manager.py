@@ -416,10 +416,14 @@ class PtyProcess:
         acquired = self._buffer_lock.acquire(timeout=0.1)
         if not acquired:
             return "", self._cursor, False
+        requested_cursor = self._cursor if cursor is None else int(cursor)
+        buffer_start = 0
+        reset = False
+        log_total_bytes = 0
+        log_buffer_len = 0
         try:
             buffer_start = self._total_bytes - len(self._buffer)
-            effective_cursor = self._cursor if cursor is None else int(cursor)
-            reset = False
+            effective_cursor = requested_cursor
             if effective_cursor < buffer_start:
                 effective_cursor = buffer_start
                 reset = True
@@ -428,8 +432,21 @@ class PtyProcess:
             chunk = bytes(self._buffer[start_idx:end_idx])
             new_cursor = effective_cursor + len(chunk)
             self._cursor = max(self._cursor, new_cursor)
+            log_total_bytes = self._total_bytes
+            log_buffer_len = len(self._buffer)
         finally:
             self._buffer_lock.release()
+        if reset:
+            print(
+                "[PTY RESET] "
+                f"session_id={self.session_id} "
+                f"pty_id={self.id} "
+                f"requested_cursor={requested_cursor} "
+                f"buffer_start={buffer_start} "
+                f"applied_cursor={self._cursor} "
+                f"total_bytes={log_total_bytes} "
+                f"buffer_len={log_buffer_len}"
+            )
         return _decode_output_bytes(chunk), self._cursor, reset
 
     def write(self, data: bytes) -> int:
