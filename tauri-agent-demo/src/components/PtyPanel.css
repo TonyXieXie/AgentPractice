@@ -176,7 +176,7 @@
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  height: 220px;
+  height: 280px;
   flex: 0 0 auto;
 }
 
@@ -330,6 +330,24 @@
 }
 
 .pty-output .xterm-viewport {
-  overflow-y: auto;
+  overflow-y: auto !important;
+}
+
+.pty-output .xterm-viewport::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.pty-output .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.pty-output .xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
+}
+
+.pty-output .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.24);
 }
 

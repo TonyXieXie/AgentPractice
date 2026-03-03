@@ -1,10 +1,11 @@
 import { memo, useCallback, useEffect, useRef } from 'react';
 import { Terminal } from 'xterm';
-import { FitAddon } from 'xterm-addon-fit';
 import 'xterm/css/xterm.css';
 import type { PtyStoreEntry } from '../ptyStore';
 
 const TERM_CLEAR_AND_HOME = '\x1b[2J\x1b[H';
+const PTY_FIXED_COLS = 120;
+const PTY_FIXED_ROWS = 30;
 
 type TerminalRenderState = {
   seq: number;
@@ -48,10 +49,7 @@ function PtyTerminalSurface({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const entryRef = useRef<PtyStoreEntry | undefined>(entry);
   const termRef = useRef<Terminal | null>(null);
-  const fitRef = useRef<FitAddon | null>(null);
   const renderStateRef = useRef<TerminalRenderState>({ seq: -1, ansiLen: 0 });
-  const resizeObserverRef = useRef<ResizeObserver | null>(null);
-  const fitRafRef = useRef<number | null>(null);
   const onDataSubscriptionRef = useRef<{ dispose: () => void } | null>(null);
   const onTerminalDataRef = useRef(onTerminalData);
   const onFlushPendingInputRef = useRef(onFlushPendingInput);
@@ -86,35 +84,11 @@ function PtyTerminalSurface({
     onActivityRef.current = onActivity;
   }, [onActivity]);
 
-  const clearPendingFit = useCallback(() => {
-    if (fitRafRef.current !== null && typeof window !== 'undefined') {
-      window.cancelAnimationFrame(fitRafRef.current);
-      fitRafRef.current = null;
-    }
-  }, []);
-
-  const scheduleFit = useCallback(() => {
-    if (typeof window === 'undefined') return;
-    if (fitRafRef.current !== null) return;
-    fitRafRef.current = window.requestAnimationFrame(() => {
-      fitRafRef.current = null;
-      const fit = fitRef.current;
-      if (!fit) return;
-      try {
-        fit.fit();
-      } catch {
-        // ignore fit race after disposal
-      }
-    });
-  }, []);
-
   const disposeTerminal = useCallback(() => {
     logLifecycle('dispose_begin', {
       hasTerm: Boolean(termRef.current),
-      hasObserver: Boolean(resizeObserverRef.current),
       hasSubscription: Boolean(onDataSubscriptionRef.current)
     });
-    clearPendingFit();
     const dataSubscription = onDataSubscriptionRef.current;
     if (dataSubscription) {
       try {
@@ -123,11 +97,6 @@ function PtyTerminalSurface({
         // ignore dispose errors
       }
       onDataSubscriptionRef.current = null;
-    }
-    const observer = resizeObserverRef.current;
-    if (observer) {
-      observer.disconnect();
-      resizeObserverRef.current = null;
     }
     const term = termRef.current;
     if (term) {
@@ -138,21 +107,29 @@ function PtyTerminalSurface({
       }
       termRef.current = null;
     }
-    fitRef.current = null;
     renderStateRef.current = { seq: -1, ansiLen: 0 };
     logLifecycle('dispose_end');
-  }, [clearPendingFit, logLifecycle]);
+  }, [logLifecycle]);
 
   const safeWrite = useCallback((payload: string): boolean => {
     if (!payload) return false;
     const term = termRef.current;
     if (!term) return false;
+    let shouldFollow = true;
+    try {
+      const activeBuffer = term.buffer.active;
+      shouldFollow = activeBuffer.viewportY >= (activeBuffer.baseY - 1);
+    } catch {
+      shouldFollow = true;
+    }
     try {
       term.write(payload, () => {
-        try {
-          term.scrollToBottom();
-        } catch {
-          // ignore
+        if (shouldFollow) {
+          try {
+            term.scrollToBottom();
+          } catch {
+            // ignore
+          }
         }
       });
       onActivityRef.current?.();
@@ -187,6 +164,8 @@ function PtyTerminalSurface({
       convertEol: true,
       disableStdin: false,
       scrollback: 4000,
+      cols: PTY_FIXED_COLS,
+      rows: PTY_FIXED_ROWS,
       fontFamily: "'SFMono-Regular', 'Menlo', 'Consolas', 'Liberation Mono', 'Courier New', monospace",
       fontSize: 12,
       lineHeight: 1.4,
@@ -196,15 +175,12 @@ function PtyTerminalSurface({
         cursor: '#e2e8f0'
       }
     });
-    const fit = new FitAddon();
-    term.loadAddon(fit);
     term.open(host);
     onDataSubscriptionRef.current = term.onData((data) => {
       onTerminalDataRef.current?.(data);
     });
 
     termRef.current = term;
-    fitRef.current = fit;
 
     // For writable xterm, always prefer raw ANSI stream to preserve control
     // semantics (CR/BS/CSI). rendered_content is display-friendly text only.
@@ -217,26 +193,19 @@ function PtyTerminalSurface({
       ansiLen: initialEntry?.ansi_log?.length ?? 0
     };
 
-    scheduleFit();
     try {
       term.focus();
     } catch {
       // ignore focus errors
     }
-
-    if (typeof window !== 'undefined' && typeof ResizeObserver !== 'undefined') {
-      const observer = new ResizeObserver(() => {
-        scheduleFit();
-      });
-      observer.observe(host);
-      resizeObserverRef.current = observer;
-    }
     logLifecycle('init_end', {
       initialLen: initial.length,
       seq: initialEntry?.seq ?? 0,
-      ansiLen: initialEntry?.ansi_log?.length ?? 0
+      ansiLen: initialEntry?.ansi_log?.length ?? 0,
+      cols: PTY_FIXED_COLS,
+      rows: PTY_FIXED_ROWS
     });
-  }, [logLifecycle, running, safeWrite, scheduleFit, writable]);
+  }, [logLifecycle, running, safeWrite, writable]);
 
   const setHostRef = useCallback((node: HTMLDivElement | null) => {
     if (!node) {
@@ -323,13 +292,12 @@ function PtyTerminalSurface({
 
   useEffect(() => {
     if (!writable || !running) return;
-    scheduleFit();
     try {
       termRef.current?.focus();
     } catch {
       // ignore focus errors
     }
-  }, [running, scheduleFit, writable]);
+  }, [running, writable]);
 
   if (!writable || !running) {
     const content = staticText ?? entry?.rendered_content ?? entry?.ansi_log ?? '';

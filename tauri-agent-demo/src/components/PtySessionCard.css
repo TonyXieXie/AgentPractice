@@ -17,11 +17,11 @@
 
 .pty-session-card-step {
   height: auto;
-  min-height: 220px;
+  min-height: 360px;
 }
 
 .pty-session-card-step .pty-output {
-  min-height: 150px;
+  min-height: 280px;
 }
 
 .pty-mode {

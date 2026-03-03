@@ -23,6 +23,8 @@ from ..pty_manager import (
     get_pty_manager,
     PtyProcess,
     DEFAULT_BUFFER_SIZE,
+    DEFAULT_SCREEN_COLS,
+    DEFAULT_SCREEN_ROWS,
     _decode_output_bytes,
     sanitize_pty_screen_text,
 )
@@ -1867,8 +1869,8 @@ def _windows_assign_job(kernel32, process_handle):
 def _windows_start_conpty_process(
     command: str,
     workdir: Path,
-    cols: int = 120,
-    rows: int = 30,
+    cols: int = DEFAULT_SCREEN_COLS,
+    rows: int = DEFAULT_SCREEN_ROWS,
     keep_open: bool = False,
     use_restricted_token: bool = True
 ):
