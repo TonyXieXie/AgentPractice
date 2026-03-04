@@ -1,30 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
-import { Terminal } from 'xterm';
-import { FitAddon } from 'xterm-addon-fit';
-import 'xterm/css/xterm.css';
-import { closePty, listPtys, readPty, sendPty, type PtyListItem } from '../api';
-import { wsClient } from '../wsClient';
-import type { PtyOutputEvent } from '../wsTypes';
+import { memo, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import { listPtys, readPty, type PtyListItem } from '../api';
+import { ptyStore, usePtySessionSnapshot, type PtyStoreEntry } from '../ptyStore';
+import type { PtyInteractionController } from './ptyInteraction';
+import PtySessionCard from './PtySessionCard';
 import './PtyPanel.css';
 
-type PtyBuffer = {
-  text: string;
-  cursor: number;
-  status?: string;
-  command?: string;
-  exit_code?: number | null;
-  pty?: boolean;
-};
-
+const INITIAL_READ_MAX_OUTPUT = 8000;
 const DEFAULT_MAX_EXITED = 6;
-const LIST_POLL_MS = 2000;
-const READ_POLL_MS = 500;
-const READ_MAX_OUTPUT = 8000;
-
-type PtyTerminal = {
-  term: Terminal;
-  fit: FitAddon;
-};
 
 interface PtyPanelProps {
   sessionId?: string | null;
@@ -32,62 +14,30 @@ interface PtyPanelProps {
   onWidthChange?: (width: number) => void;
   initialWidth?: number;
   onActivity?: () => void;
+  ptyInteraction: PtyInteractionController;
 }
 
-function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity }: PtyPanelProps) {
+function PtyPanel({
+  sessionId,
+  onClose,
+  onWidthChange,
+  initialWidth,
+  onActivity,
+  ptyInteraction
+}: PtyPanelProps) {
   const [panelWidth, setPanelWidth] = useState(() => Math.max(320, initialWidth ?? 380));
   const [includeExited, setIncludeExited] = useState(true);
   const [maxExited, setMaxExited] = useState(DEFAULT_MAX_EXITED);
   const [items, setItems] = useState<PtyListItem[]>([]);
-  const [wsConnected, setWsConnected] = useState(false);
-  const buffersRef = useRef<Record<string, PtyBuffer>>({});
-  const [inputById, setInputById] = useState<Record<string, string>>({});
+
   const panelRef = useRef<HTMLDivElement>(null);
-  const itemsRef = useRef<PtyListItem[]>([]);
-  const terminalsRef = useRef<Record<string, PtyTerminal>>({});
-  const terminalContainersRef = useRef<Record<string, HTMLDivElement | null>>({});
-  const terminalRefCallbacks = useRef<Record<string, (node: HTMLDivElement | null) => void>>({});
-  const listSignatureRef = useRef<string>('');
+  const ptySnapshot = usePtySessionSnapshot(sessionId);
+  const snapshotRef = useRef<Record<string, PtyStoreEntry>>({});
+  const hydratedBySessionRef = useRef<Record<string, boolean>>({});
 
   useEffect(() => {
-    itemsRef.current = items;
-  }, [items]);
-
-  useEffect(() => {
-    const cleanupStatus = wsClient.onStatus((connected) => {
-      setWsConnected(connected);
-    });
-    const cleanupEvents = wsClient.onEvent((event) => {
-      if (event.type !== 'pty_output') return;
-      const payload = event as PtyOutputEvent;
-      if (!payload.pty_id || payload.session_id !== sessionId) return;
-      const current = buffersRef.current[payload.pty_id] || { text: '', cursor: 0 };
-      const nextCursor = typeof payload.cursor === 'number' ? payload.cursor : current.cursor;
-      let text = current.text;
-      if (payload.chunk) {
-        text = text + payload.chunk;
-      }
-      const terminalEntry = terminalsRef.current[payload.pty_id];
-      if (terminalEntry && payload.chunk) {
-        terminalEntry.term.write(payload.chunk, () => terminalEntry.term.scrollToBottom());
-      }
-      const nextBuffer = {
-        ...current,
-        text,
-        cursor: nextCursor,
-        status: payload.status ?? current.status,
-        exit_code: payload.exit_code ?? current.exit_code,
-      };
-      buffersRef.current[payload.pty_id] = nextBuffer;
-      if (payload.chunk) {
-        onActivity?.();
-      }
-    });
-    return () => {
-      cleanupEvents();
-      cleanupStatus();
-    };
-  }, [sessionId, onActivity]);
+    snapshotRef.current = ptySnapshot;
+  }, [ptySnapshot]);
 
   useEffect(() => {
     onWidthChange?.(panelWidth);
@@ -95,15 +45,95 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
 
   useEffect(() => {
     setItems([]);
-    buffersRef.current = {};
-    setInputById({});
-    for (const entry of Object.values(terminalsRef.current)) {
-      entry.term.dispose();
-    }
-    terminalsRef.current = {};
-    terminalContainersRef.current = {};
-    terminalRefCallbacks.current = {};
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) {
+      setItems([]);
+      return;
+    }
+    if (hydratedBySessionRef.current[sessionId]) return;
+    hydratedBySessionRef.current[sessionId] = true;
+    let active = true;
+    const hydrate = async () => {
+      try {
+        const list = await listPtys(sessionId, { includeExited: true, maxExited: 50 });
+        if (!active) return;
+        setItems(list);
+        list.forEach((item) => ptyStore.applyListItem(sessionId, item));
+        const liveSnapshot = ptyStore.getSessionSnapshot(sessionId);
+        await Promise.all(
+          list.map(async (item) => {
+            try {
+              const existing = liveSnapshot[item.pty_id];
+              const hasLiveData =
+                Boolean(existing?.ansi_log) ||
+                Boolean(existing?.rendered_content) ||
+                (typeof existing?.seq === 'number' && existing.seq > 0);
+              if (hasLiveData) return;
+              const cursor = existing?.cursor ?? snapshotRef.current[item.pty_id]?.cursor;
+              const response = await readPty({
+                session_id: sessionId,
+                pty_id: item.pty_id,
+                cursor: typeof cursor === 'number' ? cursor : undefined,
+                max_output: INITIAL_READ_MAX_OUTPUT
+              });
+              if (!active) return;
+              ptyStore.applyReadResponse(sessionId, response);
+            } catch {
+              // ignore
+            }
+          })
+        );
+      } catch {
+        // ignore
+      }
+    };
+    void hydrate();
+    return () => {
+      active = false;
+    };
+  }, [sessionId]);
+
+  const orderedItems = useMemo(() => {
+    const byId = new Map<string, PtyListItem>();
+    items.forEach((item) => {
+      byId.set(item.pty_id, item);
+    });
+
+    Object.entries(ptySnapshot).forEach(([ptyId, entry]) => {
+      if (byId.has(ptyId)) return;
+      byId.set(ptyId, {
+        pty_id: ptyId,
+        status: entry.status || 'running',
+        pty: true,
+        exit_code: entry.exit_code,
+        command: entry.command,
+        created_at: Math.floor(entry.updated_at / 1000)
+      });
+    });
+
+    const merged = Array.from(byId.values());
+    const running: PtyListItem[] = [];
+    const exited: PtyListItem[] = [];
+
+    merged.forEach((item) => {
+      const entry = ptySnapshot[item.pty_id];
+      const waitingInput = entry?.waiting_input ?? item.waiting_input ?? false;
+      const status = waitingInput ? 'waiting_input' : (entry?.status || item.status);
+      const isRunning = status === 'running' || status === 'waiting_input';
+      if (isRunning) {
+        running.push(item);
+      } else {
+        exited.push(item);
+      }
+    });
+
+    running.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+    exited.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+    if (!includeExited) return running;
+    return [...running, ...exited.slice(0, Math.max(0, maxExited))];
+  }, [includeExited, items, maxExited, ptySnapshot]);
 
   const handleResizeStart = (event: ReactMouseEvent) => {
     event.preventDefault();
@@ -126,227 +156,6 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
     window.addEventListener('mouseup', handleMouseUp);
   };
 
-  useEffect(() => {
-    if (!sessionId) {
-      setItems([]);
-      listSignatureRef.current = '';
-      return;
-    }
-    let active = true;
-    const fetchList = async () => {
-      try {
-        const list = await listPtys(sessionId, { includeExited, maxExited });
-        if (!active) return;
-        const signature = list
-          .map((item) => `${item.pty_id}|${item.status}|${item.exit_code ?? ''}|${item.command ?? ''}|${item.pty}`)
-          .join('||');
-        if (signature !== listSignatureRef.current) {
-          listSignatureRef.current = signature;
-          setItems(list);
-        }
-        const next: Record<string, PtyBuffer> = {};
-        const keep = new Set(list.map((item) => item.pty_id));
-        for (const item of list) {
-          const existing = buffersRef.current[item.pty_id] || { text: '', cursor: 0 };
-          const command = item.command || existing.command;
-            next[item.pty_id] = {
-              ...existing,
-              command,
-              status: item.status,
-              exit_code: item.exit_code ?? existing.exit_code,
-              pty: item.pty,
-              text: existing.text
-            };
-          }
-          for (const key of Object.keys(buffersRef.current)) {
-            if (!keep.has(key)) {
-              // drop stale buffers
-              continue;
-            }
-          }
-        buffersRef.current = next;
-      } catch {
-        // ignore polling errors
-      }
-    };
-    fetchList();
-    const interval = window.setInterval(fetchList, LIST_POLL_MS);
-    return () => {
-      active = false;
-      window.clearInterval(interval);
-    };
-  }, [sessionId, includeExited, maxExited]);
-
-  const readOnce = useCallback(async () => {
-    if (!sessionId) return;
-    const currentItems = itemsRef.current;
-    if (!currentItems.length) return;
-    for (const item of currentItems) {
-      try {
-        const current = buffersRef.current[item.pty_id] || { text: '', cursor: 0 };
-        const resp = await readPty({
-          session_id: sessionId,
-          pty_id: item.pty_id,
-          cursor: current.cursor,
-          max_output: READ_MAX_OUTPUT
-        });
-        let text = current.text;
-        if (resp.reset) {
-          text = resp.chunk || '';
-        } else if (resp.chunk) {
-          text = text + resp.chunk;
-        }
-        const command = item.command || resp.command || current.command;
-        const terminalEntry = terminalsRef.current[item.pty_id];
-        if (terminalEntry) {
-          if (resp.reset) {
-            terminalEntry.term.reset();
-          }
-          if (resp.chunk) {
-            terminalEntry.term.write(resp.chunk, () => terminalEntry.term.scrollToBottom());
-          }
-        }
-        if (resp.chunk || resp.reset || resp.status === 'running') {
-          onActivity?.();
-        }
-        const nextBuffer = {
-          ...current,
-          text,
-          cursor: resp.cursor,
-          status: resp.status,
-          exit_code: resp.exit_code,
-          pty: resp.pty,
-          command
-        };
-        buffersRef.current[item.pty_id] = nextBuffer;
-      } catch {
-        // ignore read errors
-      }
-    }
-  }, [sessionId, onActivity]);
-
-  useEffect(() => {
-    if (!sessionId || !wsConnected) return;
-    readOnce();
-  }, [sessionId, wsConnected, items, readOnce]);
-
-  useEffect(() => {
-    if (!sessionId) return;
-    let active = true;
-    if (wsConnected) {
-      readOnce();
-      return () => {
-        active = false;
-      };
-    }
-
-    const tick = async () => {
-      if (!active) return;
-      await readOnce();
-    };
-    tick();
-    const interval = window.setInterval(tick, READ_POLL_MS);
-    return () => {
-      active = false;
-      window.clearInterval(interval);
-    };
-  }, [sessionId, wsConnected, readOnce]);
-
-  useEffect(() => {
-    const handleResize = () => {
-      for (const entry of Object.values(terminalsRef.current)) {
-        entry.fit.fit();
-      }
-    };
-    window.addEventListener('resize', handleResize);
-    return () => {
-      window.removeEventListener('resize', handleResize);
-    };
-  }, []);
-
-  useEffect(() => {
-    for (const entry of Object.values(terminalsRef.current)) {
-      entry.fit.fit();
-    }
-  }, [panelWidth, items.length]);
-
-  const handleSend = async (ptyId: string) => {
-    const input = (inputById[ptyId] || '').trim();
-    if (!input || !sessionId) return;
-    const payload = input.endsWith('\n') ? input : `${input}\n`;
-    try {
-      await sendPty({ session_id: sessionId, pty_id: ptyId, input: payload });
-    } catch {
-      // ignore send errors
-    }
-    setInputById((prev) => ({ ...prev, [ptyId]: '' }));
-  };
-
-  const handleClose = async (ptyId: string) => {
-    if (!sessionId) return;
-    try {
-      await closePty({ session_id: sessionId, pty_id: ptyId });
-    } catch {
-      // ignore close errors
-    }
-  };
-
-  const orderedItems = useMemo(() => {
-    return [...items].sort((a, b) => {
-      const aRank = a.status === 'running' ? 0 : 1;
-      const bRank = b.status === 'running' ? 0 : 1;
-      if (aRank !== bRank) return aRank - bRank;
-      const aTime = a.created_at || 0;
-      const bTime = b.created_at || 0;
-      return bTime - aTime;
-    });
-  }, [items]);
-
-  const getTerminalRef = (ptyId: string) => {
-    if (!terminalRefCallbacks.current[ptyId]) {
-      terminalRefCallbacks.current[ptyId] = (node) => {
-        terminalContainersRef.current[ptyId] = node;
-        if (!node) {
-          const existing = terminalsRef.current[ptyId];
-          if (existing) {
-            existing.term.dispose();
-            delete terminalsRef.current[ptyId];
-          }
-          delete terminalRefCallbacks.current[ptyId];
-          return;
-        }
-        if (terminalsRef.current[ptyId]) {
-          return;
-        }
-        const term = new Terminal({
-          convertEol: true,
-          disableStdin: true,
-          scrollback: 2000,
-          fontFamily:
-            "'SFMono-Regular', 'Menlo', 'Consolas', 'Liberation Mono', 'Courier New', monospace",
-          fontSize: 12,
-          lineHeight: 1.4,
-          theme: {
-            background: '#0b0f14',
-            foreground: '#e2e8f0',
-            cursor: '#e2e8f0',
-            selection: 'rgba(148, 163, 184, 0.35)'
-          }
-        });
-        const fit = new FitAddon();
-        term.loadAddon(fit);
-        term.open(node);
-        fit.fit();
-        const existingText = buffersRef.current[ptyId]?.text;
-        if (existingText) {
-          term.write(existingText, () => term.scrollToBottom());
-        }
-        terminalsRef.current[ptyId] = { term, fit };
-      };
-    }
-    return terminalRefCallbacks.current[ptyId];
-  };
-
   return (
     <div className="pty-panel" ref={panelRef} style={{ width: panelWidth }}>
       <div className="pty-resize-handle" onMouseDown={handleResizeStart} />
@@ -355,90 +164,66 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
           <h2>PTY Sessions</h2>
           <span className="pty-count">{orderedItems.length}</span>
         </div>
-        <button className="close-btn" onClick={onClose} aria-label="Close">×</button>
+        <button className="close-btn" onClick={onClose} aria-label="Close">
+          x
+        </button>
       </div>
+
       <div className="pty-controls">
         <label className="pty-toggle">
           <input
             type="checkbox"
             checked={includeExited}
-            onChange={(e) => setIncludeExited(e.currentTarget.checked)}
+            onChange={(event) => setIncludeExited(event.currentTarget.checked)}
           />
-          <span>显示已退出</span>
+          <span>Show exited</span>
         </label>
         <label className="pty-max-exited">
-          <span>最多已退出</span>
+          <span>Max exited</span>
           <input
             type="number"
             min={0}
             max={50}
             value={maxExited}
-            onChange={(e) => {
-              const raw = e.currentTarget ? e.currentTarget.value : '';
+            onChange={(event) => {
+              const raw = event.currentTarget.value || '';
               setMaxExited(Math.max(0, Number(raw || 0)));
             }}
           />
         </label>
       </div>
+
       <div className="pty-content">
-        {!sessionId && (
-          <div className="pty-empty">当前会话尚未创建。</div>
-        )}
-        {sessionId && orderedItems.length === 0 && (
-          <div className="pty-empty">暂无存活的 PTY。</div>
-        )}
+        {!sessionId ? <div className="pty-empty">Session is not ready yet.</div> : null}
+        {sessionId && orderedItems.length === 0 ? <div className="pty-empty">No PTY sessions.</div> : null}
         {orderedItems.map((item) => {
-          const status = item.status;
-          const exitCode = item.exit_code;
-          const isRunning = status === 'running';
-          const isInteractive = isRunning;
+          const entry = ptySnapshot[item.pty_id];
+          const status = entry?.waiting_input ? 'waiting_input' : (entry?.status || item.status);
+          const isRunning = status === 'running' || status === 'waiting_input';
+          const ownerKey = `panel:${item.pty_id}`;
+          const activeOwner = ptyInteraction.ownerByPtyId[item.pty_id];
+          const readOnlyHint = isRunning
+            ? activeOwner
+              ? (activeOwner !== ownerKey ? '该 PTY 当前在其他视图激活，点击切换输入控制' : undefined)
+              : '点击卡片激活该 PTY 输入控制'
+            : undefined;
+
           return (
-            <div key={item.pty_id} className={`pty-card ${isRunning ? 'running' : 'exited'}`}>
-              <div className="pty-card-header">
-                <div className="pty-card-title">
-                  <span className="pty-id">{item.pty_id}</span>
-                  <span className={`pty-status ${isRunning ? 'ok' : 'idle'}`}>{status}</span>
-                  {typeof exitCode === 'number' && (
-                    <span className={`pty-exit ${exitCode === 0 ? 'ok' : 'err'}`}>exit {exitCode}</span>
-                  )}
-                </div>
-                {isInteractive && (
-                  <div className="pty-actions">
-                    <button type="button" className="pty-btn" onClick={() => handleClose(item.pty_id)}>
-                      Close
-                    </button>
-                  </div>
-                )}
-              </div>
-              <div className="pty-output">
-                <div
-                  className="pty-terminal"
-                  ref={getTerminalRef(item.pty_id)}
-                />
-              </div>
-              {isInteractive && (
-                <div className="pty-input-row">
-                  <input
-                    type="text"
-                    placeholder="Send input..."
-                    value={inputById[item.pty_id] || ''}
-                    onChange={(e) => {
-                      const value = e.currentTarget ? e.currentTarget.value : '';
-                      setInputById((prev) => ({ ...prev, [item.pty_id]: value }));
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        handleSend(item.pty_id);
-                      }
-                    }}
-                  />
-                  <button type="button" className="pty-btn primary" onClick={() => handleSend(item.pty_id)}>
-                    Send
-                  </button>
-                </div>
-              )}
-            </div>
+            <PtySessionCard
+              key={item.pty_id}
+              variant="panel"
+              sessionId={sessionId}
+              ptyId={item.pty_id}
+              entry={entry}
+              fallbackStatus={item.status}
+              fallbackExitCode={item.exit_code}
+              command={item.command}
+              mode={item.pty_mode}
+              ownerKey={ownerKey}
+              ptyInteraction={ptyInteraction}
+              readOnlyHint={readOnlyHint}
+              onActivity={onActivity}
+            />
           );
         })}
       </div>
@@ -446,4 +231,4 @@ function PtyPanel({ sessionId, onClose, onWidthChange, initialWidth, onActivity 
   );
 }
 
-export default PtyPanel;
+export default memo(PtyPanel);

@@ -23,6 +23,7 @@ import {
 } from './types';
 import {
   sendMessageAgentStream,
+  sendPtyStream,
   getDefaultConfig,
   getAppConfig,
   getConfig,
@@ -34,6 +35,10 @@ import {
   getSessionToolStats,
   getSessionAgentSteps,
   stopAgentStream,
+  sendPty,
+  closePty,
+  listPtys,
+  readPty,
   rollbackSession,
   revertPatch,
   getToolPermissions,
@@ -42,6 +47,11 @@ import {
   updateSession,
   AgentStep,
   AgentStepWithMessage,
+  PtySseEvent,
+  PtyDeltaEvent,
+  PtyStateEvent,
+  PtyMessageUpsertSseEvent,
+  PtyResyncRequiredEvent,
   getAttachmentUrl,
   getAstSettings,
   updateAstSettings,
@@ -54,9 +64,11 @@ import PtyPanel from './components/PtyPanel';
 import AgentStepView from './components/AgentStepView';
 import ConfirmDialog from './components/ConfirmDialog';
 import TaskWorkbench from './components/TaskWorkbench';
+import type { PtyInteractionController, ResolveStepPtyBinding } from './components/ptyInteraction';
 import { loadExtraWorkPaths, migrateExtraWorkPaths, saveExtraWorkPaths } from './workdirStorage';
 import { wsClient } from './wsClient';
 import type { SubagentDoneEvent, SubagentStartedEvent } from './wsTypes';
+import { ptyStore } from './ptyStore';
 
 const DRAFT_SESSION_KEY = '__draft__';
 
@@ -91,6 +103,8 @@ const CONTEXT_RING_RADIUS = 10;
 const AST_DEFAULT_MAX_FILES = 500;
 const STREAM_STALL_MS = 90_000;
 const STREAM_STALL_CHECK_MS = 5_000;
+const PTY_RESYNC_READ_MAX_OUTPUT = 8000;
+const PTY_INPUT_BATCH_MS = 16;
 const AST_LANGUAGE_OPTIONS = [
   { id: 'python', label: 'Python (.py)' },
   { id: 'javascript', label: 'JavaScript (.js/.jsx/.mjs/.cjs)' },
@@ -131,6 +145,24 @@ const extractRunShellCommand = (raw?: string): string => {
   } catch {
     return match[1];
   }
+};
+
+const parseBooleanMeta = (value: unknown): boolean | undefined => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+  }
+  return undefined;
+};
+
+const parseRunShellPtyIdFromContent = (content?: string): string => {
+  const text = String(content || '').replace(/\r\n/g, '\n');
+  const firstLine = (text.split('\n')[0] || '').trim();
+  if (!firstLine) return '';
+  const match = firstLine.match(/\bpty_id=([^\s\]]+)/);
+  return match?.[1] || '';
 };
 
 type WorkdirBounds = {
@@ -372,7 +404,7 @@ const findSkillInvocation = (value: string, pattern: RegExp | null) => {
 const stripExistingSkillCommands = (value: string, pattern: RegExp | null) => {
   if (!value || !pattern) return value;
   return value
-    .replace(pattern, (match, leading) => (leading ? String(leading) : ''))
+    .replace(pattern, (_match, leading) => (leading ? String(leading) : ''))
     .replace(/[ \t]{2,}/g, ' ');
 };
 
@@ -710,6 +742,17 @@ type PendingContextEstimate = {
   payload: Record<string, any>;
 };
 
+type PtyOwnerMapBySession = Record<string, Record<string, string>>;
+
+type PtyInputQueueItem = {
+  sessionId: string;
+  ptyId: string;
+  buffer: string;
+  timerId: number | null;
+  inFlight: boolean;
+  lastErrorAt?: number;
+};
+
 type CommandItem = {
   kind: 'skill';
   id: string;
@@ -761,6 +804,7 @@ function App() {
   const [toolStats, setToolStats] = useState<SessionToolStats | null>(null);
   const [pendingContextEstimate, setPendingContextEstimate] = useState<PendingContextEstimate | null>(null);
   const [contextEstimateBySession, setContextEstimateBySession] = useState<Record<string, ContextEstimate>>({});
+  const [ptyOwnerBySession, setPtyOwnerBySession] = useState<PtyOwnerMapBySession>({});
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [heightTick, setHeightTick] = useState(0);
   const [virtualRange, setVirtualRange] = useState({ start: 0, end: 0 });
@@ -844,6 +888,7 @@ function App() {
   const inFlightBySessionRef = useRef<Record<string, InFlightState>>({});
   const pendingPermissionBySessionRef = useRef<Record<string, ToolPermissionRequest | null>>({});
   const permissionBusyBySessionRef = useRef<Record<string, boolean>>({});
+  const ptyInputQueuesRef = useRef<Record<string, PtyInputQueueItem>>({});
   const processingQueueRef = useRef(false);
   const pendingQueueRunRef = useRef(false);
   const lastWorkFileOpenRef = useRef<{ key: string; at: number } | null>(null);
@@ -851,6 +896,9 @@ function App() {
   const astNotifyRef = useRef<{ timer: number | null; paths: Set<string> }>({ timer: null, paths: new Set() });
   const appWindow = useMemo(() => getCurrentWindow(), []);
   const wsSessionRef = useRef<string | null>(null);
+  const ptyStreamAbortRef = useRef<AbortController | null>(null);
+  const ptyStreamSessionRef = useRef<string | null>(null);
+  const ptyResyncInFlightRef = useRef<Record<string, boolean>>({});
 
   useEffect(() => {
     try {
@@ -897,6 +945,14 @@ function App() {
       inflight.lastEventAt = Date.now();
     }
   }, []);
+
+  const handlePtyPanelActivity = useCallback(() => {
+    markStreamActivity(currentSessionIdRef.current);
+  }, [markStreamActivity]);
+
+  const handlePtyPanelWidthChange = useCallback((width: number) => {
+    handlePanelWidthChange('pty', width);
+  }, [handlePanelWidthChange]);
 
   const openPtyPanel = useCallback(() => {
     if (panelOpenRef.current.pty) return;
@@ -1816,6 +1872,222 @@ function App() {
 
   const getCurrentSessionKey = () => getSessionKey(currentSessionIdRef.current);
 
+  const isPtyIoDebugEnabled = useCallback(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      const value = window.localStorage.getItem('PTY_XTERM_LIFECYCLE_DEBUG');
+      if (value === '1' || value === 'true') return true;
+    } catch {
+      // ignore
+    }
+    return Boolean((window as any).__PTY_XTERM_LIFECYCLE_DEBUG__);
+  }, []);
+
+  const getPtyQueueKey = useCallback((sessionId: string, ptyId: string) => `${sessionId}:${ptyId}`, []);
+
+  const clearPtyQueueTimer = useCallback((queue: PtyInputQueueItem) => {
+    if (queue.timerId === null) return;
+    window.clearTimeout(queue.timerId);
+    queue.timerId = null;
+  }, []);
+
+  const ensurePtyInputQueue = useCallback((sessionId: string, ptyId: string): PtyInputQueueItem => {
+    const key = getPtyQueueKey(sessionId, ptyId);
+    const existing = ptyInputQueuesRef.current[key];
+    if (existing) return existing;
+    const created: PtyInputQueueItem = {
+      sessionId,
+      ptyId,
+      buffer: '',
+      timerId: null,
+      inFlight: false
+    };
+    ptyInputQueuesRef.current[key] = created;
+    return created;
+  }, [getPtyQueueKey]);
+
+  const flushPtyInputQueue = useCallback(async (params: { sessionId: string; ptyId: string }) => {
+    const { sessionId, ptyId } = params;
+    if (!sessionId || !ptyId) return;
+    const key = getPtyQueueKey(sessionId, ptyId);
+    const queue = ptyInputQueuesRef.current[key];
+    if (!queue) return;
+
+    clearPtyQueueTimer(queue);
+    if (queue.inFlight || !queue.buffer) return;
+
+    const payload = queue.buffer;
+    queue.buffer = '';
+    queue.inFlight = true;
+    try {
+      if (isPtyIoDebugEnabled()) {
+        console.info('[PTY INPUT SEND]', {
+          sessionId,
+          ptyId,
+          len: payload.length,
+          escaped: JSON.stringify(payload)
+        });
+      }
+      await sendPty({ session_id: sessionId, pty_id: ptyId, input: payload });
+      markStreamActivity(sessionId);
+      queue.lastErrorAt = undefined;
+    } catch (error) {
+      queue.lastErrorAt = Date.now();
+      queue.buffer = `${payload}${queue.buffer}`;
+      console.warn('[PTY INPUT FLUSH FAILED]', {
+        sessionId,
+        ptyId,
+        error: error instanceof Error ? error.message : String(error || 'unknown')
+      });
+    } finally {
+      queue.inFlight = false;
+    }
+
+    if (queue.buffer) {
+      if (queue.timerId === null) {
+        queue.timerId = window.setTimeout(() => {
+          queue.timerId = null;
+          void flushPtyInputQueue({ sessionId, ptyId });
+        }, 0);
+      }
+      return;
+    }
+
+    if (!queue.inFlight && queue.timerId === null) {
+      delete ptyInputQueuesRef.current[key];
+    }
+  }, [clearPtyQueueTimer, getPtyQueueKey, isPtyIoDebugEnabled, markStreamActivity]);
+
+  const flushAllPtyInputQueues = useCallback(async () => {
+    const targets = Object.values(ptyInputQueuesRef.current).map((item) => ({
+      sessionId: item.sessionId,
+      ptyId: item.ptyId
+    }));
+    for (const target of targets) {
+      // eslint-disable-next-line no-await-in-loop
+      await flushPtyInputQueue(target);
+    }
+  }, [flushPtyInputQueue]);
+
+  useEffect(() => {
+    void flushAllPtyInputQueues();
+  }, [currentSessionId, flushAllPtyInputQueues]);
+
+  useEffect(() => {
+    return () => {
+      void flushAllPtyInputQueues();
+    };
+  }, [flushAllPtyInputQueues]);
+
+  const releasePtyOwner = useCallback((sessionId: string | null | undefined, ptyId: string) => {
+    const sessionKey = sessionId ?? DRAFT_SESSION_KEY;
+    if (!ptyId) return;
+    setPtyOwnerBySession((prev) => {
+      const sessionOwners = prev[sessionKey];
+      if (!sessionOwners || !sessionOwners[ptyId]) return prev;
+      const nextSessionOwners = { ...sessionOwners };
+      delete nextSessionOwners[ptyId];
+      if (Object.keys(nextSessionOwners).length === 0) {
+        const next = { ...prev };
+        delete next[sessionKey];
+        return next;
+      }
+      return { ...prev, [sessionKey]: nextSessionOwners };
+    });
+  }, []);
+
+  const activatePtyOwner = useCallback((params: { sessionId?: string | null; ptyId: string; ownerKey: string }) => {
+    const sessionKey = params.sessionId ?? DRAFT_SESSION_KEY;
+    const ptyId = params.ptyId || '';
+    const ownerKey = params.ownerKey || '';
+    if (!ptyId || !ownerKey) return;
+    if (params.sessionId) {
+      void flushPtyInputQueue({ sessionId: params.sessionId, ptyId });
+    }
+    setPtyOwnerBySession((prev) => {
+      const sessionOwners = prev[sessionKey] || {};
+      if (sessionOwners[ptyId] === ownerKey) return prev;
+      return {
+        ...prev,
+        [sessionKey]: {
+          ...sessionOwners,
+          [ptyId]: ownerKey
+        }
+      };
+    });
+  }, [flushPtyInputQueue]);
+
+  const sendPtyInput = useCallback(async (params: { sessionId: string; ptyId: string; input: string }) => {
+    if (!params.input) return;
+    const queue = ensurePtyInputQueue(params.sessionId, params.ptyId);
+    queue.buffer += params.input;
+    if (isPtyIoDebugEnabled()) {
+      console.info('[PTY INPUT ENQUEUE]', {
+        sessionId: params.sessionId,
+        ptyId: params.ptyId,
+        inputLen: params.input.length,
+        inputEscaped: JSON.stringify(params.input),
+        queuedLen: queue.buffer.length,
+        inFlight: queue.inFlight
+      });
+    }
+    if (queue.timerId !== null || queue.inFlight) return;
+    queue.timerId = window.setTimeout(() => {
+      queue.timerId = null;
+      void flushPtyInputQueue({ sessionId: params.sessionId, ptyId: params.ptyId });
+    }, PTY_INPUT_BATCH_MS);
+  }, [ensurePtyInputQueue, flushPtyInputQueue, isPtyIoDebugEnabled]);
+
+  const continuePtyWithoutInput = useCallback(async (params: { sessionId: string; ptyId: string }) => {
+    await flushPtyInputQueue({ sessionId: params.sessionId, ptyId: params.ptyId });
+    await closePty({ session_id: params.sessionId, pty_id: params.ptyId });
+    markStreamActivity(params.sessionId);
+    releasePtyOwner(params.sessionId, params.ptyId);
+  }, [flushPtyInputQueue, markStreamActivity, releasePtyOwner]);
+
+  const closePtySession = useCallback(async (params: { sessionId: string; ptyId: string }) => {
+    await flushPtyInputQueue({ sessionId: params.sessionId, ptyId: params.ptyId });
+    await closePty({ session_id: params.sessionId, pty_id: params.ptyId });
+    markStreamActivity(params.sessionId);
+    releasePtyOwner(params.sessionId, params.ptyId);
+  }, [flushPtyInputQueue, markStreamActivity, releasePtyOwner]);
+
+  const currentPtyOwnerByPtyId = useMemo(() => {
+    const key = getCurrentSessionKey();
+    return ptyOwnerBySession[key] || {};
+  }, [currentSessionId, ptyOwnerBySession]);
+
+  const ptyInteraction = useMemo<PtyInteractionController>(() => ({
+    ownerByPtyId: currentPtyOwnerByPtyId,
+    activateOwner: activatePtyOwner,
+    sendInput: sendPtyInput,
+    flushInput: flushPtyInputQueue,
+    continueWithoutInput: continuePtyWithoutInput,
+    closePty: closePtySession
+  }), [
+    activatePtyOwner,
+    closePtySession,
+    continuePtyWithoutInput,
+    currentPtyOwnerByPtyId,
+    flushPtyInputQueue,
+    sendPtyInput
+  ]);
+
+  const resolveStepPtyBinding = useCallback<ResolveStepPtyBinding>(({ step, index, messageId }) => {
+    const meta = (step.metadata || {}) as Record<string, any>;
+    const ptyFromMeta = typeof meta.pty_id === 'string' ? meta.pty_id.trim() : '';
+    const ptyId = ptyFromMeta || parseRunShellPtyIdFromContent(step.content);
+    const streamKey =
+      typeof meta.stream_key === 'string' && meta.stream_key.trim()
+        ? meta.stream_key.trim()
+        : `run_shell_${index}`;
+    return {
+      ptyId: ptyId || undefined,
+      streamKey,
+      ownerKey: ptyId ? `step:${String(messageId ?? 'na')}:${streamKey}:${ptyId}` : undefined
+    };
+  }, []);
+
   const getSessionWorkPath = (sessionKey: string) => workPathBySessionRef.current[sessionKey] || '';
 
   const setSessionWorkPath = (sessionKey: string, nextPath: string) => {
@@ -1999,6 +2271,9 @@ function App() {
   const clearSessionCache = (sessionKey: string) => {
     delete messagesCacheRef.current[sessionKey];
     delete messagePagingRef.current[sessionKey];
+    if (sessionKey !== DRAFT_SESSION_KEY) {
+      ptyStore.clearSession(sessionKey);
+    }
   };
 
   useEffect(() => {
@@ -2040,6 +2315,142 @@ function App() {
     }
     wsSessionRef.current = currentSessionId;
   }, [currentSessionId]);
+
+  useEffect(() => {
+    const previous = ptyStreamAbortRef.current;
+    if (previous) {
+      previous.abort();
+      ptyStreamAbortRef.current = null;
+    }
+
+    if (!currentSessionId) {
+      ptyStreamSessionRef.current = null;
+      ptyResyncInFlightRef.current = {};
+      return;
+    }
+
+    const sessionId = currentSessionId;
+    const abortController = new AbortController();
+    ptyStreamAbortRef.current = abortController;
+    ptyStreamSessionRef.current = sessionId;
+
+    const run = async () => {
+      try {
+        const initialSeq = ptyStore.getSessionLastSeq(sessionId);
+        const streamGenerator = sendPtyStream(
+          {
+            session_id: sessionId,
+            last_seq: initialSeq > 0 ? initialSeq : undefined
+          },
+          abortController.signal
+        );
+
+        for await (const event of streamGenerator) {
+          if (abortController.signal.aborted) break;
+          if ((event as any).keepalive) continue;
+
+          const payload = event as PtySseEvent;
+          if (payload.event === 'pty_delta' || payload.event === 'pty_state') {
+            ptyStore.applySseOutput(payload as PtyDeltaEvent | PtyStateEvent);
+            markStreamActivity(payload.session_id);
+            continue;
+          }
+          if (payload.event === 'pty_message_upsert') {
+            ptyStore.applyMessageUpsertSse(payload as PtyMessageUpsertSseEvent);
+            continue;
+          }
+          if (payload.event === 'pty_resync_required') {
+            const resyncEvent = payload as PtyResyncRequiredEvent;
+            ptyStore.applyResyncRequired(resyncEvent);
+            const targetPtyId =
+              typeof resyncEvent.pty_id === 'string' ? resyncEvent.pty_id.trim() : '';
+            const pendingTargets = ptyStore.consumeResyncTargets(
+              resyncEvent.session_id,
+              targetPtyId ? [targetPtyId] : undefined
+            );
+            const key = `${resyncEvent.session_id}:${targetPtyId || '*'}`;
+            if (ptyResyncInFlightRef.current[key]) {
+              continue;
+            }
+            ptyResyncInFlightRef.current[key] = true;
+            void (async () => {
+              try {
+                const snapshot = ptyStore.getSessionSnapshot(resyncEvent.session_id);
+                const targets = (targetPtyId ? [targetPtyId] : pendingTargets).filter((ptyId) => {
+                  if (!ptyId) return false;
+                  const status = String(snapshot[ptyId]?.status || '').toLowerCase();
+                  if (!status) return true;
+                  return status === 'running' || status === 'waiting_input';
+                });
+                if (targets.length > 0) {
+                  await Promise.all(
+                    targets.map(async (ptyId) => {
+                      try {
+                        const cursor = snapshot[ptyId]?.cursor;
+                        const response = await readPty({
+                          session_id: resyncEvent.session_id,
+                          pty_id: ptyId,
+                          cursor: typeof cursor === 'number' ? cursor : undefined,
+                          max_output: PTY_RESYNC_READ_MAX_OUTPUT
+                        });
+                        ptyStore.applyReadResponse(resyncEvent.session_id, response);
+                      } catch {
+                        // ignore per-pty resync errors
+                      }
+                    })
+                  );
+                } else {
+                  const list = await listPtys(resyncEvent.session_id, { includeExited: false, maxExited: 0 });
+                  const nextSnapshot = ptyStore.getSessionSnapshot(resyncEvent.session_id);
+                  await Promise.all(
+                    list.map(async (item) => {
+                      try {
+                        const cursor = nextSnapshot[item.pty_id]?.cursor;
+                        const response = await readPty({
+                          session_id: resyncEvent.session_id,
+                          pty_id: item.pty_id,
+                          cursor: typeof cursor === 'number' ? cursor : undefined,
+                          max_output: PTY_RESYNC_READ_MAX_OUTPUT
+                        });
+                        ptyStore.applyReadResponse(resyncEvent.session_id, response);
+                      } catch {
+                        // ignore per-pty resync errors
+                      }
+                    })
+                  );
+                }
+              } catch {
+                // ignore resync errors
+              } finally {
+                delete ptyResyncInFlightRef.current[key];
+              }
+            })();
+            continue;
+          }
+        }
+      } catch (error) {
+        if (abortController.signal.aborted) return;
+        console.warn('PTY SSE stream stopped:', error);
+      }
+    };
+
+    void run();
+
+    return () => {
+      abortController.abort();
+      if (ptyStreamAbortRef.current === abortController) {
+        ptyStreamAbortRef.current = null;
+      }
+      if (ptyStreamSessionRef.current === sessionId) {
+        ptyStreamSessionRef.current = null;
+      }
+      Object.keys(ptyResyncInFlightRef.current).forEach((key) => {
+        if (key.startsWith(`${sessionId}:`)) {
+          delete ptyResyncInFlightRef.current[key];
+        }
+      });
+    };
+  }, [currentSessionId, markStreamActivity]);
 
   const migrateSessionKey = (fromKey: string, toKey: string) => {
     if (!fromKey || !toKey || fromKey === toKey) return;
@@ -2261,8 +2672,17 @@ function App() {
           }
         }
 
-        updateSessionMessages(activeSessionKey, (prev) =>
-          prev.map((msg) => {
+        const stepMetaRaw = (step.metadata || {}) as Record<string, any>;
+        const isRunShellKeepaliveDelta =
+          step.step_type === 'observation_delta' &&
+          String(stepMetaRaw.tool || '').toLowerCase() === 'run_shell' &&
+          !String(step.content || '') &&
+          parseBooleanMeta(stepMetaRaw.keepalive) === true &&
+          parseBooleanMeta(stepMetaRaw.reset) !== true;
+
+        if (!isRunShellKeepaliveDelta) {
+          updateSessionMessages(activeSessionKey, (prev) =>
+            prev.map((msg) => {
             if (msg.id !== currentAssistantId) return msg;
 
             const existingSteps = (msg.metadata?.agent_steps || []) as AgentStep[];
@@ -2423,16 +2843,30 @@ function App() {
                 (s) => s.step_type === 'observation' && s.metadata?.streaming && s.metadata?.stream_key === streamKey
               );
               if (streamingIndex >= 0) {
+                  const mergedMetadata = {
+                    ...(nextSteps[streamingIndex].metadata || {}),
+                    ...(step.metadata || {}),
+                    stream_key: streamKey,
+                    streaming: true,
+                    tool: toolName,
+                    tool_display: toolDisplay
+                  };
                   nextSteps[streamingIndex] = {
                     ...nextSteps[streamingIndex],
                     content: buffer,
-                    metadata: { ...(nextSteps[streamingIndex].metadata || {}), stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay }
+                    metadata: mergedMetadata
                   };
                 } else {
                   nextSteps.push({
                     step_type: 'observation',
                     content: buffer,
-                    metadata: { stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay }
+                    metadata: {
+                      ...(step.metadata || {}),
+                      stream_key: streamKey,
+                      streaming: true,
+                      tool: toolName,
+                      tool_display: toolDisplay
+                    }
                   });
                 }
 
@@ -2495,9 +2929,15 @@ function App() {
             nextMetadata.agent_steps = nextSteps;
             nextMetadata.agent_streaming = true;
             return { ...msg, metadata: nextMetadata };
-          })
-        );
+            })
+          );
+        }
 
+        const resolvedStreamSessionId =
+          newSessionId || targetSessionId || (activeSessionKey === DRAFT_SESSION_KEY ? null : activeSessionKey);
+        if (resolvedStreamSessionId) {
+          ptyStore.applyRunShellStep(resolvedStreamSessionId, step);
+        }
         const debugSessionId = activeSessionKey === DRAFT_SESSION_KEY ? null : activeSessionKey;
         scheduleDebugRefresh(debugSessionId);
       }
@@ -2827,7 +3267,7 @@ function App() {
       if (!proceed) return;
     }
 
-    const payload: Record<string, any> = { root: astSettingsRoot };
+    const payload: { root: string } & Record<string, any> = { root: astSettingsRoot };
     if ('ignore_paths' in settings) {
       payload.ignore_paths = normalizeAstImportList(settings.ignore_paths);
     }
@@ -3042,7 +3482,7 @@ function App() {
     setWorkPathMenu({ x: event.clientX, y: event.clientY });
   };
 
-  const handlePaste = async (event: React.ClipboardEvent<HTMLInputElement>) => {
+  const handlePaste = async (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = event.clipboardData?.items;
     if (!items) return;
     const files: File[] = [];
@@ -3565,7 +4005,17 @@ function App() {
     [currentSessionKey, inFlightTick]
   );
   const displayMessages = useMemo(
-    () => messages.filter((msg) => !(msg as any)?.metadata?.skill_prompt),
+    () =>
+      messages.filter((msg) => {
+        const metadata = ((msg as any)?.metadata || {}) as Record<string, unknown>;
+        if (metadata?.skill_prompt) return false;
+        const isPersistentPtyMessage =
+          msg.role === 'assistant' &&
+          typeof metadata?.pty_id === 'string' &&
+          metadata.pty_id.trim().length > 0 &&
+          parseBooleanMeta(metadata?.persistent) === true;
+        return !isPersistentPtyMessage;
+      }),
     [messages]
   );
 
@@ -4077,6 +4527,7 @@ function App() {
                           {msg.role === 'assistant' && (steps.length > 0 || showPermission) ? (
                             <AgentStepView
                               steps={steps}
+                              sessionId={msg.session_id || currentSessionId || undefined}
                               messageId={msg.id}
                               streaming={streaming}
                               pendingPermission={showPermission ? currentPendingPermission : null}
@@ -4096,6 +4547,8 @@ function App() {
                               currentWorkPath={currentWorkPath}
                               debugActive={showDebugPanel}
                               onOpenDebugCall={(iteration) => handleOpenDebugCall(msg.id, iteration)}
+                              ptyInteraction={ptyInteraction}
+                              resolveStepPtyBinding={resolveStepPtyBinding}
                             />
                           ) : msg.role === 'user' ? (
                             <>
@@ -4347,7 +4800,7 @@ function App() {
                   }
                 }
                 if (e.key === 'Enter' && !e.shiftKey) {
-                  if (composingRef.current || (e.nativeEvent as any).isComposing || e.isComposing) {
+                  if (composingRef.current || (e.nativeEvent as any).isComposing) {
                     return;
                   }
                   e.preventDefault();
@@ -4704,8 +5157,9 @@ function App() {
           sessionId={currentSessionId}
           onClose={closePtyPanel}
           initialWidth={panelWidthRef.current.pty}
-          onWidthChange={(width) => handlePanelWidthChange('pty', width)}
-          onActivity={() => markStreamActivity(currentSessionId)}
+          onWidthChange={handlePtyPanelWidthChange}
+          onActivity={handlePtyPanelActivity}
+          ptyInteraction={ptyInteraction}
         />
       )}
       {showDebugPanel && (

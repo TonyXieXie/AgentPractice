@@ -1,5 +1,4 @@
 import type { Message, TaskStatus, TaskErrorCode } from './types';
-
 export interface TaskWsEventBase {
   session_id: string;
   task_id: string;
@@ -51,7 +50,6 @@ export interface SubagentStartedEvent {
   child_session_id?: string;
   child_title?: string;
 }
-
 export interface PtyOutputEvent {
   type: 'pty_output';
   session_id: string;
@@ -72,5 +70,4 @@ export type WsEvent =
   | SubagentDoneEvent
   | SubagentStartedEvent
   | PtyOutputEvent;
-
 export type WsStatusListener = (connected: boolean) => void;

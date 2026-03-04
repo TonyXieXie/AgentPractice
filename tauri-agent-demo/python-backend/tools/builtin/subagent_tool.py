@@ -11,6 +11,24 @@ from models import AgentTaskCreateRequest, TaskStatus
 _PENDING_TASKS = set()
 
 
+def prepare_subagent_session(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    from subagent_runner import prepare_subagent_session as _prepare_subagent_session
+
+    return _prepare_subagent_session(*args, **kwargs)
+
+
+async def notify_parent_subagent_started(*args: Any, **kwargs: Any) -> None:
+    from subagent_runner import notify_parent_subagent_started as _notify_parent_subagent_started
+
+    await _notify_parent_subagent_started(*args, **kwargs)
+
+
+def get_task_orchestrator() -> Any:
+    from task_orchestrator import get_task_orchestrator as _get_task_orchestrator
+
+    return _get_task_orchestrator()
+
+
 def _parse_json_input(input_data: str) -> Dict[str, Any]:
     if not input_data:
         return {}
@@ -142,10 +160,8 @@ class SpawnSubagentTool(Tool):
         parent_session_id: str,
     ) -> str:
         from subagent_runner import (
-            prepare_subagent_session,
             execute_subagent_context,
             register_subagent_task,
-            notify_parent_subagent_started,
         )
 
         if wait:
@@ -213,10 +229,6 @@ class SpawnSubagentTool(Tool):
         parent_session_id: str,
         parent_task_id: str,
     ) -> str:
-        from subagent_runner import (
-            prepare_subagent_session,
-        )
-
         context = prepare_subagent_session(
             task=str(task),
             parent_session_id=str(parent_session_id),
@@ -240,8 +252,6 @@ class SpawnSubagentTool(Tool):
             source_task_id=str(parent_task_id) if parent_task_id else None,
             metadata=metadata,
         )
-
-        from task_orchestrator import get_task_orchestrator
 
         orchestrator = get_task_orchestrator()
         created = await orchestrator.create_task(create_request)

@@ -1279,14 +1279,26 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT id, role, content, timestamp
+            SELECT id, role, content, timestamp, metadata
             FROM chat_messages
             WHERE session_id = ? AND id >= ? AND id <= ? AND role IN ('user', 'assistant')
             ORDER BY id ASC
         ''', (session_id, start_id, end_id))
         rows = cursor.fetchall()
         conn.close()
-        return [dict(row) for row in rows]
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw_meta = item.get("metadata")
+            if raw_meta:
+                try:
+                    item["metadata"] = json.loads(raw_meta)
+                except Exception:
+                    item["metadata"] = {}
+            else:
+                item["metadata"] = {}
+            result.append(item)
+        return result
 
     def get_dialogue_messages_after(
         self,
@@ -1297,21 +1309,33 @@ class Database:
         cursor = conn.cursor()
         if after_id is None:
             cursor.execute('''
-                SELECT id, role, content, timestamp
+                SELECT id, role, content, timestamp, metadata
                 FROM chat_messages
                 WHERE session_id = ? AND role IN ('user', 'assistant')
                 ORDER BY id ASC
             ''', (session_id,))
         else:
             cursor.execute('''
-                SELECT id, role, content, timestamp
+                SELECT id, role, content, timestamp, metadata
                 FROM chat_messages
                 WHERE session_id = ? AND id > ? AND role IN ('user', 'assistant')
                 ORDER BY id ASC
             ''', (session_id, after_id))
         rows = cursor.fetchall()
         conn.close()
-        return [dict(row) for row in rows]
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw_meta = item.get("metadata")
+            if raw_meta:
+                try:
+                    item["metadata"] = json.loads(raw_meta)
+                except Exception:
+                    item["metadata"] = {}
+            else:
+                item["metadata"] = {}
+            result.append(item)
+        return result
 
     def get_latest_assistant_message_id(self, session_id: str) -> Optional[int]:
         conn = self.get_connection()

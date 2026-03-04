@@ -493,7 +493,7 @@ const decodeUtf8 = (bytes: Uint8Array) => {
 
 const readTextFileSafe = async (path: string) => {
   let timer: number | null = null;
-  const timeout = new Promise<Uint8Array | string>((_, reject) => {
+  const timeout = new Promise<never>((_, reject) => {
     timer = window.setTimeout(() => reject(new Error('Read timeout')), READ_TEXT_TIMEOUT_MS);
   });
   try {
@@ -895,7 +895,7 @@ function WorkDirBrowser({
       if (!proceed) return;
     }
 
-    const payload: Record<string, any> = { root: astSettingsRoot };
+    const payload: { root: string } & Record<string, any> = { root: astSettingsRoot };
     if ('ignore_paths' in settings) {
       payload.ignore_paths = normalizeAstImportList(settings.ignore_paths);
     }

@@ -208,8 +208,6 @@ def _coerce_react_max_iterations(value: Any) -> int:
         raise ValueError("agent.react_max_iterations must be an integer")
     if max_iterations < 1:
         raise ValueError("agent.react_max_iterations must be >= 1")
-    if max_iterations > 200:
-        raise ValueError("agent.react_max_iterations must be <= 200")
     return max_iterations
 
 
@@ -237,6 +235,16 @@ def _coerce_int_range(value: Any, field: str, min_value: int, max_value: int) ->
     return parsed
 
 
+def _coerce_int_min(value: Any, field: str, min_value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be an integer")
+    if parsed < min_value:
+        raise ValueError(f"{field} must be >= {min_value}")
+    return parsed
+
+
 def _normalize_context_config(context: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(context)
     if "compression_enabled" in normalized:
@@ -252,16 +260,16 @@ def _normalize_context_config(context: Dict[str, Any]) -> Dict[str, Any]:
             normalized["compress_target_pct"], "context.compress_target_pct", 1, 100
         )
     if "min_keep_messages" in normalized:
-        normalized["min_keep_messages"] = _coerce_int_range(
-            normalized["min_keep_messages"], "context.min_keep_messages", 0, 200
+        normalized["min_keep_messages"] = _coerce_int_min(
+            normalized["min_keep_messages"], "context.min_keep_messages", 0
         )
     if "keep_recent_calls" in normalized:
-        normalized["keep_recent_calls"] = _coerce_int_range(
-            normalized["keep_recent_calls"], "context.keep_recent_calls", 0, 200
+        normalized["keep_recent_calls"] = _coerce_int_min(
+            normalized["keep_recent_calls"], "context.keep_recent_calls", 0
         )
     if "step_calls" in normalized:
-        normalized["step_calls"] = _coerce_int_range(
-            normalized["step_calls"], "context.step_calls", 1, 200
+        normalized["step_calls"] = _coerce_int_min(
+            normalized["step_calls"], "context.step_calls", 1
         )
     if "truncate_long_data" in normalized:
         normalized["truncate_long_data"] = _coerce_bool(

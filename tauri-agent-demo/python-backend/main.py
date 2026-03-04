@@ -14,7 +14,6 @@ import re
 import time
 import atexit
 import signal
-import uuid
 from io import BytesIO
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
@@ -44,6 +43,7 @@ from tools.builtin import register_builtin_tools
 from tools.base import ToolRegistry
 from tools.config import get_tool_config, update_tool_config, get_tool_config_path
 from stream_registry import get_stream_registry
+from pty_stream_registry import get_pty_stream_registry
 from ws_hub import get_ws_hub
 from tools.context import set_tool_context, reset_tool_context
 from tools.builtin.system_tools import ApplyPatchTool, CodeAstTool
@@ -69,6 +69,7 @@ from skills import (
 
 app = FastAPI(title="Tauri Agent Chat Backend")
 STREAM_REGISTRY = get_stream_registry()
+PTY_STREAM_REGISTRY = get_pty_stream_registry()
 WS_HUB = get_ws_hub()
 TASK_ORCHESTRATOR = get_task_orchestrator()
 TASK_BY_MESSAGE_ID: Dict[int, str] = {}
@@ -104,6 +105,10 @@ def _cleanup_spawned_subagents(child_session_ids: List[str]) -> None:
 async def on_startup():
     try:
         WS_HUB.set_loop(asyncio.get_running_loop())
+    except Exception:
+        pass
+    try:
+        PTY_STREAM_REGISTRY.set_loop(asyncio.get_running_loop())
     except Exception:
         pass
     try:
@@ -221,8 +226,14 @@ def local_file_exists(path: str = Query(...)):
 TITLE_MAX_CHARS = 40
 TITLE_FALLBACK_CHARS = 20
 TITLE_REQUEST_TIMEOUT = 15.0
-PTY_PROMPT_MAX_ITEMS = 6
 PTY_PROMPT_CMD_MAX_CHARS = 160
+PTY_PROMPT_PER_PTY_MAX_LINES = 120
+PTY_PROMPT_PER_PTY_MAX_BYTES = 4 * 1024
+PTY_PROMPT_TOTAL_MAX_BYTES = 12 * 1024
+PTY_PROMPT_MAX_VISIBLE_PTYS = 64
+_PTY_PROMPT_ANSI_RE = re.compile(r"[\u001b\u009b][\\[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[@-~]")
+_PTY_PROMPT_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+_PTY_PROMPT_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -241,6 +252,36 @@ def _fallback_title(user_message: str) -> str:
     return base
 
 
+def _strip_pty_prompt_controls(text: str) -> str:
+    value = str(text or "")
+    if not value:
+        return ""
+    value = _PTY_PROMPT_OSC_RE.sub("", value)
+    value = _PTY_PROMPT_ANSI_RE.sub("", value)
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = _PTY_PROMPT_CTRL_RE.sub("", value)
+    return value
+
+
+def _tail_lines(text: str, max_lines: int) -> str:
+    lines = str(text or "").splitlines()
+    if max_lines <= 0:
+        return ""
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    return "\n".join(lines[-max_lines:])
+
+
+def _tail_bytes_utf8(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    encoded = str(text or "").encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return str(text or "")
+    tail = encoded[-max_bytes:]
+    return tail.decode("utf-8", errors="ignore")
+
+
 def _build_live_pty_prompt(session_id: Optional[str]) -> str:
     if not session_id:
         return "None."
@@ -251,21 +292,69 @@ def _build_live_pty_prompt(session_id: Optional[str]) -> str:
     running = [item for item in items if item.status == "running"]
     if not running:
         return "None."
-    running.sort(key=lambda item: item.created_at, reverse=True)
+
+    # Prefer most recently active PTYs first when applying the global budget.
+    running.sort(key=lambda item: item.last_output_at, reverse=True)
+    running = running[:PTY_PROMPT_MAX_VISIBLE_PTYS]
+
     now = time.time()
     now_mono = time.monotonic()
-    lines: List[str] = []
-    for item in running[:PTY_PROMPT_MAX_ITEMS]:
-        cmd = _truncate_text(item.command or "", PTY_PROMPT_CMD_MAX_CHARS)
-        if not cmd:
-            cmd = "(no command)"
+    sections: List[str] = []
+    remaining_total = PTY_PROMPT_TOTAL_MAX_BYTES
+
+    for item in running:
+        if remaining_total <= 0:
+            break
+        cmd = _truncate_text(item.command or "", PTY_PROMPT_CMD_MAX_CHARS) or "(no command)"
         idle_sec = max(0, int(now_mono - item.last_output_at))
         age_sec = max(0, int(now - item.created_at))
-        mode = "pty" if item.pty_enabled else "pipe"
-        lines.append(f"- {item.id} | {mode} | age={age_sec}s | idle={idle_sec}s | cmd={cmd}")
-    if len(running) > PTY_PROMPT_MAX_ITEMS:
-        lines.append(f"... and {len(running) - PTY_PROMPT_MAX_ITEMS} more.")
-    return "\n".join(lines)
+
+        try:
+            snapshot = item.get_snapshot() if hasattr(item, "get_snapshot") else {}
+        except Exception:
+            snapshot = {}
+        screen_text = str(snapshot.get("screen_text") or "")
+        screen_hash = str(snapshot.get("screen_hash") or "")
+
+        cleaned = _strip_pty_prompt_controls(screen_text)
+        cleaned = _tail_lines(cleaned, PTY_PROMPT_PER_PTY_MAX_LINES)
+        cleaned = _tail_bytes_utf8(cleaned, PTY_PROMPT_PER_PTY_MAX_BYTES)
+
+        header = (
+            f"### PTY {item.id}\n"
+            f"- status: {item.status}\n"
+            f"- mode: {getattr(item, 'pty_mode', 'ephemeral')}\n"
+            f"- waiting_input: {str(bool(getattr(item, 'waiting_input', False))).lower()}\n"
+            f"- wait_reason: {getattr(item, 'wait_reason', None) or 'none'}\n"
+            f"- age_sec: {age_sec}\n"
+            f"- idle_sec: {idle_sec}\n"
+            f"- command: {cmd}\n"
+        )
+        if screen_hash:
+            header += f"- screen_hash: {screen_hash}\n"
+        content_block = cleaned if cleaned else "(no screen output)"
+        section = f"{header}```text\n{content_block}\n```"
+
+        encoded = section.encode("utf-8", errors="replace")
+        if len(encoded) > remaining_total:
+            # Trim current section body to fit remaining global budget.
+            overhead = len((f"{header}```text\n\n```").encode("utf-8", errors="replace"))
+            allowed_body = max(0, remaining_total - overhead)
+            trimmed_body = _tail_bytes_utf8(content_block, allowed_body)
+            section = f"{header}```text\n{trimmed_body}\n```"
+            encoded = section.encode("utf-8", errors="replace")
+            if len(encoded) > remaining_total:
+                break
+        sections.append(section)
+        remaining_total -= len(encoded)
+
+    if not sections:
+        return "None."
+
+    hidden = max(0, len(running) - len(sections))
+    if hidden > 0:
+        sections.append(f"... and {hidden} more running PTY session(s) omitted by budget.")
+    return "\n\n".join(sections)
 
 
 def _append_reasoning_summary_prompt(system_prompt: str, reasoning_summary: Optional[str]) -> str:
@@ -2272,20 +2361,24 @@ class PtyReadRequest(BaseModel):
     pty_id: str
     cursor: Optional[int] = None
     max_output: Optional[int] = None
-    completion_key: Optional[str] = None
 
 
 class PtySendRequest(BaseModel):
     session_id: str
     pty_id: str
     input: str
-    track_completion: Optional[bool] = False
-    completion_key: Optional[str] = None
 
 
 class PtyCloseRequest(BaseModel):
     session_id: str
     pty_id: str
+
+
+class PtyStreamRequest(BaseModel):
+    session_id: str
+    stream_id: Optional[str] = None
+    last_seq: Optional[int] = None
+    resume: Optional[bool] = False
 
 
 def _pty_debug_enabled() -> bool:
@@ -2296,11 +2389,7 @@ def _pty_debug_enabled() -> bool:
             return False
         if value in ("1", "true", "yes", "on"):
             return True
-    dev_value = str(os.environ.get("TAURI_AGENT_DEV", "")).strip().lower()
-    if dev_value in ("1", "true", "yes", "on"):
-        return True
-    env_value = str(os.environ.get("TAURI_AGENT_ENV", "")).strip().lower()
-    return env_value in ("dev", "development")
+    return False
 
 
 def _tail_bytes_hex(data: bytes, max_len: int = 16) -> str:
@@ -2320,52 +2409,52 @@ def _resolve_stream_keepalive_sec() -> int:
     return keepalive_sec
 
 
+def _resolve_pty_stream_keepalive_sec() -> int:
+    keepalive_sec = 15
+    try:
+        keepalive_sec = int(os.getenv("PTY_STREAM_KEEPALIVE_SEC", "15") or "15")
+    except (TypeError, ValueError):
+        keepalive_sec = 15
+    if keepalive_sec < 5:
+        keepalive_sec = 5
+    return keepalive_sec
+
+
 def _normalize_windows_pty_input(text: str) -> str:
+    # Keep raw interactive semantics: do not append an implicit newline.
+    # Convert any line-ending variant to CR so pasted LF/CRLF behaves like Enter.
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    if not normalized.endswith("\n"):
-        normalized += "\n"
-    return normalized.replace("\n", "\r\n")
+    normalized = normalized.replace("\n", "\r")
+    return normalized
 
 
-def _coerce_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return value != 0
-    text = str(value).strip().lower()
-    if text in ("1", "true", "yes", "on"):
-        return True
-    if text in ("0", "false", "no", "off"):
-        return False
-    return default
+@app.post("/pty/stream")
+async def stream_pty(request: PtyStreamRequest):
+    session_id = str(request.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Missing session_id")
 
+    keepalive_sec = _resolve_pty_stream_keepalive_sec()
+    last_seq = int(request.last_seq or 0)
+    if last_seq < 0:
+        last_seq = 0
 
-def _pty_completion_marker_enabled() -> bool:
-    shell_cfg = get_tool_config().get("shell", {}) or {}
-    return _coerce_bool(shell_cfg.get("pty_completion_marker_enabled"), True)
+    if request.resume and request.stream_id:
+        state = await PTY_STREAM_REGISTRY.get(session_id)
+        if not state or state.stream_id != request.stream_id:
+            raise HTTPException(status_code=404, detail="PTY stream not found")
+    else:
+        state = await PTY_STREAM_REGISTRY.ensure(session_id, keepalive_sec=keepalive_sec)
 
-
-def _build_completion_key(raw_key: Optional[str]) -> str:
-    text = str(raw_key or "").strip()
-    if text:
-        text = re.sub(r"[^A-Za-z0-9_.:-]+", "", text)
-        if text:
-            return text[:160]
-    return f"__PTY_COMPLETION_{uuid.uuid4().hex}__"
-
-
-def _append_completion_marker_command(payload: Optional[str], completion_key: str, windows: bool) -> str:
-    text = "" if payload is None else str(payload)
-    marker_command = f"echo {completion_key}"
-    if windows:
-        if text:
-            text = _normalize_windows_pty_input(text)
-        return f"{text}{marker_command}\r\n"
-    if text and not text.endswith("\n"):
-        text += "\n"
-    return f"{text}{marker_command}\n"
+    return StreamingResponse(
+        state.stream(last_seq),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 @app.get("/pty/list")
@@ -2394,16 +2483,22 @@ def list_ptys(
         merged = running + exited[:max_exited]
     payload = []
     for item in merged:
+        snapshot = item.get_snapshot() if hasattr(item, "get_snapshot") else {}
         payload.append({
             "pty_id": item.id,
             "status": item.status,
             "pty": item.pty_enabled,
             "exit_code": item.exit_code,
             "command": item.command,
+            "pty_mode": getattr(item, "pty_mode", "ephemeral"),
+            "waiting_input": bool(getattr(item, "waiting_input", False)),
+            "wait_reason": getattr(item, "wait_reason", None),
             "created_at": item.created_at,
             "idle_timeout": item.idle_timeout_ms,
             "buffer_size": item.buffer_size,
-            "last_output_at": item.last_output_at
+            "last_output_at": item.last_output_at,
+            "seq": snapshot.get("seq"),
+            "screen_hash": snapshot.get("screen_hash")
         })
     return {"ok": True, "items": payload}
 
@@ -2425,6 +2520,7 @@ def read_pty(request: PtyReadRequest):
     except (TypeError, ValueError):
         max_output = 20000
     chunk, cursor, reset = proc.read(request.cursor, max_output)
+    snapshot = proc.get_snapshot() if hasattr(proc, "get_snapshot") else {}
     response = {
         "ok": True,
         "pty_id": proc.id,
@@ -2432,13 +2528,19 @@ def read_pty(request: PtyReadRequest):
         "pty": proc.pty_enabled,
         "exit_code": proc.exit_code,
         "command": proc.command,
+        "pty_mode": getattr(proc, "pty_mode", "ephemeral"),
+        "pty_live": bool(getattr(proc, "pty_live", False)),
         "cursor": cursor,
         "reset": reset,
-        "chunk": chunk
+        "chunk": chunk,
+        "waiting_input": bool(getattr(proc, "waiting_input", False)),
+        "wait_reason": getattr(proc, "wait_reason", None),
+        "screen_text": snapshot.get("screen_text"),
+        "screen_hash": snapshot.get("screen_hash"),
+        "seq": snapshot.get("seq")
     }
-    completion_key = str(request.completion_key or "").strip()
-    if completion_key:
-        response["completion_reached"] = proc.is_completion_reached(completion_key)
+    if getattr(proc, "pty_message_id", None) is not None:
+        response["pty_message_id"] = proc.pty_message_id
     return response
 
 
@@ -2449,28 +2551,16 @@ def send_pty(request: PtySendRequest):
     if not proc:
         raise HTTPException(status_code=404, detail="PTY not found")
     payload = request.input or ""
-    completion_key: Optional[str] = None
-    track_completion = _coerce_bool(request.track_completion, False)
-    marker_enabled = _pty_completion_marker_enabled()
-    if track_completion and marker_enabled:
-        completion_key = proc.register_completion_key(_build_completion_key(request.completion_key))
-        payload = _append_completion_marker_command(payload, completion_key, os.name == "nt")
-    elif os.name == "nt" and payload:
+    if os.name == "nt" and payload:
         payload = _normalize_windows_pty_input(payload)
     data = payload.encode("utf-8", errors="replace")
     written = proc.write(data)
-    if _pty_debug_enabled():
-        endswith_crlf = payload.endswith("\r\n")
-        print(
-            "[PTY DEBUG] api send "
-            f"pty_id={proc.id} bytes_written={written} input_len={len(payload)} "
-            f"endswith_crlf={endswith_crlf} track_completion={str(track_completion).lower()} "
-            f"marker_enabled={str(marker_enabled).lower()} tail_hex={_tail_bytes_hex(data)}"
-        )
-    response = {"ok": True, "pty_id": proc.id, "bytes_written": written}
-    if completion_key:
-        response["completion_key"] = completion_key
-    return response
+    if hasattr(proc, "update_waiting_state"):
+        proc.update_waiting_state(False, None)
+    else:
+        proc.waiting_input = False
+        proc.wait_reason = None
+    return {"ok": True, "pty_id": proc.id, "bytes_written": written}
 
 
 @app.post("/pty/close")
