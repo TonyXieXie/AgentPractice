@@ -3719,8 +3719,19 @@ class RunShellTool(Tool):
             if status == "approved" and agent_mode == "default" and not shell_unrestricted and not persistent_bootstrap and cmd_name not in allowset:
                 _ensure_shell_allowlist_entry(cmd_name)
 
+        # NOTE: We intentionally do not enforce the "work path" restriction on
+        # `cwd` for `run_shell`. The shell sandbox/unrestricted allowlist already
+        # gates what can be executed; blocking `cwd` outside work_path makes it
+        # impossible to run commands that legitimately need an external working
+        # directory (e.g. OS temp), and current UX expects "allow" to proceed.
         cwd = data.get("cwd")
-        workdir = _resolve_path(cwd, self.name, "execute") if cwd else root
+        if cwd:
+            workdir = Path(str(cwd))
+            if not workdir.is_absolute():
+                workdir = root / workdir
+            workdir = workdir.expanduser().resolve()
+        else:
+            workdir = root
 
         timeout_sec: Optional[float] = None
         timeout_ms = data.get("timeout")

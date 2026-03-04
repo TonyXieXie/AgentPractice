@@ -1109,6 +1109,8 @@ class ReActAgent(AgentStrategy):
                                 ):
                                     yield obs_step
                                 tool_output = output_holder.get("output", "")
+                                if not str(tool_output or "").strip():
+                                    tool_output = "(no output)"
                             else:
                                 tool_output = await self._execute_tool(tool, tool_input)
                                 yield AgentStep(
@@ -1418,6 +1420,8 @@ class ReActAgent(AgentStrategy):
                             ):
                                 yield obs_step
                             tool_output = output_holder.get("output", "")
+                            if not str(tool_output or "").strip():
+                                tool_output = "(no output)"
                         else:
                             tool_output = await self._execute_tool(tool, tool_input)
                             yield AgentStep(
@@ -1441,12 +1445,12 @@ class ReActAgent(AgentStrategy):
                             failure_reason=failure_reason
                         )
 
-                    dynamic_messages.append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": tool_output,
-                        "__origin_call_seq": current_call_seq
-                    })
+                        dynamic_messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": tool_output,
+                            "__origin_call_seq": current_call_seq
+                        })
                     messages = base_messages + dynamic_messages
 
                     break
@@ -1717,6 +1721,8 @@ class ReActAgent(AgentStrategy):
                             ):
                                 yield obs_step
                             observation = output_holder.get("output", "")
+                            if not str(observation or "").strip():
+                                observation = "(no output)"
                         else:
                             observation = await tool.execute(action_input)
                             yield AgentStep(
@@ -2275,7 +2281,11 @@ class ReActAgent(AgentStrategy):
 
     async def _execute_tool(self, tool: Tool, tool_input: str) -> str:
         try:
-            return await tool.execute(tool_input)
+            tool_output = await tool.execute(tool_input)
+            text = "" if tool_output is None else str(tool_output)
+            if not text.strip():
+                return "(no output)"
+            return text
         except Exception as e:
             return f"Tool execution failed: {str(e)}"
 

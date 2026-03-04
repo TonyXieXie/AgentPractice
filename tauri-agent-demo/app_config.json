@@ -5,7 +5,7 @@
     "auto_title_enabled": false
   },
   "agent": {
-    "react_max_iterations": 200,
+    "react_max_iterations": 2000,
     "base_system_prompt": "",
     "subagent_profile": "",
     "mcp": {

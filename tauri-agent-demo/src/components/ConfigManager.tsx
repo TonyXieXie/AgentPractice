@@ -383,7 +383,7 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
     const normalizeAgentConfig = (data?: AgentConfig | null): AgentConfig => {
         const raw = isRecord(data) ? data : {};
         const parsedMax = Number.parseInt(String(raw.react_max_iterations ?? ''), 10);
-        const reactMaxIterations = Number.isFinite(parsedMax) ? Math.min(200, Math.max(1, parsedMax)) : 50;
+        const reactMaxIterations = Number.isFinite(parsedMax) ? Math.max(1, parsedMax) : 50;
         const profileList = Array.isArray(raw.profiles) ? raw.profiles : [];
         const hasSubagentProfile = Object.prototype.hasOwnProperty.call(raw, 'subagent_profile');
         const subagentProfileValue = hasSubagentProfile
@@ -1282,8 +1282,8 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             return;
         }
         const reactMaxValue = Number.parseInt(globalReactMaxIterations, 10);
-        if (!Number.isFinite(reactMaxValue) || reactMaxValue < 1 || reactMaxValue > 200) {
-            alert('ReAct max iterations must be an integer between 1 and 200.');
+        if (!Number.isFinite(reactMaxValue) || reactMaxValue < 1) {
+            alert('ReAct max iterations must be an integer >= 1.');
             setGlobalSaving(false);
             return;
         }
@@ -1305,20 +1305,20 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             return;
         }
         const minKeep = Number.parseInt(globalContextMinKeepMessages, 10);
-        if (!Number.isFinite(minKeep) || minKeep < 0 || minKeep > 200) {
-            alert('最少保留消息数必须是 0 到 200 之间的整数。');
+        if (!Number.isFinite(minKeep) || minKeep < 0) {
+            alert('最少保留消息数必须是 >= 0 的整数。');
             setGlobalSaving(false);
             return;
         }
         const keepCalls = Number.parseInt(globalContextKeepRecentCalls, 10);
-        if (!Number.isFinite(keepCalls) || keepCalls < 0 || keepCalls > 200) {
-            alert('保留最近 Calls 必须是 0 到 200 之间的整数。');
+        if (!Number.isFinite(keepCalls) || keepCalls < 0) {
+            alert('保留最近 Calls 必须是 >= 0 的整数。');
             setGlobalSaving(false);
             return;
         }
         const stepCalls = Number.parseInt(globalContextStepCalls, 10);
-        if (!Number.isFinite(stepCalls) || stepCalls < 1 || stepCalls > 200) {
-            alert('步进压缩 Calls 必须是 1 到 200 之间的整数。');
+        if (!Number.isFinite(stepCalls) || stepCalls < 1) {
+            alert('步进压缩 Calls 必须是 >= 1 的整数。');
             setGlobalSaving(false);
             return;
         }
@@ -2322,7 +2322,6 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                                 <input
                                     type="number"
                                     min="1"
-                                    max="200"
                                     step="1"
                                     value={globalReactMaxIterations}
                                     onChange={(e) => {
@@ -2331,7 +2330,7 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                                     }}
                                     disabled={globalLoading || globalSaving}
                                 />
-                                <small>ReAct agent 每次对话允许的最大循环步数（1-200）。</small>
+                                <small>ReAct agent 每次对话允许的最大循环步数（≥ 1）。</small>
                             </div>
 
                             <div className="config-subsection">
@@ -2432,7 +2431,6 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                                     <input
                                         type="number"
                                         min="0"
-                                        max="200"
                                         step="1"
                                         value={globalContextMinKeepMessages}
                                         onChange={(e) => {
@@ -2450,7 +2448,6 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                                         <input
                                             type="number"
                                             min="0"
-                                            max="200"
                                             step="1"
                                             value={globalContextKeepRecentCalls}
                                             onChange={(e) => {
@@ -2466,7 +2463,6 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                                         <input
                                             type="number"
                                             min="1"
-                                            max="200"
                                             step="1"
                                             value={globalContextStepCalls}
                                             onChange={(e) => {
