@@ -16,6 +16,7 @@ from models import (
     AgentTaskCancelRequest,
     AgentTaskCreateRequest,
     AgentTaskHandoffRequest,
+    ChatMessageCreate,
     TaskErrorCode,
     TaskStatus,
 )
@@ -356,8 +357,11 @@ class TaskOrchestrator:
         prepared_context = metadata.get("prepared_subagent_context") if isinstance(metadata, dict) else None
 
         result_payload: Dict[str, Any]
+        task_context = {"task_id": task.id, "instance_id": task.assigned_instance_id}
         if isinstance(prepared_context, dict):
             context = dict(prepared_context)
+            context["task_context"] = dict(task_context)
+            context["use_task_center"] = True
             exec_result = await execute_subagent_context(context)
             if str(exec_result.get("status")) not in ("ok", "success"):
                 raise RuntimeError(str(exec_result.get("error") or exec_result.get("result") or "Subagent execution failed"))
@@ -373,6 +377,8 @@ class TaskOrchestrator:
                 title=task.title,
                 profile_id=profile_id,
                 suppress_parent_notify=True,
+                task_context=task_context,
+                use_task_center=True,
             )
             if str(exec_result.get("status")) not in ("ok", "success"):
                 raise RuntimeError(str(exec_result.get("error") or exec_result.get("result") or "Task execution failed"))
@@ -460,25 +466,32 @@ class TaskOrchestrator:
             )
         elif event_type in ("task_completed", "task_failed", "task_cancelled") and child_session_id:
             status_label = "ok" if event_type == "task_completed" else "error"
-            now = datetime.now().isoformat()
+            child_title = task.title or "Subagent Task"
+            final_answer = str((payload or {}).get("result") or message or "")
+            if event_type == "task_cancelled":
+                completion_label = "取消"
+            else:
+                completion_label = "完成" if status_label == "ok" else "失败"
+            content = f"子agent「{child_title}」{completion_label}：\n\n{final_answer}"
+            created_message = db.create_message(
+                ChatMessageCreate(
+                    session_id=task.session_id,
+                    role="assistant",
+                    content=content,
+                    metadata={
+                        "subagent_done": True,
+                        "child_session_id": child_session_id,
+                        "child_title": child_title,
+                        "status": status_label,
+                    },
+                )
+            )
             await self.ws_hub.emit(
                 task.session_id,
                 {
                     "type": "subagent_done",
                     "session_id": task.session_id,
-                    "message": {
-                        "id": 0,
-                        "session_id": task.session_id,
-                        "role": "assistant",
-                        "content": str((payload or {}).get("result") or message or ""),
-                        "timestamp": now,
-                        "metadata": {
-                            "subagent_done": True,
-                            "child_session_id": child_session_id,
-                            "child_title": task.title or "Subagent Task",
-                            "status": status_label,
-                        },
-                    },
+                    "message": created_message.model_dump(),
                     "child_session_id": child_session_id,
                     "status": status_label,
                 },
@@ -608,7 +621,12 @@ class TaskOrchestrator:
             created = db.update_agent_task(created.id, root_task_id=created.id) or created
 
         if request.parent_task_id:
-            db.add_agent_task_edge(request.parent_task_id, created.id, "handoff")
+            db.add_agent_task_edge(
+                str(request.parent_task_id),
+                str(created.id),
+                "handoff",
+                metadata={"from": str(request.parent_task_id), "to": str(created.id)},
+            )
 
         await self.enqueue_task(created.id)
         return created
@@ -640,8 +658,6 @@ class TaskOrchestrator:
             metadata=request.metadata,
         )
         child = await self.create_task(create_req)
-
-        db.add_agent_task_edge(source.id, child.id, "handoff", metadata={"from": source.id, "to": child.id})
         await self._emit_event(
             source,
             event_type="task_handoff",

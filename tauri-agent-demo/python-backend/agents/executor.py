@@ -100,12 +100,17 @@ class AgentExecutor:
             elif request_overrides and request_overrides.get("shell_unrestricted") is not None:
                 shell_unrestricted = bool(request_overrides.get("shell_unrestricted"))
 
+            use_task_center = None
+            if request_overrides and request_overrides.get("use_task_center") is not None:
+                use_task_center = bool(request_overrides.get("use_task_center"))
+
             task_context = {}
             if request_overrides and isinstance(request_overrides.get("task_context"), dict):
                 task_context = dict(request_overrides.get("task_context") or {})
 
             token = set_tool_context({
                 "shell_unrestricted": shell_unrestricted,
+                "use_task_center": use_task_center,
                 "agent_mode": agent_mode or "default",
                 "session_id": session_id,
                 "work_path": work_path,

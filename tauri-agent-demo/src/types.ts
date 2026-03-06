@@ -502,6 +502,7 @@ export interface ChatRequest {
     extra_work_paths?: string[] | null;
     agent_mode?: AgentMode;
     shell_unrestricted?: boolean;
+    use_task_center?: boolean;
     attachments?: ChatAttachmentInput[];
     stream_id?: string;
     last_seq?: number;

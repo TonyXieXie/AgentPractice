@@ -15,6 +15,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "run_shell": True,
         "code_ast": True,
         "spawn_subagent": True,
+        "spawn_subagents_parallel": True,
         "calculator": False,
         "weather": False
     },

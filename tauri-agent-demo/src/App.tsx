@@ -1,8 +1,7 @@
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
-import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import { readDir, watchImmediate, type UnwatchFn } from '@tauri-apps/plugin-fs';
+import { watchImmediate, type UnwatchFn } from '@tauri-apps/plugin-fs';
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
@@ -66,710 +65,69 @@ import ConfirmDialog from './components/ConfirmDialog';
 import TaskWorkbench from './components/TaskWorkbench';
 import type { PtyInteractionController, ResolveStepPtyBinding } from './components/ptyInteraction';
 import { loadExtraWorkPaths, migrateExtraWorkPaths, saveExtraWorkPaths } from './workdirStorage';
-import { wsClient } from './wsClient';
-import type { SubagentDoneEvent, SubagentStartedEvent } from './wsTypes';
 import { ptyStore } from './ptyStore';
-
-const DRAFT_SESSION_KEY = '__draft__';
-
-const REASONING_OPTIONS: { value: ReasoningEffort; label: string }[] = [
-  { value: 'none', label: 'none' },
-  { value: 'minimal', label: 'minimal' },
-  { value: 'low', label: 'low' },
-  { value: 'medium', label: 'medium' },
-  { value: 'high', label: 'high' },
-  { value: 'xhigh', label: 'xhigh' },
-];
-
-const AGENT_MODE_OPTIONS: { value: AgentMode; label: string; description: string }[] = [
-  { value: 'default', label: '默认', description: '使用默认安全策略' },
-  { value: 'super', label: '超级', description: '允许所有操作' },
-];
-
-const IS_MAC = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent);
-const MAX_CONCURRENT_STREAMS = 10;
-const WORK_PATH_MAX_LENGTH = 200;
-const MAIN_WINDOW_BOUNDS_KEY = 'mainWindowBounds';
-const WORKDIR_BOUNDS_KEY = 'workdirWindowBounds';
-const SIDEBAR_OPEN_KEY = 'sessionSidebarOpen';
-const MAIN_DEFAULT_WIDTH = 1200;
-const MAIN_DEFAULT_HEIGHT = 950;
-const WORKDIR_DEFAULT_WIDTH = 1200;
-const WORKDIR_DEFAULT_HEIGHT = 800;
-const DEFAULT_PTY_PANEL_WIDTH = 380;
-const DEFAULT_DEBUG_PANEL_WIDTH = 400;
-const DEFAULT_MAX_CONTEXT_TOKENS = 200000;
-const CONTEXT_RING_RADIUS = 10;
-const AST_DEFAULT_MAX_FILES = 500;
-const STREAM_STALL_MS = 90_000;
-const STREAM_STALL_CHECK_MS = 5_000;
-const PTY_RESYNC_READ_MAX_OUTPUT = 8000;
-const PTY_INPUT_BATCH_MS = 16;
-const AST_LANGUAGE_OPTIONS = [
-  { id: 'python', label: 'Python (.py)' },
-  { id: 'javascript', label: 'JavaScript (.js/.jsx/.mjs/.cjs)' },
-  { id: 'typescript', label: 'TypeScript (.ts)' },
-  { id: 'tsx', label: 'TSX (.tsx)' },
-  { id: 'c', label: 'C (.c)' },
-  { id: 'cpp', label: 'C++ (.h/.hpp/.cpp...)' },
-  { id: 'rust', label: 'Rust (.rs)' },
-  { id: 'json', label: 'JSON (.json)' },
-];
-const SESSION_SWITCH_PROFILE = true;
-const MESSAGE_PAGE_SIZE = 80;
-const MESSAGE_LOAD_THRESHOLD_PX = 240;
-const MESSAGE_OVERSCAN_PX = 600;
-const MESSAGE_ESTIMATED_HEIGHT = 220;
-
-const extractRunShellCommand = (raw?: string): string => {
-  if (!raw) return '';
-  let text = String(raw).trim();
-  if (!text) return '';
-  const bracketStart = text.indexOf('[');
-  const bracketEnd = text.lastIndexOf(']');
-  if (text.startsWith('run_shell[') && bracketStart >= 0 && bracketEnd > bracketStart) {
-    text = text.slice(bracketStart + 1, bracketEnd).trim();
-  }
-  try {
-    const parsed = JSON.parse(text) as { command?: string } | null;
-    if (parsed && typeof parsed === 'object' && typeof parsed.command === 'string') {
-      return parsed.command;
-    }
-  } catch {
-    // fall through
-  }
-  const match = text.match(/"command"\s*:\s*"((?:\\.|[^"])*)"/);
-  if (!match) return '';
-  try {
-    return JSON.parse(`"${match[1].replace(/"/g, '\\"')}"`);
-  } catch {
-    return match[1];
-  }
-};
-
-const parseBooleanMeta = (value: unknown): boolean | undefined => {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'string') {
-    const normalized = value.trim().toLowerCase();
-    if (normalized === 'true') return true;
-    if (normalized === 'false') return false;
-  }
-  return undefined;
-};
-
-const parseRunShellPtyIdFromContent = (content?: string): string => {
-  const text = String(content || '').replace(/\r\n/g, '\n');
-  const firstLine = (text.split('\n')[0] || '').trim();
-  if (!firstLine) return '';
-  const match = firstLine.match(/\bpty_id=([^\s\]]+)/);
-  return match?.[1] || '';
-};
-
-type WorkdirBounds = {
-  x?: number;
-  y?: number;
-  width?: number;
-  height?: number;
-};
-
-type MainWindowBounds = {
-  width?: number;
-  height?: number;
-};
-
-const getMainWindowBounds = (): MainWindowBounds => {
-  const fallback: MainWindowBounds = {
-    width: MAIN_DEFAULT_WIDTH,
-    height: MAIN_DEFAULT_HEIGHT,
-  };
-  try {
-    const raw = localStorage.getItem(MAIN_WINDOW_BOUNDS_KEY);
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw) as Partial<MainWindowBounds> | null;
-    if (!parsed || typeof parsed !== 'object') return fallback;
-    const next: MainWindowBounds = { ...fallback };
-    if (Number.isFinite(parsed.width)) next.width = Math.max(800, Math.round(parsed.width as number));
-    if (Number.isFinite(parsed.height)) next.height = Math.max(600, Math.round(parsed.height as number));
-    return next;
-  } catch {
-    return fallback;
-  }
-};
-
-const getWorkdirWindowBounds = (): WorkdirBounds | null => {
-  try {
-    const raw = localStorage.getItem(WORKDIR_BOUNDS_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<WorkdirBounds> | null;
-    if (!parsed || typeof parsed !== 'object') return null;
-    const next: WorkdirBounds = {};
-    if (Number.isFinite(parsed.width)) next.width = Math.max(640, Math.round(parsed.width as number));
-    if (Number.isFinite(parsed.height)) next.height = Math.max(480, Math.round(parsed.height as number));
-    if (Number.isFinite(parsed.x)) next.x = Math.round(parsed.x as number);
-    if (Number.isFinite(parsed.y)) next.y = Math.round(parsed.y as number);
-    return next;
-  } catch {
-    return null;
-  }
-};
-
-const hashPath = (value: string) => {
-  let hash = 5381;
-  for (let i = 0; i < value.length; i += 1) {
-    hash = (hash << 5) + hash + value.charCodeAt(i);
-  }
-  return (hash >>> 0).toString(16);
-};
-
-const makeWorkdirLabel = (path: string) => {
-  const normalized = path.toLowerCase();
-  const base = normalized
-    .replace(/[^a-zA-Z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 12);
-  const safeBase = base || 'path';
-  return `workdir-${safeBase}-${hashPath(normalized)}`;
-};
-
-const formatWorkPath = (path: string) => {
-  if (!path) return '点击选择工作路径';
-  if (path.length <= WORK_PATH_MAX_LENGTH) return path;
-  const tailLength = Math.max(1, WORK_PATH_MAX_LENGTH - 3);
-  return `...${path.slice(-tailLength)}`;
-};
-
-const getParentPath = (filePath: string) => {
-  const trimmed = filePath.replace(/[\\/]+$/, '');
-  const idx = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'));
-  if (idx < 0) {
-    return trimmed;
-  }
-  const parent = trimmed.slice(0, idx);
-  if (/^[a-zA-Z]:$/.test(parent)) {
-    return `${parent}\\`;
-  }
-  return parent || trimmed;
-};
-
-const getBaseName = (filePath: string) => {
-  const trimmed = filePath.replace(/[\\/]+$/, '');
-  const idx = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'));
-  if (idx < 0) return trimmed;
-  return trimmed.slice(idx + 1) || trimmed;
-};
-
-const isAbsolutePath = (value: string) =>
-  /^(?:[a-zA-Z]:[\\/]|\\\\|\/)/.test(value);
-
-const isBareFilename = (value: string) =>
-  Boolean(value) && !/[\\/]/.test(value) && !value.startsWith('./') && !value.startsWith('../');
-
-const FILE_EXT_PATTERN = /\.[A-Za-z0-9]{1,10}$/;
-const FILE_HASH_PATTERN = /^(.*)#L(\d+)(?:C(\d+))?(?:-L?(\d+))?$/i;
-const FILE_LINE_PATTERN = /^(.*?)(?::(\d+))(?:-(\d+))?(?:[:#](\d+))?$/;
-const TRAILING_PUNCTUATION = /[)\],.;:!?}]+$/;
-
-const hasScheme = (value: string) => /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value);
-
-const ESCAPE_SEGMENTS = new Set(['n', 'r', 't', 'b', 'f', 'v', '0']);
-const MAC_ABSOLUTE_PREFIX = /^(Users|Volumes|private|System|Library|Applications|opt|etc|var|tmp)[\\/]/;
-
-const normalizeMacAbsolutePath = (value: string) => {
-  if (!IS_MAC) return value;
-  if (!value) return value;
-  if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return value;
-  if (/^[a-zA-Z]:[\\/]/.test(value)) return value;
-  if (/^file:\/\//i.test(value)) return value;
-  if (MAC_ABSOLUTE_PREFIX.test(value)) return `/${value}`;
-  return value;
-};
-
-const looksLikeFilePath = (value: string) => {
-  if (!value) return false;
-  if (/^www\./i.test(value)) return false;
-  if (/^file:\/\//i.test(value)) return true;
-  if (/^[a-zA-Z]:[\\/]/.test(value)) {
-    const rest = value.slice(3);
-    const firstSegment = rest.split(/[\\/]/)[0];
-    if (firstSegment.length === 1 && ESCAPE_SEGMENTS.has(firstSegment.toLowerCase())) {
-      return false;
-    }
-    return true;
-  }
-  if (value.startsWith('\\\\')) return true;
-  if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return true;
-  if (value.includes('/') || value.includes('\\')) return true;
-  return FILE_EXT_PATTERN.test(value);
-};
-
-const normalizeFileHref = (value: string) => {
-  if (!value) return '';
-  if (value.startsWith('file://')) {
-    try {
-      const url = new URL(value);
-      let pathname = decodeURIComponent(url.pathname || '');
-      if (/^\/[A-Za-z]:\//.test(pathname)) {
-        pathname = pathname.slice(1);
-      }
-      return normalizeMacAbsolutePath(pathname);
-    } catch {
-      return normalizeMacAbsolutePath(value);
-    }
-  }
-  return normalizeMacAbsolutePath(value);
-};
-
-const stripTrailingPunctuation = (value: string) => {
-  const match = value.match(TRAILING_PUNCTUATION);
-  if (!match) return value;
-  return value.slice(0, -match[0].length);
-};
-
-const parseFileLocation = (rawValue: string) => {
-  const trimmed = rawValue.trim();
-  if (!trimmed) return { path: '' };
-  const normalized = stripTrailingPunctuation(trimmed);
-  const candidate = normalized || trimmed;
-  const hashMatch = candidate.match(FILE_HASH_PATTERN);
-  if (hashMatch) {
-    const path = hashMatch[1];
-    if (looksLikeFilePath(path) && (!hasScheme(path) || /^[a-zA-Z]:[\\/]/.test(path) || /^file:\/\//i.test(path))) {
-      return {
-        path,
-        line: Number(hashMatch[2]),
-        column: hashMatch[3] ? Number(hashMatch[3]) : undefined,
-      };
-    }
-  }
-  const lineMatch = candidate.match(FILE_LINE_PATTERN);
-  if (lineMatch) {
-    const path = lineMatch[1];
-    if (looksLikeFilePath(path) && (!hasScheme(path) || /^[a-zA-Z]:[\\/]/.test(path) || /^file:\/\//i.test(path))) {
-      return {
-        path,
-        line: Number(lineMatch[2]),
-        column: lineMatch[4] ? Number(lineMatch[4]) : undefined,
-      };
-    }
-  }
-  if (looksLikeFilePath(candidate) && (!hasScheme(candidate) || /^[a-zA-Z]:[\\/]/.test(candidate) || /^file:\/\//i.test(candidate))) {
-    return { path: candidate };
-  }
-  return { path: '' };
-};
-
-const COMMAND_TRIGGER_PATTERN = /(^|\s)\/([A-Za-z0-9_-]*)$/;
-
-const findCommandTrigger = (value: string, cursor: number | null) => {
-  if (cursor == null || cursor < 0) return null;
-  const slice = value.slice(0, cursor);
-  const match = slice.match(COMMAND_TRIGGER_PATTERN);
-  if (!match || match.index == null) return null;
-  const start = match.index + match[1].length;
-  return { start, end: cursor, query: match[2] || '' };
-};
-
-const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-const buildSkillCommandPattern = (items: SkillSummary[]) => {
-  if (!items.length) return null;
-  const names = items.map((item) => item.name).filter(Boolean);
-  if (!names.length) return null;
-  const alternation = names.map(escapeRegExp).sort((a, b) => b.length - a.length).join('|');
-  if (!alternation) return null;
-  return new RegExp(`(^|\\s)[\\\\/$](${alternation})(?=\\s|$)`, 'gi');
-};
-
-const buildSkillInvocationPattern = (items: SkillSummary[]) => {
-  if (!items.length) return null;
-  const names = items.map((item) => item.name).filter(Boolean);
-  if (!names.length) return null;
-  const alternation = names.map(escapeRegExp).sort((a, b) => b.length - a.length).join('|');
-  if (!alternation) return null;
-  return new RegExp(`(^|\\s)([\\\\/$])(${alternation})(?=\\s|$)`, 'i');
-};
-
-const findSkillInvocation = (value: string, pattern: RegExp | null) => {
-  if (!value || !pattern) return null;
-  const match = pattern.exec(value);
-  if (!match || match.index == null) return null;
-  const leading = match[1] || '';
-  const prefix = match[2] || '';
-  const name = match[3] || '';
-  const start = match.index + leading.length;
-  const end = start + prefix.length + name.length;
-  return { name, start, end };
-};
-
-const stripExistingSkillCommands = (value: string, pattern: RegExp | null) => {
-  if (!value || !pattern) return value;
-  return value
-    .replace(pattern, (_match, leading) => (leading ? String(leading) : ''))
-    .replace(/[ \t]{2,}/g, ' ');
-};
-
-
-const joinPath = (base: string, child: string) => {
-  if (!base) return child;
-  const separator = base.includes('\\') ? '\\' : '/';
-  if (base.endsWith('\\') || base.endsWith('/')) {
-    return `${base}${child}`;
-  }
-  return `${base}${separator}${child}`;
-};
-
-const pathExists = async (filePath: string) => {
-  const parent = getParentPath(filePath);
-  const name = getBaseName(filePath);
-  if (!parent || !name) return false;
-  try {
-    const entries = await readDir(parent);
-    return entries.some((entry) => entry.name === name);
-  } catch {
-    return false;
-  }
-};
-
-const findWorkFileByName = async (root: string, fileName: string) => {
-  const target = fileName.trim().toLowerCase();
-  if (!root || !target) return '';
-
-  const queue: Array<{ path: string; depth: number }> = [{ path: root, depth: 0 }];
-  const maxDepth = 8;
-  const maxNodes = 5000;
-  let visited = 0;
-
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current) break;
-    let entries;
-    try {
-      entries = await readDir(current.path);
-    } catch {
-      continue;
-    }
-
-    const sorted = [...entries].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
-    for (const entry of sorted) {
-      visited += 1;
-      if (visited > maxNodes) {
-        return '';
-      }
-      const entryPath = joinPath(current.path, entry.name);
-      if (!entry.isDirectory) {
-        if (entry.name.toLowerCase() === target) {
-          return entryPath;
-        }
-        continue;
-      }
-      if (current.depth < maxDepth) {
-        queue.push({ path: entryPath, depth: current.depth + 1 });
-      }
-    }
-  }
-
-  return '';
-};
-
-const resolveRelativePath = async (relativePath: string, roots: string[]) => {
-  if (!relativePath || roots.length === 0) return relativePath;
-  if (isBareFilename(relativePath)) {
-    for (const root of roots) {
-      const matched = await findWorkFileByName(root, relativePath);
-      if (matched) return matched;
-    }
-    return joinPath(roots[0], relativePath);
-  }
-  for (const root of roots) {
-    const candidate = joinPath(root, relativePath);
-    if (await pathExists(candidate)) {
-      return candidate;
-    }
-  }
-  return joinPath(roots[0], relativePath);
-};
-
-const estimateTokensForText = (text: string) => {
-  if (!text) return 0;
-  let ascii = 0;
-  let nonAscii = 0;
-  for (let i = 0; i < text.length; i += 1) {
-    const code = text.charCodeAt(i);
-    if (code <= 0x7f) {
-      ascii += 1;
-    } else {
-      nonAscii += 1;
-    }
-  }
-  return Math.ceil(ascii / 4) + nonAscii;
-};
-
-const formatTokenCount = (value: number) => {
-  if (!Number.isFinite(value)) return '0';
-  if (value >= 10000) {
-    return `${(value / 1000).toFixed(1)}k`;
-  }
-  if (value >= 1000) {
-    return `${(value / 1000).toFixed(2)}k`;
-  }
-  return String(Math.max(0, Math.round(value)));
-};
-
-const normalizeContextEstimate = (estimate: any, fallbackTime?: string | null): ContextEstimate => ({
-  total: Number(estimate?.total) || 0,
-  system: Number(estimate?.system) || 0,
-  history: Number(estimate?.history) || 0,
-  tools: Number(estimate?.tools) || 0,
-  other: Number(estimate?.other) || 0,
-  max_tokens: Number.isFinite(Number(estimate?.max_tokens)) ? Number(estimate?.max_tokens) : undefined,
-  updated_at: typeof estimate?.updated_at === 'string' ? estimate.updated_at : (fallbackTime || undefined),
-});
-
-const collectTextFromContent = (content: any, bucket: string[]) => {
-  if (!content) return;
-  if (typeof content === 'string') {
-    if (content.trim()) bucket.push(content);
-    return;
-  }
-  if (Array.isArray(content)) {
-    content.forEach((item) => collectTextFromContent(item, bucket));
-    return;
-  }
-  if (typeof content === 'object') {
-    if (typeof content.text === 'string') {
-      if (content.text.trim()) bucket.push(content.text);
-    }
-    if (typeof content.content === 'string') {
-      if (content.content.trim()) bucket.push(content.content);
-    }
-    if (Array.isArray(content.content)) {
-      content.content.forEach((item: any) => collectTextFromContent(item, bucket));
-    }
-  }
-};
-
-const estimateTokensForContent = (content: any) => {
-  if (!content) return 0;
-  const texts: string[] = [];
-  collectTextFromContent(content, texts);
-  return texts.reduce((sum, text) => sum + estimateTokensForText(text), 0);
-};
-
-const estimateTokensFromRequestBreakdown = (request: Record<string, any> | null) => {
-  const breakdown = { total: 0, system: 0, history: 0, tools: 0, other: 0 };
-  if (!request) return breakdown;
-
-  const addMessageTokens = (role: string, content: any) => {
-    const tokens = estimateTokensForContent(content) + 4;
-    if (role === 'system' || role === 'developer') {
-      breakdown.system += tokens;
-    } else {
-      breakdown.history += tokens;
-    }
-  };
-
-  if (Array.isArray(request.messages)) {
-    request.messages.forEach((msg: any) => {
-      if (!msg) return;
-      const role = typeof msg.role === 'string' ? msg.role : '';
-      addMessageTokens(role, msg.content);
-    });
-  }
-
-  const handleInputItem = (item: any) => {
-    if (!item) return;
-    if (typeof item === 'string') {
-      breakdown.other += estimateTokensForText(item) + 4;
-      return;
-    }
-    if (Array.isArray(item)) {
-      item.forEach(handleInputItem);
-      return;
-    }
-    if (typeof item === 'object') {
-      if (typeof item.role === 'string') {
-        addMessageTokens(item.role, item.content);
-        return;
-      }
-      if (Object.prototype.hasOwnProperty.call(item, 'content')) {
-        breakdown.other += estimateTokensForContent(item.content) + 4;
-        return;
-      }
-      breakdown.other += estimateTokensForContent(item) + 4;
-    }
-  };
-
-  if (request.input) {
-    if (Array.isArray(request.input)) {
-      request.input.forEach(handleInputItem);
-    } else {
-      handleInputItem(request.input);
-    }
-  }
-
-  if (typeof request.instructions === 'string') {
-    breakdown.system += estimateTokensForText(request.instructions);
-  }
-
-  if (typeof request.prompt === 'string') {
-    breakdown.other += estimateTokensForText(request.prompt);
-  }
-
-  if (request.tools) {
-    try {
-      breakdown.tools += estimateTokensForText(JSON.stringify(request.tools));
-    } catch {
-      // ignore tool serialization errors
-    }
-  }
-
-  breakdown.total = breakdown.system + breakdown.history + breakdown.tools + breakdown.other;
-  return breakdown;
-};
-
-const getLatestRequestPayload = (calls: LLMCall[], history: Message[]) => {
-  for (let i = calls.length - 1; i >= 0; i -= 1) {
-    const payload = calls[i]?.request_json;
-    if (payload) return payload as Record<string, any>;
-  }
-  for (let i = history.length - 1; i >= 0; i -= 1) {
-    const payload = history[i]?.raw_request;
-    if (payload) return payload as Record<string, any>;
-  }
-  return null;
-};
-
-const buildEstimatedRequestPayload = (
-  history: Message[],
-  userMessage: string,
-  baseSystemPrompt?: string,
-  maxHistory: number = 20
-) => {
-  const trimmed = history.length > maxHistory ? history.slice(-maxHistory) : history;
-  const messages = trimmed.map((msg) => ({
-    role: msg.role,
-    content: msg.content,
-  }));
-  if (baseSystemPrompt && baseSystemPrompt.trim()) {
-    messages.unshift({ role: 'system', content: baseSystemPrompt });
-  }
-  messages.push({ role: 'user', content: userMessage });
-  return { messages };
-};
-
-const findItemIndexByOffset = (offsets: number[], value: number) => {
-  if (offsets.length <= 1) return 0;
-  let low = 0;
-  let high = offsets.length - 1;
-  while (low < high) {
-    const mid = Math.floor((low + high) / 2);
-    if (offsets[mid] <= value) {
-      low = mid + 1;
-    } else {
-      high = mid;
-    }
-  }
-  return Math.max(0, low - 1);
-};
-
-type MeasuredMessageProps = {
-  rowKey: string;
-  className: string;
-  onHeight: (key: string, height: number) => void;
-  children: ReactNode;
-};
-
-const MeasuredMessage = ({ rowKey, className, onHeight, children }: MeasuredMessageProps) => {
-  const ref = useRef<HTMLDivElement | null>(null);
-
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const measure = () => onHeight(rowKey, el.offsetHeight);
-    measure();
-    if (typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(() => measure());
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [rowKey, onHeight]);
-
-  return (
-    <div ref={ref} className={className}>
-      {children}
-    </div>
-  );
-};
-
-type PendingAttachment = {
-  id: string;
-  name: string;
-  mime: string;
-  size: number;
-  width?: number;
-  height?: number;
-  previewUrl: string;
-  dataBase64: string;
-};
-
-type QueueItem = {
-  id: string;
-  message: string;
-  sessionId: string | null;
-  sessionKey: string;
-  configId: string;
-  agentMode: AgentMode;
-  agentProfileId?: string | null;
-  workPath?: string;
-  extraWorkPaths?: string[];
-  enqueuedAt: number;
-  attachments?: PendingAttachment[];
-  estimatedRequest?: Record<string, any>;
-};
-
-type InFlightState = {
-  abortController: AbortController;
-  stopRequested: boolean;
-  activeAssistantId: number | null;
-  tempAssistantId: number;
-  sessionKey: string;
-  lastEventAt: number;
-  stalled?: boolean;
-};
-
-type PendingContextEstimate = {
-  sessionKey: string;
-  queueId: string;
-  payload: Record<string, any>;
-};
-
-type PtyOwnerMapBySession = Record<string, Record<string, string>>;
-
-type PtyInputQueueItem = {
-  sessionId: string;
-  ptyId: string;
-  buffer: string;
-  timerId: number | null;
-  inFlight: boolean;
-  lastErrorAt?: number;
-};
-
-type CommandItem = {
-  kind: 'skill';
-  id: string;
-  label: string;
-  description?: string;
-  insertText: string;
-};
+import {
+  AGENT_MODE_OPTIONS,
+  AST_DEFAULT_MAX_FILES,
+  AST_LANGUAGE_OPTIONS,
+  CONTEXT_RING_RADIUS,
+  DEFAULT_DEBUG_PANEL_WIDTH,
+  DEFAULT_MAX_CONTEXT_TOKENS,
+  DEFAULT_PTY_PANEL_WIDTH,
+  DRAFT_SESSION_KEY,
+  IS_MAC,
+  LEGACY_USE_TASK_CENTER_KEY,
+  MAIN_WINDOW_BOUNDS_KEY,
+  MAX_CONCURRENT_STREAMS,
+  MESSAGE_ESTIMATED_HEIGHT,
+  MESSAGE_LOAD_THRESHOLD_PX,
+  MESSAGE_OVERSCAN_PX,
+  MESSAGE_PAGE_SIZE,
+  PTY_INPUT_BATCH_MS,
+  PTY_RESYNC_READ_MAX_OUTPUT,
+  REASONING_OPTIONS,
+  SESSION_SWITCH_PROFILE,
+  SIDEBAR_OPEN_KEY,
+  STREAM_STALL_CHECK_MS,
+  STREAM_STALL_MS,
+  WORKDIR_DEFAULT_HEIGHT,
+  WORKDIR_DEFAULT_WIDTH,
+  MeasuredMessage,
+  buildEstimatedRequestPayload,
+  estimateTokensFromRequestBreakdown,
+  extractRunShellCommand,
+  findItemIndexByOffset,
+  findSkillInvocation,
+  formatTokenCount,
+  formatWorkPath,
+  getLatestRequestPayload,
+  getMainWindowBounds,
+  getParentPath,
+  getWorkdirWindowBounds,
+  isAbsolutePath,
+  makeWorkdirLabel,
+  normalizeContextEstimate,
+  normalizeFileHref,
+  parseBooleanMeta,
+  parseFileLocation,
+  parseRunShellPtyIdFromContent,
+  resolveRelativePath,
+} from './app/shared';
+import type {
+  InFlightState,
+  PendingAttachment,
+  PendingContextEstimate,
+  PtyInputQueueItem,
+  PtyOwnerMapBySession,
+  QueueItem,
+} from './app/shared';
+import { useSkillCommands } from './hooks/useSkillCommands';
+import { useSessionWebSocket } from './hooks/useSessionWebSocket';
 
 function App() {
   const [inputMsg, setInputMsg] = useState('');
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [activeSkill, setActiveSkill] = useState<SkillSummary | null>(null);
-  const [commandSuggestions, setCommandSuggestions] = useState<CommandItem[]>([]);
-  const [showCommandSuggestions, setShowCommandSuggestions] = useState(false);
-  const [commandActiveIndex, setCommandActiveIndex] = useState(0);
-  const commandTriggerRef = useRef<{ start: number; end: number; query: string } | null>(null);
-  const commandQueryRef = useRef('');
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [dragActive, setDragActive] = useState(false);
   const [imagePreview, setImagePreview] = useState<{ src: string; name?: string } | null>(null);
@@ -815,30 +173,18 @@ function App() {
   const [taskCenterEnabled, setTaskCenterEnabled] = useState(false);
   const [taskUiEnabled, setTaskUiEnabled] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<'task' | 'legacy'>('legacy');
-  const workspaceModeInitializedRef = useRef(false);
-
-  const commandItems = useMemo<CommandItem[]>(
-    () =>
-      skills.map((skill) => ({
-        kind: 'skill',
-        id: skill.name,
-        label: skill.name,
-        description: skill.description,
-        insertText: `$${skill.name}`,
-      })),
-    [skills]
-  );
-  const skillCommandPattern = useMemo(() => buildSkillCommandPattern(skills), [skills]);
-  const skillInvocationPattern = useMemo(() => buildSkillInvocationPattern(skills), [skills]);
-  const skillLookup = useMemo(() => {
-    const map = new Map<string, SkillSummary>();
-    skills.forEach((skill) => {
-      if (skill?.name) {
-        map.set(skill.name.toLowerCase(), skill);
+  const [legacyUseTaskCenter, setLegacyUseTaskCenter] = useState(() => {
+    try {
+      const raw = localStorage.getItem(LEGACY_USE_TASK_CENTER_KEY);
+      if (raw !== null) {
+        return raw === '1' || raw.toLowerCase() === 'true';
       }
-    });
-    return map;
-  }, [skills]);
+    } catch {
+      // ignore
+    }
+    return false;
+  });
+  const workspaceModeInitializedRef = useRef(false);
 
   const astEnabled = agentConfig?.ast_enabled ?? true;
   const [showProfileSelector, setShowProfileSelector] = useState(false);
@@ -876,6 +222,26 @@ function App() {
   const INPUT_MAX_HEIGHT = 240;
   const resizeInputRef = useRef<number | null>(null);
   const composingRef = useRef(false);
+  const {
+    applyCommandSuggestion,
+    applyInputValue,
+    closeCommandSuggestions,
+    commandActiveIndex,
+    commandItems,
+    commandQuery,
+    commandSuggestions,
+    setCommandActiveIndex,
+    showCommandSuggestions,
+    skillInvocationPattern,
+    updateCommandSuggestions,
+  } = useSkillCommands({
+    autoScrollRef,
+    inputMsg,
+    inputRef,
+    setActiveSkill,
+    setInputMsg,
+    skills,
+  });
   const messagesCacheRef = useRef<Record<string, Message[]>>({});
   const messagePagingRef = useRef<Record<string, { loading: boolean; hasMore: boolean; oldestId: number | null }>>({});
   const pendingPrependRef = useRef<{ anchorKey: string; anchorOffset: number } | null>(null);
@@ -895,7 +261,6 @@ function App() {
   const astWatchRef = useRef<UnwatchFn | null>(null);
   const astNotifyRef = useRef<{ timer: number | null; paths: Set<string> }>({ timer: null, paths: new Set() });
   const appWindow = useMemo(() => getCurrentWindow(), []);
-  const wsSessionRef = useRef<string | null>(null);
   const ptyStreamAbortRef = useRef<AbortController | null>(null);
   const ptyStreamSessionRef = useRef<string | null>(null);
   const ptyResyncInFlightRef = useRef<Record<string, boolean>>({});
@@ -1724,150 +1089,6 @@ function App() {
     }
   };
 
-  const closeCommandSuggestions = useCallback(() => {
-    setShowCommandSuggestions(false);
-    setCommandSuggestions([]);
-    setCommandActiveIndex(0);
-    commandTriggerRef.current = null;
-    commandQueryRef.current = '';
-  }, []);
-
-  const updateCommandSuggestions = useCallback((value: string, cursor: number | null) => {
-    const trigger = findCommandTrigger(value, cursor);
-    if (!trigger) {
-      closeCommandSuggestions();
-      return;
-    }
-    const query = trigger.query.toLowerCase();
-    commandTriggerRef.current = trigger;
-
-    if (!commandItems.length) {
-      commandQueryRef.current = query;
-      setCommandSuggestions([]);
-      setShowCommandSuggestions(true);
-      setCommandActiveIndex(0);
-      return;
-    }
-
-    const matches = commandItems.filter((item) => {
-      if (!query) return true;
-      const label = item.label.toLowerCase();
-      const desc = item.description?.toLowerCase() || '';
-      return label.includes(query) || desc.includes(query);
-    });
-    const queryChanged = commandQueryRef.current !== query;
-    commandQueryRef.current = query;
-    setCommandSuggestions(matches);
-    setShowCommandSuggestions(true);
-    setCommandActiveIndex((prev) => {
-      if (queryChanged) return 0;
-      return prev >= matches.length ? 0 : prev;
-    });
-  }, [commandItems, closeCommandSuggestions]);
-
-  const applyInputValue = useCallback(
-    (rawValue: string, cursor: number | null, options?: { normalizeSkill?: boolean }) => {
-      let nextValue = rawValue;
-      let nextCursor = cursor;
-      let matchedSkill: SkillSummary | null = null;
-      let changed = false;
-      const shouldNormalize = options?.normalizeSkill !== false;
-
-      if (shouldNormalize && skillInvocationPattern && skillCommandPattern) {
-        const match = findSkillInvocation(rawValue, skillInvocationPattern);
-        if (match) {
-          matchedSkill = skillLookup.get(match.name.toLowerCase()) ?? null;
-          nextValue = stripExistingSkillCommands(rawValue, skillCommandPattern).replace(/^\s+/, '');
-          if (cursor != null) {
-            const before = rawValue.slice(0, cursor);
-            const nextBefore = stripExistingSkillCommands(before, skillCommandPattern);
-            nextCursor = nextBefore.length;
-          }
-          changed = nextValue !== rawValue;
-        }
-      }
-
-      if (matchedSkill) {
-        setActiveSkill(matchedSkill);
-      }
-      setInputMsg(nextValue);
-      autoScrollRef.current = true;
-      updateCommandSuggestions(nextValue, nextCursor);
-
-      if (changed) {
-        requestAnimationFrame(() => {
-          const input = inputRef.current;
-          if (!input) return;
-          const caret = nextCursor ?? nextValue.length;
-          input.setSelectionRange(caret, caret);
-        });
-      }
-    },
-    [skillInvocationPattern, skillCommandPattern, skillLookup, updateCommandSuggestions]
-  );
-
-  useEffect(() => {
-    if (!inputMsg || !skillInvocationPattern) return;
-    const match = findSkillInvocation(inputMsg, skillInvocationPattern);
-    if (!match) return;
-    applyInputValue(inputMsg, inputRef.current?.selectionStart ?? null);
-  }, [applyInputValue, inputMsg, skillInvocationPattern]);
-
-  const applyCommandSuggestion = useCallback((command: CommandItem) => {
-    const trigger = commandTriggerRef.current;
-    const currentValue = inputRef.current?.value ?? inputMsg;
-    if (!trigger) return;
-    const beforeRaw = currentValue.slice(0, trigger.start);
-    const afterRaw = currentValue.slice(trigger.end);
-
-    if (command.kind === 'skill') {
-      const withoutTrigger = `${beforeRaw}${afterRaw}`;
-      const nextValue = stripExistingSkillCommands(withoutTrigger, skillCommandPattern).replace(/^\s+/, '');
-      const skill = skillLookup.get(command.id.toLowerCase()) ?? null;
-      if (skill) {
-        setActiveSkill(skill);
-      }
-      setInputMsg(nextValue);
-      closeCommandSuggestions();
-      requestAnimationFrame(() => {
-        const input = inputRef.current;
-        if (!input) return;
-        const before = withoutTrigger.slice(0, trigger.start);
-        const caret = stripExistingSkillCommands(before, skillCommandPattern).length;
-        input.focus();
-        input.setSelectionRange(caret, caret);
-      });
-      return;
-    }
-
-    const before = stripExistingSkillCommands(beforeRaw, skillCommandPattern);
-    const after = stripExistingSkillCommands(afterRaw, skillCommandPattern);
-    const insertion = `${command.insertText} `;
-    const nextValue = `${before}${insertion}${after}`;
-    setInputMsg(nextValue);
-    closeCommandSuggestions();
-    requestAnimationFrame(() => {
-      const input = inputRef.current;
-      if (!input) return;
-      const caret = before.length + insertion.length;
-      input.focus();
-      input.setSelectionRange(caret, caret);
-    });
-  }, [inputMsg, closeCommandSuggestions, skillCommandPattern, skillLookup]);
-
-  useEffect(() => {
-    const input = inputRef.current;
-    if (!input) return;
-    if (document.activeElement !== input) return;
-    const value = input.value ?? '';
-    if (!value) {
-      closeCommandSuggestions();
-      return;
-    }
-    const cursor = Number.isFinite(input.selectionStart) ? input.selectionStart : value.length;
-    updateCommandSuggestions(value, cursor);
-  }, [commandItems, closeCommandSuggestions, updateCommandSuggestions]);
-
   const getSessionKey = (sessionId: string | null) => sessionId ?? DRAFT_SESSION_KEY;
 
   const getCurrentSessionKey = () => getSessionKey(currentSessionIdRef.current);
@@ -2276,45 +1497,12 @@ function App() {
     }
   };
 
-  useEffect(() => {
-    wsClient.connect();
-    const cleanupEvents = wsClient.onEvent((event) => {
-      if (event.type === 'subagent_done') {
-        const payload = event as SubagentDoneEvent;
-        if (!payload.session_id || !payload.message) return;
-        const sessionKey = getSessionKey(payload.session_id);
-        updateSessionMessages(sessionKey, (prev) => {
-          if (prev.some((msg) => msg.id === payload.message.id)) return prev;
-          return [...prev, payload.message];
-        });
-        if (sessionKey !== getCurrentSessionKey()) {
-          markSessionUnread(sessionKey);
-        }
-        setSessionRefreshTrigger((prev) => prev + 1);
-        return;
-      }
-      if (event.type === 'subagent_started') {
-        const payload = event as SubagentStartedEvent;
-        if (!payload.session_id) return;
-        setSessionRefreshTrigger((prev) => prev + 1);
-      }
-    });
-    return () => {
-      cleanupEvents();
-      wsClient.disconnect();
-    };
-  }, []);
-
-  useEffect(() => {
-    const prev = wsSessionRef.current;
-    if (prev && prev !== currentSessionId) {
-      wsClient.unsubscribe([prev]);
-    }
-    if (currentSessionId) {
-      wsClient.subscribe([currentSessionId]);
-    }
-    wsSessionRef.current = currentSessionId;
-  }, [currentSessionId]);
+  useSessionWebSocket({
+    bumpSessionRefresh: () => setSessionRefreshTrigger((prev) => prev + 1),
+    currentSessionId,
+    markSessionUnread,
+    updateSessionMessages,
+  });
 
   useEffect(() => {
     const previous = ptyStreamAbortRef.current;
@@ -2569,6 +1757,7 @@ function App() {
           agent_profile: item.agentProfileId || undefined,
           work_path: item.workPath || undefined,
           extra_work_paths: item.extraWorkPaths && item.extraWorkPaths.length > 0 ? item.extraWorkPaths : undefined,
+          use_task_center: item.useTaskCenter,
           attachments: attachmentPayload,
         },
         abortController.signal
@@ -3090,6 +2279,14 @@ function App() {
     }
   }, [taskUiEnabled, workspaceMode]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(LEGACY_USE_TASK_CENTER_KEY, legacyUseTaskCenter ? '1' : '0');
+    } catch {
+      // ignore
+    }
+  }, [legacyUseTaskCenter]);
+
   const scheduleDebugRefresh = (sessionId: string | null | undefined) => {
     if (!showDebugPanelRef.current || !sessionId) return;
     if (currentSessionIdRef.current && sessionId !== currentSessionIdRef.current) return;
@@ -3417,10 +2614,10 @@ function App() {
 
   const openWorkdirForFile = async (filePath: string, line?: number, column?: number) => {
     const parsed = parseFileLocation(filePath);
-    const rawPath = parsed.path || filePath;
+    const rawPath = parsed?.path || filePath;
     const normalizedInput = normalizeFileHref(rawPath);
-    const targetLine = line ?? parsed.line;
-    const targetColumn = column ?? parsed.column;
+    const targetLine = line ?? parsed?.line;
+    const targetColumn = column ?? parsed?.column;
     const trimmed = normalizedInput.trim();
     if (!trimmed) return;
 
@@ -3552,6 +2749,7 @@ function App() {
       message,
       agentConfig?.base_system_prompt || ''
     );
+    const useTaskCenter = workspaceMode === 'task' ? true : taskCenterEnabled ? legacyUseTaskCenter : false;
 
     const queueItem: QueueItem = {
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -3561,6 +2759,7 @@ function App() {
       configId: currentConfig.id,
       agentMode,
       agentProfileId: resolveAgentProfileId(agentConfig, currentAgentProfileId),
+      useTaskCenter,
       workPath,
       extraWorkPaths,
       enqueuedAt: Date.now(),
@@ -4711,7 +3910,7 @@ function App() {
                   <div className="command-empty">
                     {commandItems.length === 0
                       ? 'No skills available'
-                      : commandQueryRef.current
+                      : commandQuery
                         ? 'No matching skills'
                         : 'No skills available'}
                   </div>
@@ -4897,6 +4096,20 @@ function App() {
                       </div>
                     )}
                   </div>
+
+                  {workspaceMode === 'legacy' && taskCenterEnabled && (
+                    <label
+                      className="legacy-task-center-toggle"
+                      title={legacyUseTaskCenter ? '已启用：多 agent（Task Center）' : '已关闭：单 agent（Legacy）'}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={legacyUseTaskCenter}
+                        onChange={(event) => setLegacyUseTaskCenter(event.currentTarget.checked)}
+                      />
+                      <span>多 Agent</span>
+                    </label>
+                  )}
 
                   {agentProfiles.length > 0 && (
                     <div className="agent-profile-selector-inline">

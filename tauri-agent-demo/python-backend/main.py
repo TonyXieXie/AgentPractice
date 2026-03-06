@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
+from contextlib import asynccontextmanager
 import uvicorn
 import json
 import os
@@ -67,7 +68,6 @@ from skills import (
     set_empty_skill_cache
 )
 
-app = FastAPI(title="Tauri Agent Chat Backend")
 STREAM_REGISTRY = get_stream_registry()
 PTY_STREAM_REGISTRY = get_pty_stream_registry()
 WS_HUB = get_ws_hub()
@@ -101,8 +101,10 @@ def _cleanup_spawned_subagents(child_session_ids: List[str]) -> None:
             print(f"[Subagent Cleanup] Failed to delete child session {child_session_id}: {exc}")
 
 
-@app.on_event("startup")
-async def on_startup():
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    background_tasks: List[asyncio.Task[Any]] = []
+
     try:
         WS_HUB.set_loop(asyncio.get_running_loop())
     except Exception:
@@ -116,13 +118,35 @@ async def on_startup():
     except Exception as exc:
         print(f"[Task Orchestrator] failed to start: {exc}")
     try:
-        asyncio.create_task(_init_skills_background())
+        background_tasks.append(asyncio.create_task(_init_skills_background()))
     except Exception as exc:
         print(f"[Skills] failed to start background load: {exc}")
     try:
-        asyncio.create_task(_init_mcp_tools_background())
+        background_tasks.append(asyncio.create_task(_init_mcp_tools_background()))
     except Exception as exc:
         print(f"[MCP] Failed to start background registration: {exc}")
+
+    try:
+        yield
+    finally:
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        try:
+            count = get_pty_manager().close_all()
+            if count:
+                print(f"[PTY] closed {count} sessions on shutdown")
+        except Exception:
+            pass
+        try:
+            await TASK_ORCHESTRATOR.stop()
+        except Exception:
+            pass
+
+
+app = FastAPI(title="Tauri Agent Chat Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -165,19 +189,6 @@ try:
     signal.signal(signal.SIGINT, lambda *_: _close_all_ptys())
 except Exception:
     pass
-
-@app.on_event("shutdown")
-async def _shutdown_cleanup():
-    try:
-        count = get_pty_manager().close_all()
-        if count:
-            print(f"[PTY] closed {count} sessions on shutdown")
-    except Exception:
-        pass
-    try:
-        await TASK_ORCHESTRATOR.stop()
-    except Exception:
-        pass
 
 # ==================== AST Cache ====================
 
@@ -250,6 +261,64 @@ def _fallback_title(user_message: str) -> str:
     if len(base) > TITLE_FALLBACK_CHARS:
         return base[:TITLE_FALLBACK_CHARS].rstrip() + "..."
     return base
+
+
+def _update_message_content(message_id: Optional[int], content: str) -> None:
+    if not message_id:
+        return
+    conn = db.get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE chat_messages
+            SET content = ?
+            WHERE id = ?
+            ''',
+            (content, message_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _persist_agent_failure_message(
+    session_id: Optional[str],
+    assistant_message_id: Optional[int],
+    content: str,
+    metadata: Optional[Dict[str, Any]] = None
+) -> Optional[int]:
+    failure_text = str(content or "").strip()
+    if not failure_text:
+        return assistant_message_id
+
+    target_message_id = assistant_message_id
+    if target_message_id:
+        _update_message_content(target_message_id, failure_text)
+    elif session_id:
+        created = db.create_message(ChatMessageCreate(
+            session_id=session_id,
+            role="assistant",
+            content=failure_text,
+            metadata=metadata or {"failed": True}
+        ))
+        target_message_id = created.id
+    else:
+        return assistant_message_id
+
+    try:
+        next_sequence = len(db.get_agent_steps(target_message_id))
+        db.save_agent_step(
+            message_id=target_message_id,
+            step_type="error",
+            content=failure_text,
+            sequence=next_sequence,
+            metadata=metadata or {"failed": True}
+        )
+    except Exception:
+        pass
+
+    return target_message_id
 
 
 def _strip_pty_prompt_controls(text: str) -> str:
@@ -1528,6 +1597,7 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
     stop_event = None
     had_error = False
     parent_session_id = None
+    session = None
     try:
         await state.emit({"stream_id": state.stream_id})
         if request.session_id:
@@ -1593,7 +1663,7 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
             ToolRegistry.get_all(),
             include_tools=include_tools,
             extra_context={"pty_sessions": pty_prompt},
-            exclude_ability_ids=["code_map"]
+            exclude_ability_ids=["code_map", "task_decompose_parallel", "tool-spawn-subagents-parallel"]
         )
         enabled_skills = get_enabled_skills()
         invoked_skill_names = extract_skill_invocations(processed_message, max_count=1)
@@ -1723,6 +1793,8 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
             },
             "work_path": request.work_path or getattr(session, 'work_path', None)
         }
+        if request.use_task_center is not None:
+            request_overrides["use_task_center"] = request.use_task_center
         request_overrides["prompt_truncation"] = prompt_truncation_cfg
         if request.extra_work_paths:
             request_overrides["extra_work_paths"] = [str(p) for p in request.extra_work_paths if p]
@@ -1762,11 +1834,15 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
             request_overrides=request_overrides if request_overrides else None
         )
         step_queue: asyncio.Queue = asyncio.Queue()
+        producer_error: Optional[Exception] = None
 
         async def _produce_steps():
+            nonlocal producer_error
             try:
                 async for step in step_iter:
                     await step_queue.put(step)
+            except Exception as exc:
+                producer_error = exc
             finally:
                 await step_queue.put(None)
 
@@ -1836,6 +1912,9 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
                 except Exception:
                     pass
 
+        if producer_error is not None:
+            raise producer_error
+
         if final_answer and assistant_msg_id:
             conn = db.get_connection()
             cursor = conn.cursor()
@@ -1860,10 +1939,18 @@ async def _run_agent_stream(request: ChatRequest, state) -> None:
 
     except Exception as e:
         had_error = True
+        error_text = f"Agent failed: {str(e)}"
+        error_metadata = {"error": str(e), "traceback": traceback.format_exc()}
+        assistant_msg_id = _persist_agent_failure_message(
+            session.id if session else parent_session_id,
+            assistant_msg_id,
+            error_text,
+            error_metadata
+        )
         error_step = AgentStep(
             step_type="error",
-            content=f"Agent failed: {str(e)}",
-            metadata={"error": str(e), "traceback": traceback.format_exc()}
+            content=error_text,
+            metadata=error_metadata
         )
         try:
             await state.emit(error_step.to_dict())
@@ -1926,6 +2013,7 @@ async def _run_task_center_stream(request: ChatRequest, state) -> None:
     assistant_msg_id: Optional[int] = None
     stop_event = None
     task_id: Optional[str] = None
+    session = None
     try:
         await state.emit({"stream_id": state.stream_id})
 
@@ -2090,10 +2178,18 @@ async def _run_task_center_stream(request: ChatRequest, state) -> None:
 
         await state.emit({"done": True, "session_id": session.id})
     except Exception as exc:
+        error_text = f"Agent failed: {exc}"
+        error_metadata = {"error": str(exc), "traceback": traceback.format_exc()}
+        assistant_msg_id = _persist_agent_failure_message(
+            session.id if session else None,
+            assistant_msg_id,
+            error_text,
+            error_metadata
+        )
         error_step = AgentStep(
             step_type="error",
-            content=f"Agent failed: {exc}",
-            metadata={"error": str(exc), "traceback": traceback.format_exc()}
+            content=error_text,
+            metadata=error_metadata
         )
         try:
             await state.emit(error_step.to_dict())
@@ -2135,7 +2231,8 @@ async def chat_agent_stream(request: ChatRequest):
 
         keepalive_sec = _resolve_stream_keepalive_sec()
         state = await STREAM_REGISTRY.create(keepalive_sec)
-        runner = _run_task_center_stream if _task_center_enabled() else _run_agent_stream
+        use_task_center = request.use_task_center if request.use_task_center is not None else _task_center_enabled()
+        runner = _run_task_center_stream if use_task_center else _run_agent_stream
         asyncio.create_task(runner(request, state))
         last_seq = request.last_seq or 0
         return StreamingResponse(

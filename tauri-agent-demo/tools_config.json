@@ -9,6 +9,7 @@
     "run_shell": true,
     "code_ast": true,
     "spawn_subagent": true,
+    "spawn_subagents_parallel": true,
     "calculator": false,
     "weather": false
   },

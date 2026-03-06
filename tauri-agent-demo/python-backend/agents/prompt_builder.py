@@ -264,17 +264,17 @@ def build_agent_prompt_and_tools(
         if isinstance(ability, dict) and ability.get("id")
     ]
     exclude = set([str(item) for item in (exclude_ability_ids or []) if item])
-    prompt_abilities = [
+    active_abilities = [
         ability
         for ability in abilities
         if str(ability.get("id")) not in exclude
     ]
-    tools = _resolve_tool_list(abilities, all_tools, include_tools)
+    tools = _resolve_tool_list(active_abilities, all_tools, include_tools)
     tools = [tool for tool in tools if tool.name != "code_ast"]
     prompt = build_system_prompt(
         agent_config,
         profile,
-        prompt_abilities,
+        active_abilities,
         tools,
         include_tools=include_tools,
         extra_context=extra_context

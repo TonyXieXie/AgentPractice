@@ -451,6 +451,12 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
                 "current_user_message_id": user_msg_id
             }
         }
+        use_task_center = context.get("use_task_center")
+        if isinstance(use_task_center, bool):
+            request_overrides["use_task_center"] = use_task_center
+        task_context = context.get("task_context")
+        if isinstance(task_context, dict):
+            request_overrides["task_context"] = dict(task_context)
         if code_map_prompt:
             request_overrides["_code_map_prompt"] = code_map_prompt
         if skills_prompt:
@@ -572,7 +578,9 @@ async def run_subagent_task(
     parent_session_id: str,
     title: Optional[str] = None,
     profile_id: Optional[str] = None,
-    suppress_parent_notify: bool = False
+    suppress_parent_notify: bool = False,
+    task_context: Optional[Dict[str, Any]] = None,
+    use_task_center: Optional[bool] = None,
 ) -> Dict[str, Any]:
     try:
         context = prepare_subagent_session(
@@ -582,6 +590,10 @@ async def run_subagent_task(
             profile_id,
             suppress_parent_notify=suppress_parent_notify
         )
+        if isinstance(task_context, dict):
+            context["task_context"] = dict(task_context)
+        if isinstance(use_task_center, bool):
+            context["use_task_center"] = use_task_center
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
     return await execute_subagent_context(context)

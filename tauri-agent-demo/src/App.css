@@ -1545,6 +1545,29 @@ body[data-platform="mac"] .app-titlebar {
   min-width: auto;
 }
 
+.legacy-task-center-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  color: #cbd5e1;
+  font-size: 0.82rem;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.legacy-task-center-toggle:hover {
+  color: #fff;
+}
+
+.legacy-task-center-toggle input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  accent-color: #38bdf8;
+}
+
 .agent-mode-selector-btn {
   display: flex;
   align-items: center;

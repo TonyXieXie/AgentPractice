@@ -140,6 +140,7 @@ class ChatRequest(BaseModel):
     extra_work_paths: Optional[List[str]] = None
     agent_mode: Optional[AgentMode] = None
     shell_unrestricted: Optional[bool] = None
+    use_task_center: Optional[bool] = None
     attachments: Optional[List[AttachmentInput]] = None
     stream_id: Optional[str] = None
     last_seq: Optional[int] = None

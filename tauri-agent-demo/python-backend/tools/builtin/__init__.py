@@ -13,7 +13,7 @@ This module provides basic tools that are included by default:
 from ..base import Tool, ToolParameter
 from ..config import is_tool_enabled
 from .system_tools import ReadFileTool, WriteFileTool, RunShellTool, TavilySearchTool, RgTool, ApplyPatchTool, CodeAstTool, ListFilesTool
-from .subagent_tool import SpawnSubagentTool
+from .subagent_tool import SpawnSubagentTool, SpawnSubagentsParallelTool
 
 
 class CalculatorTool(Tool):
@@ -127,3 +127,5 @@ def register_builtin_tools():
         ToolRegistry.register(CodeAstTool())
     if is_tool_enabled("spawn_subagent"):
         ToolRegistry.register(SpawnSubagentTool())
+    if is_tool_enabled("spawn_subagents_parallel"):
+        ToolRegistry.register(SpawnSubagentsParallelTool())

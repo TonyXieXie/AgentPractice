@@ -1,6 +1,7 @@
-from typing import List, Optional, Dict, Any, Set
+from typing import List, Optional, Dict, Any, Set, Iterator
 import json
 import os
+from contextlib import contextmanager
 from datetime import datetime
 import sqlite3
 import uuid
@@ -22,6 +23,28 @@ from models import (
 )
 
 DATABASE_PATH = os.getenv("TAURI_AGENT_DB_PATH", "chat_app.db")
+SCHEMA_VERSION = 20260306
+CORE_TABLES = (
+    'session_tool_call_history',
+    'file_snapshots',
+    'tool_permission_requests',
+    'llm_calls',
+    'tool_calls',
+    'agent_steps',
+    'message_attachments',
+    'chat_messages',
+    'chat_sessions',
+    'llm_configs',
+)
+AGENT_TABLES = (
+    'agent_task_edges',
+    'agent_artifacts',
+    'agent_task_events',
+    'agent_task_counters',
+    'agent_tasks',
+    'agent_instances',
+)
+
 
 class Database:
     def __init__(self, db_path: str = DATABASE_PATH):
@@ -30,119 +53,137 @@ class Database:
         if parent:
             os.makedirs(parent, exist_ok=True)
         self.init_database()
-    
-    def get_connection(self):
-        """Get database connection"""
-        conn = sqlite3.connect(self.db_path)
+
+    def get_connection(self) -> sqlite3.Connection:
+        """Get database connection."""
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA foreign_keys = ON')
+        conn.execute('PRAGMA busy_timeout = 30000')
+        try:
+            conn.execute('PRAGMA journal_mode = WAL')
+        except sqlite3.DatabaseError:
+            pass
+        try:
+            conn.execute('PRAGMA synchronous = NORMAL')
+        except sqlite3.DatabaseError:
+            pass
         return conn
-    
-    def init_database(self):
-        """Initialize database tables"""
+
+    @contextmanager
+    def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
+        try:
+            if immediate:
+                conn.execute('BEGIN IMMEDIATE')
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def init_database(self) -> None:
+        """Initialize or rebuild the schema when the version changes."""
+        current_version = self._read_schema_version()
+        if current_version != SCHEMA_VERSION:
+            self.rebuild_schema()
+
+    def _read_schema_version(self) -> Optional[int]:
+        if not os.path.exists(self.db_path):
+            return None
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'")
+            if not cursor.fetchone():
+                return None
+            cursor.execute("SELECT version FROM schema_meta WHERE key = 'app'")
+            row = cursor.fetchone()
+            if not row or row['version'] is None:
+                return None
+            return int(row['version'])
+        except sqlite3.DatabaseError:
+            return None
+        finally:
+            conn.close()
+
+    def rebuild_schema(self) -> None:
+        with self.transaction(immediate=True) as conn:
+            cursor = conn.cursor()
+            cursor.execute('PRAGMA foreign_keys = OFF')
+            self._drop_known_tables(cursor)
+            self._create_schema(cursor)
+            cursor.execute('PRAGMA foreign_keys = ON')
+
+    def _drop_known_tables(self, cursor: sqlite3.Cursor) -> None:
+        cursor.execute('DROP TABLE IF EXISTS schema_meta')
+        for table_name in AGENT_TABLES:
+            cursor.execute(f'DROP TABLE IF EXISTS {table_name}')
+        for table_name in CORE_TABLES:
+            cursor.execute(f'DROP TABLE IF EXISTS {table_name}')
+
+    def _create_schema(self, cursor: sqlite3.Cursor) -> None:
+        self._create_meta_table(cursor)
+        self._create_core_tables(cursor)
+        self._create_agent_tables(cursor)
+        self._create_core_indexes(cursor)
+        self._create_agent_indexes(cursor)
+        self._set_schema_version(cursor)
+
+    def _create_meta_table(self, cursor: sqlite3.Cursor) -> None:
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            '''
+        )
+
+    def _set_schema_version(self, cursor: sqlite3.Cursor) -> None:
+        cursor.execute(
+            '''
+            INSERT OR REPLACE INTO schema_meta (key, version, updated_at)
+            VALUES ('app', ?, ?)
+            ''',
+            (SCHEMA_VERSION, datetime.now().isoformat())
+        )
+
+    def _create_core_tables(self, cursor: sqlite3.Cursor) -> None:
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS llm_configs (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 api_type TEXT,
-                api_format TEXT,
-                api_profile TEXT,
+                api_format TEXT NOT NULL DEFAULT 'openai_chat_completions',
+                api_profile TEXT NOT NULL DEFAULT 'openai',
                 api_key TEXT NOT NULL,
                 base_url TEXT,
                 model TEXT NOT NULL,
                 temperature REAL DEFAULT 0.7,
                 max_tokens INTEGER DEFAULT 2000,
                 max_context_tokens INTEGER DEFAULT 200000,
-                is_default INTEGER DEFAULT 0,
-                reasoning_effort TEXT DEFAULT "medium",
-                reasoning_summary TEXT DEFAULT "detailed",
+                is_default INTEGER NOT NULL DEFAULT 0,
+                reasoning_effort TEXT NOT NULL DEFAULT 'medium',
+                reasoning_summary TEXT NOT NULL DEFAULT 'detailed',
                 created_at TEXT NOT NULL
             )
-        ''')
+            '''
+        )
 
-        try:
-            cursor.execute('ALTER TABLE llm_configs ADD COLUMN api_format TEXT')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE llm_configs ADD COLUMN api_profile TEXT')
-        except sqlite3.OperationalError:
-            pass
-        
-        try:
-            cursor.execute('ALTER TABLE llm_configs ADD COLUMN reasoning_effort TEXT')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE llm_configs ADD COLUMN reasoning_summary TEXT')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE llm_configs ADD COLUMN max_context_tokens INTEGER')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('''
-                UPDATE llm_configs
-                SET api_format = ?
-                WHERE api_format IS NULL
-            ''', ("openai_chat_completions",))
-        except sqlite3.OperationalError:
-            pass
-        
-        try:
-            cursor.execute('''
-                UPDATE llm_configs
-                SET reasoning_effort = ?
-                WHERE reasoning_effort IS NULL
-            ''', ("medium",))
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('''
-                UPDATE llm_configs
-                SET reasoning_summary = ?
-                WHERE reasoning_summary IS NULL
-            ''', ("detailed",))
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('''
-                UPDATE llm_configs
-                SET max_context_tokens = ?
-                WHERE max_context_tokens IS NULL
-            ''', (200000,))
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('''
-                UPDATE llm_configs
-                SET api_profile = api_type
-                WHERE api_profile IS NULL AND api_type IS NOT NULL
-            ''')
-            cursor.execute('''
-                UPDATE llm_configs
-                SET api_profile = ?
-                WHERE api_profile IS NULL
-            ''', ("openai",))
-        except sqlite3.OperationalError:
-            pass
-        
-        cursor.execute('''
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS chat_sessions (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 config_id TEXT NOT NULL,
                 work_path TEXT,
+                agent_type TEXT NOT NULL DEFAULT 'simple',
                 agent_profile TEXT,
                 parent_session_id TEXT,
                 context_summary TEXT,
@@ -151,51 +192,14 @@ class Database:
                 context_estimate_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                FOREIGN KEY (config_id) REFERENCES llm_configs(id)
+                FOREIGN KEY (config_id) REFERENCES llm_configs(id) ON DELETE RESTRICT,
+                FOREIGN KEY (parent_session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
             )
-        ''')
+            '''
+        )
 
-        try:
-            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN agent_type TEXT DEFAULT "simple"')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN work_path TEXT')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN agent_profile TEXT')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN parent_session_id TEXT')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN context_summary TEXT')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN last_compressed_llm_call_id INTEGER')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN context_estimate TEXT')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN context_estimate_at TEXT')
-        except sqlite3.OperationalError:
-            pass
-        
-        cursor.execute('''
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS chat_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -207,9 +211,11 @@ class Database:
                 raw_response TEXT,
                 FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
             )
-        ''')
+            '''
+        )
 
-        cursor.execute('''
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS message_attachments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id INTEGER NOT NULL,
@@ -222,9 +228,11 @@ class Database:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
             )
-        ''')
-        
-        cursor.execute('''
+            '''
+        )
+
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS agent_steps (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id INTEGER NOT NULL,
@@ -235,9 +243,11 @@ class Database:
                 timestamp TEXT NOT NULL,
                 FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
             )
-        ''')
-        
-        cursor.execute('''
+            '''
+        )
+
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS tool_calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id INTEGER NOT NULL,
@@ -247,9 +257,11 @@ class Database:
                 timestamp TEXT NOT NULL,
                 FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
             )
-        ''')
+            '''
+        )
 
-        cursor.execute('''
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS llm_calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT,
@@ -265,11 +277,15 @@ class Database:
                 response_json TEXT,
                 response_text TEXT,
                 processed_json TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE SET NULL
             )
-        ''')
+            '''
+        )
 
-        cursor.execute('''
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS tool_permission_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT,
@@ -279,11 +295,14 @@ class Database:
                 reason TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE SET NULL
             )
-        ''')
+            '''
+        )
 
-        cursor.execute('''
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS file_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -291,11 +310,15 @@ class Database:
                 tree_hash TEXT NOT NULL,
                 work_path TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                UNIQUE(session_id, message_id)
+                UNIQUE(session_id, message_id),
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE SET NULL
             )
-        ''')
+            '''
+        )
 
-        cursor.execute('''
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS session_tool_call_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -305,30 +328,14 @@ class Database:
                 tool_name TEXT NOT NULL,
                 success INTEGER NOT NULL,
                 failure_reason TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE SET NULL
             )
-        ''')
+            '''
+        )
 
-        try:
-            cursor.execute('ALTER TABLE tool_permission_requests ADD COLUMN session_id TEXT')
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE llm_calls ADD COLUMN api_profile TEXT')
-        except sqlite3.OperationalError:
-            pass
-        
-        try:
-            cursor.execute('ALTER TABLE chat_messages ADD COLUMN raw_request TEXT')
-        except sqlite3.OperationalError:
-            pass
-        
-        try:
-            cursor.execute('ALTER TABLE chat_messages ADD COLUMN raw_response TEXT')
-        except sqlite3.OperationalError:
-            pass
-        
+    def _create_core_indexes(self, cursor: sqlite3.Cursor) -> None:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_attachments_message ON message_attachments(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_config ON chat_sessions(config_id)')
@@ -341,19 +348,8 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_message ON file_snapshots(session_id, message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_history_session ON session_tool_call_history(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_history_session_tool ON session_tool_call_history(session_id, tool_name)')
-        self.migrate_agent_tasks_up(cursor)
-        
-        conn.commit()
-        conn.close()
 
-    def migrate_agent_tasks_up(self, cursor: Optional[sqlite3.Cursor] = None) -> None:
-        own_connection = False
-        conn: Optional[sqlite3.Connection] = None
-        if cursor is None:
-            own_connection = True
-            conn = self.get_connection()
-            cursor = conn.cursor()
-
+    def _create_agent_tables(self, cursor: sqlite3.Cursor) -> None:
         cursor.execute(
             '''
             CREATE TABLE IF NOT EXISTS agent_instances (
@@ -361,12 +357,13 @@ class Database:
                 session_id TEXT NOT NULL,
                 profile_id TEXT NOT NULL,
                 name TEXT,
-                abilities TEXT,
-                metadata TEXT,
+                abilities TEXT NOT NULL DEFAULT '[]',
+                metadata TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(session_id, profile_id)
+                UNIQUE(session_id, profile_id),
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
             )
             '''
         )
@@ -382,7 +379,7 @@ class Database:
                 assigned_instance_id TEXT,
                 created_by_instance_id TEXT,
                 target_profile_id TEXT,
-                required_abilities TEXT,
+                required_abilities TEXT NOT NULL DEFAULT '[]',
                 parent_task_id TEXT,
                 root_task_id TEXT,
                 source_task_id TEXT,
@@ -394,13 +391,29 @@ class Database:
                 error_code TEXT,
                 error_message TEXT,
                 result TEXT,
-                metadata TEXT,
+                metadata TEXT NOT NULL DEFAULT '{}',
                 legacy_child_session_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT,
-                UNIQUE(session_id, idempotency_key)
+                UNIQUE(session_id, idempotency_key),
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY (assigned_instance_id) REFERENCES agent_instances(id) ON DELETE SET NULL,
+                FOREIGN KEY (created_by_instance_id) REFERENCES agent_instances(id) ON DELETE SET NULL,
+                FOREIGN KEY (parent_task_id) REFERENCES agent_tasks(id) ON DELETE SET NULL,
+                FOREIGN KEY (root_task_id) REFERENCES agent_tasks(id) ON DELETE SET NULL,
+                FOREIGN KEY (source_task_id) REFERENCES agent_tasks(id) ON DELETE SET NULL
+            )
+            '''
+        )
+
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS agent_task_counters (
+                task_id TEXT PRIMARY KEY,
+                next_seq INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
             )
             '''
         )
@@ -418,7 +431,8 @@ class Database:
                 error_code TEXT,
                 error_message TEXT,
                 created_at TEXT NOT NULL,
-                UNIQUE(task_id, seq)
+                UNIQUE(task_id, seq),
+                FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
             )
             '''
         )
@@ -435,7 +449,9 @@ class Database:
                 tree_hash TEXT,
                 checksum TEXT,
                 metadata TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE,
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
             )
             '''
         )
@@ -449,11 +465,14 @@ class Database:
                 edge_type TEXT NOT NULL,
                 metadata TEXT,
                 created_at TEXT NOT NULL,
-                UNIQUE(from_task_id, to_task_id, edge_type)
+                UNIQUE(from_task_id, to_task_id, edge_type),
+                FOREIGN KEY (from_task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE,
+                FOREIGN KEY (to_task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
             )
             '''
         )
 
+    def _create_agent_indexes(self, cursor: sqlite3.Cursor) -> None:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_instances_session ON agent_instances(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_instances_profile ON agent_instances(profile_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_tasks_session_status_created ON agent_tasks(session_id, status, created_at)')
@@ -466,21 +485,32 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_edges_from ON agent_task_edges(from_task_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_edges_to ON agent_task_edges(to_task_id)')
 
-        if own_connection and conn is not None:
-            conn.commit()
-            conn.close()
+    def migrate_agent_tasks_up(self, cursor: Optional[sqlite3.Cursor] = None) -> None:
+        own_connection = cursor is None
+        if own_connection:
+            with self.transaction(immediate=True) as conn:
+                cursor = conn.cursor()
+                self._create_meta_table(cursor)
+                self._create_agent_tables(cursor)
+                self._create_agent_indexes(cursor)
+                self._set_schema_version(cursor)
+            return
+
+        self._create_meta_table(cursor)
+        self._create_agent_tables(cursor)
+        self._create_agent_indexes(cursor)
+        self._set_schema_version(cursor)
 
     def migrate_agent_tasks_down(self) -> None:
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('DROP TABLE IF EXISTS agent_task_edges')
-        cursor.execute('DROP TABLE IF EXISTS agent_artifacts')
-        cursor.execute('DROP TABLE IF EXISTS agent_task_events')
-        cursor.execute('DROP TABLE IF EXISTS agent_tasks')
-        cursor.execute('DROP TABLE IF EXISTS agent_instances')
-        conn.commit()
-        conn.close()
-    
+        with self.transaction(immediate=True) as conn:
+            cursor = conn.cursor()
+            cursor.execute('DROP TABLE IF EXISTS agent_task_edges')
+            cursor.execute('DROP TABLE IF EXISTS agent_artifacts')
+            cursor.execute('DROP TABLE IF EXISTS agent_task_events')
+            cursor.execute('DROP TABLE IF EXISTS agent_task_counters')
+            cursor.execute('DROP TABLE IF EXISTS agent_tasks')
+            cursor.execute('DROP TABLE IF EXISTS agent_instances')
+
     # ==================== LLM Configs ====================
     
     def create_config(self, config: LLMConfigCreate) -> LLMConfig:
@@ -1054,35 +1084,11 @@ class Database:
         return self.get_session(session_id)
     
     def delete_session(self, session_id: str) -> bool:
-        """Delete session and its messages"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT id FROM chat_sessions WHERE parent_session_id = ?', (session_id,))
-        child_rows = cursor.fetchall()
-        conn.close()
-        for row in child_rows:
-            try:
-                child_id = row["id"]
-            except Exception:
-                child_id = row[0] if row else None
-            if child_id:
-                self.delete_session(str(child_id))
-
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            DELETE FROM message_attachments
-            WHERE message_id IN (
-                SELECT id FROM chat_messages WHERE session_id = ?
-            )
-        ''', (session_id,))
-        cursor.execute('DELETE FROM session_tool_call_history WHERE session_id = ?', (session_id,))
-        cursor.execute('DELETE FROM chat_messages WHERE session_id = ?', (session_id,))
-        cursor.execute('DELETE FROM chat_sessions WHERE id = ?', (session_id,))
-        deleted = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-        return deleted
+        """Delete a session tree and rely on foreign-key rules for cleanup."""
+        with self.transaction(immediate=True) as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM chat_sessions WHERE id = ?', (session_id,))
+            return cursor.rowcount > 0
     
     # ==================== Messages ====================
     
@@ -2317,62 +2323,60 @@ class Database:
         legacy_child_session_id: Optional[str] = None,
         initial_event: Optional[Dict[str, Any]] = None
     ) -> AgentTask:
-        conn = self.get_connection()
-        cursor = conn.cursor()
         now = datetime.now().isoformat()
         task_id = str(uuid.uuid4())
-        cursor.execute(
-            '''
-            INSERT INTO agent_tasks (
-                id, session_id, title, input, status, assigned_instance_id, created_by_instance_id, target_profile_id,
-                required_abilities, parent_task_id, root_task_id, source_task_id, loop_group_id, loop_iteration,
-                max_retries, retry_count, idempotency_key, error_code, error_message, result, metadata, legacy_child_session_id,
-                created_at, updated_at, started_at, finished_at
+        with self.transaction(immediate=True) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                INSERT INTO agent_tasks (
+                    id, session_id, title, input, status, assigned_instance_id, created_by_instance_id, target_profile_id,
+                    required_abilities, parent_task_id, root_task_id, source_task_id, loop_group_id, loop_iteration,
+                    max_retries, retry_count, idempotency_key, error_code, error_message, result, metadata, legacy_child_session_id,
+                    created_at, updated_at, started_at, finished_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    task_id,
+                    session_id,
+                    title,
+                    input_text,
+                    status.value if isinstance(status, TaskStatus) else str(status),
+                    assigned_instance_id,
+                    created_by_instance_id,
+                    target_profile_id,
+                    json.dumps(required_abilities or [], ensure_ascii=False),
+                    parent_task_id,
+                    root_task_id,
+                    source_task_id,
+                    loop_group_id,
+                    int(loop_iteration or 0),
+                    int(max_retries or 0),
+                    int(retry_count or 0),
+                    idempotency_key,
+                    error_code.value if isinstance(error_code, TaskErrorCode) else error_code,
+                    error_message,
+                    result,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    legacy_child_session_id,
+                    now,
+                    now,
+                    now if status == TaskStatus.running else None,
+                    now if status in (TaskStatus.succeeded, TaskStatus.failed, TaskStatus.cancelled) else None
+                )
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''',
-            (
-                task_id,
-                session_id,
-                title,
-                input_text,
-                status.value if isinstance(status, TaskStatus) else str(status),
-                assigned_instance_id,
-                created_by_instance_id,
-                target_profile_id,
-                json.dumps(required_abilities or [], ensure_ascii=False),
-                parent_task_id,
-                root_task_id,
-                source_task_id,
-                loop_group_id,
-                int(loop_iteration or 0),
-                int(max_retries or 0),
-                int(retry_count or 0),
-                idempotency_key,
-                error_code.value if isinstance(error_code, TaskErrorCode) else error_code,
-                error_message,
-                result,
-                json.dumps(metadata or {}, ensure_ascii=False),
-                legacy_child_session_id,
-                now,
-                now,
-                now if status == TaskStatus.running else None,
-                now if status in (TaskStatus.succeeded, TaskStatus.failed, TaskStatus.cancelled) else None
-            )
-        )
-        if initial_event:
-            self.append_agent_task_event(
-                task_id=task_id,
-                event_type=str(initial_event.get("event_type") or "task_progress"),
-                status=initial_event.get("status") or status,
-                message=initial_event.get("message"),
-                payload=initial_event.get("payload") or {},
-                error_code=initial_event.get("error_code"),
-                error_message=initial_event.get("error_message"),
-                conn=conn
-            )
-        conn.commit()
-        conn.close()
+            if initial_event:
+                self.append_agent_task_event(
+                    task_id=task_id,
+                    event_type=str(initial_event.get("event_type") or "task_progress"),
+                    status=initial_event.get("status") or status,
+                    message=initial_event.get("message"),
+                    payload=initial_event.get("payload") or {},
+                    error_code=initial_event.get("error_code"),
+                    error_message=initial_event.get("error_message"),
+                    conn=conn
+                )
         task = self.get_agent_task(task_id)
         if not task:
             raise RuntimeError("Failed to create agent task")
@@ -2439,6 +2443,34 @@ class Database:
         if not fields:
             return self.get_agent_task(task_id)
 
+        allowed_fields = {
+            "title",
+            "input",
+            "status",
+            "assigned_instance_id",
+            "created_by_instance_id",
+            "target_profile_id",
+            "required_abilities",
+            "parent_task_id",
+            "root_task_id",
+            "source_task_id",
+            "loop_group_id",
+            "loop_iteration",
+            "max_retries",
+            "retry_count",
+            "idempotency_key",
+            "error_code",
+            "error_message",
+            "result",
+            "metadata",
+            "legacy_child_session_id",
+            "started_at",
+            "finished_at",
+        }
+        unknown_fields = set(fields.keys()) - allowed_fields
+        if unknown_fields:
+            raise ValueError(f"Unsupported agent task fields: {sorted(unknown_fields)}")
+
         serialized: Dict[str, Any] = {}
         for key, value in fields.items():
             if key in ("required_abilities", "metadata") and value is not None:
@@ -2461,12 +2493,28 @@ class Database:
         serialized["updated_at"] = datetime.now().isoformat()
         assignments = ", ".join([f"{key} = ?" for key in serialized.keys()])
         values = list(serialized.values()) + [task_id]
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute(f"UPDATE agent_tasks SET {assignments} WHERE id = ?", values)
-        conn.commit()
-        conn.close()
+        with self.transaction(immediate=True) as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"UPDATE agent_tasks SET {assignments} WHERE id = ?", values)
         return self.get_agent_task(task_id)
+
+    def _allocate_agent_task_event_seq(self, cursor: sqlite3.Cursor, task_id: str) -> int:
+        cursor.execute(
+            'INSERT OR IGNORE INTO agent_task_counters (task_id, next_seq) VALUES (?, 1)',
+            (task_id,)
+        )
+        cursor.execute(
+            'UPDATE agent_task_counters SET next_seq = next_seq + 1 WHERE task_id = ?',
+            (task_id,)
+        )
+        cursor.execute(
+            'SELECT next_seq - 1 AS seq FROM agent_task_counters WHERE task_id = ?',
+            (task_id,)
+        )
+        row = cursor.fetchone()
+        if not row or row['seq'] is None:
+            raise RuntimeError(f"Failed to allocate event sequence for task {task_id}")
+        return int(row['seq'])
 
     def append_agent_task_event(
         self,
@@ -2483,17 +2531,9 @@ class Database:
         own_connection = conn is None
         if own_connection:
             conn = self.get_connection()
+            conn.execute('BEGIN IMMEDIATE')
         cursor = conn.cursor()
-        cursor.execute(
-            '''
-            SELECT COALESCE(MAX(seq), 0) AS max_seq
-            FROM agent_task_events
-            WHERE task_id = ?
-            ''',
-            (task_id,)
-        )
-        row = cursor.fetchone()
-        next_seq = int((row["max_seq"] if row and row["max_seq"] is not None else 0) or 0) + 1
+        next_seq = self._allocate_agent_task_event_seq(cursor, task_id)
         now = datetime.now().isoformat()
         normalized_status = status.value if isinstance(status, TaskStatus) else status
         normalized_code = error_code.value if isinstance(error_code, TaskErrorCode) else error_code
