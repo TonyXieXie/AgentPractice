@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict
 
+from runtime_paths import get_project_root, get_tools_config_path as resolve_runtime_tools_config_path
+
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": {
@@ -14,9 +16,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "list_files": True,
         "run_shell": True,
         "code_ast": True,
-        "spawn_subagent": True,
-        "calculator": False,
-        "weather": False
+        "spawn_subagent": True
     },
     "files": {
         "max_bytes": 20000
@@ -67,37 +67,8 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return result
 
 
-def _get_project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def _normalize_config_path(path: Path) -> Path:
-    if path.exists() and path.is_file():
-        return path
-    if path.suffix:
-        return path
-    return path / "tools_config.json"
-
-
 def _get_config_file_path() -> Path:
-    env_path = os.getenv("TOOLS_CONFIG_PATH")
-    if env_path:
-        return _normalize_config_path(Path(env_path))
-
-    tauri_data_dir = os.getenv("TAURI_AGENT_DATA_DIR")
-    if tauri_data_dir:
-        return _normalize_config_path(Path(tauri_data_dir))
-
-    root = _get_project_root()
-    default_path = root / "tools_config.json"
-    if default_path.exists():
-        return default_path
-
-    backend_path = root / "python-backend" / "tools_config.json"
-    if backend_path.exists():
-        return backend_path
-
-    return default_path
+    return resolve_runtime_tools_config_path()
 
 
 def get_tool_config_path() -> str:
@@ -114,7 +85,7 @@ def _load_config_file() -> Dict[str, Any]:
 def _load_config() -> Dict[str, Any]:
     config = _deep_merge(_DEFAULT_CONFIG, _load_config_file())
     root_override = os.getenv("TOOLS_PROJECT_ROOT") or config.get("project_root")
-    root_path = Path(root_override) if root_override else _get_project_root()
+    root_path = Path(root_override) if root_override else get_project_root()
     config["project_root"] = str(root_path.resolve())
 
     search = config.setdefault("search", {})

@@ -22,7 +22,8 @@ from tools.config import get_tool_config
 from context_estimate import build_context_estimate
 from llm_client import LLMTransientError
 from app_config import get_app_config
-from database import db
+from repositories import chat_repository
+from repositories.permission_repository import create_permission_request, get_permission_request, update_permission_request
 from mcp_tools import build_mcp_tool_name, persist_mcp_tool_approval, safe_mcp_tool_name
 from tools.mcp_tool import MCPTool
 from context_compress import build_history_for_llm, maybe_compress_context, summarize_dialogue
@@ -84,7 +85,7 @@ async def _wait_for_mcp_permission(
             except Exception:
                 pass
         try:
-            record = db.get_permission_request(request_id)
+            record = get_permission_request(request_id)
             if record and record.get("status") and record["status"] != "pending":
                 return record["status"]
         except Exception:
@@ -92,7 +93,7 @@ async def _wait_for_mcp_permission(
 
         if timeout_sec is not None and (time.monotonic() - start) >= timeout_sec:
             try:
-                db.update_permission_request(request_id, "timeout")
+                update_permission_request(request_id, "timeout")
             except Exception:
                 pass
             return "timeout"
@@ -456,15 +457,15 @@ class ReActAgent(AgentStrategy):
                 return None
 
             context_summary = new_summary
-            latest_call_id = db.get_latest_llm_call_id(session_id)
+            latest_call_id = chat_repository.get_latest_llm_call_id(session_id)
             if latest_call_id:
                 last_compressed_call_id = latest_call_id
-                last_compressed_message_id = db.get_max_message_id_for_llm_call(
+                last_compressed_message_id = chat_repository.get_max_message_id_for_llm_call(
                     session_id,
                     latest_call_id
                 )
             try:
-                db.update_session_context(session_id, context_summary, last_compressed_call_id)
+                chat_repository.update_session_context(session_id, context_summary, last_compressed_call_id)
             except Exception as exc:
                 print(f"[Context Compress] Failed to update session context: {exc}")
 
@@ -525,7 +526,7 @@ class ReActAgent(AgentStrategy):
                 last_compressed_call_id = updated_call_id
                 last_compressed_message_id = updated_message_id
                 try:
-                    db.update_session_context(session_id, context_summary, last_compressed_call_id)
+                    chat_repository.update_session_context(session_id, context_summary, last_compressed_call_id)
                 except Exception as exc:
                     print(f"[Context Compress] Failed to update session context: {exc}")
 
@@ -631,15 +632,15 @@ class ReActAgent(AgentStrategy):
                 return None
 
             context_summary = new_summary
-            latest_call_id = db.get_latest_llm_call_id(session_id)
+            latest_call_id = chat_repository.get_latest_llm_call_id(session_id)
             if latest_call_id:
                 last_compressed_call_id = latest_call_id
-                last_compressed_message_id = db.get_max_message_id_for_llm_call(
+                last_compressed_message_id = chat_repository.get_max_message_id_for_llm_call(
                     session_id,
                     latest_call_id
                 )
             try:
-                db.update_session_context(session_id, context_summary, last_compressed_call_id)
+                chat_repository.update_session_context(session_id, context_summary, last_compressed_call_id)
             except Exception as exc:
                 print(f"[Context Compress] Failed to update session context: {exc}")
 
@@ -1540,7 +1541,7 @@ class ReActAgent(AgentStrategy):
                 last_compressed_call_id = updated_call_id
                 last_compressed_message_id = updated_message_id
                 try:
-                    db.update_session_context(session_id, context_summary, last_compressed_call_id)
+                    chat_repository.update_session_context(session_id, context_summary, last_compressed_call_id)
                 except Exception as exc:
                     print(f"[Context Compress] Failed to update session context: {exc}")
 
@@ -1965,7 +1966,7 @@ class ReActAgent(AgentStrategy):
 
             request_id = None
             try:
-                request_id = db.create_permission_request(
+                request_id = create_permission_request(
                     tool_name=display_label,
                     action="mcp_approval",
                     path=display_label,
@@ -2105,7 +2106,7 @@ class ReActAgent(AgentStrategy):
         normalized_tool_name = str(tool_name or "").strip() or "unknown"
         normalized_reason = self._short_failure_reason(failure_reason, "failed") if not success else None
         try:
-            db.save_session_tool_call_history(
+            chat_repository.save_session_tool_call_history(
                 session_id=session_id,
                 message_id=message_id,
                 agent_type=agent_type,
@@ -3006,8 +3007,7 @@ class ReActAgent(AgentStrategy):
 
     def _update_llm_processed(self, llm_call_id: int, payload: Dict[str, Any]) -> None:
         try:
-            from database import db
-            db.update_llm_call_processed(llm_call_id, payload)
+            chat_repository.update_llm_call_processed(llm_call_id, payload)
         except Exception:
             pass
 

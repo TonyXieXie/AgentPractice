@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from runtime_paths import get_app_config_path as resolve_runtime_app_config_path
+
 
 _DEFAULT_APP_CONFIG: Dict[str, Any] = {
     "llm": {
@@ -124,37 +126,11 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return result
 
 
-def _get_project_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-def _normalize_config_path(path: Path) -> Path:
-    if path.exists() and path.is_dir():
-        return path / "app_config.json"
-    return path
-
-
 def _get_config_file_path() -> Path:
     global _CONFIG_PATH_OVERRIDE
     if _CONFIG_PATH_OVERRIDE is not None:
         return _CONFIG_PATH_OVERRIDE
-    env_path = os.getenv("APP_CONFIG_PATH")
-    if env_path:
-        return _normalize_config_path(Path(env_path))
-
-    tauri_data_dir = os.getenv("TAURI_AGENT_DATA_DIR")
-    if tauri_data_dir:
-        return _normalize_config_path(Path(tauri_data_dir))
-
-    root = _get_project_root()
-    default_path = root / "app_config.json"
-    if default_path.exists():
-        return default_path
-
-    backend_path = root / "python-backend" / "app_config.json"
-    if backend_path.exists():
-        return backend_path
-
-    return default_path
+    return resolve_runtime_app_config_path()
 
 
 def get_app_config_path() -> str:
@@ -512,7 +488,6 @@ def get_app_config() -> Dict[str, Any]:
 
 def update_app_config(patch: Dict[str, Any]) -> Dict[str, Any]:
     global _APP_CONFIG
-    global _CONFIG_PATH_OVERRIDE
     if not isinstance(patch, dict):
         raise ValueError("Config update must be a JSON object.")
     current_file = _load_config_file()
@@ -520,16 +495,7 @@ def update_app_config(patch: Dict[str, Any]) -> Dict[str, Any]:
     merged_file = _normalize_config(merged_file)
     path = _get_config_file_path()
     content = json.dumps(merged_file, ensure_ascii=False, indent=2)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-    except OSError:
-        fallback_path = Path.home() / ".tauri-agent" / "app_config.json"
-        if fallback_path != path:
-            fallback_path.parent.mkdir(parents=True, exist_ok=True)
-            fallback_path.write_text(content, encoding="utf-8")
-            _CONFIG_PATH_OVERRIDE = fallback_path
-        else:
-            raise
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
     _APP_CONFIG = _load_config()
     return _APP_CONFIG

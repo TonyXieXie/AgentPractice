@@ -4,7 +4,7 @@ import os
 import re
 
 from models import LLMConfig
-from database import db
+from repositories import chat_repository
 from mcp_tools import safe_mcp_tool_name
 
 
@@ -114,10 +114,6 @@ def _default_tool_args(tool_name: Optional[str], raw_text: str) -> Dict[str, Any
         return {"pattern": raw_text}
     if name == "search":
         return {"query": raw_text}
-    if name == "calculator":
-        return {"expression": raw_text}
-    if name == "weather":
-        return {"city": raw_text}
     return {"input": raw_text}
 
 
@@ -262,7 +258,7 @@ def build_history_for_llm(
     code_map: Optional[str],
     trunc_cfg: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
-    messages = db.get_dialogue_messages_after(session_id, after_message_id)
+    messages = chat_repository.list_dialogue_messages_after(session_id, after_message_id)
     filtered = []
     for msg in messages:
         msg_for_history = dict(msg)
@@ -279,7 +275,7 @@ def build_history_for_llm(
     assistant_ids = [msg.get("id") for msg in filtered if msg.get("role") == "assistant"]
     steps_by_message: Dict[int, List[Dict[str, Any]]] = {}
     if assistant_ids:
-        steps = db.get_session_agent_steps_for_messages(session_id, assistant_ids)
+        steps = chat_repository.list_agent_steps_for_messages(session_id, assistant_ids)
         for step in steps:
             message_id = step.get("message_id")
             if not message_id:
@@ -422,7 +418,7 @@ async def maybe_compress_context(
 
     summary = current_summary or ""
     last_call_id = int(last_compressed_call_id or 0)
-    last_message_id = db.get_max_message_id_for_llm_call(session_id, last_call_id) if last_call_id else None
+    last_message_id = chat_repository.get_max_message_id_for_llm_call(session_id, last_call_id) if last_call_id else None
     _debug_log(
         f"start: max_tokens={max_tokens} start_pct={start_pct} target_pct={target_pct} "
         f"keep_recent_calls={keep_recent_calls} step_calls={step_calls} last_call_id={last_call_id} "
@@ -430,7 +426,7 @@ async def maybe_compress_context(
     )
 
     def build_uncompressed_messages(after_id: Optional[int]) -> List[Dict[str, Any]]:
-        messages = db.get_dialogue_messages_after(session_id, after_id)
+        messages = chat_repository.list_dialogue_messages_after(session_id, after_id)
         filtered = []
         for msg in messages:
             msg_for_history = dict(msg)
@@ -469,7 +465,7 @@ async def maybe_compress_context(
     did_compress = False
 
     while True:
-        calls_after = db.get_llm_call_metas_after(session_id, last_call_id)
+        calls_after = chat_repository.get_llm_call_metas_after(session_id, last_call_id)
         if len(calls_after) <= keep_window:
             _debug_log(f"stop: calls_after={len(calls_after)} <= keep_window={keep_window}")
             break
@@ -500,12 +496,12 @@ async def maybe_compress_context(
             continue
 
         boundary_call_id = int(boundary_call["id"])
-        boundary_message_id = db.get_max_message_id_for_llm_call(session_id, boundary_call_id)
+        boundary_message_id = chat_repository.get_max_message_id_for_llm_call(session_id, boundary_call_id)
         if not boundary_message_id:
             _debug_log(f"stop: no boundary_message_id for call {boundary_call_id}")
             break
 
-        messages_between = db.get_dialogue_messages_between(
+        messages_between = chat_repository.list_dialogue_messages_between(
             session_id,
             (last_message_id or 0) + 1,
             boundary_message_id

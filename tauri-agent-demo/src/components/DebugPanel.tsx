@@ -1,5 +1,5 @@
 ﻿import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
-import { runAstTool, getAstCache, getAstCacheFile, getCodeMap } from '../api';
+import { runAstTool, getAstCache, getAstCacheFile, getCodeMap } from '../shared/api/config';
 import { Message, LLMCall, AstPayload, AstRequest, AgentMode, AstCacheResponse, AstCacheFile, CodeMapResponse, SessionToolStats } from '../types';
 import AstViewer from './AstViewer';
 import './DebugPanel.css';

@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
-import { listPtys, readPty, type PtyListItem } from '../api';
+import { listPtys, readPty, type PtyListItem } from '../shared/api/pty';
 import { ptyStore, usePtySessionSnapshot, type PtyStoreEntry } from '../ptyStore';
 import type { PtyInteractionController } from './ptyInteraction';
 import PtySessionCard from './PtySessionCard';

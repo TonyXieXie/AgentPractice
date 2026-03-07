@@ -5,8 +5,9 @@ from datetime import datetime
 import sqlite3
 import uuid
 from models import LLMConfig, LLMConfigCreate, LLMConfigUpdate, ChatMessage, ChatMessageCreate, ChatSession, ChatSessionCreate, ChatSessionUpdate
+from runtime_paths import get_database_path
 
-DATABASE_PATH = os.getenv("TAURI_AGENT_DB_PATH", "chat_app.db")
+DATABASE_PATH = str(get_database_path())
 
 class Database:
     def __init__(self, db_path: str = DATABASE_PATH):
@@ -1103,22 +1104,6 @@ class Database:
         conn.close()
         return dict(row) if row else None
 
-    def get_previous_user_message_id(self, session_id: str, before_message_id: int) -> Optional[int]:
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id
-            FROM chat_messages
-            WHERE session_id = ? AND role = 'user' AND id < ?
-            ORDER BY id DESC
-            LIMIT 1
-        ''', (session_id, before_message_id))
-        row = cursor.fetchone()
-        conn.close()
-        if not row:
-            return None
-        return int(row["id"])
-
     def get_dialogue_messages_between(
         self,
         session_id: str,
@@ -1236,35 +1221,6 @@ class Database:
             "created_at": created_at
         }
 
-    def save_message_attachments(self, message_id: int, attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        saved: List[Dict[str, Any]] = []
-        for item in attachments:
-            saved.append(
-                self.save_message_attachment(
-                    message_id=message_id,
-                    name=item.get("name"),
-                    mime=item.get("mime"),
-                    data=item.get("data") or b"",
-                    width=item.get("width"),
-                    height=item.get("height"),
-                    size=item.get("size")
-                )
-            )
-        return saved
-
-    def get_message_attachments(self, message_id: int) -> List[Dict[str, Any]]:
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id, message_id, name, mime, width, height, size, created_at
-            FROM message_attachments
-            WHERE message_id = ?
-            ORDER BY created_at ASC
-        ''', (message_id,))
-        rows = cursor.fetchall()
-        conn.close()
-        return [dict(row) for row in rows]
-
     def get_attachment(self, attachment_id: int) -> Optional[Dict[str, Any]]:
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -1298,33 +1254,6 @@ class Database:
         
         return step_id
     
-    def get_agent_steps(self, message_id: int) -> List[Dict[str, Any]]:
-        """Get agent steps for message"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, step_type, content, metadata, sequence, timestamp
-            FROM agent_steps
-            WHERE message_id = ?
-            ORDER BY sequence ASC
-        ''', (message_id,))
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        return [
-            {
-                "id": row["id"],
-                "step_type": row["step_type"],
-                "content": row["content"],
-                "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                "sequence": row["sequence"],
-                "timestamp": row["timestamp"]
-            }
-            for row in rows
-        ]
-
     def get_session_agent_steps(self, session_id: str) -> List[Dict[str, Any]]:
         """Get agent steps for all messages in a session"""
         conn = self.get_connection()
@@ -1812,22 +1741,6 @@ class Database:
             return None
         value = row["id"]
         return int(value) if value is not None else None
-
-    def update_session_agent_type(self, session_id: str, agent_type: str):
-        """Update session agent type"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            UPDATE chat_sessions
-            SET agent_type = ?, updated_at = ?
-            WHERE id = ?
-        ''', (agent_type, datetime.now().isoformat(), session_id))
-        
-        conn.commit()
-        conn.close()
-
-    # ==================== Rollback ====================
 
     def rollback_session(self, session_id: str, message_id: int) -> Optional[Dict[str, Any]]:
         conn = self.get_connection()

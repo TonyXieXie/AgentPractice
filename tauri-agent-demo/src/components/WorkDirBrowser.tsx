@@ -491,7 +491,7 @@ const decodeUtf8 = (bytes: Uint8Array) => {
   }
 };
 
-const readTextFileSafe = async (path: string) => {
+const readTextFileSafe = async (path: string): Promise<string> => {
   let timer: number | null = null;
   const timeout = new Promise<Uint8Array | string>((_, reject) => {
     timer = window.setTimeout(() => reject(new Error('Read timeout')), READ_TEXT_TIMEOUT_MS);
@@ -501,7 +501,7 @@ const readTextFileSafe = async (path: string) => {
       const bytes = (await Promise.race([readFile(path), timeout])) as Uint8Array;
       return decodeUtf8(bytes);
     }
-    return await Promise.race([readTextFile(path), timeout]);
+    return (await Promise.race([readTextFile(path), timeout])) as string;
   } finally {
     if (timer != null) {
       window.clearTimeout(timer);
@@ -527,7 +527,7 @@ const readTextFromBackend = async (path: string) => {
   }
 };
 
-const readTextFileWithFallback = async (path: string) => {
+const readTextFileWithFallback = async (path: string): Promise<string> => {
   if (IS_MAC) {
     try {
       return await readTextFromBackend(path);
@@ -895,7 +895,7 @@ function WorkDirBrowser({
       if (!proceed) return;
     }
 
-    const payload: Record<string, any> = { root: astSettingsRoot };
+    const payload: { root: string; [key: string]: any } = { root: astSettingsRoot };
     if ('ignore_paths' in settings) {
       payload.ignore_paths = normalizeAstImportList(settings.ignore_paths);
     }

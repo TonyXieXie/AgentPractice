@@ -82,6 +82,30 @@ fn pick_backend_port() -> Result<u16, String> {
     Ok(port)
 }
 
+fn resolve_runtime_data_dir<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
+    if let Ok(value) = std::env::var("TAURI_AGENT_DATA_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            std::fs::create_dir_all(&path)
+                .map_err(|err| format!("Failed to create runtime data directory: {err}"))?;
+            return Ok(path);
+        }
+    }
+
+    let path = if tauri::is_dev() {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join(".tauri-agent-data")
+    } else {
+        app.path()
+            .app_data_dir()
+            .map_err(|_| "Failed to resolve app data directory.".to_string())?
+    };
+
+    std::fs::create_dir_all(&path)
+        .map_err(|err| format!("Failed to create runtime data directory: {err}"))?;
+    Ok(path)
+}
+
 fn spawn_backend<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     port: u16,
@@ -94,29 +118,13 @@ fn spawn_backend<R: tauri::Runtime>(
         return Err("External backend enabled; skipping sidecar spawn.".to_string());
     }
     eprintln!("[Backend] Spawning sidecar backend.");
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| "Failed to resolve app data directory.".to_string())?;
-    std::fs::create_dir_all(&app_data_dir)
-        .map_err(|err| format!("Failed to create app data directory: {err}"))?;
+    let runtime_data_dir = resolve_runtime_data_dir(app)?;
 
     let db_path = std::env::var("TAURI_AGENT_DB_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            if tauri::is_dev() {
-                let dev_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("..")
-                    .join("python-backend")
-                    .join("chat_app.db");
-                if dev_candidate.exists() {
-                    return dev_candidate;
-                }
-            }
-            app_data_dir.join("chat_app.db")
-        });
-    let app_config_path = app_data_dir.join("app_config.json");
-    let tools_config_path = app_data_dir.join("tools_config.json");
+        .unwrap_or_else(|_| runtime_data_dir.join("chat_app.db"));
+    let app_config_path = runtime_data_dir.join("app_config.json");
+    let tools_config_path = runtime_data_dir.join("tools_config.json");
     let backend_path = resolve_backend_path(app)?;
 
     let mut command = Command::new(backend_path);
@@ -125,14 +133,14 @@ fn spawn_backend<R: tauri::Runtime>(
         .arg("127.0.0.1")
         .arg("--port")
         .arg(port.to_string());
-    command.env("TAURI_AGENT_DATA_DIR", &app_data_dir);
+    command.env("TAURI_AGENT_DATA_DIR", &runtime_data_dir);
     command.env("TAURI_AGENT_DB_PATH", &db_path);
     command.env("APP_CONFIG_PATH", &app_config_path);
     command.env("TOOLS_CONFIG_PATH", &tools_config_path);
     if tauri::is_dev() {
         command.env("TAURI_AGENT_DEV", "1");
     }
-    command.current_dir(&app_data_dir);
+    command.current_dir(&runtime_data_dir);
     if !tauri::is_dev() {
         command.stdout(Stdio::null()).stderr(Stdio::null());
     }

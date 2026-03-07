@@ -5,11 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:frontend": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "dev:backend": "set TAURI_AGENT_DEV=1 && python-backend\\venv\\Scripts\\python -m uvicorn python-backend.main:app --reload --port 8000",
-    "dev:all": "concurrently \"npm run dev:backend\" \"npm run tauri dev\""
+    "dev:backend": "cmd /c \"set TAURI_AGENT_DEV=1&& set TAURI_AGENT_DATA_DIR=%CD%\\.tauri-agent-data&& cd python-backend&& venv\\Scripts\\python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000 --no-use-colors\"",
+    "dev:desktop": "cmd /c \"set TAURI_AGENT_EXTERNAL_BACKEND=1&& set VITE_API_BASE_URL=http://127.0.0.1:8000&& set TAURI_AGENT_DATA_DIR=%CD%\\.tauri-agent-data&& tauri dev --config src-tauri\\tauri.conf.dev.json\"",
+    "dev:all": "concurrently \"npm run dev:backend\" \"npm run dev:desktop\""
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.1",

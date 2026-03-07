@@ -1,6 +1,9 @@
 @echo off
 title Frontend - Tauri Desktop App
 cd /d "%~dp0"
+set "TAURI_AGENT_DATA_DIR=%~dp0.tauri-agent-data"
+set "TAURI_AGENT_EXTERNAL_BACKEND=1"
+set "VITE_API_BASE_URL=http://127.0.0.1:8000"
 cls
 echo ========================================
 echo   Tauri Desktop App (Frontend)
@@ -10,18 +13,10 @@ echo Starting Tauri desktop application...
 echo This will start both Vite and open the desktop window
 echo Press Ctrl+C to stop the app
 echo.
-echo ========================================
-echo.
-set "PORT_FILE=%~dp0backend_port.txt"
-set "BACKEND_PORT=8000"
-if exist "%PORT_FILE%" (
-  for /f "usebackq delims=" %%P in ("%PORT_FILE%") do set "BACKEND_PORT=%%P"
-)
-set /a PORT_TEST=%BACKEND_PORT% >nul 2>&1
-if errorlevel 1 set "BACKEND_PORT=8000"
-set "VITE_API_BASE_URL=http://127.0.0.1:%BACKEND_PORT%"
-set "TAURI_AGENT_EXTERNAL_BACKEND=1"
 echo [Info] Using backend: %VITE_API_BASE_URL%
+echo [Info] Runtime data dir: %TAURI_AGENT_DATA_DIR%
+echo.
+echo ========================================
 echo.
 set "NODE_HOME=%~dp0..\.tools\node-v20.19.0-win-x64"
 if exist "%NODE_HOME%\node.exe" (

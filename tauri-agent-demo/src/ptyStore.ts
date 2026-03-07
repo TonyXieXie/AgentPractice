@@ -7,7 +7,7 @@ import type {
   PtyReadResponse,
   PtyResyncRequiredEvent,
   PtyStateEvent
-} from './api';
+} from './shared/api';
 import { sanitizePtyChunk, stripAnsiForDisplay } from './ptyAnsi';
 
 export type PtyMode = 'ephemeral' | 'persistent' | string;
@@ -259,21 +259,23 @@ class PtyStore {
       nextStatus !== entry.status ||
       nextWaitingInput !== entry.waiting_input ||
       nextWaitReason !== entry.wait_reason ||
-      nextCursor !== entry.cursor ||
       nextPtyMode !== entry.pty_mode ||
       nextCommand !== entry.command ||
       nextExitCode !== entry.exit_code ||
       nextPtyMessageId !== entry.pty_message_id ||
       nextPtyLive !== entry.pty_live ||
       nextNeedsResync !== entry.needs_resync;
-    const seqOrHashChanged = nextSeq !== entry.seq || nextScreenHash !== entry.screen_hash;
-    if (!visualOrStateChanged && !seqOrHashChanged) {
+    const cursorChanged = nextCursor !== entry.cursor;
+    const seqHashOrCursorChanged =
+      nextSeq !== entry.seq || nextScreenHash !== entry.screen_hash || cursorChanged;
+    if (!visualOrStateChanged && !seqHashOrCursorChanged) {
       return;
     }
-    // Drop UI notifications for seq/screen_hash-only updates to avoid render flicker on high-frequency heartbeats.
-    if (!visualOrStateChanged && seqOrHashChanged) {
+    // Drop UI notifications for seq/screen_hash/cursor-only updates to avoid render flicker on high-frequency heartbeats.
+    if (!visualOrStateChanged && seqHashOrCursorChanged) {
       entry.seq = nextSeq;
       entry.screen_hash = nextScreenHash;
+      entry.cursor = nextCursor;
       entry.updated_at = Date.now();
       return;
     }
@@ -321,9 +323,12 @@ class PtyStore {
 
   applyReadResponse(sessionId: string, response: PtyReadResponse) {
     if (!sessionId || !response?.pty_id) return;
+    const readChunk = String(response.chunk || '');
+    const hasScreenText = typeof response.screen_text === 'string' && response.screen_text.length > 0;
+    const effectiveReset = Boolean(response.reset) && (readChunk.length > 0 || hasScreenText);
     this.updateEntry(sessionId, response.pty_id, {
-      chunk: response.chunk || '',
-      reset: Boolean(response.reset),
+      chunk: readChunk,
+      reset: effectiveReset,
       rendered_content: typeof response.screen_text === 'string' ? response.screen_text : undefined,
       status: response.status,
       waiting_input: parseBool(response.waiting_input),

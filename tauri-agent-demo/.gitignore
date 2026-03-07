@@ -32,13 +32,19 @@ ENV/
 venv.invalid.*/
 
 # Database files (runtime data)
-# Note: chat_app.db is kept in git for project setup
-# *.db
-# *.sqlite
-# *.sqlite3
+*.db
+*.sqlite
+*.sqlite3
+backend_port.txt
+.tauri-agent-data/
+output/
 
 # Local runtime DB copies
 python-backend/chat_app.db
+chat_app.db
+app_config.json
+tools_config.json
+ast_settings.json
 
 # Python distribution / packaging
 .Python

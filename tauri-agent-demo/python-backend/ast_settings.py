@@ -3,7 +3,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app_config import get_app_config_path
+from runtime_paths import get_ast_settings_path
 
 
 DEFAULT_MAX_FILES = 500
@@ -64,8 +64,7 @@ def is_within_root(path: Path, root: Path) -> bool:
 
 
 def _get_settings_path() -> Path:
-    config_path = Path(get_app_config_path())
-    return config_path.parent / "ast_settings.json"
+    return get_ast_settings_path()
 
 
 def _load_settings_file() -> Dict[str, Any]:

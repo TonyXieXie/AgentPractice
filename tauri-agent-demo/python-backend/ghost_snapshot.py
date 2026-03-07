@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 
-from database import db
+from repositories import chat_repository
 
 
 def _run_git(args: list, cwd: str, env: Optional[dict] = None) -> str:
@@ -139,12 +139,12 @@ def ensure_snapshot(session_id: str, message_id: int, work_path: str) -> Optiona
     if not session_id or not message_id or not work_path:
         return None
 
-    existing = db.get_file_snapshot(session_id, message_id)
+    existing = chat_repository.get_file_snapshot(session_id, message_id)
     if existing:
         return existing.get("tree_hash")
 
     tree_hash = create_snapshot_tree(work_path)
-    db.create_file_snapshot(session_id, message_id, tree_hash, work_path)
+    chat_repository.create_file_snapshot(session_id, message_id, tree_hash, work_path)
     return tree_hash
 
 

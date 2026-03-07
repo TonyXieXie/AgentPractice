@@ -298,7 +298,7 @@ class LLMClient:
         response_text: str
     ) -> Optional[int]:
         try:
-            from database import db
+            from repositories import chat_repository
         except Exception:
             return None
 
@@ -311,7 +311,7 @@ class LLMClient:
         iteration = debug_ctx.get("iteration")
 
         response_payload = response_json if self._should_store_raw(debug_ctx) else None
-        llm_call_id = db.save_llm_call(
+        llm_call_id = chat_repository.save_llm_call(
             session_id=session_id,
             message_id=message_id,
             agent_type=agent_type,

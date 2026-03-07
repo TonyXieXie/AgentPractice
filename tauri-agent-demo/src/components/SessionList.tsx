@@ -1,6 +1,6 @@
 import { useMemo, useState, useEffect, useRef, type CSSProperties } from 'react';
 import { ChatSession } from '../types';
-import { getSessions, deleteSession, updateSession, copySession } from '../api';
+import { getSessions, deleteSession, updateSession, copySession } from '../shared/api/sessions';
 import ConfirmDialog from './ConfirmDialog';
 import './SessionList.css';
 

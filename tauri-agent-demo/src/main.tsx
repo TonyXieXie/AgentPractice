@@ -2,7 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import WorkDirWindow from "./WorkDirWindow";
-import { resolveApiBaseUrl } from "./api";
+import { resolveApiBaseUrl } from "./shared/api/base";
 
 const params = new URLSearchParams(window.location.search);
 const isWorkdirWindow = params.get("window") === "workdir";

@@ -9,7 +9,7 @@ from tree_sitter_languages import get_language, get_parser
 
 from ast_index import get_ast_index
 from app_config import get_app_config
-from database import db
+from repositories import chat_repository
 
 
 _WORD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -1055,7 +1055,7 @@ def build_code_map_prompt(session_id: str, work_path: Optional[str]) -> Optional
 
     messages = [
         getattr(msg, "content", "")
-        for msg in db.get_session_messages(session_id)
+        for msg in chat_repository.list_messages(session_id)
         if getattr(msg, "role", None) == "user"
     ]
     for symbol in all_defs:

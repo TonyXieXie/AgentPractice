@@ -4,11 +4,7 @@ chcp 65001 >nul
 set PYTHONUTF8=1
 title Backend Server - FastAPI
 cd /d "%~dp0python-backend"
-set "DB_DIR=%LOCALAPPDATA%\TauriAgent"
-set "DB_PATH=%DB_DIR%\chat_app.db"
-if not exist "%DB_DIR%" mkdir "%DB_DIR%" >nul 2>&1
-if not exist "%DB_PATH%" if exist "%~dp0python-backend\chat_app.db" copy /y "%~dp0python-backend\chat_app.db" "%DB_PATH%" >nul
-set "TAURI_AGENT_DB_PATH=%DB_PATH%"
+set "TAURI_AGENT_DATA_DIR=%~dp0.tauri-agent-data"
 set "PTY_DEBUG=1"
 set "PTY_STREAM_DEBUG=1"
 set "PTY_STREAM_LOG_INTERVAL_SEC=5"
@@ -18,24 +14,8 @@ echo ========================================
 echo   Backend Server (FastAPI)
 echo ========================================
 echo.
-set "BACKEND_PORT=8000"
-set "PORT_IN_USE="
-:CHECK_PORT
-for /f "tokens=1" %%A in ('netstat -ano ^| findstr /R /C:":%BACKEND_PORT% .*LISTENING"') do set "PORT_IN_USE=1"
-if defined PORT_IN_USE (
-  set "PORT_IN_USE="
-  set /a BACKEND_PORT+=1
-  if !BACKEND_PORT! GTR 8100 (
-    echo [Error] No free port found in range 8000-8100.
-    pause
-    exit /b 1
-  )
-  goto CHECK_PORT
-)
-set "PORT_FILE=%~dp0backend_port.txt"
-> "%PORT_FILE%" echo %BACKEND_PORT%
-echo [Info] Backend port: %BACKEND_PORT% (saved to %PORT_FILE%)
-echo Starting FastAPI server on port %BACKEND_PORT% (auto-reload)...
+echo [Info] Runtime data dir: %TAURI_AGENT_DATA_DIR%
+echo Starting FastAPI server on port 8000 (auto-reload)...
 echo Press Ctrl+C to stop the server
 echo.
 echo ========================================
@@ -53,7 +33,7 @@ if not exist "%PY%" (
   "!SYS_PY!" -m venv "%~dp0python-backend\venv"
   "%~dp0python-backend\venv\Scripts\python.exe" -m pip install -r "%~dp0python-backend\requirements.txt"
 )
-"%PY%" -m uvicorn main:app --reload --port %BACKEND_PORT% --no-use-colors
+"%PY%" -m uvicorn main:app --reload --host 127.0.0.1 --port 8000 --no-use-colors
 pause
 goto :eof
 

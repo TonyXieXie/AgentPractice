@@ -1,4 +1,4 @@
-import type { AgentStep } from '../api';
+import type { AgentStep } from '../shared/api/agent';
 
 export type PtyOwnerByPtyId = Record<string, string>;
 

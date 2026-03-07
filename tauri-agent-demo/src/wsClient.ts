@@ -1,4 +1,4 @@
-import { API_BASE_URL } from './api';
+import { API_BASE_URL } from './shared/api/base';
 import type { WsEvent, WsStatusListener } from './wsTypes';
 
 type EventListener = (event: WsEvent) => void;

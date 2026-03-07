@@ -130,8 +130,8 @@ class SimpleAgent(AgentStrategy):
 
             llm_call_id = response.get("llm_call_id")
             if llm_call_id:
-                from database import db
-                db.update_llm_call_processed(llm_call_id, {"content": processed_content})
+                from repositories import chat_repository
+                chat_repository.update_llm_call_processed(llm_call_id, {"content": processed_content})
 
             yield AgentStep(
                 step_type="answer",
