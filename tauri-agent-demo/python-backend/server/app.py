@@ -16,6 +16,7 @@ from tools.base import ToolRegistry
 from tools.builtin import register_builtin_tools
 
 
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Tauri Agent Chat Backend")
     app.add_middleware(

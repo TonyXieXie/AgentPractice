@@ -10,6 +10,15 @@ export interface ToolDefinition {
     parameters?: Record<string, any>[];
 }
 
+export interface ShellToolsConfig {
+    persistent_pty_blocks_steps?: boolean;
+}
+
+export interface ToolsConfig {
+    shell?: ShellToolsConfig;
+    [key: string]: any;
+}
+
 export interface AgentPromptResponse {
     prompt: string;
     profile_id?: string | null;

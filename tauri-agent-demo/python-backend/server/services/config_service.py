@@ -19,6 +19,25 @@ from tools.config import get_tool_config, update_tool_config
 logger = logging.getLogger(__name__)
 
 
+
+def _mcp_servers_signature(config: Any) -> str:
+    if not isinstance(config, dict):
+        return ""
+    agent = config.get("agent")
+    if not isinstance(agent, dict):
+        return ""
+    mcp = agent.get("mcp")
+    if not isinstance(mcp, dict):
+        return ""
+    servers = mcp.get("servers")
+    if not isinstance(servers, list):
+        return ""
+    try:
+        return json.dumps(servers, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return ""
+
+
 def get_configs():
     return config_repository.list_configs()
 
@@ -76,11 +95,16 @@ def get_app_config_route():
 
 
 def set_app_config(payload: Dict[str, Any]):
-    before_sig = _mcp_servers_signature(get_app_config())
     try:
+        before_sig = _mcp_servers_signature(get_app_config())
         updated = update_app_config(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Set app config failed")
+        raise HTTPException(status_code=500, detail=f"Set app config failed: {exc}")
     after_sig = _mcp_servers_signature(updated)
     if before_sig != after_sig:
         try:

@@ -2175,6 +2175,12 @@ class ReActAgent(AgentStrategy):
         except (TypeError, ValueError):
             return None
 
+    def _persistent_pty_blocks_steps_enabled(self) -> bool:
+        shell_config = get_tool_config().get("shell", {}) if isinstance(get_tool_config(), dict) else {}
+        raw_value = shell_config.get("persistent_pty_blocks_steps", False)
+        parsed_value = self._parse_shell_bool(raw_value)
+        return bool(parsed_value) if parsed_value is not None else bool(raw_value)
+
     def _build_run_shell_step_metadata(
         self,
         *,
@@ -2357,7 +2363,7 @@ class ReActAgent(AgentStrategy):
                     tool_name=tool_name,
                     iteration=iteration,
                     stream_key=stream_key,
-                    extra={"stopped_by_user": True}
+                    extra={"stopped_by_user": True, "pty_mode": stream_pty_mode}
                 )
             )
             _pty_stream_log(
@@ -2400,7 +2406,9 @@ class ReActAgent(AgentStrategy):
             )
             return
 
-        if mode == "persistent":
+        persistent_blocks_steps = mode == "persistent" and self._persistent_pty_blocks_steps_enabled()
+
+        if mode == "persistent" and not persistent_blocks_steps:
             persistent_args = dict(args)
             persistent_args["mode"] = "persistent"
             command_text = str(persistent_args.get("command") or "")
@@ -2435,7 +2443,7 @@ class ReActAgent(AgentStrategy):
             return
 
         command = args.get("command")
-        if not command:
+        if not command and not persistent_blocks_steps:
             tool_output = await self._execute_tool(tool, tool_input)
             output_holder["output"] = tool_output
             no_command_header, _ = self._split_shell_output(tool_output)
@@ -2457,17 +2465,21 @@ class ReActAgent(AgentStrategy):
             )
             return
 
-        command_text = str(command)
-        use_windows_ephemeral_shell = os.name == "nt"
+        command_text = str(command or "")
+        stream_pty_mode = "persistent" if persistent_blocks_steps else "ephemeral"
+        use_windows_ephemeral_shell = stream_pty_mode == "ephemeral" and os.name == "nt"
 
         start_args = dict(args)
-        start_args["mode"] = "ephemeral"
+        start_args["mode"] = stream_pty_mode
         start_args.pop("action", None)
         start_args.pop("pty_id", None)
         start_args.pop("cursor", None)
-        if "idle_timeout" not in start_args:
-            start_args["idle_timeout"] = 120000
-        start_args["command"] = "" if use_windows_ephemeral_shell else command_text
+        if stream_pty_mode == "ephemeral":
+            if "idle_timeout" not in start_args:
+                start_args["idle_timeout"] = 120000
+            start_args["command"] = "" if use_windows_ephemeral_shell else command_text
+        else:
+            start_args["command"] = command_text
 
         if _stop_requested():
             stopped_output = self._append_stop_note("")
@@ -2479,7 +2491,7 @@ class ReActAgent(AgentStrategy):
                     tool_name=tool_name,
                     iteration=iteration,
                     stream_key=stream_key,
-                    command=str(command),
+                    command=command_text,
                     status="closed",
                     waiting_input=False,
                     extra={"stopped_by_user": True}
@@ -2507,12 +2519,12 @@ class ReActAgent(AgentStrategy):
                 iteration=iteration,
                 stream_key=stream_key,
                 header_data=header_data,
-                command=str(command),
+                command=command_text,
                 pty_id=pty_id or None,
                 status=status,
                 waiting_input=waiting_input,
                 wait_reason=wait_reason,
-                extra={"pty_mode": "ephemeral"}
+                extra={"pty_mode": stream_pty_mode}
             )
             yield AgentStep(
                 step_type="observation",
@@ -2550,7 +2562,7 @@ class ReActAgent(AgentStrategy):
                         status="error",
                         waiting_input=waiting_input,
                         wait_reason=wait_reason,
-                        extra={"pty_mode": "ephemeral"}
+                        extra={"pty_mode": stream_pty_mode}
                     )
                 )
                 return
@@ -2569,14 +2581,20 @@ class ReActAgent(AgentStrategy):
                 iteration=iteration,
                 stream_key=stream_key,
                 header_data=header_data,
-                command=str(command),
+                command=command_text,
                 pty_id=pty_id,
                 status=status,
                 waiting_input=waiting_input,
                 wait_reason=wait_reason,
-                extra={"streaming": True, "pty_mode": "ephemeral"}
+                extra={"streaming": True, "pty_mode": stream_pty_mode}
             )
         )
+
+        async def _close_pty(force: bool = False) -> None:
+            if not pty_id:
+                return
+            if force or stream_pty_mode == "ephemeral" or status in ("exited", "closed"):
+                await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
 
         try:
             max_output = args.get("max_output")
@@ -2624,6 +2642,7 @@ class ReActAgent(AgentStrategy):
         current_wait_reason = wait_reason
         timeout_pause_started_at: Optional[float] = time.monotonic() if current_waiting_input else None
         timeout_paused_total_sec = 0.0
+        persistent_waiting_input_break = stream_pty_mode == "persistent" and current_waiting_input and status not in ("exited", "closed")
 
         def _sync_timeout_pause(waiting: bool, now: Optional[float] = None) -> None:
             nonlocal timeout_pause_started_at, timeout_paused_total_sec
@@ -2649,9 +2668,9 @@ class ReActAgent(AgentStrategy):
         total_bytes = 0
         last_chunk_at = time.monotonic()
 
-        while True:
+        while not persistent_waiting_input_break:
             if _stop_requested():
-                await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+                await _close_pty()
                 stopped_output = self._append_stop_note(body_buffer or "")
                 output_holder["output"] = stopped_output
                 yield AgentStep(
@@ -2661,12 +2680,12 @@ class ReActAgent(AgentStrategy):
                         tool_name=tool_name,
                         iteration=iteration,
                         stream_key=stream_key,
-                        command=str(command),
+                        command=command_text,
                         pty_id=pty_id,
-                        status="closed",
+                        status="closed" if stream_pty_mode == "ephemeral" else status,
                         waiting_input=current_waiting_input,
                         wait_reason=current_wait_reason,
-                        extra={"stopped_by_user": True, "pty_mode": "ephemeral"}
+                        extra={"stopped_by_user": True, "pty_mode": stream_pty_mode}
                     )
                 )
                 _pty_stream_log(
@@ -2705,7 +2724,7 @@ class ReActAgent(AgentStrategy):
                     f"read_timeout stream_key={stream_key} pty_id={pty_id} timeout_sec={read_timeout_sec}"
                 )
                 if _stop_requested():
-                    await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+                    await _close_pty()
                     stopped_output = self._append_stop_note(body_buffer or "")
                     output_holder["output"] = stopped_output
                     yield AgentStep(
@@ -2715,12 +2734,12 @@ class ReActAgent(AgentStrategy):
                             tool_name=tool_name,
                             iteration=iteration,
                             stream_key=stream_key,
-                            command=str(command),
+                            command=command_text,
                             pty_id=pty_id,
-                            status="closed",
+                            status="closed" if stream_pty_mode == "ephemeral" else status,
                             waiting_input=current_waiting_input,
                             wait_reason=current_wait_reason,
-                            extra={"stopped_by_user": True, "pty_mode": "ephemeral"}
+                            extra={"stopped_by_user": True, "pty_mode": stream_pty_mode}
                         )
                     )
                     _pty_stream_log(
@@ -2739,7 +2758,7 @@ class ReActAgent(AgentStrategy):
                 f"read_end stream_key={stream_key} pty_id={pty_id} bytes={len(read_output or '')}"
             )
             if _stop_requested():
-                await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+                await _close_pty()
                 stopped_output = self._append_stop_note(body_buffer or "")
                 output_holder["output"] = stopped_output
                 yield AgentStep(
@@ -2749,12 +2768,12 @@ class ReActAgent(AgentStrategy):
                         tool_name=tool_name,
                         iteration=iteration,
                         stream_key=stream_key,
-                        command=str(command),
+                        command=command_text,
                         pty_id=pty_id,
-                        status="closed",
+                        status="closed" if stream_pty_mode == "ephemeral" else status,
                         waiting_input=current_waiting_input,
                         wait_reason=current_wait_reason,
-                        extra={"stopped_by_user": True, "pty_mode": "ephemeral"}
+                        extra={"stopped_by_user": True, "pty_mode": stream_pty_mode}
                     )
                 )
                 _pty_stream_log(
@@ -2814,13 +2833,13 @@ class ReActAgent(AgentStrategy):
                         iteration=iteration,
                         stream_key=stream_key,
                         header_data=header_data,
-                        command=str(command),
+                        command=command_text,
                         pty_id=pty_id,
                         status=status,
                         waiting_input=current_waiting_input,
                         wait_reason=current_wait_reason,
                         reset=bool(reset),
-                        extra={"pty_mode": "ephemeral"}
+                        extra={"pty_mode": stream_pty_mode}
                     )
                 )
                 last_emit_at = time.monotonic()
@@ -2836,12 +2855,12 @@ class ReActAgent(AgentStrategy):
                             iteration=iteration,
                             stream_key=stream_key,
                             header_data=header_data,
-                            command=str(command),
+                            command=command_text,
                             pty_id=pty_id,
                             status=status,
                             waiting_input=current_waiting_input,
                             wait_reason=current_wait_reason,
-                            extra={"keepalive": True, "pty_mode": "ephemeral"}
+                            extra={"keepalive": True, "pty_mode": stream_pty_mode}
                         )
                     )
                     last_emit_at = now
@@ -2863,11 +2882,15 @@ class ReActAgent(AgentStrategy):
                     break
                 continue
 
+            if stream_pty_mode == "persistent" and current_waiting_input:
+                persistent_waiting_input_break = True
+                break
+
             if not chunk:
                 await asyncio.sleep(0.05)
 
         if error_output:
-            await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+            await _close_pty()
             output_holder["output"] = error_output
             yield AgentStep(
                 step_type="observation",
@@ -2876,24 +2899,29 @@ class ReActAgent(AgentStrategy):
                     tool_name=tool_name,
                     iteration=iteration,
                     stream_key=stream_key,
-                    command=str(command),
+                    command=command_text,
                     pty_id=pty_id,
                     status="error",
                     waiting_input=current_waiting_input,
                     wait_reason=current_wait_reason,
-                    extra={"pty_mode": "ephemeral"}
+                    extra={"pty_mode": stream_pty_mode}
                 )
             )
             return
 
         if timed_out:
-            await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+            await _close_pty()
             final_body = body_buffer if body_buffer else "(no output)"
             elapsed_ms = int(_active_elapsed_sec() * 1000)
             timeout_marker = f"[timeout elapsed_ms={elapsed_ms} timeout_sec={timeout_sec}]"
             if timeout_marker not in final_body:
                 final_body = f"{final_body}\n{timeout_marker}"
-            final_output = f"[exit_code=124]\n{final_body}"
+            if stream_pty_mode == "ephemeral":
+                final_output = f"[exit_code=124]\n{final_body}"
+                final_status = "closed"
+            else:
+                final_output = f"{last_header_line}\n{final_body}"
+                final_status = status
             output_holder["output"] = final_output
             yield AgentStep(
                 step_type="observation",
@@ -2902,12 +2930,12 @@ class ReActAgent(AgentStrategy):
                     tool_name=tool_name,
                     iteration=iteration,
                     stream_key=stream_key,
-                    command=str(command),
+                    command=command_text,
                     pty_id=pty_id,
-                    status="closed",
+                    status=final_status,
                     waiting_input=current_waiting_input,
                     wait_reason=current_wait_reason,
-                    extra={"pty_mode": "ephemeral"}
+                    extra={"pty_mode": stream_pty_mode}
                 )
             )
             _pty_stream_log(
@@ -2915,12 +2943,16 @@ class ReActAgent(AgentStrategy):
             )
             return
 
-        await self._execute_tool(tool, json.dumps({"action": "close", "pty_id": pty_id}))
+        await _close_pty()
         final_body = body_buffer if body_buffer else "(no output)"
         if idle_timed_out:
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
             final_body = f"{final_body}\n[idle_timeout elapsed_ms={elapsed_ms}]"
-        final_output = f"{last_header_line}\n{final_body}"
+        if stream_pty_mode == "persistent" and persistent_waiting_input_break and not body_buffer:
+            final_output = last_header_line
+        else:
+            final_output = f"{last_header_line}\n{final_body}"
+        final_status = "closed" if stream_pty_mode == "ephemeral" else status
         output_holder["output"] = final_output
         yield AgentStep(
             step_type="observation",
@@ -2929,17 +2961,22 @@ class ReActAgent(AgentStrategy):
                 tool_name=tool_name,
                 iteration=iteration,
                 stream_key=stream_key,
-                command=str(command),
+                command=command_text,
                 pty_id=pty_id,
-                status="closed",
+                status=final_status,
                 waiting_input=current_waiting_input,
                 wait_reason=current_wait_reason,
-                extra={"pty_mode": "ephemeral"}
+                extra={"pty_mode": stream_pty_mode}
             )
         )
-        _pty_stream_log(
-            f"done stream_key={stream_key} pty_id={pty_id} status={status} reads={total_reads} bytes={total_bytes}"
-        )
+        if persistent_waiting_input_break:
+            _pty_stream_log(
+                f"waiting_input stream_key={stream_key} pty_id={pty_id} status={status} reads={total_reads} bytes={total_bytes}"
+            )
+        else:
+            _pty_stream_log(
+                f"done stream_key={stream_key} pty_id={pty_id} status={status} reads={total_reads} bytes={total_bytes}"
+            )
 
     async def _execute_tool_call(self, tools: List[Tool], tool_name: Optional[str], args_text: str) -> Tuple[str, str]:
         tool, tool_input, error_msg = self._prepare_tool_call(tools, tool_name, args_text)

@@ -12,6 +12,7 @@
   PatchRevertResponse,
   SkillSummary,
   ToolDefinition,
+  ToolsConfig,
 } from '../../../types';
 import { API_BASE_URL, buildApiError } from './base';
 
@@ -115,6 +116,26 @@ export async function getTools(): Promise<ToolDefinition[]> {
     const response = await fetch(`${API_BASE_URL}/tools`);
     if (!response.ok) {
         throw await buildApiError(response, 'Failed to fetch tools');
+    }
+    return response.json();
+}
+
+export async function getToolsConfig(): Promise<ToolsConfig> {
+    const response = await fetch(`${API_BASE_URL}/tools/config`);
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to fetch tools config');
+    }
+    return response.json();
+}
+
+export async function updateToolsConfig(update: ToolsConfig): Promise<ToolsConfig> {
+    const response = await fetch(`${API_BASE_URL}/tools/config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(update),
+    });
+    if (!response.ok) {
+        throw await buildApiError(response, 'Failed to update tools config');
     }
     return response.json();
 }

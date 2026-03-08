@@ -38,13 +38,16 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "buffer_size": 2097152,
         "max_output": 20000,
         "permission_timeout_sec": 300,
-        "oneshot_status_interval_sec": 1.0
+        "oneshot_status_interval_sec": 1.0,
+        "persistent_pty_blocks_steps": False
     },
     "search": {
         "provider": "tavily",
+        "providers": ["tavily"],
         "max_results": 5,
         "search_depth": "basic",
-        "min_score": 0.4
+        "min_score": 0.4,
+        "gemini_model": "gemini-2.5-flash"
     },
     "ast": {
         "max_bytes": 200000,
@@ -89,8 +92,34 @@ def _load_config() -> Dict[str, Any]:
     config["project_root"] = str(root_path.resolve())
 
     search = config.setdefault("search", {})
+
+    raw_providers = search.get("providers")
+    providers = []
+    if isinstance(raw_providers, list):
+        providers = [str(item).strip().lower() for item in raw_providers if str(item).strip()]
+    elif isinstance(raw_providers, str):
+        providers = [item.strip().lower() for item in raw_providers.split(",") if item.strip()]
+
+    legacy_provider = str(search.get("provider") or "").strip().lower()
+    if not providers and legacy_provider:
+        providers = [legacy_provider]
+    if not providers:
+        providers = ["tavily"]
+
+    deduped_providers = []
+    for provider in providers:
+        if provider and provider not in deduped_providers:
+            deduped_providers.append(provider)
+
+    search["providers"] = deduped_providers
+    search["provider"] = deduped_providers[0]
+
     if not search.get("tavily_api_key"):
         search["tavily_api_key"] = os.getenv("TAVILY_API_KEY", "")
+    if not search.get("gemini_api_key"):
+        search["gemini_api_key"] = os.getenv("GEMINI_API_KEY", "")
+    if not search.get("gemini_model"):
+        search["gemini_model"] = os.getenv("GEMINI_SEARCH_MODEL") or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     return config
 

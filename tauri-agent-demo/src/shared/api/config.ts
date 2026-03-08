@@ -13,11 +13,13 @@ export {
   getDefaultConfig,
   getSkills,
   getTools,
+  getToolsConfig,
   refreshMcpTools,
   revertPatch,
   runAstTool,
   updateAppConfig,
   updateAstSettings,
   updateConfig,
+  updateToolsConfig,
   notifyAstChanges,
 } from './internal';

@@ -12,6 +12,7 @@ import {
     AgentAbility,
     AgentProfile,
     ToolDefinition,
+    ToolsConfig,
     ReasoningSummary
 } from '../types';
 import {
@@ -24,6 +25,8 @@ import {
     updateAppConfig,
     refreshMcpTools,
     getTools,
+    getToolsConfig,
+    updateToolsConfig,
     getAgentPrompt,
     getAstSettingsAll,
     updateAstSettings
@@ -70,7 +73,7 @@ const REASONING_SUMMARY_OPTIONS: { value: ReasoningSummary; label: string }[] = 
 import { ABILITY_TYPE_OPTIONS, ALL_IMPORT_KINDS, AGENT_IMPORT_KINDS, buildExportName, buildMcpServersPayload, coerceInt, coerceNumber, createEmptyMcpServer, filterLocalTools, formatToolAbilityName, getMcpToolPrefix, GLOBAL_IMPORT_KINDS, isAllowedKind, isRecord, MODEL_IMPORT_KINDS, normalizeMcpServers, splitMcpToolDescription, stripAgentGlobalFields, normalizeTools, type MCPServerForm } from '../features/config/helpers';
 
 export default function ConfigManager({ onClose, onConfigCreated, currentSessionId }: ConfigManagerProps) {
-    type ConfigTab = 'models' | 'global' | 'mcp' | 'agents';
+    type ConfigTab = 'models' | 'global' | 'tools' | 'mcp' | 'agents';
     const [configs, setConfigs] = useState<LLMConfig[]>([]);
     const [activeTab, setActiveTab] = useState<ConfigTab>('models');
     const [globalTimeoutSec, setGlobalTimeoutSec] = useState('180');
@@ -108,9 +111,13 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
         String(DEFAULT_CONTEXT_LONG_TAIL_CHARS)
     );
     const [globalMcpServers, setGlobalMcpServers] = useState<MCPServerForm[]>([]);
+    const [persistentPtyBlocksSteps, setPersistentPtyBlocksSteps] = useState(false);
     const [globalLoading, setGlobalLoading] = useState(false);
     const [globalSaving, setGlobalSaving] = useState(false);
     const [globalSaved, setGlobalSaved] = useState(false);
+    const [toolsConfigLoading, setToolsConfigLoading] = useState(false);
+    const [toolsConfigSaving, setToolsConfigSaving] = useState(false);
+    const [toolsSaved, setToolsSaved] = useState(false);
     const [mcpSaving, setMcpSaving] = useState(false);
     const [mcpSaved, setMcpSaved] = useState(false);
     const [mcpRefreshing, setMcpRefreshing] = useState(false);
@@ -190,6 +197,7 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
     useEffect(() => {
         loadConfigs();
         loadAppConfig();
+        loadToolsConfig();
         loadTools();
     }, []);
 
@@ -299,6 +307,27 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             alert(errorMessage);
         } finally {
             setGlobalLoading(false);
+        }
+    };
+
+    const applyToolsConfigState = (data?: ToolsConfig | null) => {
+        setPersistentPtyBlocksSteps(Boolean(data?.shell?.persistent_pty_blocks_steps));
+    };
+
+    const loadToolsConfig = async () => {
+        setToolsConfigLoading(true);
+        try {
+            const data = await getToolsConfig();
+            applyToolsConfigState(data);
+        } catch (error: any) {
+            console.error('Failed to load tools config:', error);
+            let errorMessage = 'Failed to load tools config';
+            if (error?.message) {
+                errorMessage += `: ${error.message}`;
+            }
+            alert(errorMessage);
+        } finally {
+            setToolsConfigLoading(false);
         }
     };
 
@@ -571,6 +600,27 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             }
         }
         return payload;
+    };
+
+    const extractToolsImportPayload = (data: unknown): ToolsConfig | null => {
+        if (!isRecord(data)) return null;
+        const candidate = isRecord(data.tools)
+            ? data.tools
+            : isRecord(data.tools_config)
+                ? data.tools_config
+                : isRecord(data.toolsConfig)
+                    ? data.toolsConfig
+                    : data;
+        if (!isRecord(candidate)) return null;
+
+        const payload: ToolsConfig = {};
+        if (isRecord(candidate.shell)) {
+            payload.shell = {
+                ...candidate.shell,
+                persistent_pty_blocks_steps: Boolean(candidate.shell.persistent_pty_blocks_steps)
+            };
+        }
+        return Object.keys(payload).length > 0 ? payload : null;
     };
 
     const extractGlobalImportPayload = (data: unknown): AppConfigUpdate | null => {
@@ -873,15 +923,17 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
     const handleExportAllConfigs = async () => {
         setBundleBusy(true);
         try {
-            const [latestConfigs, appConfig, astBundle] = await Promise.all([
+            const [latestConfigs, appConfig, astBundle, toolsConfig] = await Promise.all([
                 getConfigs(),
                 getAppConfig(),
-                getAstSettingsAll()
+                getAstSettingsAll(),
+                getToolsConfig()
             ]);
             const payload = {
                 models: { configs: latestConfigs },
                 global: buildGlobalExportFromAppConfig(appConfig),
                 agent: stripAgentGlobalFields(appConfig?.agent || {}),
+                tools: toolsConfig,
                 ast: { paths: Array.isArray(astBundle?.paths) ? astBundle.paths : [] }
             };
             const ok = await exportConfigFile('all', payload, {
@@ -936,6 +988,15 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                     ? data.agent_config
                     : null
         );
+        const toolsPayload = extractToolsImportPayload(
+            isRecord(data.tools)
+                ? data.tools
+                : isRecord(data.tools_config)
+                    ? data.tools_config
+                    : isRecord(data.toolsConfig)
+                        ? data.toolsConfig
+                        : null
+        );
         const astEntries = extractAstBundleEntries(
             isRecord(data.ast)
                 ? data.ast
@@ -946,7 +1007,7 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                         : null
         );
 
-        if (modelItems.length === 0 && !globalPayload && !agentPayload && astEntries.length === 0) {
+        if (modelItems.length === 0 && !globalPayload && !agentPayload && !toolsPayload && astEntries.length === 0) {
             alert('配置包中没有可导入的内容。');
             return;
         }
@@ -955,6 +1016,7 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
         if (modelItems.length > 0) summaryLines.push(`模型配置：${modelItems.length} 项`);
         if (globalPayload) summaryLines.push('全局配置');
         if (agentPayload) summaryLines.push('Agent 配置');
+        if (toolsPayload) summaryLines.push('Tools config');
         if (astEntries.length > 0) summaryLines.push(`AST 设置：${astEntries.length} 个根路径`);
 
         const proceed = window.confirm(`将导入以下内容：\n${summaryLines.join('\n')}\n\n是否继续？`);
@@ -993,6 +1055,13 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                 appUpdated = true;
             }
 
+            let toolsUpdated = false;
+            if (toolsPayload) {
+                const updatedTools = await updateToolsConfig(toolsPayload);
+                applyToolsConfigState(updatedTools);
+                toolsUpdated = true;
+            }
+
             let astSuccess = 0;
             const astFailed: string[] = [];
             if (astEntries.length > 0) {
@@ -1013,7 +1082,7 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             if (modelItems.length > 0) {
                 await loadConfigs();
             }
-            if (modelItems.length > 0 || appUpdated) {
+            if (modelItems.length > 0 || appUpdated || toolsUpdated) {
                 onConfigCreated?.();
             }
 
@@ -1023,6 +1092,7 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             }
             if (globalPayload) resultLines.push('全局配置：已更新');
             if (agentPayload) resultLines.push('Agent 配置：已更新');
+            if (toolsPayload) resultLines.push('Tools config: updated');
             if (astEntries.length > 0) {
                 resultLines.push(`AST 设置：成功 ${astSuccess}，失败 ${astFailed.length}`);
             }
@@ -1238,6 +1308,30 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             alert(errorMessage);
         } finally {
             setGlobalSaving(false);
+        }
+    };
+
+    const handleToolsConfigSave = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setToolsConfigSaving(true);
+        setToolsSaved(false);
+        try {
+            const updated = await updateToolsConfig({
+                shell: {
+                    persistent_pty_blocks_steps: persistentPtyBlocksSteps
+                }
+            });
+            applyToolsConfigState(updated);
+            setToolsSaved(true);
+        } catch (error: any) {
+            console.error('Failed to save tools config:', error);
+            let errorMessage = 'Failed to save tools config';
+            if (error?.message) {
+                errorMessage += `: ${error.message}`;
+            }
+            alert(errorMessage);
+        } finally {
+            setToolsConfigSaving(false);
         }
     };
 
@@ -1896,7 +1990,7 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
         setFormData({ ...formData, api_profile: value });
     };
 
-    const bundleDisabled = bundleBusy || globalLoading || globalSaving || mcpSaving || agentLoading || agentSaving || loading;
+    const bundleDisabled = bundleBusy || globalLoading || globalSaving || toolsConfigLoading || toolsConfigSaving || mcpSaving || agentLoading || agentSaving || loading;
 
     return (
         <div className="modal-overlay">
@@ -1944,6 +2038,16 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                             type="button"
                         >
                             全局配置
+                        </button>
+                        <button
+                            className={`config-tab ${activeTab === 'tools' ? 'active' : ''}`}
+                            onClick={() => {
+                                setActiveTab('tools');
+                                setToolsSaved(false);
+                            }}
+                            type="button"
+                        >
+                            Tools
                         </button>
                         <button
                             className={`config-tab ${activeTab === 'mcp' ? 'active' : ''}`}
@@ -2358,6 +2462,47 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                                 </button>
                             </div>
                             {globalSaved && <div className="save-hint">已保存</div>}
+                        </form>
+                    ) : activeTab === 'tools' ? (
+                        <form onSubmit={handleToolsConfigSave} className="config-form">
+                            <div className="config-form-header">
+                                <h3>Tools</h3>
+                            </div>
+
+                            <div className="form-group checkbox-group">
+                                <label>
+                                    <input
+                                        type="checkbox"
+                                        checked={persistentPtyBlocksSteps}
+                                        onChange={(e) => {
+                                            setPersistentPtyBlocksSteps(e.target.checked);
+                                            setToolsSaved(false);
+                                        }}
+                                        disabled={toolsConfigLoading || toolsConfigSaving}
+                                    />
+                                    <span>Persistent PTY blocks later steps</span>
+                                </label>
+                                <small>
+                                    When enabled, persistent PTY waits until it reaches waiting_input, exits, or times out before the agent continues to the next step.
+                                </small>
+                            </div>
+
+                            <div className="form-actions">
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        setToolsSaved(false);
+                                        loadToolsConfig();
+                                    }}
+                                    disabled={toolsConfigLoading || toolsConfigSaving}
+                                >
+                                    Reset
+                                </button>
+                                <button type="submit" disabled={toolsConfigLoading || toolsConfigSaving}>
+                                    {toolsConfigSaving ? 'Saving...' : 'Save'}
+                                </button>
+                            </div>
+                            {toolsSaved && <div className="save-hint">Saved</div>}
                         </form>
                     ) : activeTab === 'mcp' ? (
                         <form onSubmit={handleMcpSave} className="config-form">
