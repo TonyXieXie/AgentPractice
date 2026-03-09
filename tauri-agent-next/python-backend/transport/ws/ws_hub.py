@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 from fastapi import WebSocket
 
-from transport.ws.ws_types import SubscriptionScope, WsOutboundMessage
+from transport.ws.ws_types import SubscriptionScope, WSChunk
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +115,7 @@ class WsHub:
         if not candidates:
             return seq
 
-        outbound = WsOutboundMessage(
-            kind="chunk",
+        outbound = WSChunk(
             seq=seq,
             stream=stream,
             run_id=run_id,

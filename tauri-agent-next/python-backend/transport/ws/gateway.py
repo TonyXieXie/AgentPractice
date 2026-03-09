@@ -3,7 +3,12 @@ from __future__ import annotations
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from transport.ws.ws_hub import get_ws_hub
-from transport.ws.ws_types import WsInboundMessage, WsOutboundMessage
+from transport.ws.ws_types import (
+    WsAckFrame,
+    WsErrorFrame,
+    WsHeartbeatFrame,
+    WsInboundMessage,
+)
 
 
 router = APIRouter()
@@ -15,8 +20,7 @@ async def websocket_gateway(websocket: WebSocket) -> None:
     hub = get_ws_hub()
     connection = await hub.register(websocket)
     await websocket.send_json(
-        WsOutboundMessage(
-            kind="ack",
+        WsAckFrame(
             connection_id=connection.id,
             message="connected",
         ).model_dump()
@@ -27,10 +31,8 @@ async def websocket_gateway(websocket: WebSocket) -> None:
             message = WsInboundMessage.model_validate(raw_message)
             if message.kind == "heartbeat":
                 await websocket.send_json(
-                    WsOutboundMessage(
-                        kind="heartbeat",
+                    WsHeartbeatFrame(
                         connection_id=connection.id,
-                        message="alive",
                     ).model_dump()
                 )
                 continue
@@ -40,9 +42,10 @@ async def websocket_gateway(websocket: WebSocket) -> None:
                 await hub.unsubscribe(connection, message.scopes)
             elif message.kind == "set_scope":
                 await hub.set_scope(connection, message.scopes)
+            elif message.kind == "resume":
+                pass
             await websocket.send_json(
-                WsOutboundMessage(
-                    kind="ack",
+                WsAckFrame(
                     connection_id=connection.id,
                     message=message.kind,
                     payload={"scopes": [scope.model_dump() for scope in message.scopes]},
@@ -52,8 +55,7 @@ async def websocket_gateway(websocket: WebSocket) -> None:
         await hub.unregister(connection)
     except Exception as exc:
         await websocket.send_json(
-            WsOutboundMessage(
-                kind="error",
+            WsErrorFrame(
                 connection_id=connection.id,
                 message=str(exc),
             ).model_dump()

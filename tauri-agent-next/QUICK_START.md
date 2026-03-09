@@ -29,5 +29,5 @@ python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
 ```powershell
 cd python-backend
-python -m pytest tests
+python -m unittest discover -s tests
 ```

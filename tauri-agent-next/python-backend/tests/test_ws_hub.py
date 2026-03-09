@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import unittest
 
 from transport.ws.ws_hub import WsHub
 from transport.ws.ws_types import SubscriptionScope
@@ -14,8 +14,8 @@ class FakeWebSocket:
         self.messages.append(payload)
 
 
-def test_ws_hub_scope_filtering() -> None:
-    async def scenario() -> None:
+class WsHubTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ws_hub_scope_filtering(self) -> None:
         hub = WsHub()
         ws_a = FakeWebSocket()
         ws_b = FakeWebSocket()
@@ -37,9 +37,7 @@ def test_ws_hub_scope_filtering() -> None:
             agent_id="agent-2",
         )
 
-        assert len(ws_a.messages) == 1
-        assert ws_a.messages[0]["payload"]["topic"] == "run.started"
-        assert len(ws_b.messages) == 1
-        assert ws_b.messages[0]["payload"]["topic"] == "agent.state_changed"
-
-    asyncio.run(scenario())
+        self.assertEqual(len(ws_a.messages), 1)
+        self.assertEqual(ws_a.messages[0]["payload"]["topic"], "run.started")
+        self.assertEqual(len(ws_b.messages), 1)
+        self.assertEqual(ws_b.messages[0]["payload"]["topic"], "agent.state_changed")

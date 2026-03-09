@@ -44,7 +44,7 @@ Windows 也可以直接运行 `StartBackend.bat`。
 
 ```powershell
 cd python-backend
-python -m pytest tests
+python -m unittest discover -s tests
 ```
 
 执行清单见：`docs/rewrite-todo.md`
