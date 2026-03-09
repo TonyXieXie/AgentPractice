@@ -4,7 +4,7 @@ from typing import Optional
 from fastapi import HTTPException, Query
 
 from ghost_snapshot import restore_snapshot
-from models import RollbackRequest
+from models import ChatSessionCreate, ChatSessionUpdate, RollbackRequest
 from repositories import config_repository, session_repository
 from ..session_support import build_copy_title, cleanup_spawned_subagents, schedule_ast_scan
 from tools.pty_manager import get_pty_manager
@@ -24,7 +24,7 @@ def get_session(session_id: str, include_count: bool = Query(True)):
     return session
 
 
-def create_session(session):
+def create_session(session: ChatSessionCreate):
     config = config_repository.get_config(session.config_id)
     if not config:
         raise HTTPException(status_code=404, detail="Config not found")
@@ -33,7 +33,7 @@ def create_session(session):
     return created
 
 
-def update_session(session_id: str, update):
+def update_session(session_id: str, update: ChatSessionUpdate):
     if update.config_id is not None and not config_repository.get_config(update.config_id):
         raise HTTPException(status_code=404, detail="Config not found")
     session = session_repository.update_session(session_id, update)
