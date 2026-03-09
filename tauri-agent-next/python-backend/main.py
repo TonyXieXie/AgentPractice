@@ -1,26 +1,36 @@
 from __future__ import annotations
 
-import asyncio
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
 
 from app_config import get_app_config
-from runtime_paths import ensure_runtime_dirs
+from app_services import AppServices, build_app_services
 from transport.http.routes import router as http_router
 from transport.ws.gateway import router as ws_router
-from transport.ws.ws_hub import get_ws_hub
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="tauri-agent-next backend", version="0.1.0")
+def create_app(*, services: AppServices | None = None) -> FastAPI:
+    resolved_services = services or build_app_services()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.services = resolved_services
+        await resolved_services.startup()
+        try:
+            yield
+        finally:
+            await resolved_services.shutdown()
+
+    app = FastAPI(
+        title="tauri-agent-next backend",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
     app.include_router(http_router)
     app.include_router(ws_router)
-
-    @app.on_event("startup")
-    async def _startup() -> None:
-        ensure_runtime_dirs()
-        get_ws_hub().set_loop(asyncio.get_running_loop())
+    app.state.services = resolved_services
 
     return app
 

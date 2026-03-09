@@ -153,6 +153,9 @@ class AgentBase(ABC):
         tool_call_id: Optional[str] = None,
         visibility: VisibilityLevel = "public",
         level: SeverityLevel = "info",
+        source_type: Optional[str] = None,
+        source_id: Optional[str] = None,
+        tags: Optional[list[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ExecutionEvent:
         event = ExecutionEvent(
@@ -163,6 +166,9 @@ class AgentBase(ABC):
             tool_call_id=tool_call_id,
             visibility=visibility,
             level=level,
+            source_type=source_type or "agent",
+            source_id=source_id or (agent_id or self.agent_id),
+            tags=list(tags or []),
             payload=payload or {},
             metadata=metadata or {},
         )
@@ -187,6 +193,7 @@ class AgentBase(ABC):
                 **merged_metadata,
             },
             level="info" if status != "error" else "error",
+            source_type="agent",
         )
 
     @abstractmethod

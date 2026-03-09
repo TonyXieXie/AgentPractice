@@ -19,9 +19,14 @@ def get_runtime_data_dir() -> Path:
     return get_project_root() / ".tauri-agent-next-data"
 
 
+def get_runs_data_dir() -> Path:
+    return get_runtime_data_dir() / "runs"
+
+
 def ensure_runtime_dirs() -> Path:
     data_dir = get_runtime_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
+    get_runs_data_dir().mkdir(parents=True, exist_ok=True)
     return data_dir
 
 

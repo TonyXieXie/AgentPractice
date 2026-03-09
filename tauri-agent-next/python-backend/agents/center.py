@@ -104,9 +104,11 @@ class AgentCenter:
                 run_id=message.run_id,
                 agent_id=message.sender_id,
                 message_id=message.id,
-                seq=message.seq,
                 visibility=message.visibility,
                 level=message.level,
+                source_type="center",
+                source_id=message.sender_id,
+                tags=[message.kind, message.delivery],
                 payload={
                     "topic": message.topic,
                     "kind": message.kind,

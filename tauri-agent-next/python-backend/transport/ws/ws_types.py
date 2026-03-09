@@ -5,6 +5,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from agents.message import SeverityLevel, VisibilityLevel
+
 
 StreamKind = Literal[
     "run_event",
@@ -18,13 +20,8 @@ StreamKind = Literal[
 class SubscriptionScope(BaseModel):
     run_id: Optional[str] = None
     agent_id: Optional[str] = None
-
-    def matches(self, run_id: Optional[str], agent_id: Optional[str]) -> bool:
-        if self.run_id and self.run_id != run_id:
-            return False
-        if self.agent_id and self.agent_id != agent_id:
-            return False
-        return True
+    visibility: Optional[VisibilityLevel] = None
+    level: Optional[SeverityLevel] = None
 
 
 class WsInboundMessage(BaseModel):
@@ -40,6 +37,14 @@ class WSChunk(BaseModel):
     chunk_id: str = Field(default_factory=lambda: uuid4().hex)
     run_id: Optional[str] = None
     agent_id: Optional[str] = None
+    message_id: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    event_type: Optional[str] = None
+    source_type: Optional[str] = None
+    source_id: Optional[str] = None
+    visibility: VisibilityLevel = "public"
+    level: SeverityLevel = "info"
+    tags: List[str] = Field(default_factory=list)
     done: bool = False
     payload: Dict[str, Any] = Field(default_factory=dict)
 

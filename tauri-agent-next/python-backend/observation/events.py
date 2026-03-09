@@ -1,11 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
 from agents.message import SeverityLevel, VisibilityLevel, utc_now_iso
+
+
+SEVERITY_ORDER: Dict[SeverityLevel, int] = {
+    "debug": 0,
+    "info": 1,
+    "warning": 2,
+    "error": 3,
+}
 
 
 class ExecutionEvent(BaseModel):
@@ -18,6 +26,9 @@ class ExecutionEvent(BaseModel):
     seq: Optional[int] = None
     visibility: VisibilityLevel = "public"
     level: SeverityLevel = "info"
+    source_type: Optional[str] = None
+    source_id: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
     payload: Dict[str, Any] = Field(default_factory=dict)
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now_iso)
@@ -34,6 +45,7 @@ class AgentSnapshot(BaseModel):
 class ToolCallSnapshot(BaseModel):
     tool_call_id: str
     status: str
+    run_id: Optional[str] = None
     agent_id: Optional[str] = None
     tool_name: Optional[str] = None
     updated_at: str = Field(default_factory=utc_now_iso)
@@ -44,62 +56,59 @@ class ExecutionSnapshot(BaseModel):
     run_id: Optional[str] = None
     status: str = "idle"
     latest_seq: int = 0
+    latest_event_type: Optional[str] = None
     agents: Dict[str, AgentSnapshot] = Field(default_factory=dict)
     tool_calls: Dict[str, ToolCallSnapshot] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     updated_at: str = Field(default_factory=utc_now_iso)
 
     def apply(self, event: ExecutionEvent) -> "ExecutionSnapshot":
-        update_payload: Dict[str, Any] = {
-            "latest_seq": max(self.latest_seq, int(event.seq or 0)),
-            "updated_at": event.created_at,
-        }
+        from observation.snapshot_builder import SnapshotBuilder
 
-        if event.run_id and not self.run_id:
-            update_payload["run_id"] = event.run_id
+        return SnapshotBuilder().apply(self, event)
 
-        if event.event_type == "run.started":
-            update_payload["status"] = "running"
-        elif event.event_type == "run.finished":
-            update_payload["status"] = "finished"
 
-        snapshot = self.model_copy(update=update_payload, deep=True)
+class RunProjection(BaseModel):
+    run_id: str
+    status: str = "idle"
+    latest_seq: int = 0
+    strategy: Optional[str] = None
+    reply: Optional[str] = None
+    error: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    updated_at: str = Field(default_factory=utc_now_iso)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
-        if event.agent_id:
-            agents = dict(snapshot.agents)
-            current = agents.get(event.agent_id) or AgentSnapshot(
-                agent_id=event.agent_id,
-                status="idle",
-            )
-            agent_status = event.payload.get("status", current.status)
-            agents[event.agent_id] = current.model_copy(
-                update={
-                    "status": agent_status,
-                    "role": event.payload.get("role", current.role),
-                    "updated_at": event.created_at,
-                    "metadata": {
-                        **current.metadata,
-                        **(event.payload if event.event_type == "agent.state_changed" else {}),
-                    },
-                }
-            )
-            snapshot = snapshot.model_copy(update={"agents": agents}, deep=True)
 
-        if event.tool_call_id:
-            tool_calls = dict(snapshot.tool_calls)
-            current_tool = tool_calls.get(event.tool_call_id) or ToolCallSnapshot(
-                tool_call_id=event.tool_call_id,
-                status="pending",
-                agent_id=event.agent_id,
-            )
-            tool_calls[event.tool_call_id] = current_tool.model_copy(
-                update={
-                    "status": event.payload.get("status", current_tool.status),
-                    "tool_name": event.payload.get("tool_name", current_tool.tool_name),
-                    "agent_id": event.agent_id or current_tool.agent_id,
-                    "updated_at": event.created_at,
-                    "payload": {**current_tool.payload, **event.payload},
-                }
-            )
-            snapshot = snapshot.model_copy(update={"tool_calls": tool_calls}, deep=True)
+class AgentProjection(BaseModel):
+    run_id: str
+    agent_id: str
+    status: str
+    role: Optional[str] = None
+    updated_at: str = Field(default_factory=utc_now_iso)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
-        return snapshot
+
+class ToolCallProjection(BaseModel):
+    run_id: str
+    tool_call_id: str
+    status: str
+    agent_id: Optional[str] = None
+    tool_name: Optional[str] = None
+    updated_at: str = Field(default_factory=utc_now_iso)
+    output: Optional[str] = None
+    error: Optional[str] = None
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExecutionProjectionState(BaseModel):
+    run_projection: Optional[RunProjection] = None
+    agent_projections: Dict[str, AgentProjection] = Field(default_factory=dict)
+    tool_call_projections: Dict[str, ToolCallProjection] = Field(default_factory=dict)
+
+
+def level_at_least(level: SeverityLevel, minimum: Optional[SeverityLevel]) -> bool:
+    if minimum is None:
+        return True
+    return SEVERITY_ORDER.get(level, 0) >= SEVERITY_ORDER.get(minimum, 0)

@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Iterable, List, Optional, Set
 
 from fastapi import WebSocket
 
+from observation.events import level_at_least
 from transport.ws.ws_types import SubscriptionScope, WSChunk
 
 
@@ -14,15 +15,26 @@ from transport.ws.ws_types import SubscriptionScope, WSChunk
 class ScopeRef:
     run_id: Optional[str] = None
     agent_id: Optional[str] = None
+    visibility: Optional[str] = None
+    level: Optional[str] = None
 
     @classmethod
     def from_scope(cls, scope: SubscriptionScope) -> "ScopeRef":
-        return cls(run_id=scope.run_id, agent_id=scope.agent_id)
+        return cls(
+            run_id=scope.run_id,
+            agent_id=scope.agent_id,
+            visibility=scope.visibility,
+            level=scope.level,
+        )
 
-    def matches(self, run_id: Optional[str], agent_id: Optional[str]) -> bool:
-        if self.run_id and self.run_id != run_id:
+    def matches(self, chunk: WSChunk) -> bool:
+        if self.run_id and self.run_id != chunk.run_id:
             return False
-        if self.agent_id and self.agent_id != agent_id:
+        if self.agent_id and self.agent_id != chunk.agent_id:
+            return False
+        if self.visibility and self.visibility != chunk.visibility:
+            return False
+        if self.level and not level_at_least(chunk.level, self.level):
             return False
         return True
 
@@ -35,14 +47,15 @@ class WsConnection:
     id: str
     websocket: WebSocket
     scopes: Set[ScopeRef] = field(default_factory=lambda: {WILDCARD_SCOPE})
+    replaying: bool = False
+    buffered_chunks: List[WSChunk] = field(default_factory=list)
 
 
 class WsHub:
     def __init__(self) -> None:
-        self._connections: Dict[str, WsConnection] = {}
+        self._connections: dict[str, WsConnection] = {}
         self._lock = asyncio.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._seq = 0
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -74,6 +87,66 @@ class WsHub:
     ) -> None:
         await self._mutate_scopes(connection, scopes, mode="replace")
 
+    async def emit_chunk(self, chunk: WSChunk) -> int:
+        async with self._lock:
+            candidates: List[WsConnection] = []
+            for connection in self._connections.values():
+                if not self._matches_any_scope(connection.scopes, chunk):
+                    continue
+                if connection.replaying:
+                    connection.buffered_chunks.append(chunk)
+                else:
+                    candidates.append(connection)
+
+        if not candidates:
+            return 0
+
+        delivered = 0
+        failed: List[WsConnection] = []
+        for connection in candidates:
+            try:
+                await connection.websocket.send_json(chunk.model_dump(mode="json"))
+                delivered += 1
+            except Exception:
+                failed.append(connection)
+
+        if failed:
+            async with self._lock:
+                for connection in failed:
+                    self._connections.pop(connection.id, None)
+        return delivered
+
+    async def send_chunk(self, connection: WsConnection, chunk: WSChunk) -> None:
+        try:
+            await connection.websocket.send_json(chunk.model_dump(mode="json"))
+        except Exception:
+            await self.unregister(connection)
+
+    async def begin_replay(self, connection: WsConnection) -> bool:
+        async with self._lock:
+            existing = self._connections.get(connection.id)
+            if existing is None:
+                return False
+            existing.replaying = True
+            existing.buffered_chunks = []
+            return True
+
+    async def end_replay(self, connection: WsConnection) -> List[WSChunk]:
+        async with self._lock:
+            existing = self._connections.get(connection.id)
+            if existing is None:
+                return []
+            buffered = list(existing.buffered_chunks)
+            existing.buffered_chunks = []
+            existing.replaying = False
+            return buffered
+
+    def emit_chunk_threadsafe(self, chunk: WSChunk) -> None:
+        loop = self._loop
+        if not loop or not loop.is_running():
+            return
+        asyncio.run_coroutine_threadsafe(self.emit_chunk(chunk), loop)
+
     async def _mutate_scopes(
         self,
         connection: WsConnection,
@@ -99,73 +172,8 @@ class WsHub:
                 if not existing.scopes:
                     existing.scopes = {WILDCARD_SCOPE}
 
-    async def emit(
-        self,
-        *,
-        stream: str,
-        payload: Dict[str, Any],
-        run_id: Optional[str] = None,
-        agent_id: Optional[str] = None,
-        done: bool = False,
-    ) -> int:
-        async with self._lock:
-            self._seq += 1
-            seq = self._seq
-            candidates = list(self._connections.values())
-        if not candidates:
-            return seq
-
-        outbound = WSChunk(
-            seq=seq,
-            stream=stream,
-            run_id=run_id,
-            agent_id=agent_id,
-            done=done,
-            payload=payload,
-        ).model_dump()
-
-        to_remove: List[WsConnection] = []
-        for connection in candidates:
-            if not self._matches_any_scope(connection.scopes, run_id, agent_id):
-                continue
-            try:
-                await connection.websocket.send_json(outbound)
-            except Exception:
-                to_remove.append(connection)
-
-        if to_remove:
-            async with self._lock:
-                for connection in to_remove:
-                    self._connections.pop(connection.id, None)
-        return seq
-
-    def emit_threadsafe(
-        self,
-        *,
-        stream: str,
-        payload: Dict[str, Any],
-        run_id: Optional[str] = None,
-        agent_id: Optional[str] = None,
-        done: bool = False,
-    ) -> None:
-        loop = self._loop
-        if not loop or not loop.is_running():
-            return
-        asyncio.run_coroutine_threadsafe(
-            self.emit(
-                stream=stream,
-                payload=payload,
-                run_id=run_id,
-                agent_id=agent_id,
-                done=done,
-            ),
-            loop,
-        )
-
-    def _matches_any_scope(
-        self, scopes: Set[ScopeRef], run_id: Optional[str], agent_id: Optional[str]
-    ) -> bool:
-        return any(scope.matches(run_id, agent_id) for scope in scopes)
+    def _matches_any_scope(self, scopes: Set[ScopeRef], chunk: WSChunk) -> bool:
+        return any(scope.matches(chunk) for scope in scopes)
 
 
 _WS_HUB = WsHub()

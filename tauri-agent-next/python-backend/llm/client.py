@@ -464,6 +464,18 @@ class LLMClient:
     ) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         for message in messages:
+            if not isinstance(message, dict):
+                continue
+            item_type = str(message.get("type", "") or "")
+            if item_type in {"function_call", "function_call_output", "reasoning"}:
+                items.append(
+                    {
+                        key: value
+                        for key, value in message.items()
+                        if value is not None
+                    }
+                )
+                continue
             role = str(message.get("role", "user") or "user")
             content = message.get("content", "")
             text = content if isinstance(content, str) else self._coerce_text(content)

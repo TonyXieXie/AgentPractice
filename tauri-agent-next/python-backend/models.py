@@ -1,8 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+from observation.events import (
+    AgentProjection,
+    ExecutionEvent,
+    ExecutionSnapshot,
+    RunProjection,
+    ToolCallProjection,
+)
 
 
 LLMApiFormat = Literal["openai_chat_completions", "openai_responses"]
@@ -34,10 +42,41 @@ class HealthResponse(BaseModel):
     runtime_data_dir: str
 
 
-class DebugEmitRequest(BaseModel):
-    stream: str = "run_event"
-    topic: str = "debug.event"
-    run_id: Optional[str] = None
-    agent_id: Optional[str] = None
-    payload: Dict[str, Any] = Field(default_factory=dict)
-    done: bool = False
+class CreateRunRequest(BaseModel):
+    content: str
+    strategy: Optional[str] = None
+    history: List[Dict[str, Any]] = Field(default_factory=list)
+    llm_config: Optional[Dict[str, Any]] = None
+    system_prompt: Optional[str] = None
+    work_path: Optional[str] = None
+    request_overrides: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateRunResponse(BaseModel):
+    ok: bool = True
+    run_id: str
+    user_agent_id: str
+    assistant_agent_id: str
+    status: Literal["accepted"] = "accepted"
+
+
+class StopRunResponse(BaseModel):
+    ok: bool = True
+    run_id: str
+    status: str
+
+
+class RunSnapshotResponse(BaseModel):
+    ok: bool = True
+    run_id: str
+    snapshot: ExecutionSnapshot
+    run_projection: Optional[RunProjection] = None
+    agent_projections: Dict[str, AgentProjection] = Field(default_factory=dict)
+    tool_call_projections: Dict[str, ToolCallProjection] = Field(default_factory=dict)
+
+
+class ListRunEventsResponse(BaseModel):
+    ok: bool = True
+    run_id: str
+    events: List[ExecutionEvent] = Field(default_factory=list)
+    next_after_seq: int = 0

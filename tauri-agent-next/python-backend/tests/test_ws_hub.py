@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from transport.ws.ws_hub import WsHub
-from transport.ws.ws_types import SubscriptionScope
+from transport.ws.ws_types import SubscriptionScope, WSChunk
 
 
 class FakeWebSocket:
@@ -22,22 +22,57 @@ class WsHubTests(unittest.IsolatedAsyncioTestCase):
         conn_a = await hub.register(ws_a)
         conn_b = await hub.register(ws_b)
         await hub.set_scope(conn_a, [SubscriptionScope(run_id="run-1")])
-        await hub.set_scope(conn_b, [SubscriptionScope(agent_id="agent-2")])
-
-        await hub.emit(
-            stream="run_event",
-            payload={"topic": "run.started"},
-            run_id="run-1",
-            agent_id="agent-1",
+        await hub.set_scope(
+            conn_b,
+            [SubscriptionScope(agent_id="agent-2", visibility="internal", level="error")],
         )
-        await hub.emit(
-            stream="agent_event",
-            payload={"topic": "agent.state_changed"},
-            run_id="run-2",
-            agent_id="agent-2",
+
+        await hub.emit_chunk(
+            WSChunk(
+                stream="run_event",
+                seq=1,
+                payload={"topic": "run.started"},
+                run_id="run-1",
+                agent_id="agent-1",
+            )
+        )
+        await hub.emit_chunk(
+            WSChunk(
+                stream="agent_event",
+                seq=2,
+                payload={"topic": "agent.state_changed"},
+                run_id="run-2",
+                agent_id="agent-2",
+                visibility="internal",
+                level="error",
+            )
         )
 
         self.assertEqual(len(ws_a.messages), 1)
         self.assertEqual(ws_a.messages[0]["payload"]["topic"], "run.started")
         self.assertEqual(len(ws_b.messages), 1)
         self.assertEqual(ws_b.messages[0]["payload"]["topic"], "agent.state_changed")
+
+    async def test_ws_hub_buffers_live_chunks_during_replay(self) -> None:
+        hub = WsHub()
+        ws = FakeWebSocket()
+        connection = await hub.register(ws)
+        await hub.set_scope(connection, [SubscriptionScope(run_id="run-1")])
+
+        started = await hub.begin_replay(connection)
+        self.assertTrue(started)
+
+        await hub.emit_chunk(
+            WSChunk(
+                stream="run_event",
+                seq=1,
+                payload={"topic": "run.started"},
+                run_id="run-1",
+            )
+        )
+        self.assertEqual(ws.messages, [])
+
+        buffered = await hub.end_replay(connection)
+        self.assertEqual(len(buffered), 1)
+        await hub.send_chunk(connection, buffered[0])
+        self.assertEqual(len(ws.messages), 1)
