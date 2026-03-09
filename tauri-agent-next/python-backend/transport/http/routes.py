@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 
 from app_config import get_app_config, get_app_config_path
 from models import (
@@ -15,6 +18,7 @@ from runtime_paths import ensure_runtime_dirs
 
 
 router = APIRouter()
+OBSERVE_PAGE = Path(__file__).resolve().parents[2] / "static" / "observe" / "index.html"
 
 
 @router.get("/healthz", response_model=HealthResponse)
@@ -29,6 +33,11 @@ async def healthz() -> HealthResponse:
 @router.get("/config")
 async def read_config():
     return {"config": get_app_config()}
+
+
+@router.get("/observe")
+async def observe_page():
+    return FileResponse(OBSERVE_PAGE)
 
 
 @router.post("/runs", response_model=CreateRunResponse)

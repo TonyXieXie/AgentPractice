@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app_config import get_app_config
 from app_services import AppServices, build_app_services
@@ -13,6 +15,7 @@ from transport.ws.gateway import router as ws_router
 
 def create_app(*, services: AppServices | None = None) -> FastAPI:
     resolved_services = services or build_app_services()
+    static_dir = Path(__file__).resolve().parent / "static"
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -30,6 +33,7 @@ def create_app(*, services: AppServices | None = None) -> FastAPI:
     )
     app.include_router(http_router)
     app.include_router(ws_router)
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
     app.state.services = resolved_services
 
     return app

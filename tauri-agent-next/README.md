@@ -8,8 +8,9 @@
 - 最小配置加载
 - 独立的 `LLMClient`
 - 新版 `Tool` / `ToolRegistry` / `ToolContext`
-- 基于 `run_id` / `agent_id` 的最小 `WS Hub`
-- 最小 HTTP + WS 调试链路
+- 基于 `run_id` / `agent_id` 的统一观测与 `WS Hub`
+- 文件型事件回放
+- 最小纯静态观察页
 - smoke tests
 
 原则：
@@ -21,7 +22,7 @@
 
 - `python-backend/`
 - `docs/`
-- `src/`：前端观察界面占位，暂未启动
+- `python-backend/static/observe/`：最小观察页静态资源
 
 ## 启动方式
 
@@ -37,8 +38,22 @@ Windows 也可以直接运行 `StartBackend.bat`。
 
 - `GET /healthz`
 - `GET /config`
-- `POST /debug/emit`
+- `GET /observe`
+- `POST /runs`
+- `POST /runs/{run_id}/stop`
+- `GET /runs/{run_id}/snapshot`
+- `GET /runs/{run_id}/events`
 - `WS /ws`
+
+## 最小观察页
+
+启动 backend 后，直接打开：
+
+```text
+http://127.0.0.1:8000/observe
+```
+
+页面会通过 HTTP 创建和查询 run，通过同一个 WS 连接追流、切 scope 和断线恢复。
 
 ## 验证
 

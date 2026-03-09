@@ -22,8 +22,10 @@ python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
 - HTTP health: `GET http://127.0.0.1:8000/healthz`
 - Read merged config: `GET http://127.0.0.1:8000/config`
+- Open observation page: `http://127.0.0.1:8000/observe`
+- Create one run: `POST http://127.0.0.1:8000/runs`
+- Query snapshot: `GET http://127.0.0.1:8000/runs/{run_id}/snapshot`
 - WS gateway: connect `ws://127.0.0.1:8000/ws`
-- Emit one debug chunk: `POST http://127.0.0.1:8000/debug/emit`
 
 ## 5. Run tests
 

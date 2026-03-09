@@ -12,6 +12,24 @@ from main import create_app
 
 
 class HttpRouteTests(unittest.TestCase):
+    def test_observe_page_and_static_assets_are_served(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app(services=build_app_services(data_dir=Path(temp_dir)))
+            with TestClient(app) as client:
+                page_response = client.get("/observe")
+                self.assertEqual(page_response.status_code, 200)
+                self.assertIn("Minimal Run Observation", page_response.text)
+                self.assertIn("/static/observe/observe.js", page_response.text)
+                self.assertIn("/static/observe/observe.css", page_response.text)
+
+                js_response = client.get("/static/observe/observe.js")
+                self.assertEqual(js_response.status_code, 200)
+                self.assertIn("loadRun", js_response.text)
+
+                css_response = client.get("/static/observe/observe.css")
+                self.assertEqual(css_response.status_code, 200)
+                self.assertIn(".layout-grid", css_response.text)
+
     def test_create_run_and_query_snapshot_and_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             app = create_app(services=build_app_services(data_dir=Path(temp_dir)))
