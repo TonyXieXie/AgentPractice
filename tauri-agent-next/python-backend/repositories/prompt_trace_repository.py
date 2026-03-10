@@ -13,6 +13,7 @@ class PromptTraceRecord:
     id: int
     session_id: str
     run_id: Optional[str]
+    agent_id: Optional[str]
     llm_model: Optional[str]
     max_context_tokens: int
     prompt_budget: int
@@ -34,6 +35,7 @@ def _row_to_record(row) -> PromptTraceRecord:
         id=int(row["id"]),
         session_id=str(row["session_id"]),
         run_id=row["run_id"],
+        agent_id=row["agent_id"],
         llm_model=row["llm_model"],
         max_context_tokens=int(row["max_context_tokens"]),
         prompt_budget=int(row["prompt_budget"]),
@@ -53,6 +55,7 @@ class PromptTraceRepository:
         *,
         session_id: str,
         run_id: Optional[str],
+        agent_id: Optional[str] = None,
         llm_model: Optional[str],
         max_context_tokens: int,
         prompt_budget: int,
@@ -64,13 +67,14 @@ class PromptTraceRepository:
         trace_id = await self.store.execute_insert(
             """
             INSERT INTO prompt_traces
-              (session_id, run_id, llm_model, max_context_tokens, prompt_budget,
+              (session_id, run_id, agent_id, llm_model, max_context_tokens, prompt_budget,
                estimated_prompt_tokens, rendered_message_count, actions_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """.strip(),
             (
                 session_id,
                 run_id,
+                agent_id,
                 llm_model,
                 int(max_context_tokens),
                 int(prompt_budget),
@@ -84,18 +88,36 @@ class PromptTraceRepository:
             raise RuntimeError("failed to insert prompt trace")
         return trace_id
 
-    async def get_latest(self, session_id: str) -> Optional[PromptTraceRecord]:
-        row = await self.store.fetchone(
-            """
-            SELECT id, session_id, run_id, llm_model, max_context_tokens, prompt_budget,
-                   estimated_prompt_tokens, rendered_message_count, actions_json, created_at
-            FROM prompt_traces
-            WHERE session_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """.strip(),
-            (session_id,),
-        )
+    async def get_latest(
+        self,
+        session_id: str,
+        *,
+        agent_id: Optional[str] = None,
+    ) -> Optional[PromptTraceRecord]:
+        if agent_id is None:
+            row = await self.store.fetchone(
+                """
+                SELECT id, session_id, run_id, agent_id, llm_model, max_context_tokens, prompt_budget,
+                       estimated_prompt_tokens, rendered_message_count, actions_json, created_at
+                FROM prompt_traces
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """.strip(),
+                (session_id,),
+            )
+        else:
+            row = await self.store.fetchone(
+                """
+                SELECT id, session_id, run_id, agent_id, llm_model, max_context_tokens, prompt_budget,
+                       estimated_prompt_tokens, rendered_message_count, actions_json, created_at
+                FROM prompt_traces
+                WHERE session_id = ? AND agent_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """.strip(),
+                (session_id, agent_id),
+            )
         if row is None:
             return None
         return _row_to_record(row)

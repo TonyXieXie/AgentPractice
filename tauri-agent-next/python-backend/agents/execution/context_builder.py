@@ -10,8 +10,8 @@ from models import LLMConfig
 
 
 class ContextBuilder:
-    def __init__(self, *, prompt_manager=None) -> None:
-        self.prompt_manager = prompt_manager
+    def __init__(self, *, memory=None) -> None:
+        self.memory = memory
 
     def build_request(
         self,
@@ -57,7 +57,9 @@ class ContextBuilder:
             ),
             tool_arguments=tool_arguments,
             session_id=self._optional_str(
-                payload.get("session_id") or request_overrides.get("session_id")
+                message.session_id
+                or payload.get("session_id")
+                or request_overrides.get("session_id")
             ),
         )
 
@@ -75,8 +77,8 @@ class ContextBuilder:
         default_system_prompt: str = "You are a helpful AI assistant.",
         max_history: int = 10,
     ) -> List[Dict[str, Any]]:
-        if self.prompt_manager is not None and llm_client is not None:
-            return await self.prompt_manager.build_messages(
+        if self.memory is not None and llm_client is not None:
+            return await self.memory.build_messages(
                 request,
                 llm_client=llm_client,
                 default_system_prompt=default_system_prompt,

@@ -208,12 +208,13 @@ class ReactStrategy(AgentStrategy):
                     tool_calls=tool_calls,
                     tool_results=tool_results,
                 )
-                prompt_manager = getattr(context_builder, "prompt_manager", None)
-                if prompt_manager is not None:
-                    messages = await prompt_manager.ensure_budget_for_messages(
+                memory = getattr(context_builder, "memory", None)
+                if memory is not None:
+                    messages = await memory.ensure_budget_for_messages(
                         messages,
                         llm_client=llm_client,
                         session_id=getattr(request, "session_id", None),
+                        agent_id=getattr(request, "agent_id", None),
                         run_id=getattr(request, "run_id", None),
                         phase="react_iteration",
                         iteration=iteration,

@@ -7,12 +7,14 @@ from typing import Optional
 
 from agents.center import AgentCenter
 from agents.execution import ToolExecutor
-from agents.execution.prompt_manager import PromptManager
+from agents.execution.agent_memory import AgentMemory
 from agents.execution.tool_recorder import ConversationToolRecorder
+from repositories.agent_instance_repository import AgentInstanceRepository
+from repositories.agent_prompt_state_repository import AgentPromptStateRepository
 from observation.center import ObservationCenter
 from repositories.conversation_repository import ConversationRepository
 from repositories.event_repository import FileEventStore
-from repositories.prompt_state_repository import PromptStateRepository
+from repositories.message_center_repository import MessageCenterRepository
 from repositories.prompt_trace_repository import PromptTraceRepository
 from repositories.session_repository import SessionRepository
 from repositories.sqlite_store import SqliteStore
@@ -46,13 +48,16 @@ def build_app_services(*, data_dir: Optional[Path] = None) -> AppServices:
     event_store = FileEventStore(get_runs_data_dir() if data_dir is None else runtime_dir / "runs")
     sqlite_store = SqliteStore(get_database_path(base_dir=runtime_dir))
     session_repository = SessionRepository(sqlite_store)
+    agent_instance_repository = AgentInstanceRepository(sqlite_store)
+    message_center_repository = MessageCenterRepository(sqlite_store)
     conversation_repository = ConversationRepository(sqlite_store)
-    prompt_state_repository = PromptStateRepository(sqlite_store)
+    agent_prompt_state_repository = AgentPromptStateRepository(sqlite_store)
     prompt_trace_repository = PromptTraceRepository(sqlite_store)
-    prompt_manager = PromptManager(
+    memory = AgentMemory(
         session_repository=session_repository,
+        message_center_repository=message_center_repository,
         conversation_repository=conversation_repository,
-        prompt_state_repository=prompt_state_repository,
+        agent_prompt_state_repository=agent_prompt_state_repository,
         prompt_trace_repository=prompt_trace_repository,
     )
     tool_executor = ToolExecutor(recorder=ConversationToolRecorder(conversation_repository))
@@ -61,13 +66,16 @@ def build_app_services(*, data_dir: Optional[Path] = None) -> AppServices:
         event_store=event_store,
         ws_hub=ws_hub,
     )
-    agent_center = AgentCenter(observer=observation_center)
+    agent_center = AgentCenter(
+        observer=observation_center,
+        message_center_repository=message_center_repository,
+    )
     run_manager = RunManager(
         agent_center=agent_center,
         observation_center=observation_center,
         session_repository=session_repository,
-        conversation_repository=conversation_repository,
-        prompt_manager=prompt_manager,
+        agent_instance_repository=agent_instance_repository,
+        memory=memory,
         tool_executor=tool_executor,
     )
     return AppServices(

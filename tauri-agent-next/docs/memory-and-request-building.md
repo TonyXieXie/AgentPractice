@@ -19,13 +19,18 @@
 更像“外层适配/装配器”，当前同时做了两类事情：
 - 解析 `AgentMessage` → `ExecutionRequest`（标准化内部执行请求）
 - 创建 `LLMClient`、生成 `request_overrides`
-- 构建 messages：有 PromptManager 时委托；否则自行做 fallback 拼接
+- 构建 messages：委托给 Memory（v1 已接入 `AgentMemory`）；无 Memory 时使用 request.history fallback 拼接
 
-### 1.3 `PromptManager`
-当前更偏“单 assistant 视角”的 prompt 构建器：
-- 从 session（SQLite）读取 summary + events 渲染为 messages
-- 做截断/摘要/丢弃预算与 trace
-- 当前没有 viewer/owner 概念，难以支持“tool_result 默认私有、多 Agent 多实例”的投影需求
+### 1.3 `AgentMemory`（v1 已落地）
+当前工程已将“Prompt IR + 压缩”能力落到 `AgentMemory`（代码：`python-backend/agents/execution/agent_memory.py`），用于替代早期的 `PromptManager` 实现。
+
+v1 口径（与我们对齐一致）：
+- 静态：agent profile 的基础提示词、静态工具定义/策略等
+- 动态：
+  - shared：Message Center 中“该 Agent 可接收”的消息历史（含 rpc_request/rpc_response）
+  - private：该 Agent 自己的执行过程（工具调用记录等）
+- 压缩/摘要：仅对 private 生效；shared 只做预算截断/丢弃兜底
+- artifacts：只注入路径/索引，需要内容时再调用工具读取
 
 ---
 

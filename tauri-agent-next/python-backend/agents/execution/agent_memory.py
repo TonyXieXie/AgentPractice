@@ -5,21 +5,22 @@ from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 from app_config import get_app_config
+from repositories.agent_prompt_state_repository import AgentPromptStateRepository
 from repositories.conversation_repository import ConversationEventRecord, ConversationRepository
-from repositories.prompt_state_repository import PromptStateRepository
+from repositories.message_center_repository import MessageCenterEventRecord, MessageCenterRepository
 from repositories.prompt_trace_repository import PromptTraceRepository
 from repositories.session_repository import SessionRepository
 
 
-CONTEXT_SUMMARY_PROMPT = (
-    "你是对话摘要助手。请将对话压缩为可供后续继续对话的简明摘要。\n"
-    "- 只总结用户与助手之间的对话内容\n"
-    "- 保留关键目标、已做结论、关键事实、约束、待办、代码/文件/命令\n"
-    "- 不要包含系统提示词或工具调用过程\n"
+PRIVATE_CONTEXT_SUMMARY_PROMPT = (
+    "你是执行过程摘要助手。请将该 Agent 的私有执行过程压缩为可供后续继续工作的简明摘要。\n"
+    "- 只总结工具调用结果、关键中间结论、产生/修改的文件路径、命令、错误与修复尝试\n"
+    "- 不要复述 shared 对话原文（shared 由 Message Center 负责保存）\n"
+    "- 如果有产物，只记录路径/索引，不要粘贴大段内容\n"
     "- 输出纯摘要文本，不要添加标题或前缀"
 )
 
-CONTEXT_SUMMARY_MARKER = "[Context Summary]"
+PRIVATE_CONTEXT_SUMMARY_MARKER = "[Private Summary]"
 TRUNCATION_MARKER_START = "[TRUNCATED_START]"
 TRUNCATION_MARKER_END = "[TRUNCATED_END]"
 
@@ -58,7 +59,7 @@ def _coerce_text(value: Any) -> str:
     if isinstance(value, list):
         return "".join(_coerce_text(item) for item in value)
     if isinstance(value, dict):
-        for key in ("text", "content", "delta", "value", "output", "error"):
+        for key in ("text", "content", "delta", "value", "output", "error", "reply"):
             if key in value and value[key] is not None:
                 return _coerce_text(value[key])
     return str(value)
@@ -85,18 +86,20 @@ def _truncate_text_middle(text: str, cfg: Dict[str, Any]) -> tuple[str, bool]:
     return truncated, True
 
 
-class PromptManager:
+class AgentMemory:
     def __init__(
         self,
         *,
         session_repository: SessionRepository,
+        message_center_repository: MessageCenterRepository,
         conversation_repository: ConversationRepository,
-        prompt_state_repository: PromptStateRepository,
+        agent_prompt_state_repository: AgentPromptStateRepository,
         prompt_trace_repository: PromptTraceRepository,
     ) -> None:
         self.session_repository = session_repository
+        self.message_center_repository = message_center_repository
         self.conversation_repository = conversation_repository
-        self.prompt_state_repository = prompt_state_repository
+        self.agent_prompt_state_repository = agent_prompt_state_repository
         self.prompt_trace_repository = prompt_trace_repository
 
     async def build_messages(
@@ -122,13 +125,16 @@ class PromptManager:
             messages.append({"role": system_role, "content": system_prompt})
 
         session_id = getattr(request, "session_id", None)
+        agent_id = str(getattr(request, "agent_id", "") or "")
         actions: Dict[str, Any] = {"actions": [], "cfg": deepcopy(cfg)}
 
-        if session_id:
-            messages = await self._append_session_history(
+        if session_id and agent_id:
+            messages = await self._append_shared_and_private_history(
                 messages,
                 request=request,
                 llm_client=llm_client,
+                session_id=str(session_id),
+                agent_id=agent_id,
                 max_history_events=max_history_events,
                 cfg=cfg,
                 actions=actions,
@@ -141,7 +147,8 @@ class PromptManager:
         messages = await self.ensure_budget_for_messages(
             messages,
             llm_client=llm_client,
-            session_id=session_id,
+            session_id=str(session_id) if session_id else None,
+            agent_id=agent_id or None,
             run_id=getattr(request, "run_id", None),
             phase="build_messages",
             actions=actions,
@@ -154,6 +161,7 @@ class PromptManager:
         *,
         llm_client: Any,
         session_id: Optional[str],
+        agent_id: Optional[str] = None,
         run_id: Optional[str],
         phase: str,
         actions: Optional[Dict[str, Any]] = None,
@@ -205,6 +213,7 @@ class PromptManager:
                 await self.prompt_trace_repository.append(
                     session_id=session_id,
                     run_id=run_id,
+                    agent_id=agent_id,
                     llm_model=str(getattr(getattr(llm_client, "config", None), "model", None) or ""),
                     max_context_tokens=max_context_tokens,
                     prompt_budget=prompt_budget,
@@ -217,32 +226,55 @@ class PromptManager:
 
         return messages
 
-    async def _append_session_history(
+    async def _append_shared_and_private_history(
         self,
         messages: List[Dict[str, Any]],
         *,
         request,
         llm_client: Any,
+        session_id: str,
+        agent_id: str,
         max_history_events: int,
         cfg: Dict[str, Any],
         actions: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        session_id = str(getattr(request, "session_id") or "")
-        state = await self.prompt_state_repository.get_or_create(session_id)
-        cursor = int(state.summarized_until_event_id)
-        events = await self.conversation_repository.list_events_after(
+        exclude_message_id = str(getattr(request, "message_id", "") or "").strip() or None
+        max_shared = int(cfg.get("context", {}).get("max_shared_messages", 2000) or 2000)
+        shared_records = await self.message_center_repository.list_latest_visible(
             session_id,
+            agent_id,
+            limit=max_shared,
+            exclude_message_id=exclude_message_id,
+        )
+        shared_rendered = self._render_message_center_history(shared_records)
+        if max_history_events > 0 and len(shared_rendered) > max_history_events:
+            shared_rendered = shared_rendered[-max_history_events:]
+            actions["actions"].append(
+                {
+                    "type": "trim_shared_history",
+                    "kept": max_history_events,
+                    "dropped": max(0, len(self._render_message_center_history(shared_records)) - max_history_events),
+                }
+            )
+        messages.extend(shared_rendered)
+
+        state = await self.agent_prompt_state_repository.get_or_create(session_id, agent_id)
+        cursor = int(state.summarized_until_event_id)
+        private_events = await self.conversation_repository.list_events_after(
+            session_id,
+            agent_id=agent_id,
             after_id=cursor,
             limit=int(cfg.get("max_unsummarized_events", 2000) or 2000),
         )
 
         if cfg.get("context", {}).get("compression_enabled", True) and llm_client is not None:
-            events, state = await self._maybe_rollup_summary(
+            private_events, state = await self._maybe_rollup_private_summary(
                 session_id=session_id,
+                agent_id=agent_id,
                 llm_client=llm_client,
                 current_summary=state.summary_text,
                 summarized_until_event_id=cursor,
-                events=events,
+                events=private_events,
                 cfg=cfg,
                 actions=actions,
             )
@@ -252,21 +284,12 @@ class PromptManager:
             messages.append(
                 {
                     "role": "assistant",
-                    "content": f"{CONTEXT_SUMMARY_MARKER}\n{summary_text}",
+                    "content": f"{PRIVATE_CONTEXT_SUMMARY_MARKER}\n{summary_text}",
                 }
             )
 
-        rendered = self._render_events_as_history(events)
-        if max_history_events > 0 and len(rendered) > max_history_events:
-            rendered = rendered[-max_history_events:]
-            actions["actions"].append(
-                {
-                    "type": "trim_history_events",
-                    "kept": max_history_events,
-                    "dropped": max(0, len(self._render_events_as_history(events)) - max_history_events),
-                }
-            )
-        messages.extend(rendered)
+        private_rendered = self._render_private_events(private_events)
+        messages.extend(private_rendered)
 
         inline_history = getattr(request, "history", None)
         if inline_history:
@@ -275,10 +298,11 @@ class PromptManager:
 
         return messages
 
-    async def _maybe_rollup_summary(
+    async def _maybe_rollup_private_summary(
         self,
         *,
         session_id: str,
+        agent_id: str,
         llm_client: Any,
         current_summary: str,
         summarized_until_event_id: int,
@@ -298,8 +322,8 @@ class PromptManager:
         def build_preview_messages(summary_text: str, preview_events: List[ConversationEventRecord]) -> List[Dict[str, Any]]:
             preview: List[Dict[str, Any]] = []
             if summary_text.strip():
-                preview.append({"role": "assistant", "content": f"{CONTEXT_SUMMARY_MARKER}\n{summary_text.strip()}"})
-            preview.extend(self._render_events_as_history(preview_events))
+                preview.append({"role": "assistant", "content": f"{PRIVATE_CONTEXT_SUMMARY_MARKER}\n{summary_text.strip()}"})
+            preview.extend(self._render_private_events(preview_events))
             return preview
 
         preview_messages = build_preview_messages(current_summary or "", events)
@@ -318,17 +342,18 @@ class PromptManager:
             boundary_index = max(1, len(remaining) - keep_recent)
             to_summarize = remaining[:boundary_index]
             boundary_event_id = int(to_summarize[-1].id)
-            new_summary = await self._run_summary_call(
+            new_summary = await self._run_private_summary_call(
                 llm_client,
                 previous_summary=summary_text,
                 events=to_summarize,
+                cfg=cfg,
             )
             if not new_summary.strip():
                 break
 
             actions["actions"].append(
                 {
-                    "type": "summarize",
+                    "type": "summarize_private",
                     "from_event_id": int(to_summarize[0].id),
                     "to_event_id": boundary_event_id,
                     "events": len(to_summarize),
@@ -336,8 +361,9 @@ class PromptManager:
             )
             summary_text = new_summary.strip()
             cursor = boundary_event_id
-            await self.prompt_state_repository.update(
+            await self.agent_prompt_state_repository.update(
                 session_id,
+                agent_id,
                 summary_text=summary_text,
                 summarized_until_event_id=cursor,
             )
@@ -350,66 +376,93 @@ class PromptManager:
         state = type("State", (), {"summary_text": summary_text, "summarized_until_event_id": cursor})()
         return remaining, state
 
-    async def _run_summary_call(
+    async def _run_private_summary_call(
         self,
         llm_client: Any,
         *,
         previous_summary: str,
         events: List[ConversationEventRecord],
+        cfg: Dict[str, Any],
     ) -> str:
-        dialogue = self._format_events_for_summary(events)
+        dialogue = self._format_private_events_for_summary(events, cfg=cfg)
         user_payload = (
             f"当前摘要：\n{previous_summary.strip() or '(无)'}\n\n"
-            f"新增对话：\n{dialogue}\n\n"
+            f"新增私有记录：\n{dialogue}\n\n"
             "请输出更新后的摘要（只输出摘要文本）。"
         )
         system_role = self._system_role_for_client(llm_client)
         messages = [
-            {"role": system_role, "content": CONTEXT_SUMMARY_PROMPT},
+            {"role": system_role, "content": PRIVATE_CONTEXT_SUMMARY_PROMPT},
             {"role": "user", "content": user_payload},
         ]
-        response = await llm_client.chat(messages, None)
-        return str(response.get("content", "") or "").strip()
+        try:
+            response = await llm_client.chat(messages)
+        except Exception:
+            return ""
+        content = response.get("content")
+        return str(content or "").strip()
 
-    def _format_events_for_summary(self, events: List[ConversationEventRecord]) -> str:
-        lines: List[str] = []
-        for event in events:
-            kind = event.kind
-            if kind == "user_message":
-                text = _coerce_text(event.content.get("text"))
-                if text.strip():
-                    lines.append(f"User: {text.strip()}")
-                continue
-            if kind == "assistant_message":
-                text = _coerce_text(event.content.get("text"))
-                if text.strip():
-                    lines.append(f"Assistant: {text.strip()}")
-                continue
-            if kind == "tool_result":
-                tool_name = str(event.tool_name or "")
-                output = _coerce_text(event.content.get("output") or event.content.get("text"))
-                if output.strip():
-                    lines.append(f"ToolResult({tool_name}): {output.strip()}")
-                continue
-        return "\n".join(lines)
-
-    def _render_events_as_history(
+    def _format_private_events_for_summary(
         self,
         events: List[ConversationEventRecord],
+        *,
+        cfg: Dict[str, Any],
+    ) -> str:
+        trunc_cfg = cfg.get("truncation", {})
+        lines: List[str] = []
+        for event in events:
+            kind = str(event.kind or "")
+            if kind == "tool_call":
+                tool_name = str(event.tool_name or "")
+                args = event.content.get("arguments", {})
+                text = _coerce_text(args)
+                text, _ = _truncate_text_middle(text, trunc_cfg)
+                lines.append(f"Tool call: {tool_name}\n{text}".strip())
+            elif kind == "tool_result":
+                tool_name = str(event.tool_name or "")
+                output = _coerce_text(event.content.get("output"))
+                error = _coerce_text(event.content.get("error"))
+                body = error.strip() if event.ok is False and error.strip() else output
+                body, _ = _truncate_text_middle(body, trunc_cfg)
+                lines.append(f"Tool result: {tool_name} ok={bool(event.ok)}\n{body}".strip())
+        return "\n\n".join(lines).strip()
+
+    def _render_message_center_history(
+        self,
+        records: List[MessageCenterEventRecord],
     ) -> List[Dict[str, Any]]:
         rendered: List[Dict[str, Any]] = []
+        for rec in records:
+            kind = rec.kind
+            sender = rec.sender_id
+            topic = rec.topic
+            ok = rec.ok
+            payload = rec.payload or {}
+
+            if kind == "rpc_request":
+                text = _coerce_text(payload.get("content")) or _safe_json(payload)
+                header = f"[RPC request] from {sender} topic={topic}"
+                rendered.append({"role": "user", "content": f"{header}\n{text}".strip()})
+                continue
+
+            if kind == "rpc_response":
+                text = _coerce_text(payload.get("reply")) or _coerce_text(payload.get("result")) or _safe_json(payload)
+                header = f"[RPC response] from {sender} topic={topic} ok={ok}"
+                rendered.append({"role": "assistant", "content": f"{header}\n{text}".strip()})
+                continue
+
+            if kind == "event":
+                text = _coerce_text(payload.get("text")) or _safe_json(payload)
+                header = f"[Event] from {sender} topic={topic}"
+                rendered.append({"role": "assistant", "content": f"{header}\n{text}".strip()})
+                continue
+
+        return rendered
+
+    def _render_private_events(self, events: List[ConversationEventRecord]) -> List[Dict[str, Any]]:
+        rendered: List[Dict[str, Any]] = []
         for event in events:
-            kind = event.kind
-            if kind == "user_message":
-                text = _coerce_text(event.content.get("text"))
-                if text.strip():
-                    rendered.append({"role": "user", "content": text})
-                continue
-            if kind == "assistant_message":
-                text = _coerce_text(event.content.get("text"))
-                if text.strip():
-                    rendered.append({"role": "assistant", "content": text})
-                continue
+            kind = str(event.kind or "")
             if kind == "tool_call":
                 tool_name = str(event.tool_name or "")
                 args = event.content.get("arguments", {})
@@ -494,8 +547,7 @@ class PromptManager:
         cfg: Dict[str, Any] = {
             "context": context_cfg if isinstance(context_cfg, dict) else {},
             "trace": trace_cfg if isinstance(trace_cfg, dict) else {},
-            "truncation": (context_cfg.get("truncation", {}) if isinstance(context_cfg, dict) else {})
-            or {},
+            "truncation": (context_cfg.get("truncation", {}) if isinstance(context_cfg, dict) else {}) or {},
         }
         if isinstance(override, dict):
             cfg.update(deepcopy(override))
@@ -518,7 +570,18 @@ class PromptManager:
             if role in {"system", "developer"}:
                 continue
             content = _coerce_text(msg.get("content"))
-            if idx == 1 and content.startswith(CONTEXT_SUMMARY_MARKER):
+            if idx == 1 and content.startswith(PRIVATE_CONTEXT_SUMMARY_MARKER):
                 continue
             return idx
         return None
+
+
+def _safe_json(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except TypeError:
+        return str(value)

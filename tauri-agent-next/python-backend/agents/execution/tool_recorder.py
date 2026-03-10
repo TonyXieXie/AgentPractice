@@ -83,6 +83,7 @@ class ConversationToolRecorder:
         await self.conversation_repository.append_event(
             session_id=session_id,
             run_id=request.run_id,
+            agent_id=request.agent_id,
             kind="tool_call",
             content=payload,
             tool_name=tool_name,
@@ -107,6 +108,7 @@ class ConversationToolRecorder:
         await self.conversation_repository.append_event(
             session_id=session_id,
             run_id=request.run_id,
+            agent_id=request.agent_id,
             kind="tool_result",
             content={"output": output_text, "error": error_text},
             tool_name=tool_name,

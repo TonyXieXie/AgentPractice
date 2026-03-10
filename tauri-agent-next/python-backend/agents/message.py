@@ -26,6 +26,7 @@ class AgentMessage(BaseModel):
     target_id: Optional[str] = None
     correlation_id: Optional[str] = None
     run_id: Optional[str] = None
+    session_id: Optional[str] = None
     seq: Optional[int] = None
     visibility: VisibilityLevel = "public"
     level: SeverityLevel = "info"
@@ -61,6 +62,7 @@ class AgentMessage(BaseModel):
         target_id: str,
         payload: Optional[Dict[str, Any]] = None,
         run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
         timeout_ms: int = 300_000,
         visibility: VisibilityLevel = "public",
         level: SeverityLevel = "info",
@@ -76,6 +78,7 @@ class AgentMessage(BaseModel):
             target_id=target_id,
             correlation_id=message_id,
             run_id=run_id,
+            session_id=session_id,
             timeout_ms=timeout_ms,
             visibility=visibility,
             level=level,
@@ -103,6 +106,7 @@ class AgentMessage(BaseModel):
             target_id=request.sender_id,
             correlation_id=request.correlation_id or request.id,
             run_id=request.run_id,
+            session_id=request.session_id,
             visibility=visibility or request.visibility,
             level=level,
             ok=ok,
@@ -119,6 +123,7 @@ class AgentMessage(BaseModel):
         payload: Optional[Dict[str, Any]] = None,
         target_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
         delivery: AgentDelivery = "unicast",
         visibility: VisibilityLevel = "public",
         level: SeverityLevel = "info",
@@ -131,6 +136,7 @@ class AgentMessage(BaseModel):
             sender_id=sender_id,
             target_id=target_id,
             run_id=run_id,
+            session_id=session_id,
             visibility=visibility,
             level=level,
             payload=payload or {},

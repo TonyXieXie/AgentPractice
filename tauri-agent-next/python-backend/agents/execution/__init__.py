@@ -1,3 +1,4 @@
+from agents.execution.agent_memory import AgentMemory
 from agents.execution.context_builder import ContextBuilder
 from agents.execution.engine import ExecutionEngine, ExecutionResult
 from agents.execution.providers import (
@@ -16,6 +17,7 @@ from agents.execution.strategy import AgentStrategy, ExecutionRequest, Execution
 from agents.execution.tool_executor import ToolExecutionResult, ToolExecutor
 
 __all__ = [
+    "AgentMemory",
     "AgentStrategy",
     "ContextBuilder",
     "ExecutionEngine",

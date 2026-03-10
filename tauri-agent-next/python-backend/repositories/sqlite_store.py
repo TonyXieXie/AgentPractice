@@ -100,9 +100,33 @@ class SqliteStore:
         try:
             for statement in self._schema_statements():
                 conn.execute(statement)
+            self._migrate_schema(conn)
             conn.commit()
         finally:
             conn.close()
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        self._ensure_column(conn, "conversation_events", "agent_id", "TEXT NULL")
+        self._ensure_column(conn, "prompt_traces", "agent_id", "TEXT NULL")
+
+    def _ensure_column(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        decl: str,
+    ) -> None:
+        try:
+            rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
+        except sqlite3.Error:
+            return
+        existing = {str(row[1]) for row in rows if row and len(row) > 1}
+        if column in existing:
+            return
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl};")
+        except sqlite3.Error:
+            return
 
     def _schema_statements(self) -> Iterable[str]:
         yield """
@@ -118,10 +142,29 @@ class SqliteStore:
         """.strip()
 
         yield """
+        CREATE TABLE IF NOT EXISTS agent_instances (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            agent_type TEXT NOT NULL,
+            profile_id TEXT NULL,
+            role TEXT NOT NULL,
+            display_name TEXT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """.strip()
+
+        yield "CREATE INDEX IF NOT EXISTS idx_agent_instances_session_type ON agent_instances(session_id, agent_type, created_at)"
+        yield "CREATE INDEX IF NOT EXISTS idx_agent_instances_session ON agent_instances(session_id, id)"
+
+        yield """
         CREATE TABLE IF NOT EXISTS conversation_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
             run_id TEXT NULL,
+            agent_id TEXT NULL,
             kind TEXT NOT NULL,
             content_json TEXT NOT NULL,
             tool_name TEXT NULL,
@@ -133,14 +176,45 @@ class SqliteStore:
         """.strip()
 
         yield "CREATE INDEX IF NOT EXISTS idx_conversation_events_session ON conversation_events(session_id, id)"
+        yield "CREATE INDEX IF NOT EXISTS idx_conversation_events_agent ON conversation_events(session_id, agent_id, id)"
         yield "CREATE INDEX IF NOT EXISTS idx_conversation_events_tool_call ON conversation_events(session_id, tool_call_id)"
 
         yield """
-        CREATE TABLE IF NOT EXISTS prompt_state (
-            session_id TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS message_center_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            run_id TEXT NULL,
+            viewer_agent_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            seq INTEGER NULL,
+            kind TEXT NOT NULL,
+            delivery TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            target_id TEXT NULL,
+            correlation_id TEXT NULL,
+            ok INTEGER NULL,
+            visibility TEXT NOT NULL,
+            level TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """.strip()
+
+        yield "CREATE INDEX IF NOT EXISTS idx_message_center_viewer ON message_center_events(session_id, viewer_agent_id, id)"
+        yield "CREATE INDEX IF NOT EXISTS idx_message_center_message ON message_center_events(session_id, message_id)"
+        yield "CREATE INDEX IF NOT EXISTS idx_message_center_correlation ON message_center_events(session_id, correlation_id)"
+
+        yield """
+        CREATE TABLE IF NOT EXISTS agent_prompt_state (
+            session_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
             summary_text TEXT NOT NULL DEFAULT '',
             summarized_until_event_id INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, agent_id),
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
         )
         """.strip()
@@ -150,6 +224,7 @@ class SqliteStore:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
             run_id TEXT NULL,
+            agent_id TEXT NULL,
             llm_model TEXT NULL,
             max_context_tokens INTEGER NOT NULL,
             prompt_budget INTEGER NOT NULL,

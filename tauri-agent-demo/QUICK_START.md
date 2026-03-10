@@ -11,6 +11,7 @@
 
 ## 3. 启动应用
 - 整体启动：`Run.bat` 或 `run.command`
+- 动态端口启动（Windows）：`RunDynamic.ps1`
 - 后端单独启动：`StartBackend.bat` 或 `start-backend.command`
 - 桌面端单独启动：`StartFrontend.bat` 或 `start-frontend.command`
 

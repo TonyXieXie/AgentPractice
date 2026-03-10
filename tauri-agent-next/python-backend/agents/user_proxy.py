@@ -51,6 +51,7 @@ class UserProxyAgent(AgentBase):
             payload,
             target_agent_id=target_agent_id,
             run_id=run_id or self.run_id,
+            session_id=session_id,
             metadata=metadata,
         )
 

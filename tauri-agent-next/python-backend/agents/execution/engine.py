@@ -97,14 +97,6 @@ class ExecutionEngine:
             final_step = ExecutionStep("error", reply, {"status": "error"})
             if run_started:
                 await self.step_emitter.emit_step(request, final_step)
-        finally:
-            if run_started:
-                await self.step_emitter.emit_run_finished(
-                    request,
-                    strategy_name=strategy.name,
-                    status=terminal_status if not ok else "completed",
-                    reply=reply,
-                )
 
         payload: Dict[str, object] = {
             "reply": reply,

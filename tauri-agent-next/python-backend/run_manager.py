@@ -13,13 +13,14 @@ from agents.user_proxy import UserProxyAgent
 from models import CreateRunRequest, CreateRunResponse, StopRunResponse
 from observation.center import ObservationCenter
 from observation.events import ExecutionEvent
-from repositories.conversation_repository import ConversationRepository
+from repositories.agent_instance_repository import AgentInstanceRepository
 from repositories.session_repository import SessionRepository
 
 
 @dataclass
 class ActiveRun:
     run_id: str
+    session_id: str
     user_agent_id: str
     assistant_agent_id: str
     user_agent: UserProxyAgent
@@ -33,6 +34,13 @@ class SessionNotFoundError(RuntimeError):
         self.session_id = session_id
 
 
+class SessionBusyError(RuntimeError):
+    def __init__(self, session_id: str, active_run_id: str) -> None:
+        super().__init__(f"session busy: {session_id} (active_run_id={active_run_id})")
+        self.session_id = session_id
+        self.active_run_id = active_run_id
+
+
 class RunManager:
     def __init__(
         self,
@@ -40,17 +48,18 @@ class RunManager:
         agent_center: AgentCenter,
         observation_center: ObservationCenter,
         session_repository: SessionRepository,
-        conversation_repository: ConversationRepository,
-        prompt_manager,
+        agent_instance_repository: AgentInstanceRepository,
+        memory,
         tool_executor: ToolExecutor,
     ) -> None:
         self.agent_center = agent_center
         self.observation_center = observation_center
         self.session_repository = session_repository
-        self.conversation_repository = conversation_repository
-        self.prompt_manager = prompt_manager
+        self.agent_instance_repository = agent_instance_repository
+        self.memory = memory
         self.tool_executor = tool_executor
         self._active_runs: Dict[str, ActiveRun] = {}
+        self._busy_sessions: Dict[str, str] = {}
         self._lock = asyncio.Lock()
 
     async def create_run(self, request: CreateRunRequest) -> CreateRunResponse:
@@ -58,74 +67,105 @@ class RunManager:
         session_id, effective_llm_config, effective_system_prompt, effective_work_path = (
             await self._resolve_session_defaults(request)
         )
-        user_agent_id = f"user-{run_id[:8]}"
-        assistant_agent_id = f"assistant-{run_id[:8]}"
-        user_agent = UserProxyAgent(
-            AgentInstance(
-                id=user_agent_id,
-                agent_type="user_proxy",
-                role="user_proxy",
-                run_id=run_id,
-            ),
-            self.agent_center,
-            observer=self.observation_center,
-        )
-        assistant_agent = AssistantAgent(
-            AgentInstance(
-                id=assistant_agent_id,
-                agent_type="assistant",
-                role="assistant",
-                run_id=run_id,
-            ),
-            self.agent_center,
-            observer=self.observation_center,
-        )
-        assistant_agent.execution_engine = ExecutionEngine(
-            assistant_agent,
-            context_builder=ContextBuilder(prompt_manager=self.prompt_manager),
-            tool_executor=self.tool_executor,
-        )
-
-        await self.agent_center.register(user_agent)
-        await self.agent_center.register(assistant_agent)
-
-        await self.conversation_repository.append_event(
-            session_id=session_id,
-            run_id=run_id,
-            kind="user_message",
-            content={"text": request.content},
-        )
-
-        task = asyncio.create_task(
-            self._execute_run(
-                user_agent,
-                assistant_agent,
-                request,
-                run_id,
-                session_id=session_id,
-                llm_config=effective_llm_config,
-                system_prompt=effective_system_prompt,
-                work_path=effective_work_path,
-            ),
-            name=f"run:{run_id}",
-        )
         async with self._lock:
-            self._active_runs[run_id] = ActiveRun(
-                run_id=run_id,
-                user_agent_id=user_agent_id,
-                assistant_agent_id=assistant_agent_id,
-                user_agent=user_agent,
-                assistant_agent=assistant_agent,
-                task=task,
+            active_run_id = self._busy_sessions.get(session_id)
+            if active_run_id:
+                raise SessionBusyError(session_id, active_run_id)
+            self._busy_sessions[session_id] = run_id
+
+        user_agent: Optional[UserProxyAgent] = None
+        assistant_agent: Optional[AssistantAgent] = None
+        try:
+            user_record = await self.agent_instance_repository.get_or_create_primary(
+                session_id,
+                "user_proxy",
+                display_name="UserProxy",
+            )
+            assistant_record = await self.agent_instance_repository.get_or_create_primary(
+                session_id,
+                "assistant",
+                display_name="Assistant",
+            )
+            user_agent_id = user_record.id
+            assistant_agent_id = assistant_record.id
+
+            user_agent = UserProxyAgent(
+                AgentInstance(
+                    id=user_record.id,
+                    agent_type=user_record.agent_type,
+                    role=user_record.role,
+                    run_id=run_id,
+                    profile_id=user_record.profile_id,
+                    metadata=dict(user_record.metadata),
+                    created_at=user_record.created_at,
+                    updated_at=user_record.updated_at,
+                ),
+                self.agent_center,
+                observer=self.observation_center,
+            )
+            assistant_agent = AssistantAgent(
+                AgentInstance(
+                    id=assistant_record.id,
+                    agent_type=assistant_record.agent_type,
+                    role=assistant_record.role,
+                    run_id=run_id,
+                    profile_id=assistant_record.profile_id,
+                    metadata=dict(assistant_record.metadata),
+                    created_at=assistant_record.created_at,
+                    updated_at=assistant_record.updated_at,
+                ),
+                self.agent_center,
+                observer=self.observation_center,
+            )
+            assistant_agent.execution_engine = ExecutionEngine(
+                assistant_agent,
+                context_builder=ContextBuilder(memory=self.memory),
+                tool_executor=self.tool_executor,
             )
 
-        return CreateRunResponse(
-            run_id=run_id,
-            session_id=session_id,
-            user_agent_id=user_agent_id,
-            assistant_agent_id=assistant_agent_id,
-            status="accepted",
-        )
+            await self.agent_center.register(user_agent)
+            await self.agent_center.register(assistant_agent)
+
+            task = asyncio.create_task(
+                self._execute_run(
+                    user_agent,
+                    assistant_agent,
+                    request,
+                    run_id,
+                    session_id=session_id,
+                    llm_config=effective_llm_config,
+                    system_prompt=effective_system_prompt,
+                    work_path=effective_work_path,
+                ),
+                name=f"run:{run_id}",
+            )
+            async with self._lock:
+                self._active_runs[run_id] = ActiveRun(
+                    run_id=run_id,
+                    session_id=session_id,
+                    user_agent_id=user_agent_id,
+                    assistant_agent_id=assistant_agent_id,
+                    user_agent=user_agent,
+                    assistant_agent=assistant_agent,
+                    task=task,
+                )
+
+            return CreateRunResponse(
+                run_id=run_id,
+                session_id=session_id,
+                user_agent_id=user_agent_id,
+                assistant_agent_id=assistant_agent_id,
+                status="accepted",
+            )
+        except Exception:
+            if user_agent is not None:
+                await self.agent_center.unregister(user_agent.agent_id)
+            if assistant_agent is not None:
+                await self.agent_center.unregister(assistant_agent.agent_id)
+            async with self._lock:
+                if self._busy_sessions.get(session_id) == run_id:
+                    self._busy_sessions.pop(session_id, None)
+            raise
 
     async def stop_run(self, run_id: str) -> Optional[StopRunResponse]:
         active_run = await self.get_active_run(run_id)
@@ -185,12 +225,6 @@ class RunManager:
                 request_overrides=request.request_overrides,
             )
             reply = str(response.payload.get("reply") or response.payload.get("error") or "")
-            if not response.ok:
-                await self._ensure_terminal_event(
-                    run_id,
-                    status="error",
-                    reply=reply,
-                )
         except asyncio.CancelledError:
             reply = "run cancelled"
             await self._ensure_terminal_event(
@@ -219,20 +253,12 @@ class RunManager:
                 )
             )
         finally:
-            if reply:
-                try:
-                    await self.conversation_repository.append_event(
-                        session_id=session_id,
-                        run_id=run_id,
-                        kind="assistant_message",
-                        content={"text": reply},
-                    )
-                except Exception:
-                    pass
             await self.agent_center.unregister(user_agent.agent_id)
             await self.agent_center.unregister(assistant_agent.agent_id)
             async with self._lock:
                 self._active_runs.pop(run_id, None)
+                if self._busy_sessions.get(session_id) == run_id:
+                    self._busy_sessions.pop(session_id, None)
 
     async def _ensure_terminal_event(
         self,

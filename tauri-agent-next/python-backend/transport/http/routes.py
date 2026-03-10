@@ -15,7 +15,7 @@ from models import (
     StopRunResponse,
 )
 from runtime_paths import ensure_runtime_dirs
-from run_manager import SessionNotFoundError
+from run_manager import SessionBusyError, SessionNotFoundError
 
 
 router = APIRouter()
@@ -48,6 +48,15 @@ async def create_run(request: Request, body: CreateRunRequest) -> CreateRunRespo
         return await services.run_manager.create_run(body)
     except SessionNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SessionBusyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "session busy",
+                "session_id": exc.session_id,
+                "active_run_id": exc.active_run_id,
+            },
+        ) from exc
 
 
 @router.post("/runs/{run_id}/stop", response_model=StopRunResponse)

@@ -3,7 +3,7 @@ title Frontend - Tauri Desktop App
 cd /d "%~dp0"
 set "TAURI_AGENT_DATA_DIR=%~dp0.tauri-agent-data"
 set "TAURI_AGENT_EXTERNAL_BACKEND=1"
-set "VITE_API_BASE_URL=http://127.0.0.1:8000"
+if not defined VITE_API_BASE_URL set "VITE_API_BASE_URL=http://127.0.0.1:8000"
 cls
 echo ========================================
 echo   Tauri Desktop App (Frontend)

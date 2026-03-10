@@ -13,6 +13,7 @@ class ConversationEventRecord:
     id: int
     session_id: str
     run_id: Optional[str]
+    agent_id: Optional[str]
     kind: str
     content: Dict[str, Any]
     tool_name: Optional[str]
@@ -39,6 +40,7 @@ def _row_to_record(row) -> ConversationEventRecord:
         id=int(row["id"]),
         session_id=str(row["session_id"]),
         run_id=row["run_id"],
+        agent_id=row["agent_id"],
         kind=str(row["kind"]),
         content=content,
         tool_name=row["tool_name"],
@@ -57,6 +59,7 @@ class ConversationRepository:
         *,
         session_id: str,
         run_id: Optional[str],
+        agent_id: Optional[str] = None,
         kind: str,
         content: Dict[str, Any],
         tool_name: Optional[str] = None,
@@ -72,12 +75,13 @@ class ConversationRepository:
         event_id = await self.store.execute_insert(
             """
             INSERT INTO conversation_events
-              (session_id, run_id, kind, content_json, tool_name, tool_call_id, ok, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              (session_id, run_id, agent_id, kind, content_json, tool_name, tool_call_id, ok, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """.strip(),
             (
                 session_id,
                 run_id,
+                agent_id,
                 kind,
                 json.dumps(content, ensure_ascii=False),
                 tool_name,
@@ -94,37 +98,63 @@ class ConversationRepository:
         self,
         session_id: str,
         *,
+        agent_id: Optional[str] = None,
         after_id: int,
         limit: int,
     ) -> list[ConversationEventRecord]:
-        rows = await self.store.fetchall(
-            """
-            SELECT id, session_id, run_id, kind, content_json, tool_name, tool_call_id, ok, created_at
-            FROM conversation_events
-            WHERE session_id = ? AND id > ?
-            ORDER BY id ASC
-            LIMIT ?
-            """.strip(),
-            (session_id, int(after_id), int(limit)),
-        )
+        if agent_id is None:
+            rows = await self.store.fetchall(
+                """
+                SELECT id, session_id, run_id, agent_id, kind, content_json, tool_name, tool_call_id, ok, created_at
+                FROM conversation_events
+                WHERE session_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """.strip(),
+                (session_id, int(after_id), int(limit)),
+            )
+        else:
+            rows = await self.store.fetchall(
+                """
+                SELECT id, session_id, run_id, agent_id, kind, content_json, tool_name, tool_call_id, ok, created_at
+                FROM conversation_events
+                WHERE session_id = ? AND agent_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """.strip(),
+                (session_id, agent_id, int(after_id), int(limit)),
+            )
         return [_row_to_record(row) for row in rows]
 
     async def list_latest(
         self,
         session_id: str,
         *,
+        agent_id: Optional[str] = None,
         limit: int,
     ) -> list[ConversationEventRecord]:
-        rows = await self.store.fetchall(
-            """
-            SELECT id, session_id, run_id, kind, content_json, tool_name, tool_call_id, ok, created_at
-            FROM conversation_events
-            WHERE session_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """.strip(),
-            (session_id, int(limit)),
-        )
+        if agent_id is None:
+            rows = await self.store.fetchall(
+                """
+                SELECT id, session_id, run_id, agent_id, kind, content_json, tool_name, tool_call_id, ok, created_at
+                FROM conversation_events
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """.strip(),
+                (session_id, int(limit)),
+            )
+        else:
+            rows = await self.store.fetchall(
+                """
+                SELECT id, session_id, run_id, agent_id, kind, content_json, tool_name, tool_call_id, ok, created_at
+                FROM conversation_events
+                WHERE session_id = ? AND agent_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """.strip(),
+                (session_id, agent_id, int(limit)),
+            )
         records = [_row_to_record(row) for row in rows]
         records.reverse()
         return records
