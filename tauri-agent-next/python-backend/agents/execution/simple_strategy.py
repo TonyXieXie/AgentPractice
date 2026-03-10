@@ -40,7 +40,7 @@ class SimpleStrategy(AgentStrategy):
             )
             return
 
-        messages = context_builder.build_messages(
+        messages = await context_builder.build_messages(
             request,
             llm_client=llm_client,
             default_system_prompt=self.system_prompt,

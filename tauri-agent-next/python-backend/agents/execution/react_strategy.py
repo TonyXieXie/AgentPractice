@@ -59,7 +59,7 @@ class ReactStrategy(AgentStrategy):
             return
 
         tools = tool_executor.list_tools()
-        messages = context_builder.build_messages(
+        messages = await context_builder.build_messages(
             request,
             llm_client=llm_client,
             default_system_prompt=self.system_prompt,
@@ -208,6 +208,16 @@ class ReactStrategy(AgentStrategy):
                     tool_calls=tool_calls,
                     tool_results=tool_results,
                 )
+                prompt_manager = getattr(context_builder, "prompt_manager", None)
+                if prompt_manager is not None:
+                    messages = await prompt_manager.ensure_budget_for_messages(
+                        messages,
+                        llm_client=llm_client,
+                        session_id=getattr(request, "session_id", None),
+                        run_id=getattr(request, "run_id", None),
+                        phase="react_iteration",
+                        iteration=iteration,
+                    )
                 continue
 
             answer = "".join(assistant_parts).strip()

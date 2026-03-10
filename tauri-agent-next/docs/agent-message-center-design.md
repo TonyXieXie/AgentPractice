@@ -1377,6 +1377,24 @@ flowchart LR
 
 混在一起的状态清晰得多。
 
+## 10. Message Center 与 Memory（v1）
+
+为了支撑“多 Agent + private 默认隔离 + 产物落盘共享”，Memory 的动态部分建议以 Message Center 为 shared 事实源，并与 private 执行记录分离：
+
+- **shared history（进入 Memory）**
+  - 来源：Message Center 的消息日志（`AgentMessage`）
+  - 视图：对某个 `agent_instance_id` 构建上下文时，只纳入“该 Agent 可接收”的消息（`unicast` 目标命中 / `broadcast` scope 命中）
+  - v1：`rpc_request` / `rpc_response` 也进入 shared history（只要该 Agent 可接收）
+  - 用户输入与最终 Agent 输出统一走 Message Center，因此天然属于 shared history
+- **private execution（进入 Memory）**
+  - 来源：该 AgentInstance 自己的执行过程记录（例如 `tool_call` / `tool_result` / 中间笔记）
+  - 默认不发布到 Message Center（避免泄漏与噪声扩散）
+  - v1：摘要/压缩仅对 private 生效；shared 只做预算丢弃/截断兜底
+
+协作协议建议：
+- 私有执行完成后，需要把“高层结果 + 产物引用（路径/索引）+ 下一步建议”发布到 Message Center（shared），否则其它 Agent 无法感知产出
+- 由于 RPC payload 可能较大，shared history 在进入 Memory 时需要有明确的预算策略（截断/丢弃）
+
 
 
 

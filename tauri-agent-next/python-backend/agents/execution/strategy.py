@@ -17,6 +17,7 @@ class ExecutionRequest:
     message_id: Optional[str]
     correlation_id: Optional[str]
     user_input: str
+    session_id: Optional[str] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
     request_overrides: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)

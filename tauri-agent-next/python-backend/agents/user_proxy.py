@@ -19,6 +19,7 @@ class UserProxyAgent(AgentBase):
         target_agent_id: str,
         topic: str = "task.run",
         run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
         strategy: Optional[str] = None,
         history: Optional[List[Dict[str, Any]]] = None,
         llm_config: Optional[Dict[str, Any]] = None,
@@ -31,6 +32,8 @@ class UserProxyAgent(AgentBase):
         payload: Dict[str, Any] = {"content": content}
         if strategy:
             payload["strategy"] = strategy
+        if session_id is not None:
+            payload["session_id"] = session_id
         if history is not None:
             payload["history"] = deepcopy(history)
         if llm_config is not None:

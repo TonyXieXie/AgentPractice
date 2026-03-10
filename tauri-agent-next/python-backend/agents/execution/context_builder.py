@@ -10,6 +10,9 @@ from models import LLMConfig
 
 
 class ContextBuilder:
+    def __init__(self, *, prompt_manager=None) -> None:
+        self.prompt_manager = prompt_manager
+
     def build_request(
         self,
         message: AgentMessage,
@@ -53,6 +56,9 @@ class ContextBuilder:
                 payload.get("tool_name") or request_overrides.get("tool_name")
             ),
             tool_arguments=tool_arguments,
+            session_id=self._optional_str(
+                payload.get("session_id") or request_overrides.get("session_id")
+            ),
         )
 
     def build_llm_client(self, request: ExecutionRequest):
@@ -61,7 +67,7 @@ class ContextBuilder:
         config = LLMConfig.model_validate(request.llm_config)
         return create_llm_client(config)
 
-    def build_messages(
+    async def build_messages(
         self,
         request: ExecutionRequest,
         *,
@@ -69,6 +75,14 @@ class ContextBuilder:
         default_system_prompt: str = "You are a helpful AI assistant.",
         max_history: int = 10,
     ) -> List[Dict[str, Any]]:
+        if self.prompt_manager is not None and llm_client is not None:
+            return await self.prompt_manager.build_messages(
+                request,
+                llm_client=llm_client,
+                default_system_prompt=default_system_prompt,
+                max_history_events=max_history,
+            )
+
         messages: List[Dict[str, Any]] = []
         system_prompt = request.system_prompt or default_system_prompt
         profile = str(
@@ -99,6 +113,7 @@ class ContextBuilder:
                 "tool_arguments",
                 "work_path",
                 "system_prompt",
+                "session_id",
                 "stream",
             }:
                 continue

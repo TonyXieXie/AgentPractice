@@ -22,6 +22,9 @@
 
 - `python-backend/`
 - `docs/`
+- `docs/concepts.md`：概念对齐（session/run/task/iteration/AgentInstance/可见性等）
+- `docs/memory-and-request-building.md`：Memory/Prompt 与 LLM 请求装配边界（AgentMemory + RequestBodyBuilder 草案）
+- `docs/agent-message-center-design.md`：Agent 消息中心与协作层设计草案（含与 Memory 的关系）
 - `python-backend/static/observe/`：最小观察页静态资源
 
 ## 启动方式

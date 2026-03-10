@@ -6,10 +6,18 @@ from pathlib import Path
 from typing import Optional
 
 from agents.center import AgentCenter
+from agents.execution import ToolExecutor
+from agents.execution.prompt_manager import PromptManager
+from agents.execution.tool_recorder import ConversationToolRecorder
 from observation.center import ObservationCenter
+from repositories.conversation_repository import ConversationRepository
 from repositories.event_repository import FileEventStore
+from repositories.prompt_state_repository import PromptStateRepository
+from repositories.prompt_trace_repository import PromptTraceRepository
+from repositories.session_repository import SessionRepository
+from repositories.sqlite_store import SqliteStore
 from run_manager import RunManager
-from runtime_paths import ensure_runtime_dirs, get_runs_data_dir
+from runtime_paths import ensure_runtime_dirs, get_database_path, get_runs_data_dir
 from transport.ws.ws_hub import WsHub
 
 
@@ -17,6 +25,7 @@ from transport.ws.ws_hub import WsHub
 class AppServices:
     ws_hub: WsHub
     event_store: FileEventStore
+    sqlite_store: SqliteStore
     observation_center: ObservationCenter
     agent_center: AgentCenter
     run_manager: RunManager
@@ -25,6 +34,7 @@ class AppServices:
     async def startup(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "runs").mkdir(parents=True, exist_ok=True)
+        await self.sqlite_store.initialize()
         self.ws_hub.set_loop(asyncio.get_running_loop())
 
     async def shutdown(self) -> None:
@@ -34,6 +44,18 @@ class AppServices:
 def build_app_services(*, data_dir: Optional[Path] = None) -> AppServices:
     runtime_dir = Path(data_dir or ensure_runtime_dirs()).resolve()
     event_store = FileEventStore(get_runs_data_dir() if data_dir is None else runtime_dir / "runs")
+    sqlite_store = SqliteStore(get_database_path(base_dir=runtime_dir))
+    session_repository = SessionRepository(sqlite_store)
+    conversation_repository = ConversationRepository(sqlite_store)
+    prompt_state_repository = PromptStateRepository(sqlite_store)
+    prompt_trace_repository = PromptTraceRepository(sqlite_store)
+    prompt_manager = PromptManager(
+        session_repository=session_repository,
+        conversation_repository=conversation_repository,
+        prompt_state_repository=prompt_state_repository,
+        prompt_trace_repository=prompt_trace_repository,
+    )
+    tool_executor = ToolExecutor(recorder=ConversationToolRecorder(conversation_repository))
     ws_hub = WsHub()
     observation_center = ObservationCenter(
         event_store=event_store,
@@ -43,10 +65,15 @@ def build_app_services(*, data_dir: Optional[Path] = None) -> AppServices:
     run_manager = RunManager(
         agent_center=agent_center,
         observation_center=observation_center,
+        session_repository=session_repository,
+        conversation_repository=conversation_repository,
+        prompt_manager=prompt_manager,
+        tool_executor=tool_executor,
     )
     return AppServices(
         ws_hub=ws_hub,
         event_store=event_store,
+        sqlite_store=sqlite_store,
         observation_center=observation_center,
         agent_center=agent_center,
         run_manager=run_manager,

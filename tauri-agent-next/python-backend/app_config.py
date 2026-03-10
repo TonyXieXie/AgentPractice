@@ -21,6 +21,22 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
         "default_profile": "default",
         "react_max_iterations": 16,
     },
+    "context": {
+        "compression_enabled": True,
+        "compress_start_pct": 75,
+        "compress_target_pct": 55,
+        "keep_recent_events": 20,
+        "budget_safety_tokens": 256,
+        "truncation": {
+            "enabled": True,
+            "threshold_chars": 4000,
+            "head_chars": 800,
+            "tail_chars": 800,
+        },
+    },
+    "trace": {
+        "enabled": True,
+    },
     "transport": {
         "http": {
             "host": "127.0.0.1",

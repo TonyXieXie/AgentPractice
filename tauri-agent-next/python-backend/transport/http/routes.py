@@ -15,6 +15,7 @@ from models import (
     StopRunResponse,
 )
 from runtime_paths import ensure_runtime_dirs
+from run_manager import SessionNotFoundError
 
 
 router = APIRouter()
@@ -43,7 +44,10 @@ async def observe_page():
 @router.post("/runs", response_model=CreateRunResponse)
 async def create_run(request: Request, body: CreateRunRequest) -> CreateRunResponse:
     services = request.app.state.services
-    return await services.run_manager.create_run(body)
+    try:
+        return await services.run_manager.create_run(body)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/runs/{run_id}/stop", response_model=StopRunResponse)

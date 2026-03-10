@@ -45,6 +45,7 @@ class HealthResponse(BaseModel):
 class CreateRunRequest(BaseModel):
     content: str
     strategy: Optional[str] = None
+    session_id: Optional[str] = None
     history: List[Dict[str, Any]] = Field(default_factory=list)
     llm_config: Optional[Dict[str, Any]] = None
     system_prompt: Optional[str] = None
@@ -55,6 +56,7 @@ class CreateRunRequest(BaseModel):
 class CreateRunResponse(BaseModel):
     ok: bool = True
     run_id: str
+    session_id: str
     user_agent_id: str
     assistant_agent_id: str
     status: Literal["accepted"] = "accepted"
