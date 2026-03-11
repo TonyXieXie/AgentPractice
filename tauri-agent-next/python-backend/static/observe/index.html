@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Run Observation</title>
+    <link rel="stylesheet" href="/static/observe/observe.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">tauri-agent-next</p>
+          <h1>Minimal Run Observation</h1>
+          <p class="header-copy">
+            Create a run, hydrate history, and keep following the live stream on one page.
+          </p>
+        </div>
+        <div class="status-stack">
+          <div class="status-chip" id="ws-status-chip">WS connecting</div>
+          <div class="status-chip" id="scope-status-chip">Scope none</div>
+          <div class="status-chip" id="run-status-chip">Run idle</div>
+        </div>
+      </header>
+
+      <main class="layout-grid">
+        <section class="panel panel-controls">
+          <div class="panel-heading">
+            <h2>Run Launch and State</h2>
+            <button type="button" class="ghost-button" id="view-run-button">View Run</button>
+          </div>
+
+          <form id="create-run-form" class="control-form">
+            <label class="field">
+              <span>Content</span>
+              <textarea id="content-input" rows="5" placeholder="Describe the task for the assistant."></textarea>
+            </label>
+
+            <div class="field-row">
+              <label class="field">
+                <span>Strategy</span>
+                <select id="strategy-select">
+                  <option value="simple">simple</option>
+                  <option value="react">react</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>Work Path</span>
+                <input id="work-path-input" type="text" placeholder="Optional workspace path" />
+              </label>
+            </div>
+
+            <div class="button-row">
+              <button type="submit" class="primary-button">Create Run</button>
+              <button type="button" class="danger-button" id="stop-run-button" disabled>Stop Run</button>
+            </div>
+          </form>
+
+          <div class="divider"></div>
+
+          <div class="load-block">
+            <label class="field">
+              <span>Existing Run ID</span>
+              <input id="run-id-input" type="text" placeholder="Paste a run_id to hydrate history" />
+            </label>
+            <div class="button-row">
+              <button type="button" class="secondary-button" id="load-run-button">Load Run</button>
+              <button type="button" class="ghost-button" id="copy-url-button">Copy URL</button>
+            </div>
+          </div>
+
+          <div class="summary-grid">
+            <article class="summary-card">
+              <span class="summary-label">Current run</span>
+              <strong id="current-run-id">none</strong>
+            </article>
+            <article class="summary-card">
+              <span class="summary-label">Latest seq</span>
+              <strong id="latest-seq-value">0</strong>
+            </article>
+            <article class="summary-card">
+              <span class="summary-label">Visible items</span>
+              <strong id="visible-count-value">0</strong>
+            </article>
+          </div>
+
+          <p class="feedback-text" id="feedback-text">Waiting for a run.</p>
+        </section>
+
+        <section class="panel panel-timeline">
+          <div class="panel-heading">
+            <h2>Realtime Timeline</h2>
+            <button type="button" class="ghost-button" id="follow-toggle-button">Auto Follow On</button>
+          </div>
+          <div class="timeline-list" id="timeline-list"></div>
+        </section>
+
+        <section class="panel panel-details">
+          <div class="panel-heading">
+            <h2>Details</h2>
+            <span class="detail-subtitle" id="detail-subtitle">Snapshot</span>
+          </div>
+
+          <div class="scope-pills" id="scope-pills"></div>
+
+          <div class="detail-section">
+            <h3>Run Projection</h3>
+            <div class="key-value-grid" id="run-projection-grid"></div>
+          </div>
+
+          <div class="detail-section">
+            <div class="section-heading">
+              <h3>Agents</h3>
+              <span id="agent-count-label">0</span>
+            </div>
+            <div class="projection-list" id="agent-list"></div>
+          </div>
+
+          <div class="detail-section">
+            <div class="section-heading">
+              <h3>Tool Calls</h3>
+              <span id="tool-count-label">0</span>
+            </div>
+            <div class="projection-list" id="tool-list"></div>
+          </div>
+
+          <div class="detail-section">
+            <h3>Raw JSON</h3>
+            <pre class="raw-json" id="raw-json-view">{}</pre>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/observe/observe.js" defer></script>
+  </body>
+</html>

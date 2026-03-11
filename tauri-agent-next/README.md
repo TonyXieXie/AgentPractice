@@ -1,0 +1,68 @@
+# tauri-agent-next
+
+新的 Agent 协作后端重写目录。
+
+当前已落下第一批骨架：
+
+- 独立的 `python-backend` 入口
+- 最小配置加载
+- 独立的 `LLMClient`
+- 新版 `Tool` / `ToolRegistry` / `ToolContext`
+- 基于 `run_id` / `agent_id` 的统一观测与 `WS Hub`
+- 文件型事件回放
+- 最小纯静态观察页
+- smoke tests
+
+原则：
+- 保留 `tauri-agent-demo` 作为参考实现
+- 在这里重建新的 Agent / Observation / HTTP + WS 架构
+- 优先复制低耦合基础设施，避免长期跨目录直接依赖旧代码
+
+## 当前目录
+
+- `python-backend/`
+- `docs/`
+- `docs/concepts.md`：概念对齐（session/run/task/iteration/AgentInstance/可见性等）
+- `docs/memory-and-request-building.md`：Memory/Prompt 与 LLM 请求装配边界（AgentMemory + RequestBodyBuilder 草案）
+- `docs/agent-message-center-design.md`：Agent 消息中心与协作层设计草案（含与 Memory 的关系）
+- `python-backend/static/observe/`：最小观察页静态资源
+
+## 启动方式
+
+```powershell
+cd python-backend
+python -m pip install -r requirements.txt
+python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Windows 也可以直接运行 `StartBackend.bat`。
+
+## 可用接口
+
+- `GET /healthz`
+- `GET /config`
+- `GET /observe`
+- `POST /runs`
+- `POST /runs/{run_id}/stop`
+- `GET /runs/{run_id}/snapshot`
+- `GET /runs/{run_id}/events`
+- `WS /ws`
+
+## 最小观察页
+
+启动 backend 后，直接打开：
+
+```text
+http://127.0.0.1:8000/observe
+```
+
+页面会通过 HTTP 创建和查询 run，通过同一个 WS 连接追流、切 scope 和断线恢复。
+
+## 验证
+
+```powershell
+cd python-backend
+python -m unittest discover -s tests
+```
+
+执行清单见：`docs/rewrite-todo.md`

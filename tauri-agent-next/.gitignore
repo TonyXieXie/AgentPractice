@@ -1,0 +1,6 @@
+python-backend/__pycache__/
+python-backend/**/*.pyc
+python-backend/.pytest_cache/
+python-backend/venv/
+python-backend/.venv/
+.tauri-agent-next-data/
