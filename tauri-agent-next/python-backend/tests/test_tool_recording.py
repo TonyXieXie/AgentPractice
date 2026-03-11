@@ -4,7 +4,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agents.execution.strategy import ExecutionRequest
 from agents.execution.tool_executor import ToolExecutor
 from agents.execution.tool_recorder import ConversationToolRecorder
 from repositories.conversation_repository import ConversationRepository
@@ -47,18 +46,15 @@ class ToolRecordingTests(unittest.IsolatedAsyncioTestCase):
         tool_executor = ToolExecutor(
             recorder=ConversationToolRecorder(self.conversation_repo, max_payload_bytes=64 * 1024)
         )
-        request = ExecutionRequest(
+        result = await tool_executor.execute(
             agent_id="assistant-1",
             run_id="run-1",
             message_id="msg-1",
-            correlation_id="corr-1",
-            user_input="hi",
             session_id=self.session_id,
-        )
-        result = await tool_executor.execute(
+            work_path=None,
+            metadata={},
             tool_name="echo_record",
             arguments={"text": "hello"},
-            request=request,
             tool_call_id="call-1",
         )
         self.assertTrue(result.ok)

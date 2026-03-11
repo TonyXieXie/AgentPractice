@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
@@ -33,9 +34,10 @@ class AgentBase(ABC):
             "message.received",
             payload={
                 "topic": message.topic,
-                "kind": message.kind,
+                "message_type": message.message_type,
+                "rpc_phase": message.rpc_phase,
                 "sender_id": message.sender_id,
-                "delivery": message.delivery,
+                "object_type": message.object_type,
             },
             run_id=message.run_id or self.run_id,
             message_id=message.id,
@@ -49,24 +51,32 @@ class AgentBase(ABC):
         topic: str,
         payload: Dict[str, Any],
         *,
-        target_agent_id: str,
+        target_agent_id: Optional[str] = None,
+        target_profile: Optional[str] = None,
         run_id: Optional[str] = None,
         session_id: Optional[str] = None,
         visibility: VisibilityLevel = "public",
         level: SeverityLevel = "info",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
+        target_id, resolved_target_profile, target_metadata = self._normalize_target(
+            target_agent_id=target_agent_id,
+            target_profile=target_profile,
+        )
+        resolved_metadata = dict(metadata or {})
+        resolved_metadata.update(target_metadata)
         message = AgentMessage.build_event(
             topic=topic,
             sender_id=self.agent_id,
-            target_id=target_agent_id,
+            target_id=target_id,
+            target_profile=resolved_target_profile,
             payload=payload,
             run_id=run_id or self.run_id,
             session_id=session_id,
             delivery="unicast",
             visibility=visibility,
             level=level,
-            metadata=metadata,
+            metadata=resolved_metadata,
         )
         await self.center.route(message)
 
@@ -99,7 +109,8 @@ class AgentBase(ABC):
         topic: str,
         payload: Dict[str, Any],
         *,
-        target_agent_id: str,
+        target_agent_id: Optional[str] = None,
+        target_profile: Optional[str] = None,
         run_id: Optional[str] = None,
         session_id: Optional[str] = None,
         timeout_ms: int = 300_000,
@@ -107,22 +118,69 @@ class AgentBase(ABC):
         level: SeverityLevel = "info",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> AgentMessage:
+        target_id, resolved_target_profile, target_metadata = self._normalize_target(
+            target_agent_id=target_agent_id,
+            target_profile=target_profile,
+        )
+        resolved_metadata = dict(metadata or {})
+        resolved_metadata.update(target_metadata)
         message = AgentMessage.build_rpc_request(
             topic=topic,
             sender_id=self.agent_id,
-            target_id=target_agent_id,
+            target_id=target_id,
+            target_profile=resolved_target_profile,
             payload=payload,
             run_id=run_id or self.run_id,
             session_id=session_id,
             timeout_ms=timeout_ms,
             visibility=visibility,
             level=level,
-            metadata=metadata,
+            metadata=resolved_metadata,
         )
-        response = await self.center.route(message)
-        if not isinstance(response, AgentMessage):
-            raise RuntimeError("RPC route did not return AgentMessage response")
-        return response
+        correlation_id = message.correlation_id or message.id
+        future = await self.center.expect_rpc_response(correlation_id)
+        try:
+            await self.center.route(message)
+            timeout_sec = max(0.001, float(timeout_ms or 300_000) / 1000.0)
+            return await asyncio.wait_for(future, timeout=timeout_sec)
+        finally:
+            await self.center.clear_rpc_waiter(correlation_id, future)
+
+    async def send_rpc_request(
+        self,
+        topic: str,
+        payload: Dict[str, Any],
+        *,
+        target_agent_id: Optional[str] = None,
+        target_profile: Optional[str] = None,
+        run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        timeout_ms: int = 300_000,
+        visibility: VisibilityLevel = "public",
+        level: SeverityLevel = "info",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> AgentMessage:
+        target_id, resolved_target_profile, target_metadata = self._normalize_target(
+            target_agent_id=target_agent_id,
+            target_profile=target_profile,
+        )
+        resolved_metadata = dict(metadata or {})
+        resolved_metadata.update(target_metadata)
+        message = AgentMessage.build_rpc_request(
+            topic=topic,
+            sender_id=self.agent_id,
+            target_id=target_id,
+            target_profile=resolved_target_profile,
+            payload=payload,
+            run_id=run_id or self.run_id,
+            session_id=session_id,
+            timeout_ms=timeout_ms,
+            visibility=visibility,
+            level=level,
+            metadata=resolved_metadata,
+        )
+        await self.center.route(message)
+        return message
 
     async def reply_rpc(
         self,
@@ -143,10 +201,8 @@ class AgentBase(ABC):
             level=level,
             metadata=metadata,
         )
-        routed = await self.center.route(response)
-        if not isinstance(routed, AgentMessage):
-            raise RuntimeError("RPC response route did not return AgentMessage")
-        return routed
+        await self.center.route(response)
+        return response
 
     async def observe(
         self,
@@ -205,3 +261,20 @@ class AgentBase(ABC):
     @abstractmethod
     async def on_message(self, message: AgentMessage):
         ...
+
+    def _normalize_target(
+        self,
+        *,
+        target_agent_id: Optional[str],
+        target_profile: Optional[str],
+    ) -> tuple[Optional[str], Optional[str], Dict[str, Any]]:
+        normalized_target_id = str(target_agent_id or "").strip() or None
+        normalized_target_profile = str(target_profile or "").strip() or None
+        if normalized_target_id is None and normalized_target_profile is None:
+            raise ValueError("target_agent_id or target_profile is required")
+        metadata: Dict[str, Any] = {}
+        if normalized_target_profile is not None:
+            metadata["target_profile"] = normalized_target_profile
+        if normalized_target_id is not None:
+            normalized_target_profile = None
+        return normalized_target_id, normalized_target_profile, metadata

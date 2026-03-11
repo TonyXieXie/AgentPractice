@@ -108,6 +108,11 @@ class SqliteStore:
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         self._ensure_column(conn, "conversation_events", "agent_id", "TEXT NULL")
         self._ensure_column(conn, "prompt_traces", "agent_id", "TEXT NULL")
+        self._ensure_column(conn, "message_center_events", "target_profile", "TEXT NULL")
+        self._ensure_column(conn, "message_center_events", "message_type", "TEXT NULL")
+        self._ensure_column(conn, "message_center_events", "object_type", "TEXT NULL")
+        self._ensure_column(conn, "message_center_events", "rpc_phase", "TEXT NULL")
+        self._ensure_column(conn, "message_center_events", "target_agent_id", "TEXT NULL")
 
     def _ensure_column(
         self,
@@ -189,9 +194,14 @@ class SqliteStore:
             seq INTEGER NULL,
             kind TEXT NOT NULL,
             delivery TEXT NOT NULL,
+            message_type TEXT NULL,
+            object_type TEXT NULL,
+            rpc_phase TEXT NULL,
             topic TEXT NOT NULL,
             sender_id TEXT NOT NULL,
             target_id TEXT NULL,
+            target_agent_id TEXT NULL,
+            target_profile TEXT NULL,
             correlation_id TEXT NULL,
             ok INTEGER NULL,
             visibility TEXT NOT NULL,
@@ -237,3 +247,28 @@ class SqliteStore:
         """.strip()
 
         yield "CREATE INDEX IF NOT EXISTS idx_prompt_traces_session ON prompt_traces(session_id, id)"
+
+        yield """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            run_id TEXT NULL,
+            agent_id TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            source_message_kind TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            status TEXT NOT NULL,
+            work_path TEXT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            result_json TEXT NULL,
+            error_text TEXT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """.strip()
+
+        yield "CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id, created_at, id)"
+        yield "CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(session_id, agent_id, created_at, id)"
+        yield "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(run_id, status, updated_at)"

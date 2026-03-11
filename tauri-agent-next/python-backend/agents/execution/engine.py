@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
-from agents.execution.context_builder import ContextBuilder
+from agents.execution.message_utils import (
+    get_llm_config,
+    get_strategy_name,
+    render_current_message,
+)
 from agents.execution.react_strategy import ReactStrategy
 from agents.execution.simple_strategy import SimpleStrategy
 from agents.execution.step_emitter import StepEmitter
-from agents.execution.strategy import AgentStrategy, ExecutionRequest, ExecutionStep
+from agents.execution.strategy import AgentStrategy, ExecutionStep
 from agents.execution.tool_executor import ToolExecutor
+from models import LLMConfig
 
 if TYPE_CHECKING:
     from agents.base import AgentBase
@@ -28,13 +33,15 @@ class ExecutionEngine:
         self,
         agent: "AgentBase",
         *,
-        context_builder: Optional[ContextBuilder] = None,
+        memory: Optional[Any] = None,
+        llm_client_factory: Optional[Callable[["AgentMessage"], Any]] = None,
         tool_executor: Optional[ToolExecutor] = None,
         step_emitter: Optional[StepEmitter] = None,
         strategies: Optional[Dict[str, AgentStrategy]] = None,
     ) -> None:
         self.agent = agent
-        self.context_builder = context_builder or ContextBuilder()
+        self.memory = memory
+        self.llm_client_factory = llm_client_factory
         self.tool_executor = tool_executor or ToolExecutor()
         self.step_emitter = step_emitter or StepEmitter(agent)
         self._strategies: Dict[str, AgentStrategy] = {
@@ -48,30 +55,24 @@ class ExecutionEngine:
         self._strategies[strategy.name] = strategy
 
     async def execute(self, message: "AgentMessage") -> ExecutionResult:
-        request = self.context_builder.build_request(
-            message,
-            agent_id=self.agent.agent_id,
-            default_strategy="simple",
-        )
-        strategy = self._resolve_strategy(request)
+        agent_id = self.agent.agent_id
+        strategy = self._resolve_strategy(message)
 
         reply = ""
         ok = True
         terminal_status = "completed"
         final_step: Optional[ExecutionStep] = None
-        run_started = False
         try:
-            llm_client = self.context_builder.build_llm_client(request)
-            await self.step_emitter.emit_run_started(request, strategy_name=strategy.name)
-            run_started = True
+            llm_client = self._build_llm_client(message)
 
             async for step in strategy.execute(
-                request,
+                message,
+                agent_id=agent_id,
                 llm_client=llm_client,
                 tool_executor=self.tool_executor,
-                context_builder=self.context_builder,
+                memory=self.memory,
             ):
-                await self.step_emitter.emit_step(request, step)
+                await self.step_emitter.emit_step(message, agent_id=agent_id, step=step)
                 final_step = step
                 if step.step_type == "answer":
                     reply = step.content
@@ -81,26 +82,24 @@ class ExecutionEngine:
                     reply = step.content
 
             if not reply and ok:
-                reply = request.user_input
+                reply = render_current_message(message)
         except asyncio.CancelledError:
             ok = False
             terminal_status = "stopped"
             reply = "run cancelled"
             final_step = ExecutionStep("error", reply, {"status": "stopped"})
-            if run_started:
-                await self.step_emitter.emit_step(request, final_step)
+            await self.step_emitter.emit_step(message, agent_id=agent_id, step=final_step)
             raise
         except Exception as exc:
             ok = False
             terminal_status = "error"
             reply = str(exc)
             final_step = ExecutionStep("error", reply, {"status": "error"})
-            if run_started:
-                await self.step_emitter.emit_step(request, final_step)
+            await self.step_emitter.emit_step(message, agent_id=agent_id, step=final_step)
 
         payload: Dict[str, object] = {
             "reply": reply,
-            "handled_by": self.agent.agent_id,
+            "handled_by": agent_id,
             "strategy": strategy.name,
             "status": terminal_status if not ok else "completed",
         }
@@ -112,8 +111,19 @@ class ExecutionEngine:
             payload["error"] = reply
         return ExecutionResult(ok=ok, payload=payload, final_step=final_step)
 
-    def _resolve_strategy(self, request: ExecutionRequest) -> AgentStrategy:
-        strategy = self._strategies.get(request.strategy_name)
+    def _build_llm_client(self, message: "AgentMessage"):
+        if self.llm_client_factory is not None:
+            return self.llm_client_factory(message)
+        llm_config = get_llm_config(message)
+        if not llm_config:
+            return None
+        from llm.client import create_llm_client
+
+        config = LLMConfig.model_validate(llm_config)
+        return create_llm_client(config)
+
+    def _resolve_strategy(self, message: "AgentMessage") -> AgentStrategy:
+        strategy = self._strategies.get(get_strategy_name(message))
         if strategy is not None:
             return strategy
         return self._strategies["simple"]

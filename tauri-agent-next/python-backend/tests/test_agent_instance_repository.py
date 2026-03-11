@@ -36,3 +36,19 @@ class AgentInstanceRepositoryTests(unittest.IsolatedAsyncioTestCase):
         records = await self.agent_repo.list_by_session(self.session_id)
         self.assertEqual({record.agent_type for record in records}, {"assistant", "user_proxy"})
 
+    async def test_create_persists_profile_and_metadata(self) -> None:
+        created = await self.agent_repo.create(
+            session_id=self.session_id,
+            agent_type="assistant",
+            profile_id="worker",
+            role="assistant",
+            display_name="Worker",
+            metadata={"kind": "dynamic"},
+        )
+
+        fetched = await self.agent_repo.get(created.id)
+        self.assertIsNotNone(fetched)
+        assert fetched is not None
+        self.assertEqual(fetched.profile_id, "worker")
+        self.assertEqual(fetched.display_name, "Worker")
+        self.assertEqual(fetched.metadata["kind"], "dynamic")

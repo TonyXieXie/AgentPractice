@@ -1,6 +1,6 @@
 from agents.execution.agent_memory import AgentMemory
-from agents.execution.context_builder import ContextBuilder
 from agents.execution.engine import ExecutionEngine, ExecutionResult
+from agents.execution.prompt_ir import PromptIR
 from agents.execution.providers import (
     OpenAIResponsesAdapter,
     OpenAIToolCallingAdapter,
@@ -13,19 +13,19 @@ from agents.execution.providers import (
 from agents.execution.react_strategy import ReactStrategy
 from agents.execution.simple_strategy import SimpleStrategy
 from agents.execution.step_emitter import StepEmitter
-from agents.execution.strategy import AgentStrategy, ExecutionRequest, ExecutionStep
+from agents.execution.strategy import AgentStrategy, ExecutionStep
+from agents.execution.task_manager import TaskManager
 from agents.execution.tool_executor import ToolExecutionResult, ToolExecutor
 
 __all__ = [
     "AgentMemory",
     "AgentStrategy",
-    "ContextBuilder",
     "ExecutionEngine",
-    "ExecutionRequest",
     "ExecutionResult",
     "ExecutionStep",
     "OpenAIResponsesAdapter",
     "OpenAIToolCallingAdapter",
+    "PromptIR",
     "ProviderAdapter",
     "ProviderToolCall",
     "ProviderToolResult",
@@ -33,6 +33,7 @@ __all__ = [
     "ReactStrategy",
     "SimpleStrategy",
     "StepEmitter",
+    "TaskManager",
     "TextReactAdapter",
     "ToolExecutionResult",
     "ToolExecutor",

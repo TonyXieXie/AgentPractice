@@ -224,7 +224,4 @@ class ObservationCenter(ExecutionObserver):
         return "agent_event"
 
     def _is_terminal(self, event: ExecutionEvent) -> bool:
-        if event.event_type in {"run.finished", "run.error"}:
-            return True
-        status = str(event.payload.get("status") or "")
-        return status in {"completed", "error", "stopped"}
+        return event.event_type in {"run.finished", "run.error"}

@@ -2,81 +2,46 @@ from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
 
-from agents.execution.strategy import ExecutionRequest, ExecutionStep
+from agents.execution.strategy import ExecutionStep
 
 if TYPE_CHECKING:
     from agents.base import AgentBase
+    from agents.message import AgentMessage
 
 
 class StepEmitter:
     def __init__(self, agent: "AgentBase") -> None:
         self.agent = agent
 
-    async def emit_run_started(
+    async def emit_step(
         self,
-        request: ExecutionRequest,
+        message: "AgentMessage",
         *,
-        strategy_name: str,
+        agent_id: str,
+        step: ExecutionStep,
     ) -> None:
-        payload = {
-            "strategy": strategy_name,
-            "status": "running",
-            "topic": "run.started",
-        }
-        await self.agent.observe(
-            "run.started",
-            run_id=request.run_id,
-            message_id=request.message_id,
-            payload=payload,
-            source_type="engine",
-            source_id=request.agent_id,
-            tags=[strategy_name],
-        )
-
-    async def emit_run_finished(
-        self,
-        request: ExecutionRequest,
-        *,
-        strategy_name: str,
-        status: str,
-        reply: str,
-    ) -> None:
-        payload = {
-            "strategy": strategy_name,
-            "status": status,
-            "reply": reply,
-            "topic": "run.finished",
-        }
-        await self.agent.observe(
-            "run.finished",
-            run_id=request.run_id,
-            message_id=request.message_id,
-            payload=payload,
-            level="info" if status == "completed" else "error",
-            source_type="engine",
-            source_id=request.agent_id,
-            tags=[strategy_name, status],
-        )
-
-    async def emit_step(self, request: ExecutionRequest, step: ExecutionStep) -> None:
         payload = {
             "step_type": step.step_type,
             "content": step.content,
             **step.metadata,
         }
+        if step.step_type == "error":
+            payload.setdefault("error", step.content)
         tool_call_id = self._optional_str(step.metadata.get("tool_call_id"))
+        task_id = self._extract_task_id(message)
         level = "error" if step.step_type == "error" else "info"
         await self.agent.observe(
             self._event_type_for_step(step),
-            run_id=request.run_id,
-            agent_id=request.agent_id,
-            message_id=request.message_id,
+            run_id=message.run_id,
+            agent_id=agent_id,
+            message_id=message.id,
             tool_call_id=tool_call_id,
             payload=payload,
             level=level,
             source_type=self._source_type_for_step(step),
-            source_id=tool_call_id or request.agent_id,
+            source_id=tool_call_id or agent_id,
             tags=self._tags_for_step(step),
+            metadata={"task_id": task_id} if task_id else None,
         )
 
     def _event_type_for_step(self, step: ExecutionStep) -> str:
@@ -87,7 +52,7 @@ class StepEmitter:
         if step.step_type in {"thought", "thought_delta", "answer_delta", "answer"}:
             return "llm.updated"
         if step.step_type == "error":
-            return "run.error"
+            return "agent.error"
         return "agent.step"
 
     def _stream_for_step(self, step: ExecutionStep) -> str:
@@ -116,3 +81,7 @@ class StepEmitter:
             return None
         text = str(value).strip()
         return text or None
+
+    def _extract_task_id(self, message: "AgentMessage") -> str | None:
+        metadata = message.metadata if isinstance(message.metadata, dict) else {}
+        return self._optional_str(metadata.get("task_id"))

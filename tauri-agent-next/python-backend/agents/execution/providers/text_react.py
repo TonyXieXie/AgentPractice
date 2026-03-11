@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Sequence
 
+from agents.execution.prompt_ir import PromptIR
 from agents.execution.providers.base import (
     ProviderAdapter,
     ProviderToolCall,
@@ -29,11 +30,11 @@ class TextReactAdapter(ProviderAdapter):
     async def run_turn(
         self,
         *,
-        messages: List[Dict[str, Any]],
+        prompt_ir: PromptIR,
         llm_client: Any,
         request_overrides: Dict[str, Any],
     ):
-        async for event in llm_client.chat_stream_events(messages, request_overrides or None):
+        async for event in llm_client.chat_stream_events(prompt_ir, request_overrides or None):
             event_type = str(event.get("type", "") or "")
             if event_type in {"content", "reasoning"}:
                 yield ProviderTurnEvent(
@@ -47,14 +48,14 @@ class TextReactAdapter(ProviderAdapter):
     def append_tool_results(
         self,
         *,
-        messages: List[Dict[str, Any]],
+        prompt_ir: PromptIR,
         assistant_content: str,
         tool_calls: Sequence[ProviderToolCall],
         tool_results: Sequence[ProviderToolResult],
     ) -> None:
-        messages.append({"role": "assistant", "content": assistant_content})
+        prompt_ir.messages.append({"role": "assistant", "content": assistant_content})
         for item in tool_results:
-            messages.append(
+            prompt_ir.messages.append(
                 {
                     "role": "user",
                     "content": f"Tool {item.tool_name} returned:\n{item.content}",

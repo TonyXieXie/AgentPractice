@@ -53,13 +53,16 @@ class CreateRunRequest(BaseModel):
     request_overrides: Dict[str, Any] = Field(default_factory=dict)
 
 
-class CreateRunResponse(BaseModel):
+class CreateRunAcceptedResponse(BaseModel):
     ok: bool = True
     run_id: str
     session_id: str
     user_agent_id: str
     assistant_agent_id: str
     status: Literal["accepted"] = "accepted"
+
+
+CreateRunResponse = CreateRunAcceptedResponse
 
 
 class StopRunResponse(BaseModel):

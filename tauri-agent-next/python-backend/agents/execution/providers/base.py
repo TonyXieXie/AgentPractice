@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Sequence
 
+from agents.execution.prompt_ir import PromptIR
 from tools import Tool
 
 
@@ -52,7 +53,7 @@ class ProviderAdapter(ABC):
     async def run_turn(
         self,
         *,
-        messages: List[Dict[str, Any]],
+        prompt_ir: PromptIR,
         llm_client: Any,
         request_overrides: Dict[str, Any],
     ) -> AsyncGenerator[ProviderTurnEvent, None]:
@@ -62,7 +63,7 @@ class ProviderAdapter(ABC):
     def append_tool_results(
         self,
         *,
-        messages: List[Dict[str, Any]],
+        prompt_ir: PromptIR,
         assistant_content: str,
         tool_calls: Sequence[ProviderToolCall],
         tool_results: Sequence[ProviderToolResult],

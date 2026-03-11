@@ -6,7 +6,9 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import httpx
 
+from agents.execution.prompt_ir import PromptIR
 from app_config import get_app_config
+from llm.request_body_builder import RequestBodyBuilder
 from models import LLMConfig
 
 
@@ -27,6 +29,7 @@ class LLMClient:
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
+        self.request_body_builder = RequestBodyBuilder()
         self.timeout = self._resolve_timeout()
         self.max_retries, self.retry_base_delay, self.retry_max_delay = (
             self._resolve_retry_policy()
@@ -101,19 +104,6 @@ class LLMClient:
             "Content-Type": "application/json",
         }
 
-    def _apply_reasoning_params(self, request_payload: Dict[str, Any]) -> None:
-        profile = self._get_profile()
-        model_lower = self.config.model.lower()
-        if profile == "openai" and ("o1" in model_lower or "gpt-5" in model_lower):
-            request_payload.pop("temperature", None)
-            request_payload["reasoning"] = {
-                "effort": getattr(self.config, "reasoning_effort", "medium") or "medium",
-                "summary": getattr(self.config, "reasoning_summary", "detailed")
-                or "detailed",
-            }
-        if profile == "deepseek" and "reasoner" in model_lower:
-            request_payload.pop("temperature", None)
-
     async def _raise_for_http_error(self, response: httpx.Response) -> None:
         try:
             response.raise_for_status()
@@ -128,19 +118,19 @@ class LLMClient:
 
     async def chat(
         self,
-        messages: List[Dict[str, Any]],
+        prompt_ir: PromptIR,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if self._get_format() == "openai_responses":
-            return await self._chat_openai_responses(messages, request_overrides)
-        return await self._chat_openai(messages, request_overrides)
+            return await self._chat_openai_responses(prompt_ir, request_overrides)
+        return await self._chat_openai(prompt_ir, request_overrides)
 
     async def chat_stream(
         self,
-        messages: List[Dict[str, Any]],
+        prompt_ir: PromptIR,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
-        async for event in self.chat_stream_events(messages, request_overrides):
+        async for event in self.chat_stream_events(prompt_ir, request_overrides):
             if event.get("type") == "content":
                 delta = event.get("delta", "")
                 if delta:
@@ -148,43 +138,34 @@ class LLMClient:
 
     async def chat_stream_events(
         self,
-        messages: List[Dict[str, Any]],
+        prompt_ir: PromptIR,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         if self._get_format() == "openai_responses":
             async for event in self._chat_openai_responses_stream_events(
-                messages, request_overrides
+                prompt_ir, request_overrides
             ):
                 yield event
             return
-        async for event in self._chat_openai_stream_events(messages, request_overrides):
+        async for event in self._chat_openai_stream_events(prompt_ir, request_overrides):
             yield event
 
     async def _chat_openai(
         self,
-        messages: List[Dict[str, Any]],
+        prompt_ir: PromptIR,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        request_payload: Dict[str, Any] = {
-            "model": self.config.model,
-            "messages": messages,
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-        }
-        self._apply_reasoning_params(request_payload)
-        if request_overrides:
-            request_payload.update(
-                {
-                    key: value
-                    for key, value in request_overrides.items()
-                    if not str(key).startswith("_") and value is not None
-                }
-            )
+        path, request_payload = self.request_body_builder.build(
+            config=self.config,
+            prompt_ir=prompt_ir,
+            request_overrides=request_overrides,
+            stream=False,
+        )
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             for attempt in range(self.max_retries + 1):
                 try:
                     response = await client.post(
-                        f"{self._get_base_url()}/chat/completions",
+                        f"{self._get_base_url()}{path}",
                         headers=self._auth_headers(),
                         json=request_payload,
                     )
@@ -210,25 +191,15 @@ class LLMClient:
 
     async def _chat_openai_stream_events(
         self,
-        messages: List[Dict[str, Any]],
+        prompt_ir: PromptIR,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        request_payload: Dict[str, Any] = {
-            "model": self.config.model,
-            "messages": messages,
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-            "stream": True,
-        }
-        self._apply_reasoning_params(request_payload)
-        if request_overrides:
-            request_payload.update(
-                {
-                    key: value
-                    for key, value in request_overrides.items()
-                    if not str(key).startswith("_") and value is not None
-                }
-            )
+        path, request_payload = self.request_body_builder.build(
+            config=self.config,
+            prompt_ir=prompt_ir,
+            request_overrides=request_overrides,
+            stream=True,
+        )
 
         full_text = ""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -236,7 +207,7 @@ class LLMClient:
                 try:
                     async with client.stream(
                         "POST",
-                        f"{self._get_base_url()}/chat/completions",
+                        f"{self._get_base_url()}{path}",
                         headers=self._auth_headers(),
                         json=request_payload,
                     ) as response:
@@ -287,29 +258,20 @@ class LLMClient:
 
     async def _chat_openai_responses(
         self,
-        messages: List[Dict[str, Any]],
+        prompt_ir: PromptIR,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        request_payload: Dict[str, Any] = {
-            "model": self.config.model,
-            "input": self._build_responses_input(messages),
-            "temperature": self.config.temperature,
-            "max_output_tokens": self.config.max_tokens,
-        }
-        self._apply_reasoning_params(request_payload)
-        if request_overrides:
-            request_payload.update(
-                {
-                    key: value
-                    for key, value in request_overrides.items()
-                    if not str(key).startswith("_") and value is not None
-                }
-            )
+        path, request_payload = self.request_body_builder.build(
+            config=self.config,
+            prompt_ir=prompt_ir,
+            request_overrides=request_overrides,
+            stream=False,
+        )
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             for attempt in range(self.max_retries + 1):
                 try:
                     response = await client.post(
-                        f"{self._get_base_url()}/responses",
+                        f"{self._get_base_url()}{path}",
                         headers=self._auth_headers(),
                         json=request_payload,
                     )
@@ -334,25 +296,15 @@ class LLMClient:
 
     async def _chat_openai_responses_stream_events(
         self,
-        messages: List[Dict[str, Any]],
+        prompt_ir: PromptIR,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        request_payload: Dict[str, Any] = {
-            "model": self.config.model,
-            "input": self._build_responses_input(messages),
-            "temperature": self.config.temperature,
-            "max_output_tokens": self.config.max_tokens,
-            "stream": True,
-        }
-        self._apply_reasoning_params(request_payload)
-        if request_overrides:
-            request_payload.update(
-                {
-                    key: value
-                    for key, value in request_overrides.items()
-                    if not str(key).startswith("_") and value is not None
-                }
-            )
+        path, request_payload = self.request_body_builder.build(
+            config=self.config,
+            prompt_ir=prompt_ir,
+            request_overrides=request_overrides,
+            stream=True,
+        )
 
         full_text = ""
         tool_calls: Dict[int, Dict[str, Any]] = {}
@@ -361,7 +313,7 @@ class LLMClient:
                 try:
                     async with client.stream(
                         "POST",
-                        f"{self._get_base_url()}/responses",
+                        f"{self._get_base_url()}{path}",
                         headers=self._auth_headers(),
                         json=request_payload,
                     ) as response:
@@ -458,36 +410,6 @@ class LLMClient:
                         continue
                     raise LLMTransientError(f"Network error: {exc}", cause=exc) from exc
         raise RuntimeError("Unreachable retry loop in _chat_openai_responses_stream_events")
-
-    def _build_responses_input(
-        self, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        items: List[Dict[str, Any]] = []
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            item_type = str(message.get("type", "") or "")
-            if item_type in {"function_call", "function_call_output", "reasoning"}:
-                items.append(
-                    {
-                        key: value
-                        for key, value in message.items()
-                        if value is not None
-                    }
-                )
-                continue
-            role = str(message.get("role", "user") or "user")
-            content = message.get("content", "")
-            text = content if isinstance(content, str) else self._coerce_text(content)
-            item_type = "output_text" if role == "assistant" else "input_text"
-            items.append(
-                {
-                    "type": "message",
-                    "role": role,
-                    "content": [{"type": item_type, "text": text}],
-                }
-            )
-        return items
 
     def _extract_openai_responses_text(self, data: Dict[str, Any]) -> str:
         output_text = data.get("output_text")

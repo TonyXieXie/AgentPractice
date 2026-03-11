@@ -3,6 +3,12 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
+from agents.execution.message_utils import (
+    build_llm_request_overrides,
+    get_execution_metadata,
+    get_session_id,
+    get_work_path,
+)
 from agents.execution.providers import (
     OpenAIResponsesAdapter,
     OpenAIToolCallingAdapter,
@@ -11,7 +17,7 @@ from agents.execution.providers import (
     TextReactAdapter,
 )
 from agents.execution.simple_strategy import SimpleStrategy
-from agents.execution.strategy import AgentStrategy, ExecutionRequest, ExecutionStep
+from agents.execution.strategy import AgentStrategy, ExecutionStep
 from agents.execution.tool_executor import ToolExecutor
 
 
@@ -42,32 +48,38 @@ class ReactStrategy(AgentStrategy):
 
     async def execute(
         self,
-        request: ExecutionRequest,
+        message,
         *,
+        agent_id: str,
         llm_client,
         tool_executor: ToolExecutor,
-        context_builder,
+        memory,
     ):
         if llm_client is None:
             async for step in self._fallback.execute(
-                request,
+                message,
+                agent_id=agent_id,
                 llm_client=llm_client,
                 tool_executor=tool_executor,
-                context_builder=context_builder,
+                memory=memory,
             ):
                 yield step
             return
 
+        if memory is None:
+            raise RuntimeError("AgentMemory is required for llm execution")
+
         tools = tool_executor.list_tools()
-        messages = await context_builder.build_messages(
-            request,
+        prompt_ir = await memory.build_view(
+            message,
+            agent_id=agent_id,
             llm_client=llm_client,
             default_system_prompt=self.system_prompt,
-            max_history=10,
+            max_history_events=10,
         )
         provider = self._resolve_provider(llm_client)
         llm_overrides = provider.prepare_request_overrides(
-            request_overrides=context_builder.build_llm_request_overrides(request),
+            request_overrides=build_llm_request_overrides(message),
             tools=tools,
             llm_client=llm_client,
         )
@@ -78,7 +90,7 @@ class ReactStrategy(AgentStrategy):
             tool_calls = []
 
             async for event in provider.run_turn(
-                messages=messages,
+                prompt_ir=prompt_ir,
                 llm_client=llm_client,
                 request_overrides=llm_overrides,
             ):
@@ -173,9 +185,14 @@ class ReactStrategy(AgentStrategy):
                         continue
 
                     result = await tool_executor.execute(
+                        agent_id=agent_id,
+                        run_id=message.run_id,
+                        message_id=message.id,
+                        session_id=get_session_id(message),
+                        work_path=get_work_path(message),
+                        metadata=get_execution_metadata(message),
                         tool_name=tool_name,
                         arguments=parsed_arguments,
-                        request=request,
                         tool_call_id=call_id,
                     )
                     content = (
@@ -203,22 +220,20 @@ class ReactStrategy(AgentStrategy):
                     )
 
                 provider.append_tool_results(
-                    messages=messages,
+                    prompt_ir=prompt_ir,
                     assistant_content="".join(assistant_parts),
                     tool_calls=tool_calls,
                     tool_results=tool_results,
                 )
-                memory = getattr(context_builder, "memory", None)
-                if memory is not None:
-                    messages = await memory.ensure_budget_for_messages(
-                        messages,
-                        llm_client=llm_client,
-                        session_id=getattr(request, "session_id", None),
-                        agent_id=getattr(request, "agent_id", None),
-                        run_id=getattr(request, "run_id", None),
-                        phase="react_iteration",
-                        iteration=iteration,
-                    )
+                prompt_ir = await memory.ensure_budget_for_view(
+                    prompt_ir,
+                    llm_client=llm_client,
+                    session_id=get_session_id(message),
+                    agent_id=agent_id,
+                    run_id=message.run_id,
+                    phase="react_iteration",
+                    iteration=iteration,
+                )
                 continue
 
             answer = "".join(assistant_parts).strip()

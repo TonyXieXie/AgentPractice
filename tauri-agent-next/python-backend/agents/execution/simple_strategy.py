@@ -3,7 +3,17 @@ from __future__ import annotations
 from typing import Optional
 from uuid import uuid4
 
-from agents.execution.strategy import AgentStrategy, ExecutionRequest, ExecutionStep
+from agents.execution.message_utils import (
+    build_llm_request_overrides,
+    get_execution_metadata,
+    get_session_id,
+    get_tool_arguments,
+    get_tool_name,
+    get_work_path,
+    render_current_message,
+    stream_enabled,
+)
+from agents.execution.strategy import AgentStrategy, ExecutionStep
 from agents.execution.tool_executor import ToolExecutor
 
 
@@ -21,35 +31,46 @@ class SimpleStrategy(AgentStrategy):
 
     async def execute(
         self,
-        request: ExecutionRequest,
+        message,
         *,
+        agent_id: str,
         llm_client,
         tool_executor: ToolExecutor,
-        context_builder,
+        memory,
     ):
-        if request.tool_name:
-            async for step in self._execute_tool_request(request, tool_executor):
+        tool_name = get_tool_name(message)
+        if tool_name:
+            async for step in self._execute_tool_request(
+                message,
+                agent_id=agent_id,
+                tool_name=tool_name,
+                tool_executor=tool_executor,
+            ):
                 yield step
             return
 
         if llm_client is None:
             yield ExecutionStep(
                 step_type="answer",
-                content=f"echo: {request.user_input}",
+                content=f"echo: {render_current_message(message)}",
                 metadata={"mode": "echo_fallback"},
             )
             return
 
-        messages = await context_builder.build_messages(
-            request,
+        if memory is None:
+            raise RuntimeError("AgentMemory is required for llm execution")
+
+        prompt_ir = await memory.build_view(
+            message,
+            agent_id=agent_id,
             llm_client=llm_client,
             default_system_prompt=self.system_prompt,
-            max_history=self.max_history,
+            max_history_events=self.max_history,
         )
-        llm_overrides = context_builder.build_llm_request_overrides(request)
-        stream = bool(request.request_overrides.get("stream", True))
+        llm_overrides = build_llm_request_overrides(message)
+        stream = stream_enabled(message)
         if not stream:
-            response = await llm_client.chat(messages, llm_overrides or None)
+            response = await llm_client.chat(prompt_ir, llm_overrides or None)
             content = str(response.get("content", "") or "")
             yield ExecutionStep(
                 step_type="answer",
@@ -60,7 +81,7 @@ class SimpleStrategy(AgentStrategy):
 
         answer_parts: list[str] = []
         reasoning_parts: list[str] = []
-        async for event in llm_client.chat_stream_events(messages, llm_overrides or None):
+        async for event in llm_client.chat_stream_events(prompt_ir, llm_overrides or None):
             event_type = str(event.get("type", "") or "")
             if event_type == "content":
                 delta = str(event.get("delta", "") or "")
@@ -100,10 +121,12 @@ class SimpleStrategy(AgentStrategy):
 
     async def _execute_tool_request(
         self,
-        request: ExecutionRequest,
+        message,
+        *,
+        agent_id: str,
+        tool_name: str,
         tool_executor: ToolExecutor,
     ):
-        tool_name = request.tool_name or ""
         tool_call_id = uuid4().hex
         yield ExecutionStep(
             "action",
@@ -115,9 +138,14 @@ class SimpleStrategy(AgentStrategy):
             },
         )
         result = await tool_executor.execute(
+            agent_id=agent_id,
+            run_id=message.run_id,
+            message_id=message.id,
+            session_id=get_session_id(message),
+            work_path=get_work_path(message),
+            metadata=get_execution_metadata(message),
             tool_name=tool_name,
-            arguments=request.tool_arguments,
-            request=request,
+            arguments=get_tool_arguments(message),
             tool_call_id=tool_call_id,
         )
         if result.ok:

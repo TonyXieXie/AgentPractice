@@ -92,16 +92,35 @@ class AgentInstanceRepository:
         session_id: str,
         agent_type: str,
         *,
-        profile_id: str = "default",
+        profile_id: Optional[str] = "default",
         display_name: Optional[str] = None,
     ) -> AgentInstanceRecord:
         existing = await self.get_primary(session_id, agent_type)
         if existing is not None:
             return existing
 
+        return await self.create(
+            session_id=session_id,
+            agent_type=agent_type,
+            profile_id=profile_id,
+            role=str(agent_type),
+            display_name=display_name,
+        )
+
+    async def create(
+        self,
+        *,
+        session_id: str,
+        agent_type: str,
+        profile_id: Optional[str],
+        role: Optional[str] = None,
+        display_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> AgentInstanceRecord:
         now = utc_now_iso()
         agent_id = uuid4().hex
-        role = str(agent_type)
+        resolved_role = str(role or agent_type)
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
         await self.store.execute(
             """
             INSERT INTO agent_instances
@@ -113,9 +132,9 @@ class AgentInstanceRepository:
                 session_id,
                 str(agent_type),
                 profile_id,
-                role,
+                resolved_role,
                 display_name,
-                json.dumps({}, ensure_ascii=False),
+                metadata_json,
                 now,
                 now,
             ),
@@ -125,4 +144,3 @@ class AgentInstanceRepository:
         if created is None:
             raise RuntimeError("failed to create agent_instances row")
         return created
-

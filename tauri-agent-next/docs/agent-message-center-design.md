@@ -513,9 +513,8 @@ class AgentBase {
 }
 
 class AssistantAgent {
-  +llm_client: LLMClient
+  +task_manager: TaskManager
   +engine: ExecutionEngine
-  +execute_task()
   +on_message()
 }
 
@@ -540,8 +539,7 @@ class LLMClient {
 }
 
 class ExecutionEngine {
-  +run()
-  +execute_loop()
+  +execute(message)
 }
 
 class AgentStrategy {
@@ -553,13 +551,22 @@ class ReActStrategy
 class SimpleStrategy
 
 class ToolExecutor {
-  +prepare_call()
-  +execute_tool()
+  +execute()
 }
 
-class ContextBuilder {
-  +build_messages()
-  +sanitize_messages()
+class TaskManager {
+  +host(message)
+  +complete_local_task()
+  +stop_hosted_tasks()
+}
+
+class AgentMemory {
+  +build_view()
+  +ensure_budget_for_view()
+}
+
+class RequestBodyBuilder {
+  +build()
 }
 
 class StepEmitter {
@@ -583,14 +590,16 @@ AgentBase --> AgentMessage : send/receive
 AgentCenter --> AgentMessage : route/manage
 AgentCenter --> AgentBase : dispatch to
 
-AssistantAgent --> LLMClient
 AssistantAgent *-- ExecutionEngine
+AssistantAgent *-- TaskManager
 
 ExecutionEngine o-- AgentStrategy
 ExecutionEngine o-- ToolExecutor
-ExecutionEngine o-- ContextBuilder
+ExecutionEngine o-- AgentMemory
+ExecutionEngine o-- LLMClient
 ExecutionEngine o-- StepEmitter
 ExecutionEngine o-- ProviderAdapter
+LLMClient o-- RequestBodyBuilder
 
 AgentStrategy <|-- ReActStrategy
 AgentStrategy <|-- SimpleStrategy
@@ -659,10 +668,12 @@ ProviderAdapter <|-- TextReActAdapter
   - 参数解析
   - 工具执行
   - 错误包装
-- `ContextBuilder`
-  - message 构造
-  - prompt sanitize
-  - 截断与压缩
+- `AgentMemory`
+  - shared/private 投影
+  - PromptIR 构造
+  - 截断、压缩、摘要
+- `RequestBodyBuilder`
+  - `PromptIR -> /chat/completions|/responses` payload
 - `StepEmitter`
   - 统一输出 `AgentStep`
   - 统一处理 delta / final
@@ -1265,10 +1276,14 @@ python-backend/
 ```mermaid
 flowchart LR
     subgraph Exec[执行层]
+        R[RunManager]
         U[UserProxyAgent]
         A[AssistantAgent]
         C[AgentCenter]
+        TM[TaskManager]
         E[ExecutionEngine]
+        M[AgentMemory]
+        RB[RequestBodyBuilder]
         T[ToolExecutor]
         L[LLMClient]
     end
@@ -1290,16 +1305,23 @@ flowchart LR
         UI[Task / Agent / Tool UI]
     end
 
+    R --> U
     U -->|AgentMessage| C
     C -->|AgentMessage| A
-    A --> E
+    A --> TM
+    TM --> E
+    E --> M
+    M --> RB
+    RB --> L
     E --> T
-    E --> L
 
+    R --> OI
     U --> OI
     A --> OI
     C --> OI
+    TM --> OI
     E --> OI
+    M --> OI
     T --> OI
     L --> OI
 

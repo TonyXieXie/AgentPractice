@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
 
-from agents.execution.strategy import ExecutionRequest
 from agents.execution.tool_recorder import ToolEventRecorder
 from tools import (
     Tool,
@@ -49,19 +48,33 @@ class ToolExecutor:
     async def execute(
         self,
         *,
+        agent_id: str,
+        run_id: Optional[str],
+        message_id: Optional[str],
+        session_id: Optional[str],
+        work_path: Optional[str],
+        metadata: Optional[Dict[str, Any]],
         tool_name: str,
         arguments: Dict[str, Any],
-        request: ExecutionRequest,
         tool_call_id: Optional[str] = None,
     ) -> ToolExecutionResult:
         resolved_call_id = tool_call_id or uuid4().hex
         tool = self.get_tool(tool_name)
         if tool is None:
-            await self._record_tool_call(request, resolved_call_id, tool_name, arguments)
+            await self._record_tool_call(
+                session_id=session_id,
+                run_id=run_id,
+                agent_id=agent_id,
+                tool_call_id=resolved_call_id,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
             await self._record_tool_result(
-                request,
-                resolved_call_id,
-                tool_name,
+                session_id=session_id,
+                run_id=run_id,
+                agent_id=agent_id,
+                tool_call_id=resolved_call_id,
+                tool_name=tool_name,
                 ok=False,
                 output=None,
                 error=f"Tool not found: {tool_name}",
@@ -75,11 +88,20 @@ class ToolExecutor:
 
         payload = arguments if isinstance(arguments, dict) else {}
         if not tool.validate_input(payload):
-            await self._record_tool_call(request, resolved_call_id, tool_name, payload)
+            await self._record_tool_call(
+                session_id=session_id,
+                run_id=run_id,
+                agent_id=agent_id,
+                tool_call_id=resolved_call_id,
+                tool_name=tool_name,
+                arguments=payload,
+            )
             await self._record_tool_result(
-                request,
-                resolved_call_id,
-                tool_name,
+                session_id=session_id,
+                run_id=run_id,
+                agent_id=agent_id,
+                tool_call_id=resolved_call_id,
+                tool_name=tool_name,
                 ok=False,
                 output=None,
                 error=f"Invalid arguments for tool: {tool_name}",
@@ -91,23 +113,32 @@ class ToolExecutor:
                 error=f"Invalid arguments for tool: {tool_name}",
             )
 
-        await self._record_tool_call(request, resolved_call_id, tool_name, payload)
+        await self._record_tool_call(
+            session_id=session_id,
+            run_id=run_id,
+            agent_id=agent_id,
+            tool_call_id=resolved_call_id,
+            tool_name=tool_name,
+            arguments=payload,
+        )
         token = set_tool_context(
             ToolContext(
-                agent_id=request.agent_id,
-                run_id=request.run_id,
-                message_id=request.message_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                message_id=message_id,
                 tool_call_id=resolved_call_id,
-                work_path=request.work_path,
-                metadata=dict(request.metadata),
+                work_path=work_path,
+                metadata=dict(metadata or {}),
             )
         )
         try:
             output = await tool.execute(payload)
             await self._record_tool_result(
-                request,
-                resolved_call_id,
-                tool_name,
+                session_id=session_id,
+                run_id=run_id,
+                agent_id=agent_id,
+                tool_call_id=resolved_call_id,
+                tool_name=tool_name,
                 ok=True,
                 output=output,
                 error=None,
@@ -120,9 +151,11 @@ class ToolExecutor:
             )
         except ToolExecutionError as exc:
             await self._record_tool_result(
-                request,
-                resolved_call_id,
-                tool_name,
+                session_id=session_id,
+                run_id=run_id,
+                agent_id=agent_id,
+                tool_call_id=resolved_call_id,
+                tool_name=tool_name,
                 ok=False,
                 output=None,
                 error=str(exc),
@@ -135,9 +168,11 @@ class ToolExecutor:
             )
         except Exception as exc:
             await self._record_tool_result(
-                request,
-                resolved_call_id,
-                tool_name,
+                session_id=session_id,
+                run_id=run_id,
+                agent_id=agent_id,
+                tool_call_id=resolved_call_id,
+                tool_name=tool_name,
                 ok=False,
                 output=None,
                 error=str(exc),
@@ -160,19 +195,22 @@ class ToolExecutor:
 
     async def _record_tool_call(
         self,
-        request: ExecutionRequest,
+        *,
+        session_id: Optional[str],
+        run_id: Optional[str],
+        agent_id: str,
         tool_call_id: str,
         tool_name: str,
         arguments: Dict[str, Any] | Any,
     ) -> None:
         if self._recorder is None:
             return
-        if not getattr(request, "session_id", None):
-            return
         payload = arguments if isinstance(arguments, dict) else {"input": str(arguments)}
         try:
             await self._recorder.record_tool_call(
-                request=request,
+                session_id=session_id,
+                run_id=run_id,
+                agent_id=agent_id,
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 arguments=payload,
@@ -182,21 +220,23 @@ class ToolExecutor:
 
     async def _record_tool_result(
         self,
-        request: ExecutionRequest,
+        *,
+        session_id: Optional[str],
+        run_id: Optional[str],
+        agent_id: str,
         tool_call_id: str,
         tool_name: str,
-        *,
         ok: bool,
         output: Any,
         error: Optional[str],
     ) -> None:
         if self._recorder is None:
             return
-        if not getattr(request, "session_id", None):
-            return
         try:
             await self._recorder.record_tool_result(
-                request=request,
+                session_id=session_id,
+                run_id=run_id,
+                agent_id=agent_id,
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 ok=ok,

@@ -45,24 +45,25 @@ async def observe_page():
 async def create_run(request: Request, body: CreateRunRequest) -> CreateRunResponse:
     services = request.app.state.services
     try:
-        return await services.run_manager.create_run(body)
-    except SessionNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return await services.agent_center.ingress_run_request(body)
     except SessionBusyError as exc:
         raise HTTPException(
             status_code=409,
             detail={
-                "error": "session busy",
+                "status": "busy",
+                "error": str(exc),
                 "session_id": exc.session_id,
-                "active_run_id": exc.active_run_id,
+                "run_id": exc.active_run_id,
             },
         ) from exc
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/runs/{run_id}/stop", response_model=StopRunResponse)
 async def stop_run(request: Request, run_id: str) -> StopRunResponse:
     services = request.app.state.services
-    response = await services.run_manager.stop_run(run_id)
+    response = await services.agent_center.ingress_stop_request(run_id)
     if response is None:
         raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
     return response

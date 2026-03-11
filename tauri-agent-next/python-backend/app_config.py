@@ -20,6 +20,16 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
     "agent": {
         "default_profile": "default",
         "react_max_iterations": 16,
+        "profiles": {
+            "default": {
+                "agent_type": "assistant",
+                "display_name": "Assistant",
+                "system_prompt": None,
+                "tool_policy_text": None,
+                "executable_event_topics": [],
+                "metadata": {},
+            },
+        },
     },
     "context": {
         "compression_enabled": True,

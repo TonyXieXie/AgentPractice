@@ -16,11 +16,13 @@ class MessageCenterEventRecord:
     viewer_agent_id: str
     message_id: str
     seq: Optional[int]
-    kind: str
-    delivery: str
+    message_type: str
+    object_type: str
+    rpc_phase: Optional[str]
     topic: str
     sender_id: str
-    target_id: Optional[str]
+    target_agent_id: Optional[str]
+    target_profile: Optional[str]
     correlation_id: Optional[str]
     ok: Optional[bool]
     visibility: str
@@ -28,6 +30,22 @@ class MessageCenterEventRecord:
     payload: Dict[str, Any]
     metadata: Dict[str, Any]
     created_at: str
+
+    @property
+    def kind(self) -> str:
+        if self.message_type == "event":
+            return "event"
+        if self.rpc_phase == "response":
+            return "rpc_response"
+        return "rpc_request"
+
+    @property
+    def delivery(self) -> str:
+        return "broadcast" if self.object_type == "broadcast" else "unicast"
+
+    @property
+    def target_id(self) -> Optional[str]:
+        return self.target_agent_id
 
 
 def _row_to_record(row) -> MessageCenterEventRecord:
@@ -56,6 +74,21 @@ def _row_to_record(row) -> MessageCenterEventRecord:
     seq_raw = row["seq"]
     seq: Optional[int] = None if seq_raw is None else int(seq_raw)
 
+    legacy_kind = str(row["kind"] or "")
+    raw_message_type = str(row["message_type"] or "").strip()
+    raw_object_type = str(row["object_type"] or "").strip()
+    raw_rpc_phase = row["rpc_phase"]
+    if not raw_message_type:
+        raw_message_type = "event" if legacy_kind == "event" else "rpc"
+    if not raw_object_type:
+        raw_object_type = str(row["delivery"] or "").strip()
+    if raw_object_type == "unicast":
+        raw_object_type = "target"
+    if not raw_rpc_phase and legacy_kind == "rpc_request":
+        raw_rpc_phase = "request"
+    if not raw_rpc_phase and legacy_kind == "rpc_response":
+        raw_rpc_phase = "response"
+
     return MessageCenterEventRecord(
         id=int(row["id"]),
         session_id=str(row["session_id"]),
@@ -63,11 +96,13 @@ def _row_to_record(row) -> MessageCenterEventRecord:
         viewer_agent_id=str(row["viewer_agent_id"]),
         message_id=str(row["message_id"]),
         seq=seq,
-        kind=str(row["kind"]),
-        delivery=str(row["delivery"]),
+        message_type=raw_message_type,
+        object_type=raw_object_type,
+        rpc_phase=raw_rpc_phase,
         topic=str(row["topic"]),
         sender_id=str(row["sender_id"]),
-        target_id=row["target_id"],
+        target_agent_id=row["target_agent_id"] or row["target_id"],
+        target_profile=row["target_profile"],
         correlation_id=row["correlation_id"],
         ok=ok,
         visibility=str(row["visibility"]),
@@ -97,13 +132,19 @@ class MessageCenterRepository:
 
         payload_json = json.dumps(message.payload or {}, ensure_ascii=False)
         metadata_json = json.dumps(message.metadata or {}, ensure_ascii=False)
+        requested_target_profile = None
+        if isinstance(message.metadata, dict):
+            value = message.metadata.get("target_profile")
+            if value is not None:
+                requested_target_profile = str(value).strip() or None
+        resolved_target_profile = message.target_profile or requested_target_profile
 
         row_id = await self.store.execute_insert(
             """
             INSERT INTO message_center_events
-              (session_id, run_id, viewer_agent_id, message_id, seq, kind, delivery, topic,
-               sender_id, target_id, correlation_id, ok, visibility, level, payload_json, metadata_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              (session_id, run_id, viewer_agent_id, message_id, seq, kind, delivery, message_type, object_type, rpc_phase, topic,
+               sender_id, target_id, target_agent_id, target_profile, correlation_id, ok, visibility, level, payload_json, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """.strip(),
             (
                 session_id,
@@ -113,9 +154,14 @@ class MessageCenterRepository:
                 message.seq,
                 message.kind,
                 message.delivery,
+                message.message_type,
+                message.object_type,
+                message.rpc_phase,
                 message.topic,
                 message.sender_id,
                 message.target_id,
+                message.target_id,
+                resolved_target_profile,
                 message.correlation_id,
                 ok_value,
                 message.visibility,
@@ -140,8 +186,8 @@ class MessageCenterRepository:
         if exclude_message_id:
             rows = await self.store.fetchall(
                 """
-                SELECT id, session_id, run_id, viewer_agent_id, message_id, seq, kind, delivery, topic,
-                       sender_id, target_id, correlation_id, ok, visibility, level, payload_json, metadata_json, created_at
+                SELECT id, session_id, run_id, viewer_agent_id, message_id, seq, kind, delivery, message_type, object_type, rpc_phase, topic,
+                       sender_id, target_id, target_agent_id, target_profile, correlation_id, ok, visibility, level, payload_json, metadata_json, created_at
                 FROM message_center_events
                 WHERE session_id = ? AND viewer_agent_id = ? AND message_id <> ?
                 ORDER BY id DESC
@@ -152,8 +198,8 @@ class MessageCenterRepository:
         else:
             rows = await self.store.fetchall(
                 """
-                SELECT id, session_id, run_id, viewer_agent_id, message_id, seq, kind, delivery, topic,
-                       sender_id, target_id, correlation_id, ok, visibility, level, payload_json, metadata_json, created_at
+                SELECT id, session_id, run_id, viewer_agent_id, message_id, seq, kind, delivery, message_type, object_type, rpc_phase, topic,
+                       sender_id, target_id, target_agent_id, target_profile, correlation_id, ok, visibility, level, payload_json, metadata_json, created_at
                 FROM message_center_events
                 WHERE session_id = ? AND viewer_agent_id = ?
                 ORDER BY id DESC
@@ -164,4 +210,3 @@ class MessageCenterRepository:
         records = [_row_to_record(row) for row in rows]
         records.reverse()
         return records
-

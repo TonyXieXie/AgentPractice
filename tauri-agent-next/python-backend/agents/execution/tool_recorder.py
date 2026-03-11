@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional, Protocol
 
-from agents.execution.strategy import ExecutionRequest
 from repositories.conversation_repository import ConversationRepository
 
 
@@ -11,7 +10,9 @@ class ToolEventRecorder(Protocol):
     async def record_tool_call(
         self,
         *,
-        request: ExecutionRequest,
+        session_id: Optional[str],
+        run_id: Optional[str],
+        agent_id: str,
         tool_call_id: str,
         tool_name: str,
         arguments: Dict[str, Any],
@@ -21,7 +22,9 @@ class ToolEventRecorder(Protocol):
     async def record_tool_result(
         self,
         *,
-        request: ExecutionRequest,
+        session_id: Optional[str],
+        run_id: Optional[str],
+        agent_id: str,
         tool_call_id: str,
         tool_name: str,
         ok: bool,
@@ -71,19 +74,20 @@ class ConversationToolRecorder:
     async def record_tool_call(
         self,
         *,
-        request: ExecutionRequest,
+        session_id: Optional[str],
+        run_id: Optional[str],
+        agent_id: str,
         tool_call_id: str,
         tool_name: str,
         arguments: Dict[str, Any],
     ) -> None:
-        session_id = request.session_id
         if not session_id:
             return
         payload: Dict[str, Any] = {"arguments": arguments if isinstance(arguments, dict) else {"input": str(arguments)}}
         await self.conversation_repository.append_event(
             session_id=session_id,
-            run_id=request.run_id,
-            agent_id=request.agent_id,
+            run_id=run_id,
+            agent_id=agent_id,
             kind="tool_call",
             content=payload,
             tool_name=tool_name,
@@ -93,22 +97,23 @@ class ConversationToolRecorder:
     async def record_tool_result(
         self,
         *,
-        request: ExecutionRequest,
+        session_id: Optional[str],
+        run_id: Optional[str],
+        agent_id: str,
         tool_call_id: str,
         tool_name: str,
         ok: bool,
         output: Any,
         error: Optional[str],
     ) -> None:
-        session_id = request.session_id
         if not session_id:
             return
         output_text = _truncate_storage_value(_serialize_output(output), max_bytes=self.max_payload_bytes)
         error_text = _truncate_storage_value(str(error or ""), max_bytes=self.max_payload_bytes) if error else ""
         await self.conversation_repository.append_event(
             session_id=session_id,
-            run_id=request.run_id,
-            agent_id=request.agent_id,
+            run_id=run_id,
+            agent_id=agent_id,
             kind="tool_result",
             content={"output": output_text, "error": error_text},
             tool_name=tool_name,
