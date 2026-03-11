@@ -219,7 +219,7 @@ class AgentBase(ABC):
     async def broadcast_event(self, topic: str, payload: dict, scope: str):
         ...
 
-    async def call_rpc(self, topic: str, payload: dict, target_agent_id: str, timeout_ms: int = 300000):
+    async def send_rpc_request(self, topic: str, payload: dict, target_agent_id: str, timeout_ms: int = 300000):
         ...
 
     async def reply_rpc(self, request: "AgentMessage", payload: dict, ok: bool = True):
@@ -270,7 +270,8 @@ class AgentBase(ABC):
 - 接收用户输入
 - 组装标准 `AgentMessage`
 - 发送给目标 Agent
-- 等待结果并返回给用户侧调用方
+- 对外部 HTTP ingress 返回短同步确认（如 `accepted` / `stopping`）
+- 对内部 top-level `task.run` 在收到最终 `rpc_response` 时调用 `RunManager.finish_run/fail_run`
 
 它不应该负责：
 
@@ -507,7 +508,7 @@ class AgentBase {
   +agent_id()
   +send_event()
   +broadcast_event()
-  +call_rpc()
+  +send_rpc_request()
   +reply_rpc()
   +on_message()
 }
@@ -832,11 +833,11 @@ python-backend/
 标准流程建议如下：
 
 1. 发送方 Agent 发出 `rpc_request`
-2. `AgentCenter` 记录 correlation
-3. `AgentCenter` 路由到目标 Agent
-4. 目标 Agent 处理
-5. 目标 Agent 发回 `rpc_response`
-6. `AgentCenter` 完成关联并返回结果
+2. `AgentCenter` 记录并持久化消息，然后把 request 路由到目标 Agent
+3. 目标 Agent 处理当前消息；如果需要等待其它 Agent，它应结束当前 local task，而不是同步阻塞
+4. 目标 Agent 在未来某个时刻发回 `rpc_response`
+5. `AgentCenter` 持久化 response，并把它继续投递给 target Agent
+6. 如果该请求来自外部 HTTP ingress，`AgentCenter` 可以额外 resolve 一个临时 waiter，用于返回控制面确认；这不是内部 Agent 协作语义的一部分
 
 ## 6.3 Event 生命周期
 

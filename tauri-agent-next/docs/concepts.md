@@ -58,6 +58,8 @@
 - 1 task 只由 1 个 AgentInstance 串行执行（见 2.6）
 - 一个 Agent 做完当前自己内部能完成的工作后，该 local task 即可结束
 - 如果需要其它 Agent 协助，当前 Agent 发送 `rpc request` 后可以结束当前 local task；后续 `rpc response` 作为新消息，再决定是否托管新的 local task
+- 内部 Agent 协作中的 RPC 是**纯消息驱动**：发送方不应同步等待返回值，而是把后续 `rpc_response` 当成新的输入消息处理
+- 只有外部 HTTP ingress（例如 `POST /runs`、`POST /runs/{run_id}/stop`）允许保留短暂的同步确认语义；这不改变内部 Agent 协作模型
 
 ### 2.4 `iteration`（一次 ReAct 循环单元）
 模型内部一次 ReAct 回合（你之前称 round），建议统一叫 `iteration`。
@@ -300,9 +302,13 @@ flowchart TD
 边界约束：
 - `RunManager`：只负责 `run.started / run.finished / stop`
 - `AgentCenter`：只负责入口接收、消息路由、订阅匹配、Message Center 持久化
-- `UserProxyAgent`：只负责外部请求 → `AgentMessage`，并决定 start/continue/stop 等控制动作
+- `UserProxyAgent`：只负责外部请求 → `AgentMessage`，并决定 start/continue/stop 等控制动作；对 top-level `task.run`，它负责在最终 `rpc_response` 到达时收尾 run
 - `AssistantAgent`：只作为消息节点，接受消息并根据需要发出新消息
 - `task` 是 Agent 内部托管细节，不是这张消息流程图的核心表达对象
+
+补充约束：
+- 内部 `rpc_request -> rpc_response` 不采用“函数调用式同步返回”；发送方继续空闲或处理其它消息，后续再消费关联的 `rpc_response`
+- `AgentCenter` 可以为外部 HTTP 请求临时维护 waiter，以便返回 `accepted` / `stopping` 之类的控制面确认；该 waiter 不参与内部 Agent-to-Agent 协作
 
 ```mermaid
 flowchart TD

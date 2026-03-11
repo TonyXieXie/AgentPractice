@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
@@ -104,48 +103,6 @@ class AgentBase(ABC):
         )
         return await self.center.route(message)
 
-    async def call_rpc(
-        self,
-        topic: str,
-        payload: Dict[str, Any],
-        *,
-        target_agent_id: Optional[str] = None,
-        target_profile: Optional[str] = None,
-        run_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-        timeout_ms: int = 300_000,
-        visibility: VisibilityLevel = "public",
-        level: SeverityLevel = "info",
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> AgentMessage:
-        target_id, resolved_target_profile, target_metadata = self._normalize_target(
-            target_agent_id=target_agent_id,
-            target_profile=target_profile,
-        )
-        resolved_metadata = dict(metadata or {})
-        resolved_metadata.update(target_metadata)
-        message = AgentMessage.build_rpc_request(
-            topic=topic,
-            sender_id=self.agent_id,
-            target_id=target_id,
-            target_profile=resolved_target_profile,
-            payload=payload,
-            run_id=run_id or self.run_id,
-            session_id=session_id,
-            timeout_ms=timeout_ms,
-            visibility=visibility,
-            level=level,
-            metadata=resolved_metadata,
-        )
-        correlation_id = message.correlation_id or message.id
-        future = await self.center.expect_rpc_response(correlation_id)
-        try:
-            await self.center.route(message)
-            timeout_sec = max(0.001, float(timeout_ms or 300_000) / 1000.0)
-            return await asyncio.wait_for(future, timeout=timeout_sec)
-        finally:
-            await self.center.clear_rpc_waiter(correlation_id, future)
-
     async def send_rpc_request(
         self,
         topic: str,
@@ -160,24 +117,17 @@ class AgentBase(ABC):
         level: SeverityLevel = "info",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> AgentMessage:
-        target_id, resolved_target_profile, target_metadata = self._normalize_target(
+        message = self._build_outbound_rpc_request(
+            topic=topic,
+            payload=payload,
             target_agent_id=target_agent_id,
             target_profile=target_profile,
-        )
-        resolved_metadata = dict(metadata or {})
-        resolved_metadata.update(target_metadata)
-        message = AgentMessage.build_rpc_request(
-            topic=topic,
-            sender_id=self.agent_id,
-            target_id=target_id,
-            target_profile=resolved_target_profile,
-            payload=payload,
-            run_id=run_id or self.run_id,
+            run_id=run_id,
             session_id=session_id,
             timeout_ms=timeout_ms,
             visibility=visibility,
             level=level,
-            metadata=resolved_metadata,
+            metadata=metadata,
         )
         await self.center.route(message)
         return message
@@ -203,6 +153,41 @@ class AgentBase(ABC):
         )
         await self.center.route(response)
         return response
+
+    def _build_outbound_rpc_request(
+        self,
+        *,
+        topic: str,
+        payload: Dict[str, Any],
+        target_agent_id: Optional[str] = None,
+        target_profile: Optional[str] = None,
+        run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        timeout_ms: int = 300_000,
+        visibility: VisibilityLevel = "public",
+        level: SeverityLevel = "info",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> AgentMessage:
+        target_id, resolved_target_profile, target_metadata = self._normalize_target(
+            target_agent_id=target_agent_id,
+            target_profile=target_profile,
+        )
+        resolved_metadata = dict(metadata or {})
+        resolved_metadata.update(target_metadata)
+        message = AgentMessage.build_rpc_request(
+            topic=topic,
+            sender_id=self.agent_id,
+            target_id=target_id,
+            target_profile=resolved_target_profile,
+            payload=payload,
+            run_id=run_id or self.run_id,
+            session_id=session_id,
+            timeout_ms=timeout_ms,
+            visibility=visibility,
+            level=level,
+            metadata=resolved_metadata,
+        )
+        return message
 
     async def observe(
         self,

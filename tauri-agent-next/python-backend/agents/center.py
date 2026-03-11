@@ -159,14 +159,14 @@ class AgentCenter:
             message = await self._assign_seq(message)
             await self._observe_message(message, "message.sent")
             await self._persist_message(message)
-            target = await self.get(message.target_id or "") if message.target_id else None
-            if target is not None:
-                self._spawn_background_task(self._deliver_rpc_response(target, message))
             future = await self._pop_pending_rpc(message.correlation_id)
             if future is not None and not future.done():
                 future.set_result(message)
-            elif target is None:
-                raise ValueError(f"Target agent not found: {message.target_id}")
+            target = await self.get(message.target_id or "") if message.target_id else None
+            if target is not None:
+                self._spawn_background_task(self._deliver_rpc_response(target, message))
+            elif future is None:
+                await self._emit_undeliverable_rpc_response(message)
             return message
 
         target, routed_message = await self._resolve_target_message(message)
@@ -435,6 +435,26 @@ class AgentCenter:
                     },
                 )
             )
+
+    async def _emit_undeliverable_rpc_response(self, message: AgentMessage) -> None:
+        await self.emit(
+            ExecutionEvent(
+                event_type="message.undeliverable",
+                run_id=message.run_id,
+                agent_id=message.sender_id,
+                message_id=message.id,
+                visibility="internal",
+                level="warning",
+                source_type="center",
+                source_id=message.sender_id,
+                tags=["rpc", "response", "undeliverable"],
+                payload={
+                    "topic": message.topic,
+                    "target_agent_id": message.target_id,
+                    "correlation_id": message.correlation_id,
+                },
+            )
+        )
 
 
 def _extract_session_id(message: AgentMessage) -> Optional[str]:

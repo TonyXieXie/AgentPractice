@@ -294,11 +294,15 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
         self._temp_dir.cleanup()
 
     async def test_user_proxy_can_call_assistant(self) -> None:
-        response = await self.user.send_user_message(
+        request = await self.user.send_user_message(
             "hello",
             target_agent_id=self.assistant.agent_id,
             run_id=self.run_id,
             session_id=self.session_id,
+        )
+        response = await self._wait_for_response_message(
+            self.user.agent_id,
+            request.correlation_id or request.id,
         )
 
         self.assertTrue(response.ok)
@@ -341,17 +345,19 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
     async def test_engine_executes_registered_tool(self) -> None:
         ToolRegistry.register(EchoTool())
 
-        response = await self.user.call_rpc(
-            "task.run",
-            {
-                "content": "run echo",
-                "tool_name": "echo",
-                "tool_arguments": {"text": "from tool"},
-                "session_id": self.session_id,
-            },
+        request = await self.user.send_user_message(
+            "run echo",
             target_agent_id=self.assistant.agent_id,
             run_id="run-1",
             session_id=self.session_id,
+            request_overrides={
+                "tool_name": "echo",
+                "tool_arguments": {"text": "from tool"},
+            },
+        )
+        response = await self._wait_for_response_message(
+            self.user.agent_id,
+            request.correlation_id or request.id,
         )
 
         self.assertTrue(response.ok)
@@ -375,12 +381,16 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
             lambda _message: {"reply": "pong", "handled_by": "custom"},
         )
 
-        response = await self.user.call_rpc(
+        request = await self.user.send_rpc_request(
             "assistant.ping",
             {},
             target_agent_id=self.assistant.agent_id,
             run_id="run-1",
             session_id=self.session_id,
+        )
+        response = await self._wait_for_response_message(
+            self.user.agent_id,
+            request.correlation_id or request.id,
         )
 
         self.assertTrue(response.ok)
@@ -396,16 +406,16 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
             llm_client_factory=lambda _request: fake_llm,
         )
 
-        response = await self.user.call_rpc(
-            "task.run",
-            {
-                "content": "use react",
-                "strategy": "react",
-                "session_id": self.session_id,
-            },
+        request = await self.user.send_user_message(
+            "use react",
             target_agent_id=self.assistant.agent_id,
             run_id="run-1",
             session_id=self.session_id,
+            strategy="react",
+        )
+        response = await self._wait_for_response_message(
+            self.user.agent_id,
+            request.correlation_id or request.id,
         )
 
         self.assertTrue(response.ok)
@@ -434,16 +444,16 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
             llm_client_factory=lambda _request: fake_llm,
         )
 
-        response = await self.user.call_rpc(
-            "task.run",
-            {
-                "content": "use responses",
-                "strategy": "react",
-                "session_id": self.session_id,
-            },
+        request = await self.user.send_user_message(
+            "use responses",
             target_agent_id=self.assistant.agent_id,
             run_id="run-1",
             session_id=self.session_id,
+            strategy="react",
+        )
+        response = await self._wait_for_response_message(
+            self.user.agent_id,
+            request.correlation_id or request.id,
         )
 
         self.assertTrue(response.ok)
@@ -480,10 +490,10 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.user.received_events), 0)
         self.assertEqual(len(watcher.received_events), 1)
 
-    async def test_call_rpc_returns_response_and_redelivers_response_to_target_agent(self) -> None:
+    async def test_send_rpc_request_returns_response_and_redelivers_response_to_target_agent(self) -> None:
         watcher = await self._create_runtime_assistant(profile_id="default")
 
-        response = await self.assistant.call_rpc(
+        request = await self.assistant.send_rpc_request(
             "assistant.delegate",
             {
                 "content": "delegate this",
@@ -492,6 +502,10 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
             target_agent_id=watcher.agent_id,
             run_id=self.run_id,
             session_id=self.session_id,
+        )
+        response = await self._wait_for_response_message(
+            self.assistant.agent_id,
+            request.correlation_id or request.id,
         )
 
         self.assertTrue(response.ok)
@@ -541,7 +555,7 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
     async def test_profile_routed_rpc_reuses_existing_idle_instance(self) -> None:
         worker = await self._create_runtime_assistant(profile_id="worker")
 
-        response = await self.assistant.call_rpc(
+        request = await self.assistant.send_rpc_request(
             "assistant.delegate",
             {
                 "content": "delegate by profile",
@@ -550,6 +564,10 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
             target_profile="worker",
             run_id=self.run_id,
             session_id=self.session_id,
+        )
+        response = await self._wait_for_response_message(
+            self.assistant.agent_id,
+            request.correlation_id or request.id,
         )
 
         self.assertTrue(response.ok)
@@ -594,7 +612,7 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
     async def test_target_id_overrides_target_profile(self) -> None:
         worker = await self._create_runtime_assistant(profile_id="worker")
 
-        response = await self.assistant.call_rpc(
+        request = await self.assistant.send_rpc_request(
             "assistant.delegate",
             {
                 "content": "explicit target wins",
@@ -604,6 +622,10 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
             target_profile="missing-profile",
             run_id=self.run_id,
             session_id=self.session_id,
+        )
+        response = await self._wait_for_response_message(
+            self.assistant.agent_id,
+            request.correlation_id or request.id,
         )
 
         self.assertTrue(response.ok)
@@ -673,6 +695,23 @@ class AgentCenterTests(unittest.IsolatedAsyncioTestCase):
                 return tasks
             await asyncio.sleep(0.01)
         self.fail(f"expected at least {expected} tasks")
+
+    async def _wait_for_response_message(self, viewer_agent_id: str, correlation_id: str):
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while asyncio.get_running_loop().time() < deadline:
+            records = await self.message_center_repository.list_latest_visible(
+                self.session_id,
+                viewer_agent_id,
+                limit=20,
+            )
+            for record in reversed(records):
+                if (
+                    record.kind == "rpc_response"
+                    and record.correlation_id == correlation_id
+                ):
+                    return record
+            await asyncio.sleep(0.01)
+        self.fail(f"expected rpc_response for correlation_id={correlation_id}")
 
     async def _create_runtime_assistant(self, *, profile_id: str) -> AssistantAgent:
         record = await self.agent_instance_repository.create(
