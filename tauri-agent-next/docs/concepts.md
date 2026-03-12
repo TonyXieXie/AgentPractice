@@ -33,7 +33,7 @@
 
 ### 2.2 `run`（一次执行作业）
 一次执行作业（job）。run 以可观测、可取消、可回放为目标。  
-外部入口（如 HTTP `POST /runs`、`POST /runs/{run_id}/stop`）在概念上先进入 `AgentCenter`，再交由 `UserProxyAgent` 处理；当 `UserProxyAgent` 决定启动、继续或停止一次执行时，会关联、打开或终止对应的 `run`。
+外部入口（如 HTTP `POST /runs`、`POST /runs/{run_id}/stop`）在概念上先进入 `AgentCenter`，再交由 `UserProxyAgent` 处理；当 `UserProxyAgent` 决定启动、继续、结束或停止一次执行时，会关联、打开或终止对应的 `run`。
 
 - 主键：`run_id`
 - 生命周期：`run.started` →（多次 LLM/tool/step）→ `run.finished|run.error|stopped`
@@ -41,6 +41,7 @@
   - `run` 是控制/观测单位，不等价于 session
   - 同一 session 下可以有多个 run
   - `run` 的生命周期由 `RunManager` 托管，但 `RunManager` 不直接拥有用户请求语义
+  - `UserProxyAgent` 是 run 级控制者与最终完成判断者；它不会通过轮询判断 run 是否结束，而是在收到新的 shared message 时，基于当前共享事实做一次新的 LLM 决策
 
 ### 2.3 `task`（Agent 本地托管的工作项）
 `task` 不是跨 Agent 协作协议，也不是执行核心；它更接近某个 AgentInstance 在本地托管的一段可恢复、可观测的工作。
@@ -57,8 +58,9 @@
 - 1 run 内可以出现 0..N 个 local task
 - 1 task 只由 1 个 AgentInstance 串行执行（见 2.6）
 - 一个 Agent 做完当前自己内部能完成的工作后，该 local task 即可结束
-- 如果需要其它 Agent 协助，当前 Agent 发送 `rpc request` 后可以结束当前 local task；后续 `rpc response` 作为新消息，再决定是否托管新的 local task
+- 如果需要其它 Agent 协助，当前 Agent 可以发送 `rpc request` 或 `event` 后结束当前 local task；后续新收到的 shared message 再决定是否托管新的 local task
 - 内部 Agent 协作中的 RPC 是**纯消息驱动**：发送方不应同步等待返回值，而是把后续 `rpc_response` 当成新的输入消息处理
+- `UserProxyAgent` 在 active run 期间同样遵循消息驱动：只在收到新的 shared message 时被再次唤醒，不做轮询
 - 只有外部 HTTP ingress（例如 `POST /runs`、`POST /runs/{run_id}/stop`）允许保留短暂的同步确认语义；这不改变内部 Agent 协作模型
 
 ### 2.4 `iteration`（一次 ReAct 循环单元）
@@ -95,14 +97,15 @@
   - `target`：定向消息；可面向具体 `AgentInstance`，也可面向某个 `AgentProfile`
   - `broadcast`：广播消息；必须带 `topic`，并发送给所有订阅该 topic 的对象
 - `target` 与 `broadcast` 是投递对象语义，`rpc` 与 `event` 是协作语义；两者是正交维度
+- 所有 Agent 之间的消息一旦进入系统，就进入 session 级 shared facts；`target` / `broadcast` 只决定谁处理该消息，不决定它是否成为 shared fact
 
 ### 2.8 `message center`（消息中心）
 用于 session 内的 **统一通信与可查询事实源**（inbox/outbox）。
 
 - 所有外部请求、Agent 输出、RPC request/response、event、broadcast 都应通过 Message Center 投递与持久化
-- 对某个 AgentInstance 来说：它的 **shared 历史** = Message Center 中“该 Agent 可接收（可路由/订阅命中）”的消息集合
-- `target` 消息对发送方与被投递目标可见；`broadcast(topic)` 只对命中该 topic 订阅的对象可见
-- 这意味着 shared 不一定是“所有 Agent 都看到同一份”；是否可见取决于目标投递或订阅命中，而不是 session 全员默认共享
+- 对 session 内 Agent 来说：它的 **shared 历史** = Message Center 中属于该 session 的 shared message log
+- 所有 Agent 之间的消息默认都是 shared fact；`target` 与 `broadcast(topic)` 主要影响执行投递，不影响 shared fact 归档
+- `UserProxyAgent` 在 active run 期间应能收到“有新 shared message 到达”的唤醒信号，并基于 shared facts 重新判断下一步动作
 
 ---
 
@@ -133,6 +136,7 @@ profile 典型包含：
 
 - v1 中，订阅集合的默认来源是 `AgentProfile`
 - `AgentInstance` 默认继承所属 profile 的订阅 topic 集
+- 订阅规则用于决定谁会**处理**一条 broadcast event，而不是决定这条消息是否进入 shared facts
 - 运行时动态增删订阅不在本文范围内；如后续引入，应视为扩展能力
 
 ### 3.4 `agent id`
@@ -153,7 +157,9 @@ profile 典型包含：
 
 - 接收来自 `AgentCenter` 的外部请求消息
 - 负责把外部用户/控制请求转换为系统内部可协作的 `AgentMessage`
-- 负责决定下一步是启动 run、拒绝、继续会话，还是停止某个 run
+- 作为 run 级控制者与最终完成判断者，决定一次 run 是继续等待、继续发消息，还是结束
+- 在 active run 期间只在收到新的 shared message 时被再次唤醒，不通过轮询判断 run 是否结束
+- 由自身的 LLM 决定下一步动作，例如 `send_rpc`、`send_event`、`broadcast_event`、`wait`、`finish_run`、`fail_run`、`stop_run`
 
 ### 3.7 `RunManager`
 run 生命周期宿主。
@@ -167,18 +173,19 @@ run 生命周期宿主。
 ## 4. 可见性模型（Shared vs Private）
 
 ### 4.1 shared（共享）
-对某个 AgentInstance 来说，shared 历史来自 **Message Center**（并且该 Agent 能接收到）。
+对某个 AgentInstance 来说，shared 历史来自 **Message Center** 中该 session 的共享消息日志。
 
 常见包含：
 - 用户输入与需求变更（统一走 Message Center）
 - 其它 Agent 的结论、约束、决策、计划变更
-- `rpc request / rpc response`（只要该 Agent 是目标、调用方，或后续路由需要它可见）
-- `event`（包括 target event 与命中 topic 订阅的 broadcast event）
+- 所有 Agent 之间的 `rpc request / rpc response`
+- 所有 Agent 之间的 `event`（包括 target event 与 broadcast event）
 - 产物引用/索引（artifact refs，内容落盘）
 
 可见性规则：
-- `target` 消息：对发送方与解析后的目标可见
-- `broadcast(topic)`：仅对订阅该 topic 的 AgentInstance 可见
+- 所有 Agent 之间的消息默认进入 shared facts
+- `target` / `broadcast(topic)` 决定谁来处理消息，不决定它是否成为 shared fact
+- `visibility` 仍可用于 UI/观测层过滤，但不改变 shared/private 的 Memory 语义
 
 ### 4.2 private（私有）
 只对某个 AgentInstance 可见的记录，默认用于保存执行细节与工具输出：
@@ -215,7 +222,7 @@ private 记录必须带：
 
 ### 5.2 session 事件（上下文事实源）
 用于重建上下文与跨 run 复用的事实源，建议存 SQLite（或等价的可查询存储）：
-- shared：Message Center 的消息日志（按“当前 Agent 是 target 命中方或 broadcast 订阅命中方”投影进 Memory）
+- shared：Message Center 的消息日志（用户输入、Agent 间 RPC/Event 等 shared facts）
 - private：owner agent 的私有记忆/执行记录（例如工具调用过程/中间笔记）
 
 特点：
@@ -241,7 +248,7 @@ private 记录必须带：
 - agent instance override（可选）
 
 2) History（事实源）
-- shared 历史：Message Center 中该 Agent 可接收的消息
+- shared 历史：Message Center 中该 session 的 shared message log
 - private 历史：仅 owner==当前 agent_instance_id 的私有执行记录
 - 产物只注入引用（artifact refs），不注入内容
 
@@ -302,86 +309,60 @@ flowchart TD
 边界约束：
 - `RunManager`：只负责 `run.started / run.finished / stop`
 - `AgentCenter`：只负责入口接收、消息路由、订阅匹配、Message Center 持久化
-- `UserProxyAgent`：只负责外部请求 → `AgentMessage`，并决定 start/continue/stop 等控制动作；对 top-level `task.run`，它负责在最终 `rpc_response` 到达时收尾 run
+- `UserProxyAgent`：负责外部请求 → `AgentMessage`、run 级控制决策与最终完成判断；它在收到新 shared message 时被唤醒，并由 LLM 决定继续发消息、等待或结束 run
 - `AssistantAgent`：只作为消息节点，接受消息并根据需要发出新消息
 - `task` 是 Agent 内部托管细节，不是这张消息流程图的核心表达对象
 
 补充约束：
 - 内部 `rpc_request -> rpc_response` 不采用“函数调用式同步返回”；发送方继续空闲或处理其它消息，后续再消费关联的 `rpc_response`
 - `AgentCenter` 可以为外部 HTTP 请求临时维护 waiter，以便返回 `accepted` / `stopping` 之类的控制面确认；该 waiter 不参与内部 Agent-to-Agent 协作
+- `UserProxyAgent` 不轮询 run 状态；只有当新的 shared message 到达时，它才再次运行自己的决策逻辑
+- 所有 Agent 之间的消息都会进入 Message Center 的 shared log；`target` / `broadcast(topic)` 只决定执行投递对象
 
 ```mermaid
 flowchart TD
     HTTP["POST /runs"] --> ING["AgentCenter.ingress(external request)"]
-    ING --> UPMSG["UserProxyAgent.on_message()"]
-    UPMSG --> UDEC{"Start run / reject / continue?"}
+    ING --> UP["UserProxyAgent.receive(external request)"]
+    UP --> UDEC{"UserProxyAgent LLM decides next action"}
+
     UDEC -- Reject --> UREJ["Reject request"]
-    UDEC -- Start or Continue --> RM["RunManager.open / attach run lifecycle"]
+    UDEC -- Open or Continue run --> RM["RunManager.open / attach run lifecycle"]
     RM --> RS["RunManager.emit(run.started)"]
-    RS --> UOUT["UserProxyAgent.send(target rpc request)"]
+    UDEC -- "send target rpc" --> URPC["UserProxyAgent.send(target rpc request)"]
+    UDEC -- "send target event" --> UEVT["UserProxyAgent.send(target event)"]
+    UDEC -- "send broadcast event" --> UBEVT["UserProxyAgent.send(broadcast event)"]
+    UDEC -- Wait --> UWAIT["Wait for next shared message"]
+    UDEC -- "finish / fail / stop run" --> REND["RunManager.finish / fail / stop"]
 
-    UOUT --> AC1["AgentCenter.route(target rpc request)"]
-    AC1 --> TRES{"Target object"}
-    TRES -- AgentInstance --> TINST["Deliver to concrete AgentInstance"]
-    TRES -- AgentProfile --> TPROF["Resolve or create matching AgentInstance"]
-    TINST --> AMSG["AssistantAgent.receive(message)"]
-    TPROF --> AMSG
+    URPC --> AC["AgentCenter.route(message)"]
+    UEVT --> AC
+    UBEVT --> AC
 
-    AMSG --> AACT{"Agent A next action"}
-    AACT -- Reply --> BRSP["Agent A send(target rpc response)"]
-    AACT -- Delegate --> ARPC["Agent A send(target rpc request)"]
-    AACT -- Broadcast --> AEVT["Agent A send(broadcast event)"]
-    AACT -- Complete local work --> ADONE["Agent A completes current local work"]
+    AC --> MC["Message Center.append(shared fact)"]
+    AC --> TRES{"Execution delivery target"}
+    TRES -- "target agent/profile" --> AMSG["Target AssistantAgent.receive(message)"]
+    TRES -- "broadcast subscribers" --> BMSG["Subscribed AssistantAgents.receive(event)"]
 
-    ARPC --> AC2["AgentCenter.route(target rpc request)"]
-    AC2 --> BMSG["AssistantAgent.receive(message)"]
-    BMSG --> BACT{"Agent B next action"}
-    BACT -- Reply --> BRSP2["Agent B send(target rpc response)"]
-    BACT -- Delegate again --> BRPC["Agent B send(target rpc request)"]
-    BACT -- Broadcast --> BEVT["Agent B send(broadcast event)"]
-    BACT -- Complete local work --> BIDLE["Agent B idle"]
+    AMSG --> AACT{"Receiver next action"}
+    BMSG --> AACT
+    AACT -- "send rpc / event / broadcast" --> AC
+    AACT -- "complete local work" --> AIDLE["Agent idle"]
 
-    BRPC --> AC2
+    MC --> UPWAKE["UserProxyAgent wake-up on new shared message"]
+    UPWAKE --> UDEC
 
-    BRSP2 --> AC3["AgentCenter.route(target rpc response)"]
-    BRSP --> AC3["AgentCenter.route(target rpc response)"]
-    AC3 --> ANEW["Caller agent receives rpc response"]
-    ANEW --> ANEXT{"Caller next action"}
-    ANEXT -- Send another message --> AMSG
-    ANEXT -- Stay idle --> AIDLE["Caller idle"]
-
-    ADONE --> AFINAL{"Reply to top-level caller?"}
-    AFINAL -- Yes --> ARSP["AgentBase.reply(rpc response) to UserProxyAgent"]
-    ARSP --> AC4["AgentCenter.route(target rpc response)"]
-    AC4 --> UPDONE["UserProxyAgent receives final response"]
-    UPDONE --> RF["RunManager.emit(run.finished)"]
-    RF --> OUT["Snapshot / Events / WS"]
-    AFINAL -- No --> AIDLE
-
-    AEVT --> ACB["AgentCenter.route(broadcast event)"]
-    BEVT --> ACB
-    EVT["Any Agent sends broadcast event(topic)"] --> ACB
-    ACB --> SUB["Match AgentInstances subscribed to topic"]
-    SUB --> EVREC["Subscribed agents receive(event)"]
-    EVREC --> EVNEXT{"Receiver next action"}
-    EVNEXT -- Send message --> AMSG
-    EVNEXT -- Ignore or stay idle --> EVIDLE["Receiver idle"]
+    REND --> OUT["Snapshot / Events / WS"]
 
     STOP["POST /runs/{run_id}/stop"] --> SING["AgentCenter.ingress(external stop request)"]
-    SING --> SUP["UserProxyAgent.on_message()"]
-    SUP --> SDEC{"Stop target run?"}
-    SDEC -- Yes --> RSTOP["RunManager.stop_run()"]
-    SDEC -- No --> SIGN["Ignore or reject stop request"]
-    RSTOP --> TCANCEL["TaskManager.stop_hosted_tasks()"]
-    TCANCEL --> RFIN["RunManager.emit(run.finished: stopped)"]
-``` 
+    SING --> UP
+```
 
 ---
 
 ## 9. v1 约定（便于落地）
 - tool_result 默认 private（owner=当前执行 AgentInstance）
 - shared 事实源统一来自 Message Center（用户输入、Agent 输出、RPC 请求/响应等都走消息中心）
-- Memory 构建单 Agent 视图：仅纳入“该 Agent 可接收”的 Message Center 消息（target 命中或 broadcast topic 订阅命中）
+- Memory 构建单 Agent 视图：纳入该 session 的 shared Message Center 日志，再叠加当前 Agent 自己的 private 记录
 - 摘要/压缩：v1 仅对 private 做滚动摘要；shared 只做预算丢弃/截断兜底
 - shared 中必须有“请求/结果/产物引用”的高层记录，否则其它 Agent 无法协作
 - artifact 内容默认不进入 prompt；只存引用，按需读取

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, Optional
 
 if TYPE_CHECKING:
     from agents.message import AgentMessage
+    from agents.profile import AgentProfile
     from agents.execution.tool_executor import ToolExecutor
     from llm.client import LLMClient
 
@@ -15,6 +16,14 @@ class ExecutionStep:
     step_type: str
     content: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ExecutionContext:
+    resolved_profile: Optional["AgentProfile"] = None
+    system_prompt: str = ""
+    tool_policy_text: str = ""
+    tool_executor: Optional["ToolExecutor"] = None
 
 
 class AgentStrategy(ABC):
@@ -29,5 +38,6 @@ class AgentStrategy(ABC):
         llm_client: Optional["LLMClient"],
         tool_executor: "ToolExecutor",
         memory: Optional[Any],
+        execution_context: Optional[ExecutionContext] = None,
     ) -> AsyncGenerator[ExecutionStep, None]:
         """Run the strategy and stream standardized execution steps."""

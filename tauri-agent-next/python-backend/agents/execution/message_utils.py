@@ -135,6 +135,8 @@ def render_current_message(message: AgentMessage) -> str:
         topic=message.topic,
         payload=_payload(message),
         ok=message.ok,
+        message_id=message.id,
+        correlation_id=message.correlation_id,
         prefer_plain_task_run=True,
     )
 
@@ -146,6 +148,8 @@ def render_message_center_entry(
     sender_id: Optional[str],
     topic: Optional[str],
     payload: Optional[Dict[str, Any]],
+    message_id: Optional[str] = None,
+    correlation_id: Optional[str] = None,
     ok: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
     content = render_message_envelope(
@@ -155,6 +159,8 @@ def render_message_center_entry(
         topic=topic,
         payload=payload,
         ok=ok,
+        message_id=message_id,
+        correlation_id=correlation_id,
         prefer_plain_task_run=False,
     )
     if not content.strip():
@@ -170,6 +176,8 @@ def render_message_envelope(
     sender_id: Optional[str],
     topic: Optional[str],
     payload: Optional[Dict[str, Any]],
+    message_id: Optional[str] = None,
+    correlation_id: Optional[str] = None,
     ok: Optional[bool] = None,
     prefer_plain_task_run: bool = False,
 ) -> str:
@@ -178,6 +186,14 @@ def render_message_envelope(
     normalized_rpc_phase = str(rpc_phase or "").strip()
     normalized_topic = str(topic or "").strip()
     normalized_sender = str(sender_id or "").strip() or "unknown"
+    normalized_message_id = str(message_id or "").strip()
+    normalized_correlation_id = str(correlation_id or "").strip()
+    id_suffix = f" id={normalized_message_id}" if normalized_message_id else ""
+    correlation_suffix = (
+        f" correlation_id={normalized_correlation_id}"
+        if normalized_correlation_id
+        else ""
+    )
 
     if normalized_message_type == "rpc" and normalized_rpc_phase == "request":
         body = (
@@ -186,9 +202,17 @@ def render_message_envelope(
             or _coerce_text(normalized_payload.get("result"))
             or _safe_json(normalized_payload)
         )
-        if prefer_plain_task_run and normalized_topic == "task.run":
+        if (
+            prefer_plain_task_run
+            and normalized_topic == "task.run"
+            and not normalized_message_id
+            and not normalized_correlation_id
+        ):
             return body.strip()
-        header = f"[RPC request] from {normalized_sender} topic={normalized_topic or 'unknown'}"
+        header = (
+            f"[RPC request] from {normalized_sender} topic={normalized_topic or 'unknown'}"
+            f"{id_suffix}{correlation_suffix}"
+        )
         return f"{header}\n{body}".strip()
 
     if normalized_message_type == "rpc" and normalized_rpc_phase == "response":
@@ -200,6 +224,7 @@ def render_message_envelope(
         )
         header = (
             f"[RPC response] from {normalized_sender} topic={normalized_topic or 'unknown'} ok={ok}"
+            f"{id_suffix}{correlation_suffix}"
         )
         return f"{header}\n{body}".strip()
 
@@ -209,7 +234,10 @@ def render_message_envelope(
             or _coerce_text(normalized_payload.get("content"))
             or _safe_json(normalized_payload)
         )
-        header = f"[Event] from {normalized_sender} topic={normalized_topic or 'unknown'}"
+        header = (
+            f"[Event] from {normalized_sender} topic={normalized_topic or 'unknown'}"
+            f"{id_suffix}{correlation_suffix}"
+        )
         return f"{header}\n{body}".strip()
 
     return (

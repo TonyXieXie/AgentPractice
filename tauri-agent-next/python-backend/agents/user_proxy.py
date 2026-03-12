@@ -1,22 +1,32 @@
 from __future__ import annotations
 
-import asyncio
 from copy import deepcopy
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agents.base import AgentBase
-from agents.execution.message_utils import get_session_id
+from agents.execution import (
+    DirectiveRunner,
+    ExecutionEngine,
+    ReactStrategy,
+    SimpleStrategy,
+    TaskManager,
+)
+from agents.execution.directives import RESERVED_DIRECTIVE_TOOL_NAMES
+from agents.execution.message_utils import get_session_id, get_tool_name
 from agents.message import AgentMessage
 from models import CreateRunAcceptedResponse, CreateRunRequest
 
 
-@dataclass(slots=True)
-class PendingTopLevelRequest:
-    correlation_id: str
-    run_id: str
-    session_id: str
-    assistant_agent_id: str
+USER_PROXY_SYSTEM_PROMPT = (
+    "You are the run controller UserProxyAgent.\n"
+    "- You are the final judge of whether the run should continue, finish, fail, or stop.\n"
+    "- Do not finish a run only because you received one rpc response; inspect the shared facts first.\n"
+    "- Every routed message is a shared fact. Use the shared history to understand the full session state.\n"
+    "- Act only by choosing exactly one control tool: send_rpc_request, send_rpc_response, send_event, "
+    "broadcast_event, finish_run, fail_run, or stop_run.\n"
+    "- When waking another agent, prefer explicit target delivery over broadcast unless broadcast is required.\n"
+    "- Keep run.stop command-style behavior intact when asked to stop.\n"
+)
 
 
 class UserProxyAgent(AgentBase):
@@ -25,14 +35,27 @@ class UserProxyAgent(AgentBase):
         *args,
         run_manager: "RunManager",
         roster_manager: "AgentRosterManager",
+        execution_engine: Optional[ExecutionEngine] = None,
+        task_manager: Optional[TaskManager] = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.run_manager = run_manager
         self.roster_manager = roster_manager
+        self.task_manager = task_manager
         self.received_events: list[AgentMessage] = []
-        self._pending_top_level_requests: dict[str, PendingTopLevelRequest] = {}
-        self._pending_lock = asyncio.Lock()
+        self.execution_engine = execution_engine or ExecutionEngine(
+            self,
+            strategies={
+                "simple": SimpleStrategy(system_prompt=USER_PROXY_SYSTEM_PROMPT),
+                "react": ReactStrategy(system_prompt=USER_PROXY_SYSTEM_PROMPT),
+            },
+        )
+        self.directive_runner = DirectiveRunner(
+            self,
+            run_manager=self.run_manager,
+            message_center_repository=getattr(self.center, "message_center_repository", None),
+        )
 
     async def send_user_message(
         self,
@@ -113,31 +136,18 @@ class UserProxyAgent(AgentBase):
         )
 
     async def on_message(self, message: AgentMessage):
+        if message.message_type == "rpc" and message.rpc_phase == "request":
+            if message.topic == "run.submit":
+                await self._handle_run_submit(message)
+                return None
+            if message.topic == "run.stop":
+                await self._handle_run_stop(message)
+                return None
+
         if message.message_type == "event":
             self.received_events.append(message)
-            return None
 
-        if message.message_type == "rpc" and message.rpc_phase == "response":
-            await self._handle_top_level_response(message)
-            return None
-
-        if message.message_type != "rpc" or message.rpc_phase != "request":
-            return None
-
-        if message.topic == "run.submit":
-            await self._handle_run_submit(message)
-            return None
-        if message.topic == "run.stop":
-            await self._handle_run_stop(message)
-            return None
-
-        await self.reply_rpc(
-            message,
-            {"error": f"Unsupported topic: {message.topic}"},
-            ok=False,
-            level="error",
-            visibility="internal",
-        )
+        await self._handle_controller_message(message)
         return None
 
     async def _handle_run_submit(self, message: AgentMessage) -> None:
@@ -212,7 +222,6 @@ class UserProxyAgent(AgentBase):
                 visibility="internal",
             )
             return
-        await self._clear_pending_top_level_request_by_run(run_id)
         response = await self.run_manager.stop_run(run_id)
         if response is None:
             await self.reply_rpc(
@@ -236,58 +245,45 @@ class UserProxyAgent(AgentBase):
             raise RuntimeError("session_id is required")
 
         assistant_record = await self.roster_manager.ensure_primary_entry_assistant(session_id)
-        strategy = self._resolve_requested_strategy(request)
+        requested_strategy = self._resolve_requested_strategy(request)
         active_run = await self.run_manager.open_run(
             session_id,
-            assistant_record.id,
+            self.agent_id,
+            entry_assistant_id=assistant_record.id,
             metadata={
                 "user_agent_id": self.agent_id,
                 "assistant_agent_id": assistant_record.id,
-                "strategy": strategy,
+                "strategy": requested_strategy,
+                "requested_strategy": requested_strategy,
             },
         )
-        top_level_request = self._build_user_message_request(
-            request.content,
-            target_agent_id=assistant_record.id,
+        controller_message = AgentMessage.build_event(
+            topic="run.controller.input",
+            sender_id="external:http",
+            target_id=self.agent_id,
+            payload={
+                "content": request.content,
+                "session_id": session_id,
+                "strategy": "react",
+                "requested_strategy": requested_strategy,
+                "history": deepcopy(request.history),
+                "llm_config": deepcopy(request.llm_config) if request.llm_config else None,
+                "system_prompt": request.system_prompt,
+                "work_path": request.work_path,
+                "request_overrides": deepcopy(request.request_overrides),
+                "assistant_agent_id": assistant_record.id,
+                "run_request": request.model_dump(),
+            },
             run_id=active_run.run_id,
             session_id=session_id,
-            strategy=request.strategy,
-            history=request.history,
-            llm_config=request.llm_config,
-            system_prompt=request.system_prompt,
-            work_path=request.work_path,
-            request_overrides=request.request_overrides,
+            visibility="internal",
+            level="info",
+            metadata={
+                "assistant_agent_id": assistant_record.id,
+                "requested_strategy": requested_strategy,
+            },
         )
-        correlation_id = str(top_level_request.correlation_id or top_level_request.id)
-        try:
-            await self._put_pending_top_level_request(
-                PendingTopLevelRequest(
-                    correlation_id=correlation_id,
-                    run_id=active_run.run_id,
-                    session_id=session_id,
-                    assistant_agent_id=assistant_record.id,
-                )
-            )
-            await self.update_status(
-                "waiting",
-                reason="task.run",
-                metadata={
-                    "run_id": active_run.run_id,
-                    "session_id": session_id,
-                    "assistant_agent_id": assistant_record.id,
-                    "correlation_id": correlation_id,
-                },
-            )
-            await self.center.route(top_level_request)
-        except Exception as exc:
-            await self._clear_pending_top_level_request(correlation_id)
-            await self.run_manager.fail_run(active_run.run_id, str(exc))
-            await self.update_status(
-                "idle",
-                reason="run.dispatch_failed",
-                metadata={"run_id": active_run.run_id},
-            )
-            raise
+        self.center.dispatch_background(controller_message)
 
         return CreateRunAcceptedResponse(
             run_id=active_run.run_id,
@@ -296,121 +292,20 @@ class UserProxyAgent(AgentBase):
             assistant_agent_id=assistant_record.id,
         )
 
-    async def _handle_top_level_response(self, message: AgentMessage) -> None:
-        correlation_id = str(message.correlation_id or "").strip()
-        if not correlation_id:
-            await self._observe_ignored_response(message, reason="missing_correlation")
+    async def _handle_controller_message(self, message: AgentMessage) -> None:
+        if not get_session_id(message):
             return
-
-        pending = await self._pop_pending_top_level_request(correlation_id)
-        if pending is None:
-            await self._observe_ignored_response(message, reason="unknown_correlation")
-            return
-
-        active_run = await self.run_manager.get_active_run(pending.run_id)
-        if active_run is None:
-            await self._observe_ignored_response(
-                message,
-                reason="inactive_run",
-                pending=pending,
-            )
-            return
-
-        if message.ok:
-            await self.run_manager.finish_run(
-                pending.run_id,
-                dict(message.payload or {}),
-                message_id=message.correlation_id or message.id,
-            )
-        else:
-            error_text = str(
-                message.payload.get("error")
-                or message.payload.get("reply")
-                or "run failed"
-            )
-            await self.run_manager.fail_run(
-                pending.run_id,
-                error_text,
-                message_id=message.correlation_id or message.id,
-                result_payload=dict(message.payload or {}),
-            )
-        await self.update_status(
-            "idle",
-            reason="task.run.completed",
-            metadata={
-                "run_id": pending.run_id,
-                "session_id": pending.session_id,
-                "assistant_agent_id": pending.assistant_agent_id,
-                "correlation_id": pending.correlation_id,
-                "result_ok": bool(message.ok),
-            },
+        if self.task_manager is None:
+            raise RuntimeError("TaskManager is required for user proxy execution handling")
+        result = await self.task_manager.host_message_task(
+            message,
+            agent=self,
+            execution_engine=self.execution_engine,
         )
-
-    async def _put_pending_top_level_request(self, pending: PendingTopLevelRequest) -> None:
-        async with self._pending_lock:
-            self._pending_top_level_requests[pending.correlation_id] = pending
-
-    async def _pop_pending_top_level_request(
-        self,
-        correlation_id: str,
-    ) -> Optional[PendingTopLevelRequest]:
-        normalized = str(correlation_id or "").strip()
-        if not normalized:
-            return None
-        async with self._pending_lock:
-            return self._pending_top_level_requests.pop(normalized, None)
-
-    async def _clear_pending_top_level_request(
-        self,
-        correlation_id: str,
-    ) -> Optional[PendingTopLevelRequest]:
-        return await self._pop_pending_top_level_request(correlation_id)
-
-    async def _clear_pending_top_level_request_by_run(
-        self,
-        run_id: str,
-    ) -> Optional[PendingTopLevelRequest]:
-        normalized = str(run_id or "").strip()
-        if not normalized:
-            return None
-        async with self._pending_lock:
-            for correlation_id, pending in list(self._pending_top_level_requests.items()):
-                if pending.run_id != normalized:
-                    continue
-                self._pending_top_level_requests.pop(correlation_id, None)
-                return pending
-        return None
-
-    async def _observe_ignored_response(
-        self,
-        message: AgentMessage,
-        *,
-        reason: str,
-        pending: Optional[PendingTopLevelRequest] = None,
-    ) -> None:
-        payload = {
-            "topic": message.topic,
-            "sender_id": message.sender_id,
-            "correlation_id": message.correlation_id,
-            "reason": reason,
-        }
-        if pending is not None:
-            payload.update(
-                {
-                    "run_id": pending.run_id,
-                    "session_id": pending.session_id,
-                    "assistant_agent_id": pending.assistant_agent_id,
-                }
-            )
-        await self.observe(
-            "user_proxy.rpc_response_ignored",
-            payload=payload,
-            run_id=message.run_id,
-            message_id=message.id,
-            visibility="internal",
-            level="warning",
-            source_type="agent",
-        )
+        if result.protocol_violation is not None:
+            await self._handle_protocol_violation(message, result)
+            return
+        await self.directive_runner.execute(message, result.directive)
 
     def _resolve_requested_strategy(self, request: CreateRunRequest) -> str:
         if request.strategy:
@@ -419,6 +314,56 @@ class UserProxyAgent(AgentBase):
         if isinstance(request_overrides, dict) and request_overrides.get("strategy"):
             return str(request_overrides.get("strategy")).strip().lower() or "simple"
         return "simple"
+
+    async def _handle_protocol_violation(self, message: AgentMessage, result) -> None:
+        attempted_directive_kind = self._attempted_directive_kind(message, result)
+        result_summary = self._result_summary(result)
+        payload = {
+            "offending_agent_id": self.agent_id,
+            "source_message_id": message.id,
+            "source_message_type": message.message_type,
+            "source_rpc_phase": message.rpc_phase,
+            "source_topic": message.topic,
+            "reason": str(result.protocol_violation or "user proxy protocol error"),
+            "attempted_directive_kind": attempted_directive_kind,
+            "result_summary": result_summary,
+        }
+        await self.observe(
+            "user_proxy.protocol_error",
+            payload=payload,
+            run_id=message.run_id,
+            message_id=message.id,
+            visibility="internal",
+            level="error",
+        )
+        if not message.run_id:
+            return
+        await self.run_manager.fail_run(
+            message.run_id,
+            str(payload["reason"]),
+            message_id=message.id,
+            result_payload={
+                "attempted_directive_kind": attempted_directive_kind,
+                "result_summary": result_summary,
+                "status": "error",
+            },
+        )
+
+    def _attempted_directive_kind(self, message: AgentMessage, result) -> Optional[str]:
+        if result.directive is not None:
+            return result.directive.kind
+        tool_name = get_tool_name(message)
+        if tool_name in RESERVED_DIRECTIVE_TOOL_NAMES:
+            return tool_name
+        return None
+
+    def _result_summary(self, result) -> str:
+        return str(
+            result.payload.get("reply")
+            or result.payload.get("error")
+            or (result.final_step.content if result.final_step is not None else "")
+            or ""
+        )
 
 
 from typing import TYPE_CHECKING

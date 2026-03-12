@@ -325,9 +325,8 @@ class AgentMemory:
     ) -> List[Dict[str, Any]]:
         exclude_message_id = str(message.id or "").strip() or None
         max_shared = int(cfg.get("context", {}).get("max_shared_messages", 2000) or 2000)
-        shared_records = await self.message_center_repository.list_latest_visible(
+        shared_records = await self.message_center_repository.list_latest_shared(
             session_id,
-            agent_id,
             limit=max_shared,
             exclude_message_id=exclude_message_id,
         )
@@ -558,6 +557,8 @@ class AgentMemory:
                 sender_id=sender,
                 topic=topic,
                 payload=payload,
+                message_id=rec.message_id,
+                correlation_id=rec.correlation_id,
                 ok=ok,
             )
             if entry is not None:

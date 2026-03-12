@@ -106,8 +106,9 @@ class TaskManager:
                     result=result.payload,
                     error_text=error_text,
                 )
+                next_agent_status = str(result.agent_status or ("idle" if result.ok else "error"))
                 await agent.update_status(
-                    "idle" if result.ok else "error",
+                    next_agent_status,
                     reason=message.topic,
                     metadata={
                         "task_id": task_record.id,

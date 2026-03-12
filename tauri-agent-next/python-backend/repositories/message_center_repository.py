@@ -8,6 +8,9 @@ from agents.message import AgentMessage
 from repositories.sqlite_store import SqliteStore
 
 
+SHARED_VIEWER_AGENT_ID = "__shared__"
+
+
 @dataclass(slots=True)
 class MessageCenterEventRecord:
     id: int
@@ -113,15 +116,45 @@ def _row_to_record(row) -> MessageCenterEventRecord:
     )
 
 
+def _record_to_message(record: MessageCenterEventRecord) -> AgentMessage:
+    target: Optional[AgentMessage.TargetRef] = None
+    if record.object_type != "broadcast":
+        target_id = str(record.target_agent_id or "").strip() or None
+        target_profile = str(record.target_profile or "").strip() or None
+        if target_id or target_profile:
+            target = AgentMessage.TargetRef(
+                agent_id=target_id,
+                profile_id=(None if target_id else target_profile),
+            )
+    return AgentMessage(
+        id=record.message_id,
+        message_type=record.message_type,
+        object_type=record.object_type,
+        rpc_phase=record.rpc_phase,
+        topic=record.topic,
+        sender_id=record.sender_id,
+        target=target,
+        correlation_id=record.correlation_id,
+        run_id=record.run_id,
+        session_id=record.session_id,
+        seq=record.seq,
+        visibility=record.visibility,
+        level=record.level,
+        ok=record.ok,
+        payload=dict(record.payload or {}),
+        metadata=dict(record.metadata or {}),
+        created_at=record.created_at,
+    )
+
+
 class MessageCenterRepository:
     def __init__(self, store: SqliteStore) -> None:
         self.store = store
 
-    async def append_visible_message(
+    async def append_shared_message(
         self,
         *,
         session_id: str,
-        viewer_agent_id: str,
         message: AgentMessage,
     ) -> int:
         ok_value: Optional[int]
@@ -149,7 +182,7 @@ class MessageCenterRepository:
             (
                 session_id,
                 message.run_id,
-                viewer_agent_id,
+                SHARED_VIEWER_AGENT_ID,
                 message.id,
                 message.seq,
                 message.kind,
@@ -175,10 +208,18 @@ class MessageCenterRepository:
             raise RuntimeError("failed to insert message_center event")
         return row_id
 
-    async def list_latest_visible(
+    async def append_visible_message(
         self,
+        *,
         session_id: str,
         viewer_agent_id: str,
+        message: AgentMessage,
+    ) -> int:
+        return await self.append_shared_message(session_id=session_id, message=message)
+
+    async def list_latest_shared(
+        self,
+        session_id: str,
         *,
         limit: int,
         exclude_message_id: Optional[str] = None,
@@ -193,7 +234,7 @@ class MessageCenterRepository:
                 ORDER BY id DESC
                 LIMIT ?
                 """.strip(),
-                (session_id, viewer_agent_id, exclude_message_id, int(limit)),
+                (session_id, SHARED_VIEWER_AGENT_ID, exclude_message_id, int(limit)),
             )
         else:
             rows = await self.store.fetchall(
@@ -205,8 +246,42 @@ class MessageCenterRepository:
                 ORDER BY id DESC
                 LIMIT ?
                 """.strip(),
-                (session_id, viewer_agent_id, int(limit)),
+                (session_id, SHARED_VIEWER_AGENT_ID, int(limit)),
             )
         records = [_row_to_record(row) for row in rows]
         records.reverse()
         return records
+
+    async def list_latest_visible(
+        self,
+        session_id: str,
+        viewer_agent_id: str,
+        *,
+        limit: int,
+        exclude_message_id: Optional[str] = None,
+    ) -> list[MessageCenterEventRecord]:
+        return await self.list_latest_shared(
+            session_id,
+            limit=limit,
+            exclude_message_id=exclude_message_id,
+        )
+
+    async def get_shared_message(
+        self,
+        session_id: str,
+        message_id: str,
+    ) -> Optional[AgentMessage]:
+        row = await self.store.fetchone(
+            """
+            SELECT id, session_id, run_id, viewer_agent_id, message_id, seq, kind, delivery, message_type, object_type, rpc_phase, topic,
+                   sender_id, target_id, target_agent_id, target_profile, correlation_id, ok, visibility, level, payload_json, metadata_json, created_at
+            FROM message_center_events
+            WHERE session_id = ? AND viewer_agent_id = ? AND message_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """.strip(),
+            (session_id, SHARED_VIEWER_AGENT_ID, message_id),
+        )
+        if row is None:
+            return None
+        return _record_to_message(_row_to_record(row))

@@ -236,13 +236,21 @@ class AgentRosterManager:
         if record.agent_type == "user_proxy":
             if self.run_manager is None:
                 raise RuntimeError("UserProxyAgent requires bound runtime services")
-            return UserProxyAgent(
+            agent = UserProxyAgent(
                 instance,
                 self.agent_center,
                 observer=self.agent_center.observer,
                 run_manager=self.run_manager,
                 roster_manager=self,
+                task_manager=self.task_manager,
             )
+            agent.execution_engine = ExecutionEngine(
+                agent,
+                memory=self.memory,
+                tool_executor=self.tool_executor,
+                strategies=agent.execution_engine._strategies,
+            )
+            return agent
         if record.agent_type == "assistant":
             agent = AssistantAgent(
                 instance,
@@ -255,6 +263,7 @@ class AgentRosterManager:
                 agent,
                 memory=self.memory,
                 tool_executor=self.tool_executor,
+                strategies=agent.execution_engine._strategies,
             )
             return agent
         raise RuntimeError(f"Unsupported agent_type for runtime instantiation: {record.agent_type}")
@@ -263,6 +272,9 @@ class AgentRosterManager:
         normalized_topic = _normalize_text(topic)
         if not normalized_topic:
             return False
+        configured_topics = _normalize_topics(agent.instance.metadata.get("subscribed_topics"))
+        if configured_topics:
+            return normalized_topic in configured_topics
         if agent.instance.agent_type != "assistant":
             return False
         profile_id = _normalize_text(agent.instance.profile_id) or self.default_profile_id
@@ -286,7 +298,7 @@ class AgentRosterManager:
         reusable = [
             agent
             for agent in candidates
-            if agent.instance.status in {"idle", "waiting"}
+            if agent.instance.status == "idle"
         ]
         if not reusable:
             return None
@@ -333,6 +345,15 @@ def _extract_target_profile(message) -> Optional[str]:
         if target_profile:
             return target_profile
     return None
+
+
+def _normalize_topics(value: object) -> set[str]:
+    if isinstance(value, str):
+        text = _normalize_text(value)
+        return {text} if text else set()
+    if not isinstance(value, list):
+        return set()
+    return {text for item in value if (text := _normalize_text(item))}
 
 
 from typing import TYPE_CHECKING

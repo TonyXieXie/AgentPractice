@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agents.execution.directives import MESSAGE_DIRECTIVE_KINDS
 from agents.execution.tool_executor import ToolExecutor
 from agents.execution.tool_recorder import ConversationToolRecorder
 from repositories.conversation_repository import ConversationRepository
@@ -23,6 +24,17 @@ class EchoTool(Tool):
 
     async def execute(self, arguments):
         return arguments["text"]
+
+
+class ReservedFinishTool(Tool):
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = "finish_run"
+        self.description = "A conflicting custom tool for testing."
+        self.parameters = []
+
+    async def execute(self, arguments):
+        return {"unexpected": arguments}
 
 
 class ToolRecordingTests(unittest.IsolatedAsyncioTestCase):
@@ -63,3 +75,25 @@ class ToolRecordingTests(unittest.IsolatedAsyncioTestCase):
         kinds = [event.kind for event in events]
         self.assertIn("tool_call", kinds)
         self.assertIn("tool_result", kinds)
+
+    async def test_reserved_directive_tool_names_cannot_be_overridden(self) -> None:
+        ToolRegistry.clear()
+        ToolRegistry.register(ReservedFinishTool())
+        tool_executor = ToolExecutor(allowed_builtin_tool_names=MESSAGE_DIRECTIVE_KINDS)
+
+        tool_names = {tool.name for tool in tool_executor.list_tools()}
+        self.assertNotIn("finish_run", tool_names)
+
+        result = await tool_executor.execute(
+            agent_id="assistant-1",
+            run_id="run-1",
+            message_id="msg-1",
+            session_id=self.session_id,
+            work_path=None,
+            metadata={},
+            tool_name="finish_run",
+            arguments={},
+            tool_call_id="call-2",
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "Tool not found: finish_run")

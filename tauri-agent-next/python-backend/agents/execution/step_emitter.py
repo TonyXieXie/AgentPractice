@@ -49,6 +49,8 @@ class StepEmitter:
             return "tool.started"
         if step.step_type in {"observation", "observation_delta", "action_delta"}:
             return "tool.updated"
+        if step.step_type == "directive":
+            return "agent.directive_selected"
         if step.step_type in {"thought", "thought_delta", "answer_delta", "answer"}:
             return "llm.updated"
         if step.step_type == "error":
@@ -60,11 +62,15 @@ class StepEmitter:
             return "llm_chunk"
         if step.step_type in {"action", "action_delta", "observation", "observation_delta"}:
             return "tool_chunk"
+        if step.step_type == "directive":
+            return "directive"
         return "agent_event"
 
     def _source_type_for_step(self, step: ExecutionStep) -> str:
         if step.step_type in {"action", "action_delta", "observation", "observation_delta"}:
             return "tool"
+        if step.step_type == "directive":
+            return "engine"
         if step.step_type in {"thought", "thought_delta", "answer", "answer_delta"}:
             return "llm"
         return "engine"

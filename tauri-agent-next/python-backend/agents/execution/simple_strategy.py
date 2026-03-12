@@ -13,7 +13,7 @@ from agents.execution.message_utils import (
     render_current_message,
     stream_enabled,
 )
-from agents.execution.strategy import AgentStrategy, ExecutionStep
+from agents.execution.strategy import AgentStrategy, ExecutionContext, ExecutionStep
 from agents.execution.tool_executor import ToolExecutor
 
 
@@ -37,14 +37,20 @@ class SimpleStrategy(AgentStrategy):
         llm_client,
         tool_executor: ToolExecutor,
         memory,
+        execution_context: Optional[ExecutionContext] = None,
     ):
+        resolved_tool_executor = (
+            execution_context.tool_executor
+            if execution_context is not None and execution_context.tool_executor is not None
+            else tool_executor
+        )
         tool_name = get_tool_name(message)
         if tool_name:
             async for step in self._execute_tool_request(
                 message,
                 agent_id=agent_id,
                 tool_name=tool_name,
-                tool_executor=tool_executor,
+                tool_executor=resolved_tool_executor,
             ):
                 yield step
             return
@@ -60,13 +66,19 @@ class SimpleStrategy(AgentStrategy):
         if memory is None:
             raise RuntimeError("AgentMemory is required for llm execution")
 
-        prompt_ir = await memory.build_view(
-            message,
-            agent_id=agent_id,
-            llm_client=llm_client,
-            default_system_prompt=self.system_prompt,
-            max_history_events=self.max_history,
-        )
+        build_view_kwargs = {
+            "agent_id": agent_id,
+            "llm_client": llm_client,
+            "default_system_prompt": (
+                execution_context.system_prompt
+                if execution_context is not None and execution_context.system_prompt
+                else self.system_prompt
+            ),
+            "max_history_events": self.max_history,
+        }
+        if execution_context is not None:
+            build_view_kwargs["tool_policy_text"] = execution_context.tool_policy_text
+        prompt_ir = await memory.build_view(message, **build_view_kwargs)
         llm_overrides = build_llm_request_overrides(message)
         stream = stream_enabled(message)
         if not stream:
@@ -148,6 +160,26 @@ class SimpleStrategy(AgentStrategy):
             arguments=get_tool_arguments(message),
             tool_call_id=tool_call_id,
         )
+        if result.directive is not None:
+            yield ExecutionStep(
+                "observation",
+                tool_executor.serialize_output(result.output),
+                {
+                    "tool_call_id": result.tool_call_id,
+                    "tool_name": tool_name,
+                    "status": "completed",
+                },
+            )
+            yield ExecutionStep(
+                "directive",
+                result.directive.kind,
+                {
+                    "tool_call_id": result.tool_call_id,
+                    "tool_name": tool_name,
+                    "directive": result.directive.to_dict(),
+                },
+            )
+            return
         if result.ok:
             output_text = tool_executor.serialize_output(result.output)
             yield ExecutionStep(

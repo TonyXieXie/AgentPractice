@@ -30,9 +30,10 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
             json.dumps(
                 {
                     "agent": {
-                        "default_profile": "default",
+                        "default_profile": "assistant_default",
                         "profiles": {
-                            "default": {
+                            "assistant_default": {
+                                "extends": "default",
                                 "agent_type": "assistant",
                                 "display_name": "Assistant",
                                 "subscribed_topics": ["workflow.updated"],
@@ -87,6 +88,7 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
             run_manager=self.run_manager,
         )
         self.session_id = "session-1"
+        self.controller_agent_id = "user-1"
         await self.session_repository.create(session_id=self.session_id)
         self.primary_assistant = await self.agent_roster_manager.ensure_primary_entry_assistant(
             self.session_id
@@ -103,10 +105,13 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_open_run_registers_session_assistants_and_finish_unregisters_after_finish(self) -> None:
         active_run = await self.run_manager.open_run(
             self.session_id,
-            self.primary_assistant.id,
+            self.controller_agent_id,
+            entry_assistant_id=self.primary_assistant.id,
             metadata={"strategy": "simple"},
         )
 
+        self.assertEqual(active_run.controller_agent_id, self.controller_agent_id)
+        self.assertEqual(active_run.entry_assistant_id, self.primary_assistant.id)
         self.assertEqual(set(active_run.runtime_agents.keys()), {
             self.primary_assistant.id,
             "assistant-2",
@@ -122,13 +127,16 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
         events = await self.observation_center.list_events(active_run.run_id, limit=50)
         self.assertEqual([event.event_type for event in events].count("run.started"), 1)
         self.assertEqual([event.event_type for event in events].count("run.finished"), 1)
+        self.assertEqual(events[0].payload["controller_agent_id"], self.controller_agent_id)
+        self.assertEqual(events[0].payload["assistant_agent_id"], self.primary_assistant.id)
         registered_after = await self.agent_center.list_agents()
         self.assertEqual(registered_after, [])
 
     async def test_stop_run_unregisters_runtime_roster(self) -> None:
         active_run = await self.run_manager.open_run(
             self.session_id,
-            self.primary_assistant.id,
+            self.controller_agent_id,
+            entry_assistant_id=self.primary_assistant.id,
             metadata={"strategy": "simple"},
         )
         blocker = asyncio.Event()
@@ -153,7 +161,8 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_finish_run_unregisters_dynamic_profile_assistant(self) -> None:
         active_run = await self.run_manager.open_run(
             self.session_id,
-            self.primary_assistant.id,
+            self.controller_agent_id,
+            entry_assistant_id=self.primary_assistant.id,
             metadata={"strategy": "simple"},
         )
 
@@ -186,7 +195,7 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
                 agent_id,
                 self.session_id,
                 "assistant",
-                "default",
+                "assistant_default",
                 "assistant",
                 "Assistant 2",
                 json.dumps({}, ensure_ascii=False),

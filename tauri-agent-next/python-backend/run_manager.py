@@ -19,13 +19,16 @@ from observation.events import ExecutionEvent
 class ActiveRun:
     run_id: str
     session_id: str
-    entry_assistant_id: str
+    controller_agent_id: str
     runtime_agents: Dict[str, AgentBase]
+    entry_assistant_id: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     root_task: Optional[asyncio.Task[None]] = None
 
     @property
     def entry_assistant(self) -> AssistantAgent:
+        if not self.entry_assistant_id:
+            raise RuntimeError("entry assistant is not available for this run")
         agent = self.runtime_agents[self.entry_assistant_id]
         if not isinstance(agent, AssistantAgent):
             raise RuntimeError(f"runtime agent {self.entry_assistant_id} is not AssistantAgent")
@@ -66,9 +69,10 @@ class RunManager:
     async def open_run(
         self,
         session_id: str,
-        entry_assistant_id: str,
+        controller_agent_id: str,
         *,
         metadata: Optional[Dict[str, Any]] = None,
+        entry_assistant_id: Optional[str] = None,
     ) -> ActiveRun:
         run_id = uuid4().hex
         async with self._lock:
@@ -83,13 +87,14 @@ class RunManager:
                 session_id=session_id,
                 run_id=run_id,
             )
-            if entry_assistant_id not in runtime_agents:
+            if entry_assistant_id and entry_assistant_id not in runtime_agents:
                 raise RuntimeError(f"Primary assistant runtime agent missing: {entry_assistant_id}")
             active_run = ActiveRun(
                 run_id=run_id,
                 session_id=session_id,
-                entry_assistant_id=entry_assistant_id,
+                controller_agent_id=controller_agent_id,
                 runtime_agents=runtime_agents,
+                entry_assistant_id=entry_assistant_id,
                 metadata=dict(metadata or {}),
             )
             async with self._lock:
@@ -226,7 +231,7 @@ class RunManager:
             ExecutionEvent(
                 event_type="run.started",
                 run_id=active_run.run_id,
-                agent_id=active_run.entry_assistant_id,
+                agent_id=active_run.controller_agent_id,
                 visibility="public",
                 level="info",
                 source_type="run_manager",
@@ -237,6 +242,7 @@ class RunManager:
                     "strategy": strategy,
                     "topic": "run.started",
                     "session_id": active_run.session_id,
+                    "controller_agent_id": active_run.controller_agent_id,
                     "user_agent_id": active_run.metadata.get("user_agent_id"),
                     "assistant_agent_id": active_run.entry_assistant_id,
                 },
@@ -262,6 +268,7 @@ class RunManager:
             "strategy": strategy,
             "topic": "run.finished",
             "session_id": active_run.session_id,
+            "controller_agent_id": active_run.controller_agent_id,
             "user_agent_id": active_run.metadata.get("user_agent_id"),
             "assistant_agent_id": active_run.entry_assistant_id,
         }
@@ -271,7 +278,7 @@ class RunManager:
             ExecutionEvent(
                 event_type="run.finished",
                 run_id=active_run.run_id,
-                agent_id=active_run.entry_assistant_id,
+                agent_id=active_run.controller_agent_id,
                 message_id=message_id,
                 visibility="public",
                 level=level,

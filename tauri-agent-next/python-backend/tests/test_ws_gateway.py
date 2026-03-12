@@ -30,7 +30,16 @@ class WsGatewayTests(unittest.TestCase):
                     connected = websocket.receive_json()
                     self.assertEqual(connected["kind"], "ack")
 
-                    create_response = client.post("/runs", json={"content": "hello from ws"})
+                    create_response = client.post(
+                        "/runs",
+                        json={
+                            "content": "hello from ws",
+                            "request_overrides": {
+                                "tool_name": "finish_run",
+                                "tool_arguments": {"reply": "done from ws"},
+                            },
+                        },
+                    )
                     self.assertEqual(create_response.status_code, 200)
                     run_id = create_response.json()["run_id"]
 
@@ -43,7 +52,7 @@ class WsGatewayTests(unittest.TestCase):
                         if frame.get("done") and frame.get("event_type") == "run.finished":
                             break
 
-                    self.assertTrue(any(chunk["stream"] == "llm_chunk" for chunk in live_chunks))
+                    self.assertTrue(live_chunks)
                     self.assertTrue(any(chunk["event_type"] == "run.finished" for chunk in live_chunks))
 
                     websocket.send_json(

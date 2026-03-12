@@ -269,15 +269,21 @@ class AgentBase(ABC):
 
 - 接收用户输入
 - 组装标准 `AgentMessage`
-- 发送给目标 Agent
+- 作为 run 级控制者，决定下一步发给谁、发 `rpc` 还是 `event`
 - 对外部 HTTP ingress 返回短同步确认（如 `accepted` / `stopping`）
-- 对内部 top-level `task.run` 在收到最终 `rpc_response` 时调用 `RunManager.finish_run/fail_run`
+- 作为 run 的最终完成判断者；在收到新的 shared message 时，基于共享事实重新判断是否继续、等待还是结束 run
 
 它不应该负责：
 
-- 复杂推理
 - 实际任务执行
 - 充当业务工作 Agent
+- 替代其他 worker Agent 完成领域任务本身
+
+补充约束：
+
+- `UserProxyAgent` 可以做 run-level control reasoning，但不应该吞并 worker Agent 的业务职责
+- `UserProxyAgent` 不通过轮询来判断 run 是否结束；它必须等待新的 shared message 到达，再触发下一次决策
+- 启动 run 时第一条发出的消息不应被写死为固定 `rpc`；应由 LLM 决定发 `rpc request`、`event`，还是暂时保持等待
 
 ## 3.5 `AgentInstance`
 
@@ -429,6 +435,7 @@ class AgentInstance:
 
 - 用户输入先进入 `UserProxyAgent`
 - 再转换为标准 `AgentMessage`
+- 再由 `UserProxyAgent` 的 LLM 决定下一步控制动作
 - 再由 `AgentCenter` 路由到目标 Agent
 
 ## 4.3 一个典型实例关系
@@ -820,6 +827,13 @@ python-backend/
 - `rpc`
 - `event`
 
+补充语义：
+
+- 所有 Agent 之间的消息一旦被发送并进入系统，就进入 session 级 shared facts
+- `unicast` / `broadcast` 决定的是**谁来处理这条消息**
+- `rpc` / `event` 决定的是**这条消息的协作语义**
+- shared/private 是 Memory 视角；shared fact 的归档不依赖 `target` 或 `subscription` 是否命中
+
 第一版建议正式支持：
 
 - `unicast + rpc`
@@ -836,8 +850,9 @@ python-backend/
 2. `AgentCenter` 记录并持久化消息，然后把 request 路由到目标 Agent
 3. 目标 Agent 处理当前消息；如果需要等待其它 Agent，它应结束当前 local task，而不是同步阻塞
 4. 目标 Agent 在未来某个时刻发回 `rpc_response`
-5. `AgentCenter` 持久化 response，并把它继续投递给 target Agent
-6. 如果该请求来自外部 HTTP ingress，`AgentCenter` 可以额外 resolve 一个临时 waiter，用于返回控制面确认；这不是内部 Agent 协作语义的一部分
+5. `AgentCenter` 持久化 response，并把它继续投递给 target Agent；该 response 同时进入 shared facts
+6. 对 `UserProxyAgent` 来说，`rpc_response` 只是新的共享输入，不是 run 必然结束的信号；是否结束 run 要由它自己的下一次 LLM 决策决定
+7. 如果该请求来自外部 HTTP ingress，`AgentCenter` 可以额外 resolve 一个临时 waiter，用于返回控制面确认；这不是内部 Agent 协作语义的一部分
 
 ## 6.3 Event 生命周期
 
@@ -848,6 +863,7 @@ python-backend/
 - 状态通知
 - 上下文同步
 - 资源更新信号
+- 唤醒 `UserProxyAgent` 重新评估 run 状态的控制信号
 
 ### 广播 Event
 
@@ -856,6 +872,11 @@ python-backend/
 - workflow 内共享状态变化
 - 某类资源变更
 - 某个 Agent 状态变化需要通知其他 Agent
+
+补充说明：
+
+- Event 与 RPC 一样，进入系统后都属于 shared facts
+- `broadcast` 的订阅规则只决定谁会处理该 event，不决定这条 event 是否进入 shared facts
 
 ## 7. 迁移建议
 
@@ -1406,8 +1427,8 @@ flowchart LR
 
 - **shared history（进入 Memory）**
   - 来源：Message Center 的消息日志（`AgentMessage`）
-  - 视图：对某个 `agent_instance_id` 构建上下文时，只纳入“该 Agent 可接收”的消息（`unicast` 目标命中 / `broadcast` scope 命中）
-  - v1：`rpc_request` / `rpc_response` 也进入 shared history（只要该 Agent 可接收）
+- 视图：对某个 `agent_instance_id` 构建上下文时，纳入该 session 的 shared message log，再叠加 owner==当前 Agent 的 private 记录
+- v1：所有 Agent 间 `rpc_request` / `rpc_response` / `event` 都进入 shared history
   - 用户输入与最终 Agent 输出统一走 Message Center，因此天然属于 shared history
 - **private execution（进入 Memory）**
   - 来源：该 AgentInstance 自己的执行过程记录（例如 `tool_call` / `tool_result` / 中间笔记）

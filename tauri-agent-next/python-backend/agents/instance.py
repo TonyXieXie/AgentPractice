@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from agents.message import utc_now_iso
 
 
-AgentStatus = Literal["idle", "running", "waiting", "stopped", "error"]
+AgentStatus = Literal["idle", "running", "stopped", "error"]
 
 
 class AgentInstance(BaseModel):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import time
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app_config import set_app_config_path
 from app_services import build_app_services
 from main import create_app
 from tools.base import Tool, ToolParameter, ToolRegistry
@@ -30,6 +32,9 @@ class SleepTool(Tool):
 
 
 class HttpRouteTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        set_app_config_path(None)
+
     def test_observe_page_and_static_assets_are_served(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             app = create_app(services=build_app_services(data_dir=Path(temp_dir)))
@@ -47,6 +52,45 @@ class HttpRouteTests(unittest.TestCase):
                 css_response = client.get("/static/observe/observe.css")
                 self.assertEqual(css_response.status_code, 200)
                 self.assertIn(".layout-grid", css_response.text)
+
+    def test_config_endpoint_exposes_profile_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_dir = Path(temp_dir)
+            config_path = runtime_dir / "app_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "agent": {
+                            "default_profile": "worker",
+                            "profiles": {
+                                "worker": {
+                                    "extends": "default",
+                                    "description": "Worker profile",
+                                    "allowed_tool_names": ["send_event"],
+                                }
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            set_app_config_path(config_path)
+            app = create_app(services=build_app_services(data_dir=runtime_dir))
+            with TestClient(app) as client:
+                response = client.get("/config")
+                self.assertEqual(response.status_code, 200)
+                config = response.json()["config"]
+
+        default_profile = config["agent"]["profiles"]["default"]
+        self.assertIn("description", default_profile)
+        self.assertIn("allowed_tool_names", default_profile)
+        self.assertIn("extends", default_profile)
+        self.assertIn("editable", default_profile)
+        self.assertEqual(config["agent"]["profiles"]["worker"]["description"], "Worker profile")
+        self.assertEqual(
+            config["agent"]["profiles"]["worker"]["allowed_tool_names"],
+            ["send_event"],
+        )
 
     def test_create_run_and_query_snapshot_and_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -67,18 +111,8 @@ class HttpRouteTests(unittest.TestCase):
                 snapshot_response = self._wait_for_snapshot(client, run_id)
                 self.assertEqual(snapshot_response.status_code, 200)
                 snapshot_payload = snapshot_response.json()
-                self.assertEqual(snapshot_payload["snapshot"]["status"], "completed")
-                self.assertEqual(snapshot_payload["run_projection"]["status"], "completed")
-
-                followup = client.post(
-                    "/runs",
-                    json={"content": "second message", "session_id": session_id},
-                )
-                self.assertEqual(followup.status_code, 200)
-                followup_payload = followup.json()
-                self.assertEqual(followup_payload["session_id"], session_id)
-                self.assertEqual(followup_payload["user_agent_id"], first_user_agent_id)
-                self.assertEqual(followup_payload["assistant_agent_id"], first_assistant_agent_id)
+                self.assertEqual(snapshot_payload["snapshot"]["status"], "error")
+                self.assertEqual(snapshot_payload["run_projection"]["status"], "error")
 
                 events_response = client.get(
                     f"/runs/{run_id}/events",
@@ -89,25 +123,33 @@ class HttpRouteTests(unittest.TestCase):
                 events = events_payload["events"]
                 event_types = [event["event_type"] for event in events]
                 self.assertIn("run.started", event_types)
-                self.assertIn("run.finished", event_types)
                 self.assertEqual(event_types.count("run.started"), 1)
                 self.assertEqual(event_types.count("run.finished"), 1)
                 run_started = next(event for event in events if event["event_type"] == "run.started")
-                run_finished = next(event for event in events if event["event_type"] == "run.finished")
                 self.assertEqual(run_started["source_type"], "run_manager")
-                self.assertEqual(run_finished["source_type"], "run_manager")
                 self.assertGreaterEqual(events_payload["next_after_seq"], 1)
-                tasks = asyncio.run(app.state.services.task_repository.list_by_run(run_id))
+                tasks = self._wait_for_tasks(app, run_id, require_finished=True)
                 self.assertEqual(len(tasks), 1)
-                self.assertEqual(tasks[0].status, "completed")
-                self.assertEqual(tasks[0].result["status"], "completed")
-                task_event = next(
-                    event
-                    for event in events
-                    if event["event_type"] == "llm.updated"
-                    and (event.get("metadata") or {}).get("task_id")
+                self.assertEqual(tasks[0].status, "failed")
+                self.assertEqual(tasks[0].result["status"], "error")
+                self.assertIn(
+                    "allowed control directive",
+                    str(tasks[0].result.get("error") or "").lower(),
                 )
-                self.assertEqual(task_event["metadata"]["task_id"], tasks[0].id)
+                self.assertEqual(tasks[0].agent_id, first_user_agent_id)
+
+                follow_up = client.post(
+                    "/runs",
+                    json={
+                        "content": "second message",
+                        "session_id": session_id,
+                        "request_overrides": {
+                            "tool_name": "finish_run",
+                            "tool_arguments": {"reply": "done"},
+                        },
+                    },
+                )
+                self.assertEqual(follow_up.status_code, 200)
 
     def test_session_busy_returns_conflict(self) -> None:
         ToolRegistry.clear()
@@ -194,24 +236,29 @@ class HttpRouteTests(unittest.TestCase):
         finally:
             ToolRegistry.clear()
 
-    def _wait_for_snapshot(self, client: TestClient, run_id: str):
+    def _wait_for_snapshot(self, client: TestClient, run_id: str, *, terminal_only: bool = True):
         deadline = time.time() + 2.0
         last_response = None
         while time.time() < deadline:
             last_response = client.get(f"/runs/{run_id}/snapshot")
             if last_response.status_code == 200:
                 status = last_response.json()["snapshot"]["status"]
+                if not terminal_only:
+                    return last_response
                 if status in {"completed", "error", "stopped"}:
                     return last_response
             time.sleep(0.02)
         return last_response
 
-    def _wait_for_tasks(self, app, run_id: str):
+    def _wait_for_tasks(self, app, run_id: str, *, require_finished: bool = False):
         deadline = time.time() + 2.0
         tasks = []
         while time.time() < deadline:
             tasks = asyncio.run(app.state.services.task_repository.list_by_run(run_id))
-            if tasks:
+            if tasks and (
+                not require_finished
+                or all(task.status in {"completed", "failed", "stopped"} for task in tasks)
+            ):
                 return tasks
             time.sleep(0.02)
         return tasks

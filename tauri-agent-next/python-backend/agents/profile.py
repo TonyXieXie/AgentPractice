@@ -9,11 +9,27 @@ class AgentProfile(BaseModel):
     id: str
     agent_type: str = "assistant"
     display_name: Optional[str] = None
+    description: Optional[str] = None
     system_prompt: Optional[str] = None
     tool_policy_text: Optional[str] = None
+    allowed_tool_names: Optional[list[str]] = None
+    extends: Optional[str] = None
+    editable: bool = True
     subscribed_topics: list[str] = Field(default_factory=list)
     executable_event_topics: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("description", "system_prompt", "tool_policy_text", "extends", mode="before")
+    @classmethod
+    def _normalize_optional_text(cls, value: Any) -> Optional[str]:
+        text = str(value or "").strip()
+        return text or None
+
+    @field_validator("allowed_tool_names", mode="before")
+    @classmethod
+    def _normalize_allowed_tool_names(cls, value: Any) -> Optional[list[str]]:
+        normalized = cls._normalize_string_list(value)
+        return normalized or None
 
     @field_validator("subscribed_topics", mode="before")
     @classmethod

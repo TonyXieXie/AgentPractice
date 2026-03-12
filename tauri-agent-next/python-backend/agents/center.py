@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional
 from uuid import uuid4
 
 from agents.message import AgentMessage
@@ -55,6 +55,9 @@ class AgentCenter:
             if not tasks:
                 return
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def dispatch_background(self, message: AgentMessage) -> None:
+        self._spawn_background_task(self.route(message))
 
     async def expect_rpc_response(self, correlation_id: str) -> asyncio.Future[AgentMessage]:
         normalized = str(correlation_id or "").strip()
@@ -145,7 +148,7 @@ class AgentCenter:
             message = await self._assign_seq(message)
             await self._observe_message(message, "message.sent")
             recipients = await self._resolve_broadcast_targets(message)
-            await self._persist_broadcast_targets(message, recipients)
+            await self._persist_message(message)
             delivered = 0
             for agent in recipients:
                 routed_message = message.model_copy(
@@ -346,40 +349,13 @@ class AgentCenter:
         session_id = _extract_session_id(message)
         if not session_id:
             return
-        viewers = _resolve_target_viewers(message)
-        if not viewers:
+        try:
+            await repo.append_shared_message(
+                session_id=session_id,
+                message=message,
+            )
+        except Exception:
             return
-        for viewer in viewers:
-            try:
-                await repo.append_visible_message(
-                    session_id=session_id,
-                    viewer_agent_id=viewer,
-                    message=message,
-                )
-            except Exception:
-                continue
-
-    async def _persist_broadcast_targets(
-        self,
-        message: AgentMessage,
-        recipients: Sequence["AgentBase"],
-    ) -> None:
-        repo = self.message_center_repository
-        if repo is None:
-            return
-        session_id = _extract_session_id(message)
-        if not session_id:
-            return
-        viewers = [message.sender_id, *[agent.agent_id for agent in recipients]]
-        for viewer in viewers:
-            try:
-                await repo.append_visible_message(
-                    session_id=session_id,
-                    viewer_agent_id=viewer,
-                    message=message,
-                )
-            except Exception:
-                continue
 
     async def _pop_pending_rpc(
         self, correlation_id: Optional[str]
@@ -477,24 +453,6 @@ def _extract_target_profile(message: AgentMessage) -> Optional[str]:
     if isinstance(metadata, dict) and metadata.get("target_profile"):
         return str(metadata.get("target_profile"))
     return None
-
-
-def _resolve_target_viewers(message: AgentMessage) -> list[str]:
-    viewers: list[str] = []
-    if message.sender_id:
-        viewers.append(str(message.sender_id))
-    if message.target_id:
-        viewers.append(str(message.target_id))
-    if message.object_type == "broadcast":
-        return []
-    deduped: list[str] = []
-    seen = set()
-    for item in viewers:
-        if item in seen:
-            continue
-        seen.add(item)
-        deduped.append(item)
-    return deduped
 
 
 if TYPE_CHECKING:

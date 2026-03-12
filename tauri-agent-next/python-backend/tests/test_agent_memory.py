@@ -143,7 +143,9 @@ class AgentMemoryTests(unittest.IsolatedAsyncioTestCase):
                 for message in prompt_ir.messages
             )
         )
-        self.assertEqual(prompt_ir.messages[-1], {"role": "user", "content": "continue"})
+        self.assertEqual(prompt_ir.messages[-1]["role"], "user")
+        self.assertIn("continue", str(prompt_ir.messages[-1]["content"]))
+        self.assertIn("id=", str(prompt_ir.messages[-1]["content"]))
         self.assertEqual(prompt_ir.budget["max_context_tokens"], 4096)
         self.assertIn("prompt_budget", prompt_ir.budget)
         self.assertIn("estimated_prompt_tokens", prompt_ir.budget)
@@ -201,7 +203,9 @@ class AgentMemoryTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
         self.assertFalse(any("duplicate assistant turn" in content for content in contents))
-        self.assertEqual(prompt_ir.messages[-1], {"role": "user", "content": "follow up"})
+        self.assertEqual(prompt_ir.messages[-1]["role"], "user")
+        self.assertIn("follow up", str(prompt_ir.messages[-1]["content"]))
+        self.assertIn("id=", str(prompt_ir.messages[-1]["content"]))
         self.assertTrue(
             any(action.get("type") == "skip_inline_history" for action in prompt_ir.trace["actions"])
         )
@@ -237,7 +241,9 @@ class AgentMemoryTests(unittest.IsolatedAsyncioTestCase):
         contents = [str(message.get("content") or "") for message in prompt_ir.messages]
         self.assertEqual(sum("bootstrap user" in content for content in contents), 1)
         self.assertEqual(sum("bootstrap assistant" in content for content in contents), 1)
-        self.assertEqual(prompt_ir.messages[-1], {"role": "user", "content": "latest request"})
+        self.assertEqual(prompt_ir.messages[-1]["role"], "user")
+        self.assertIn("latest request", str(prompt_ir.messages[-1]["content"]))
+        self.assertIn("id=", str(prompt_ir.messages[-1]["content"]))
         self.assertTrue(
             any(
                 action.get("type") == "bootstrap_inline_history"

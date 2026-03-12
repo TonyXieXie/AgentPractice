@@ -17,7 +17,7 @@ from agents.execution.providers import (
     TextReactAdapter,
 )
 from agents.execution.simple_strategy import SimpleStrategy
-from agents.execution.strategy import AgentStrategy, ExecutionStep
+from agents.execution.strategy import AgentStrategy, ExecutionContext, ExecutionStep
 from agents.execution.tool_executor import ToolExecutor
 
 
@@ -54,14 +54,21 @@ class ReactStrategy(AgentStrategy):
         llm_client,
         tool_executor: ToolExecutor,
         memory,
+        execution_context: Optional[ExecutionContext] = None,
     ):
+        resolved_tool_executor = (
+            execution_context.tool_executor
+            if execution_context is not None and execution_context.tool_executor is not None
+            else tool_executor
+        )
         if llm_client is None:
             async for step in self._fallback.execute(
                 message,
                 agent_id=agent_id,
                 llm_client=llm_client,
-                tool_executor=tool_executor,
+                tool_executor=resolved_tool_executor,
                 memory=memory,
+                execution_context=execution_context,
             ):
                 yield step
             return
@@ -69,14 +76,20 @@ class ReactStrategy(AgentStrategy):
         if memory is None:
             raise RuntimeError("AgentMemory is required for llm execution")
 
-        tools = tool_executor.list_tools()
-        prompt_ir = await memory.build_view(
-            message,
-            agent_id=agent_id,
-            llm_client=llm_client,
-            default_system_prompt=self.system_prompt,
-            max_history_events=10,
-        )
+        tools = resolved_tool_executor.list_tools()
+        build_view_kwargs = {
+            "agent_id": agent_id,
+            "llm_client": llm_client,
+            "default_system_prompt": (
+                execution_context.system_prompt
+                if execution_context is not None and execution_context.system_prompt
+                else self.system_prompt
+            ),
+            "max_history_events": 10,
+        }
+        if execution_context is not None:
+            build_view_kwargs["tool_policy_text"] = execution_context.tool_policy_text
+        prompt_ir = await memory.build_view(message, **build_view_kwargs)
         provider = self._resolve_provider(llm_client)
         llm_overrides = provider.prepare_request_overrides(
             request_overrides=build_llm_request_overrides(message),
@@ -184,7 +197,7 @@ class ReactStrategy(AgentStrategy):
                         )
                         continue
 
-                    result = await tool_executor.execute(
+                    result = await resolved_tool_executor.execute(
                         agent_id=agent_id,
                         run_id=message.run_id,
                         message_id=message.id,
@@ -195,8 +208,30 @@ class ReactStrategy(AgentStrategy):
                         arguments=parsed_arguments,
                         tool_call_id=call_id,
                     )
+                    if result.directive is not None:
+                        yield ExecutionStep(
+                            "observation",
+                            resolved_tool_executor.serialize_output(result.output),
+                            {
+                                "tool_call_id": result.tool_call_id,
+                                "tool_name": tool_name,
+                                "status": "completed",
+                                "iteration": iteration,
+                            },
+                        )
+                        yield ExecutionStep(
+                            "directive",
+                            result.directive.kind,
+                            {
+                                "tool_call_id": result.tool_call_id,
+                                "tool_name": tool_name,
+                                "directive": result.directive.to_dict(),
+                                "iteration": iteration,
+                            },
+                        )
+                        return
                     content = (
-                        tool_executor.serialize_output(result.output)
+                        resolved_tool_executor.serialize_output(result.output)
                         if result.ok
                         else str(result.error or f"Tool execution failed: {tool_name}")
                     )

@@ -24,8 +24,13 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
             "default": {
                 "agent_type": "assistant",
                 "display_name": "Assistant",
+                "description": None,
                 "system_prompt": None,
                 "tool_policy_text": None,
+                "allowed_tool_names": None,
+                "extends": None,
+                "editable": False,
+                "subscribed_topics": [],
                 "executable_event_topics": [],
                 "metadata": {},
             },
@@ -95,6 +100,14 @@ def _load_config_file() -> Dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def get_default_app_config() -> Dict[str, Any]:
+    return deepcopy(_DEFAULT_APP_CONFIG)
+
+
+def get_runtime_app_config() -> Dict[str, Any]:
+    return _load_config_file()
 
 
 def get_app_config() -> Dict[str, Any]:

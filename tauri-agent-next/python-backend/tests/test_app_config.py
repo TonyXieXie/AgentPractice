@@ -5,7 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app_config import get_app_config, set_app_config_path
+from app_config import (
+    get_app_config,
+    get_default_app_config,
+    get_runtime_app_config,
+    set_app_config_path,
+)
 
 
 class AppConfigTests(unittest.TestCase):
@@ -31,3 +36,31 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(config["llm"]["timeout_sec"], 42)
         self.assertEqual(config["transport"]["http"]["port"], 8123)
         self.assertEqual(config["transport"]["http"]["host"], "127.0.0.1")
+
+    def test_default_and_runtime_config_accessors_are_split(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "app_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "agent": {
+                            "default_profile": "worker",
+                            "profiles": {
+                                "worker": {"extends": "default"},
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            set_app_config_path(config_path)
+            try:
+                default_config = get_default_app_config()
+                runtime_config = get_runtime_app_config()
+            finally:
+                set_app_config_path(None)
+
+        self.assertEqual(default_config["agent"]["default_profile"], "default")
+        self.assertEqual(runtime_config["agent"]["default_profile"], "worker")
+        self.assertEqual(runtime_config["agent"]["profiles"]["worker"]["extends"], "default")

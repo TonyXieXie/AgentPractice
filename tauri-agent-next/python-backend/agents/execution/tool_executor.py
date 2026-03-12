@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
 
+from agents.execution.control_tools import build_control_tools
+from agents.execution.directives import (
+    ExecutionDirective,
+    RESERVED_DIRECTIVE_TOOL_NAMES,
+    directive_from_output,
+)
 from agents.execution.tool_recorder import ToolEventRecorder
 from tools import (
     Tool,
@@ -22,6 +28,7 @@ class ToolExecutionResult:
     ok: bool
     output: Any = None
     error: Optional[str] = None
+    directive: Optional[ExecutionDirective] = None
 
 
 class ToolExecutor:
@@ -30,20 +37,65 @@ class ToolExecutor:
         tools: Optional[Iterable[Tool]] = None,
         *,
         recorder: Optional[ToolEventRecorder] = None,
+        allowed_builtin_tool_names: Optional[Iterable[str]] = None,
+        allowed_tool_names: Optional[Iterable[str]] = None,
     ) -> None:
         self._tools: List[Tool] = list(tools or [])
+        self._allowed_builtin_tool_names = _normalize_tool_names(allowed_builtin_tool_names)
+        self._allowed_tool_names = _normalize_tool_names(allowed_tool_names)
+        self._builtin_tools: List[Tool] = build_control_tools(
+            allowed_directive_kinds=self._allowed_builtin_tool_names,
+        )
         self._recorder = recorder
 
+    def clone(
+        self,
+        *,
+        allowed_builtin_tool_names: Optional[Iterable[str]] = None,
+        allowed_tool_names: Optional[Iterable[str]] = None,
+    ) -> "ToolExecutor":
+        resolved_allowed = (
+            self._allowed_builtin_tool_names
+            if allowed_builtin_tool_names is None
+            else _normalize_tool_names(allowed_builtin_tool_names)
+        )
+        resolved_tool_names = (
+            self._allowed_tool_names
+            if allowed_tool_names is None
+            else _normalize_tool_names(allowed_tool_names)
+        )
+        return ToolExecutor(
+            tools=self._tools,
+            recorder=self._recorder,
+            allowed_builtin_tool_names=resolved_allowed,
+            allowed_tool_names=resolved_tool_names,
+        )
+
     def list_tools(self) -> List[Tool]:
-        if self._tools:
-            return list(self._tools)
-        return ToolRegistry.get_all()
+        tools: List[Tool] = []
+        seen: set[str] = set()
+        visible_reserved = {tool.name for tool in self._builtin_tools}
+        for tool in [*self._builtin_tools, *self._tools, *ToolRegistry.get_all()]:
+            if not tool.name or tool.name in seen:
+                continue
+            if tool.name in RESERVED_DIRECTIVE_TOOL_NAMES and tool.name not in visible_reserved:
+                continue
+            if not self._is_tool_allowed(tool.name):
+                continue
+            seen.add(tool.name)
+            tools.append(tool)
+        return tools
 
     def get_tool(self, tool_name: str) -> Optional[Tool]:
         for tool in self.list_tools():
             if tool.name == tool_name:
                 return tool
-        return ToolRegistry.get(tool_name)
+        return None
+
+    def _is_tool_allowed(self, tool_name: str) -> bool:
+        if self._allowed_tool_names is None:
+            return True
+        return str(tool_name or "").strip() in self._allowed_tool_names
 
     async def execute(
         self,
@@ -133,6 +185,7 @@ class ToolExecutor:
         )
         try:
             output = await tool.execute(payload)
+            directive = directive_from_output(output)
             await self._record_tool_result(
                 session_id=session_id,
                 run_id=run_id,
@@ -140,7 +193,11 @@ class ToolExecutor:
                 tool_call_id=resolved_call_id,
                 tool_name=tool_name,
                 ok=True,
-                output=output,
+                output=(
+                    output
+                    if directive is None
+                    else {"directive": directive.to_dict()}
+                ),
                 error=None,
             )
             return ToolExecutionResult(
@@ -148,6 +205,7 @@ class ToolExecutor:
                 tool_name=tool_name,
                 ok=True,
                 output=output,
+                directive=directive,
             )
         except ToolExecutionError as exc:
             await self._record_tool_result(
@@ -189,6 +247,9 @@ class ToolExecutor:
     def serialize_output(self, output: Any) -> str:
         if output is None:
             return ""
+        directive = directive_from_output(output)
+        if directive is not None:
+            return f"[directive] {directive.kind}"
         if isinstance(output, str):
             return output
         return str(output)
@@ -245,3 +306,14 @@ class ToolExecutor:
             )
         except Exception:
             return
+
+
+def _normalize_tool_names(tool_names: Optional[Iterable[str]]) -> Optional[set[str]]:
+    if tool_names is None:
+        return None
+    normalized = {
+        str(tool_name or "").strip()
+        for tool_name in tool_names
+        if str(tool_name or "").strip()
+    }
+    return normalized
