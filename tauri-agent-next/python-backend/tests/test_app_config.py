@@ -64,3 +64,14 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(default_config["agent"]["default_profile"], "default")
         self.assertEqual(runtime_config["agent"]["default_profile"], "worker")
         self.assertEqual(runtime_config["agent"]["profiles"]["worker"]["extends"], "default")
+
+    def test_default_config_includes_builtin_planner_and_coder_profiles(self) -> None:
+        config = get_default_app_config()
+        profiles = config["agent"]["profiles"]
+
+        self.assertIn("planner", profiles)
+        self.assertIn("coder", profiles)
+        self.assertEqual(profiles["planner"]["agent_type"], "assistant")
+        self.assertEqual(profiles["coder"]["agent_type"], "assistant")
+        self.assertFalse(profiles["planner"]["editable"])
+        self.assertFalse(profiles["coder"]["editable"])

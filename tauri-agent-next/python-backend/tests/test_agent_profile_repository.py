@@ -113,6 +113,28 @@ class AgentProfileRepositoryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "Default agent profile not found: missing"):
             _ = repository.default_profile_id
 
+    async def test_resolves_builtin_planner_and_coder_profiles(self) -> None:
+        repository = AgentProfileRepository()
+
+        planner = await repository.get_required("planner")
+        coder = await repository.get_required("coder")
+
+        self.assertEqual(planner.agent_type, "assistant")
+        self.assertEqual(coder.agent_type, "assistant")
+        self.assertEqual(
+            planner.allowed_tool_names,
+            ["send_event", "send_rpc_request", "send_rpc_response"],
+        )
+        self.assertEqual(
+            coder.allowed_tool_names,
+            ["send_event", "send_rpc_request", "send_rpc_response"],
+        )
+        self.assertEqual(planner.executable_event_topics, ["task.plan"])
+        self.assertEqual(coder.executable_event_topics, ["task.code"])
+        self.assertFalse(planner.editable)
+        self.assertFalse(coder.editable)
+
+
     def _write_config(self, payload: dict) -> None:
         self.config_path.write_text(json.dumps(payload), encoding="utf-8")
         set_app_config_path(self.config_path)
