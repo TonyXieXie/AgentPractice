@@ -1,0 +1,31 @@
+{
+  "name": "tauri-agent-next",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:frontend": "vite",
+    "dev:backend": "cmd /c \"cd python-backend&& python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000\"",
+    "dev:desktop": "cmd /c \"set TAURI_AGENT_EXTERNAL_BACKEND=1&& set VITE_API_PROXY_TARGET=http://127.0.0.1:8000&& tauri dev --config src-tauri\\\\tauri.conf.dev.json\"",
+    "dev:all": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-all.ps1",
+    "build": "tsc --noEmit && vite build",
+    "test:e2e:task-smoke": "playwright test tests/create-run.smoke.spec.ts",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.1",
+    "lucide-react": "^0.577.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@tauri-apps/cli": "^2.10.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.4",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  }
+}

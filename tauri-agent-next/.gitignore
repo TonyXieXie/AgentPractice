@@ -4,3 +4,8 @@ python-backend/.pytest_cache/
 python-backend/venv/
 python-backend/.venv/
 .tauri-agent-next-data/
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+output/playwright/
