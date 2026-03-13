@@ -6,7 +6,11 @@ from transport.ws.ws_types import (
     WsAckFrame,
     WsErrorFrame,
     WsHeartbeatFrame,
-    WsInboundMessage,
+    WsHeartbeatMessage,
+    WsRequestBootstrapMessage,
+    WsResumePrivateMessage,
+    WsResumeSharedMessage,
+    WsSetScopeMessage,
 )
 
 
@@ -17,67 +21,110 @@ router = APIRouter()
 async def websocket_gateway(websocket: WebSocket) -> None:
     await websocket.accept()
     services = websocket.app.state.services
-    hub = services.ws_hub
-    observation_center = services.observation_center
-    connection = await hub.register(websocket)
+    manager = services.ws_session_manager
+    session = await manager.register(websocket)
     await websocket.send_json(
         WsAckFrame(
-            connection_id=connection.id,
+            ws_session_id=session.ws_session_id,
             message="connected",
-        ).model_dump()
+        ).model_dump(mode="json")
     )
     try:
         while True:
             raw_message = await websocket.receive_json()
-            message = WsInboundMessage.model_validate(raw_message)
-            if message.kind == "heartbeat":
+            kind = str(raw_message.get("kind") or "").strip()
+            if kind == "heartbeat":
+                WsHeartbeatMessage.model_validate(raw_message)
                 await websocket.send_json(
                     WsHeartbeatFrame(
-                        connection_id=connection.id,
-                    ).model_dump()
+                        ws_session_id=session.ws_session_id,
+                    ).model_dump(mode="json")
                 )
                 continue
-            if message.kind == "subscribe":
-                await hub.subscribe(connection, message.scopes)
-            elif message.kind == "unsubscribe":
-                await hub.unsubscribe(connection, message.scopes)
-            elif message.kind == "set_scope":
-                await hub.set_scope(connection, message.scopes)
-            elif message.kind == "resume":
-                run_id, replayed = await observation_center.replay_connection(
-                    connection,
-                    after_seq=max(0, int(message.after_seq or 0)),
+            if kind == "set_scope":
+                message = WsSetScopeMessage.model_validate(raw_message)
+                await manager.set_scope(
+                    session,
+                    viewer_id=message.viewer_id,
+                    target_session_id=message.target_session_id,
+                    selected_run_id=message.selected_run_id,
+                    selected_agent_id=message.selected_agent_id,
+                    include_private=message.include_private,
                 )
-                if run_id is None:
-                    await websocket.send_json(
-                        WsErrorFrame(
-                            connection_id=connection.id,
-                            message="resume requires a scope that resolves to exactly one run_id",
-                        ).model_dump()
-                    )
-                    continue
                 await websocket.send_json(
                     WsAckFrame(
-                        connection_id=connection.id,
-                        message="resume",
-                        payload={"run_id": run_id, "replayed": replayed},
-                    ).model_dump()
+                        ws_session_id=session.ws_session_id,
+                        message="set_scope",
+                        payload={
+                            "target_session_id": message.target_session_id,
+                            "selected_run_id": message.selected_run_id,
+                            "selected_agent_id": message.selected_agent_id,
+                            "include_private": message.include_private,
+                        },
+                    ).model_dump(mode="json")
+                )
+                continue
+            if kind == "request_bootstrap":
+                message = WsRequestBootstrapMessage.model_validate(raw_message)
+                shared_after_seq, private_after_id = await manager.request_bootstrap(
+                    session,
+                    shared_limit=message.shared_limit,
+                    private_limit=message.private_limit,
+                )
+                await websocket.send_json(
+                    WsAckFrame(
+                        ws_session_id=session.ws_session_id,
+                        message="request_bootstrap",
+                        payload={
+                            "shared_after_seq": shared_after_seq,
+                            "private_after_id": private_after_id,
+                        },
+                    ).model_dump(mode="json")
+                )
+                continue
+            if kind == "resume_shared":
+                message = WsResumeSharedMessage.model_validate(raw_message)
+                replayed = await manager.resume_shared(
+                    session,
+                    after_seq=message.after_seq,
+                    limit=message.limit,
+                )
+                await websocket.send_json(
+                    WsAckFrame(
+                        ws_session_id=session.ws_session_id,
+                        message="resume_shared",
+                        payload={"replayed": replayed},
+                    ).model_dump(mode="json")
+                )
+                continue
+            if kind == "resume_private":
+                message = WsResumePrivateMessage.model_validate(raw_message)
+                replayed = await manager.resume_private(
+                    session,
+                    after_id=message.after_id,
+                    limit=message.limit,
+                )
+                await websocket.send_json(
+                    WsAckFrame(
+                        ws_session_id=session.ws_session_id,
+                        message="resume_private",
+                        payload={"replayed": replayed},
+                    ).model_dump(mode="json")
                 )
                 continue
             await websocket.send_json(
-                WsAckFrame(
-                    connection_id=connection.id,
-                    message=message.kind,
-                    payload={"scopes": [scope.model_dump() for scope in message.scopes]},
-                ).model_dump()
+                WsErrorFrame(
+                    ws_session_id=session.ws_session_id,
+                    message=f"unsupported ws message kind: {kind or '(empty)'}",
+                ).model_dump(mode="json")
             )
     except WebSocketDisconnect:
-        await hub.unregister(connection)
+        await manager.unregister(session)
     except Exception as exc:
         await websocket.send_json(
             WsErrorFrame(
-                connection_id=connection.id,
+                ws_session_id=session.ws_session_id,
                 message=str(exc),
-            ).model_dump()
+            ).model_dump(mode="json")
         )
-        await hub.unregister(connection)
+        await manager.unregister(session)

@@ -4,13 +4,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from observation.events import (
-    AgentProjection,
-    ExecutionEvent,
-    ExecutionSnapshot,
-    RunProjection,
-    ToolCallProjection,
-)
+from observation.facts import PrivateExecutionEvent, SharedFact
 
 
 LLMApiFormat = Literal["openai_chat_completions", "openai_responses"]
@@ -71,17 +65,16 @@ class StopRunResponse(BaseModel):
     status: str
 
 
-class RunSnapshotResponse(BaseModel):
+class SessionSharedFactsResponse(BaseModel):
     ok: bool = True
-    run_id: str
-    snapshot: ExecutionSnapshot
-    run_projection: Optional[RunProjection] = None
-    agent_projections: Dict[str, AgentProjection] = Field(default_factory=dict)
-    tool_call_projections: Dict[str, ToolCallProjection] = Field(default_factory=dict)
-
-
-class ListRunEventsResponse(BaseModel):
-    ok: bool = True
-    run_id: str
-    events: List[ExecutionEvent] = Field(default_factory=list)
+    session_id: str
+    shared_facts: List[SharedFact] = Field(default_factory=list)
     next_after_seq: int = 0
+
+
+class SessionPrivateFactsResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    agent_id: str
+    private_events: List[PrivateExecutionEvent] = Field(default_factory=list)
+    next_after_id: int = 0

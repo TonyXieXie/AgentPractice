@@ -4,6 +4,7 @@ from agents.execution.directives import ExecutionDirective
 from agents.execution.agent_memory import AgentMemory
 from agents.execution.engine import ExecutionEngine, ExecutionResult
 from agents.execution.prompt_ir import PromptIR
+from agents.execution.prompt_assembler import PromptAssembler
 from agents.execution.providers import (
     OpenAIResponsesAdapter,
     OpenAIToolCallingAdapter,
@@ -33,6 +34,7 @@ __all__ = [
     "OpenAIResponsesAdapter",
     "OpenAIToolCallingAdapter",
     "PromptIR",
+    "PromptAssembler",
     "ProviderAdapter",
     "ProviderToolCall",
     "ProviderToolResult",

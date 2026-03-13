@@ -117,19 +117,23 @@ class ToolExecutor:
                 session_id=session_id,
                 run_id=run_id,
                 agent_id=agent_id,
+                message_id=message_id,
                 tool_call_id=resolved_call_id,
                 tool_name=tool_name,
                 arguments=arguments,
+                metadata=metadata,
             )
             await self._record_tool_result(
                 session_id=session_id,
                 run_id=run_id,
                 agent_id=agent_id,
+                message_id=message_id,
                 tool_call_id=resolved_call_id,
                 tool_name=tool_name,
                 ok=False,
                 output=None,
                 error=f"Tool not found: {tool_name}",
+                metadata=metadata,
             )
             return ToolExecutionResult(
                 tool_call_id=resolved_call_id,
@@ -144,19 +148,23 @@ class ToolExecutor:
                 session_id=session_id,
                 run_id=run_id,
                 agent_id=agent_id,
+                message_id=message_id,
                 tool_call_id=resolved_call_id,
                 tool_name=tool_name,
                 arguments=payload,
+                metadata=metadata,
             )
             await self._record_tool_result(
                 session_id=session_id,
                 run_id=run_id,
                 agent_id=agent_id,
+                message_id=message_id,
                 tool_call_id=resolved_call_id,
                 tool_name=tool_name,
                 ok=False,
                 output=None,
                 error=f"Invalid arguments for tool: {tool_name}",
+                metadata=metadata,
             )
             return ToolExecutionResult(
                 tool_call_id=resolved_call_id,
@@ -169,9 +177,11 @@ class ToolExecutor:
             session_id=session_id,
             run_id=run_id,
             agent_id=agent_id,
+            message_id=message_id,
             tool_call_id=resolved_call_id,
             tool_name=tool_name,
             arguments=payload,
+            metadata=metadata,
         )
         token = set_tool_context(
             ToolContext(
@@ -190,6 +200,7 @@ class ToolExecutor:
                 session_id=session_id,
                 run_id=run_id,
                 agent_id=agent_id,
+                message_id=message_id,
                 tool_call_id=resolved_call_id,
                 tool_name=tool_name,
                 ok=True,
@@ -199,6 +210,7 @@ class ToolExecutor:
                     else {"directive": directive.to_dict()}
                 ),
                 error=None,
+                metadata=metadata,
             )
             return ToolExecutionResult(
                 tool_call_id=resolved_call_id,
@@ -212,11 +224,13 @@ class ToolExecutor:
                 session_id=session_id,
                 run_id=run_id,
                 agent_id=agent_id,
+                message_id=message_id,
                 tool_call_id=resolved_call_id,
                 tool_name=tool_name,
                 ok=False,
                 output=None,
                 error=str(exc),
+                metadata=metadata,
             )
             return ToolExecutionResult(
                 tool_call_id=resolved_call_id,
@@ -229,11 +243,13 @@ class ToolExecutor:
                 session_id=session_id,
                 run_id=run_id,
                 agent_id=agent_id,
+                message_id=message_id,
                 tool_call_id=resolved_call_id,
                 tool_name=tool_name,
                 ok=False,
                 output=None,
                 error=str(exc),
+                metadata=metadata,
             )
             return ToolExecutionResult(
                 tool_call_id=resolved_call_id,
@@ -260,9 +276,11 @@ class ToolExecutor:
         session_id: Optional[str],
         run_id: Optional[str],
         agent_id: str,
+        message_id: Optional[str],
         tool_call_id: str,
         tool_name: str,
         arguments: Dict[str, Any] | Any,
+        metadata: Optional[Dict[str, Any]],
     ) -> None:
         if self._recorder is None:
             return
@@ -272,9 +290,11 @@ class ToolExecutor:
                 session_id=session_id,
                 run_id=run_id,
                 agent_id=agent_id,
+                message_id=message_id,
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 arguments=payload,
+                metadata=metadata,
             )
         except Exception:
             return
@@ -285,11 +305,13 @@ class ToolExecutor:
         session_id: Optional[str],
         run_id: Optional[str],
         agent_id: str,
+        message_id: Optional[str],
         tool_call_id: str,
         tool_name: str,
         ok: bool,
         output: Any,
         error: Optional[str],
+        metadata: Optional[Dict[str, Any]],
     ) -> None:
         if self._recorder is None:
             return
@@ -298,11 +320,13 @@ class ToolExecutor:
                 session_id=session_id,
                 run_id=run_id,
                 agent_id=agent_id,
+                message_id=message_id,
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 ok=ok,
                 output=output,
                 error=error,
+                metadata=metadata,
             )
         except Exception:
             return

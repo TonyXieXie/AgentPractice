@@ -12,7 +12,6 @@ from agents.execution import TaskManager
 from agents.roster_manager import AgentRosterManager
 from models import StopRunResponse
 from observation.center import ObservationCenter
-from observation.events import ExecutionEvent
 
 
 @dataclass
@@ -88,7 +87,9 @@ class RunManager:
                 run_id=run_id,
             )
             if entry_assistant_id and entry_assistant_id not in runtime_agents:
-                raise RuntimeError(f"Primary assistant runtime agent missing: {entry_assistant_id}")
+                raise RuntimeError(
+                    f"Primary assistant runtime agent missing: {entry_assistant_id}"
+                )
             active_run = ActiveRun(
                 run_id=run_id,
                 session_id=session_id,
@@ -100,7 +101,13 @@ class RunManager:
             async with self._lock:
                 self._active_runs[run_id] = active_run
 
-            await self._emit_run_started(active_run)
+            await self._append_run_lifecycle_fact(
+                active_run,
+                topic="run.started",
+                status="running",
+                reply="",
+                message_id=None,
+            )
             return active_run
         except Exception:
             await self.agent_roster_manager.teardown_run(run_id)
@@ -138,13 +145,18 @@ class RunManager:
             or result_payload.get("result")
             or ""
         )
-        strategy = str(result_payload.get("strategy") or active_run.metadata.get("strategy") or "simple")
-        await self._emit_run_finished(
+        await self._append_run_lifecycle_fact(
             active_run,
+            topic="run.finished",
             status=status,
             reply=reply,
-            strategy=strategy,
             message_id=message_id,
+            error=str(result_payload.get("error") or "") if status == "error" else None,
+            strategy=str(
+                result_payload.get("strategy")
+                or active_run.metadata.get("strategy")
+                or "simple"
+            ),
         )
         await self._finalize_run(active_run)
 
@@ -160,32 +172,35 @@ class RunManager:
         if active_run is None:
             return
         payload = dict(result_payload or {})
-        payload.setdefault("status", "error")
-        payload.setdefault("strategy", active_run.metadata.get("strategy") or "simple")
-        payload.setdefault("reply", str(error_text))
-        await self._emit_run_finished(
+        await self._append_run_lifecycle_fact(
             active_run,
+            topic="run.finished",
             status="error",
             reply=str(error_text),
-            strategy=str(payload.get("strategy") or "simple"),
             message_id=message_id,
+            error=str(error_text),
+            strategy=str(payload.get("strategy") or active_run.metadata.get("strategy") or "simple"),
         )
         await self._finalize_run(active_run)
 
     async def stop_run(self, run_id: str) -> Optional[StopRunResponse]:
         active_run = await self.get_active_run(run_id)
         if active_run is None:
-            snapshot = await self.observation_center.get_snapshot(run_id)
-            if snapshot is None:
+            session_id = await self.lookup_session_id(run_id)
+            if not session_id:
                 return None
-            return StopRunResponse(run_id=run_id, status=snapshot.status)
+            status = await self.observation_center.fact_query_service.get_latest_run_status(run_id)
+            if not status:
+                return None
+            return StopRunResponse(run_id=run_id, status=status)
 
         await self.task_manager.stop_hosted_tasks(run_id)
         if active_run.root_task is not None and not active_run.root_task.done():
             active_run.root_task.cancel()
 
-        await self._emit_run_finished(
+        await self._append_run_lifecycle_fact(
             active_run,
+            topic="run.finished",
             status="stopped",
             reply="run cancelled",
             strategy=str(active_run.metadata.get("strategy") or "simple"),
@@ -206,8 +221,7 @@ class RunManager:
 
     async def lookup_session_id(self, run_id: str) -> Optional[str]:
         async with self._lock:
-            session_id = self._known_run_sessions.get(run_id)
-        return session_id
+            return self._known_run_sessions.get(run_id)
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -225,66 +239,39 @@ class RunManager:
             if self._busy_sessions.get(active_run.session_id) == active_run.run_id:
                 self._busy_sessions.pop(active_run.session_id, None)
 
-    async def _emit_run_started(self, active_run: ActiveRun) -> None:
-        strategy = str(active_run.metadata.get("strategy") or "simple")
-        await self.observation_center.emit(
-            ExecutionEvent(
-                event_type="run.started",
-                run_id=active_run.run_id,
-                agent_id=active_run.controller_agent_id,
-                visibility="public",
-                level="info",
-                source_type="run_manager",
-                source_id=active_run.run_id,
-                tags=[tag for tag in [strategy, "running"] if tag],
-                payload={
-                    "status": "running",
-                    "strategy": strategy,
-                    "topic": "run.started",
-                    "session_id": active_run.session_id,
-                    "controller_agent_id": active_run.controller_agent_id,
-                    "user_agent_id": active_run.metadata.get("user_agent_id"),
-                    "assistant_agent_id": active_run.entry_assistant_id,
-                },
-            )
-        )
-
-    async def _emit_run_finished(
+    async def _append_run_lifecycle_fact(
         self,
         active_run: ActiveRun,
         *,
+        topic: str,
         status: str,
         reply: str,
-        strategy: str,
         message_id: Optional[str] = None,
+        error: Optional[str] = None,
+        strategy: Optional[str] = None,
     ) -> None:
-        snapshot = await self.observation_center.get_snapshot(active_run.run_id)
-        if snapshot and snapshot.latest_event_type == "run.finished":
-            return
-        level = "info" if status == "completed" else "error"
+        resolved_strategy = str(strategy or active_run.metadata.get("strategy") or "simple")
         payload = {
             "status": status,
             "reply": reply,
-            "strategy": strategy,
-            "topic": "run.finished",
+            "strategy": resolved_strategy,
             "session_id": active_run.session_id,
             "controller_agent_id": active_run.controller_agent_id,
             "user_agent_id": active_run.metadata.get("user_agent_id"),
             "assistant_agent_id": active_run.entry_assistant_id,
         }
-        if status == "error":
-            payload["error"] = reply
-        await self.observation_center.emit(
-            ExecutionEvent(
-                event_type="run.finished",
-                run_id=active_run.run_id,
-                agent_id=active_run.controller_agent_id,
-                message_id=message_id,
-                visibility="public",
-                level=level,
-                source_type="run_manager",
-                source_id=active_run.run_id,
-                tags=[tag for tag in [strategy, status] if tag],
-                payload=payload,
-            )
+        if error:
+            payload["error"] = error
+        await self.observation_center.append_shared_fact(
+            session_id=active_run.session_id,
+            run_id=active_run.run_id,
+            message_id=message_id,
+            sender_id="RunManager",
+            target_agent_id=active_run.controller_agent_id,
+            topic=topic,
+            fact_type="run_lifecycle",
+            payload_json=payload,
+            metadata_json={"status": status, "strategy": resolved_strategy},
+            visibility="public",
+            level="error" if status == "error" else "info",
         )

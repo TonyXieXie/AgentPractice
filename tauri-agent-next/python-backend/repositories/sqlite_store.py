@@ -165,6 +165,57 @@ class SqliteStore:
         yield "CREATE INDEX IF NOT EXISTS idx_agent_instances_session ON agent_instances(session_id, id)"
 
         yield """
+        CREATE TABLE IF NOT EXISTS shared_facts (
+            fact_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            fact_id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL,
+            run_id TEXT NULL,
+            message_id TEXT NULL,
+            sender_id TEXT NOT NULL,
+            target_agent_id TEXT NULL,
+            target_profile_id TEXT NULL,
+            topic TEXT NOT NULL,
+            fact_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            visibility TEXT NOT NULL,
+            level TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """.strip()
+
+        yield "CREATE INDEX IF NOT EXISTS idx_shared_facts_session_seq ON shared_facts(session_id, fact_seq)"
+        yield "CREATE INDEX IF NOT EXISTS idx_shared_facts_run_seq ON shared_facts(run_id, fact_seq)"
+        yield "CREATE INDEX IF NOT EXISTS idx_shared_facts_message ON shared_facts(session_id, message_id)"
+        yield "CREATE INDEX IF NOT EXISTS idx_shared_facts_target_agent ON shared_facts(session_id, target_agent_id, fact_seq)"
+        yield "CREATE INDEX IF NOT EXISTS idx_shared_facts_target_profile ON shared_facts(session_id, target_profile_id, fact_seq)"
+
+        yield """
+        CREATE TABLE IF NOT EXISTS agent_private_events (
+            private_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            owner_agent_id TEXT NOT NULL,
+            run_id TEXT NULL,
+            task_id TEXT NULL,
+            message_id TEXT NULL,
+            tool_call_id TEXT NULL,
+            trigger_fact_id TEXT NULL,
+            parent_private_event_id INTEGER NULL,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """.strip()
+
+        yield "CREATE INDEX IF NOT EXISTS idx_private_events_session_id ON agent_private_events(session_id, private_event_id)"
+        yield "CREATE INDEX IF NOT EXISTS idx_private_events_agent_id ON agent_private_events(session_id, owner_agent_id, private_event_id)"
+        yield "CREATE INDEX IF NOT EXISTS idx_private_events_run_id ON agent_private_events(run_id, private_event_id)"
+        yield "CREATE INDEX IF NOT EXISTS idx_private_events_trigger_fact ON agent_private_events(trigger_fact_id, private_event_id)"
+        yield "CREATE INDEX IF NOT EXISTS idx_private_events_tool_call ON agent_private_events(session_id, tool_call_id)"
+
+        yield """
         CREATE TABLE IF NOT EXISTS conversation_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,

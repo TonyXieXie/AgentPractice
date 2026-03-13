@@ -4,7 +4,9 @@ import json
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
+from agents.center import HTTP_INGRESS_SENDER_ID
 from agents.message import AgentMessage
+from observation.facts import PrivateExecutionEvent, SharedFact
 
 
 CONTROL_OVERRIDE_KEYS = {
@@ -115,7 +117,11 @@ def get_work_path(message: AgentMessage) -> Optional[str]:
 def get_session_id(message: AgentMessage) -> Optional[str]:
     request_overrides = get_request_overrides(message)
     payload = _payload(message)
-    value = message.session_id or payload.get("session_id") or request_overrides.get("session_id")
+    value = (
+        message.session_id
+        or payload.get("session_id")
+        or request_overrides.get("session_id")
+    )
     if value is None:
         return None
     text = str(value).strip()
@@ -128,124 +134,97 @@ def get_user_input(message: AgentMessage) -> str:
 
 
 def render_current_message(message: AgentMessage) -> str:
-    return render_message_envelope(
-        message_type=message.message_type,
-        rpc_phase=message.rpc_phase,
-        sender_id=message.sender_id,
-        topic=message.topic,
-        payload=_payload(message),
-        ok=message.ok,
-        message_id=message.id,
-        correlation_id=message.correlation_id,
-        prefer_plain_task_run=True,
-    )
+    return render_agent_message_text(message)
 
 
-def render_message_center_entry(
-    *,
-    message_type: str,
-    rpc_phase: Optional[str],
-    sender_id: Optional[str],
-    topic: Optional[str],
-    payload: Optional[Dict[str, Any]],
-    message_id: Optional[str] = None,
-    correlation_id: Optional[str] = None,
-    ok: Optional[bool] = None,
-) -> Optional[Dict[str, Any]]:
-    content = render_message_envelope(
-        message_type=message_type,
-        rpc_phase=rpc_phase,
-        sender_id=sender_id,
-        topic=topic,
-        payload=payload,
-        ok=ok,
-        message_id=message_id,
-        correlation_id=correlation_id,
-        prefer_plain_task_run=False,
+def render_agent_message_text(message: AgentMessage) -> str:
+    payload = _payload(message)
+    if message.sender_id == HTTP_INGRESS_SENDER_ID:
+        return render_external_user_text(payload)
+    speaker = message.sender_id or "Unknown"
+    return render_speaker_line(speaker, render_payload_text(payload, fallback_topic=message.topic))
+
+
+def render_external_user_text(payload: Optional[Dict[str, Any]]) -> str:
+    normalized_payload = deepcopy(payload) if isinstance(payload, dict) else {}
+    return (
+        _coerce_text(normalized_payload.get("content"))
+        or _coerce_text(normalized_payload.get("text"))
+        or _coerce_text(normalized_payload.get("reply"))
+        or _safe_json(normalized_payload)
+    ).strip()
+
+
+def render_shared_fact_entry(fact: SharedFact) -> Optional[Dict[str, Any]]:
+    if fact.sender_id == HTTP_INGRESS_SENDER_ID:
+        content = render_external_user_text(fact.payload)
+        if not content:
+            return None
+        return {"role": "user", "content": content}
+    content = render_speaker_line(
+        fact.sender_id or "Unknown",
+        render_payload_text(fact.payload, fallback_topic=fact.topic),
     )
     if not content.strip():
         return None
-    role = "user" if message_type == "rpc" and rpc_phase == "request" else "assistant"
-    return {"role": role, "content": content}
+    return {"role": "assistant", "content": content}
 
 
-def render_message_envelope(
+def render_private_event_entry(
+    event: PrivateExecutionEvent,
     *,
-    message_type: str,
-    rpc_phase: Optional[str],
-    sender_id: Optional[str],
-    topic: Optional[str],
+    current_agent_id: str,
+) -> Optional[Dict[str, Any]]:
+    payload = event.payload
+    if event.kind == "tool_call":
+        body = _render_tool_call_text(payload)
+    elif event.kind == "tool_result":
+        body = _render_tool_result_text(payload)
+    elif event.kind in {"reasoning_note", "reasoning_summary", "private_summary", "execution_error"}:
+        body = (
+            _coerce_text(payload.get("content"))
+            or _coerce_text(payload.get("summary_text"))
+            or _coerce_text(payload.get("error"))
+            or _coerce_text(payload.get("status"))
+            or _safe_json(payload)
+        )
+    else:
+        body = (
+            _coerce_text(payload.get("content"))
+            or _coerce_text(payload.get("text"))
+            or _coerce_text(payload.get("error"))
+            or _safe_json(payload)
+        )
+    body = str(body or "").strip()
+    if not body:
+        return None
+    return {"role": "assistant", "content": render_speaker_line(current_agent_id, body)}
+
+
+def render_payload_text(
     payload: Optional[Dict[str, Any]],
-    message_id: Optional[str] = None,
-    correlation_id: Optional[str] = None,
-    ok: Optional[bool] = None,
-    prefer_plain_task_run: bool = False,
+    *,
+    fallback_topic: Optional[str] = None,
 ) -> str:
     normalized_payload = deepcopy(payload) if isinstance(payload, dict) else {}
-    normalized_message_type = str(message_type or "").strip()
-    normalized_rpc_phase = str(rpc_phase or "").strip()
-    normalized_topic = str(topic or "").strip()
-    normalized_sender = str(sender_id or "").strip() or "unknown"
-    normalized_message_id = str(message_id or "").strip()
-    normalized_correlation_id = str(correlation_id or "").strip()
-    id_suffix = f" id={normalized_message_id}" if normalized_message_id else ""
-    correlation_suffix = (
-        f" correlation_id={normalized_correlation_id}"
-        if normalized_correlation_id
-        else ""
-    )
-
-    if normalized_message_type == "rpc" and normalized_rpc_phase == "request":
-        body = (
-            _coerce_text(normalized_payload.get("content"))
-            or _coerce_text(normalized_payload.get("reply"))
-            or _coerce_text(normalized_payload.get("result"))
-            or _safe_json(normalized_payload)
-        )
-        if (
-            prefer_plain_task_run
-            and normalized_topic == "task.run"
-            and not normalized_message_id
-            and not normalized_correlation_id
-        ):
-            return body.strip()
-        header = (
-            f"[RPC request] from {normalized_sender} topic={normalized_topic or 'unknown'}"
-            f"{id_suffix}{correlation_suffix}"
-        )
-        return f"{header}\n{body}".strip()
-
-    if normalized_message_type == "rpc" and normalized_rpc_phase == "response":
-        body = (
-            _coerce_text(normalized_payload.get("reply"))
-            or _coerce_text(normalized_payload.get("result"))
-            or _coerce_text(normalized_payload.get("error"))
-            or _safe_json(normalized_payload)
-        )
-        header = (
-            f"[RPC response] from {normalized_sender} topic={normalized_topic or 'unknown'} ok={ok}"
-            f"{id_suffix}{correlation_suffix}"
-        )
-        return f"{header}\n{body}".strip()
-
-    if normalized_message_type == "event":
-        body = (
-            _coerce_text(normalized_payload.get("text"))
-            or _coerce_text(normalized_payload.get("content"))
-            or _safe_json(normalized_payload)
-        )
-        header = (
-            f"[Event] from {normalized_sender} topic={normalized_topic or 'unknown'}"
-            f"{id_suffix}{correlation_suffix}"
-        )
-        return f"{header}\n{body}".strip()
-
     return (
         _coerce_text(normalized_payload.get("content"))
+        or _coerce_text(normalized_payload.get("text"))
         or _coerce_text(normalized_payload.get("reply"))
         or _coerce_text(normalized_payload.get("result"))
+        or _coerce_text(normalized_payload.get("error"))
+        or _coerce_text(normalized_payload.get("summary_text"))
         or _safe_json(normalized_payload)
+        or str(fallback_topic or "").strip()
     ).strip()
+
+
+def render_speaker_line(speaker: str, body: str) -> str:
+    normalized_speaker = str(speaker or "").strip() or "Unknown"
+    normalized_body = str(body or "").strip()
+    if not normalized_body:
+        return ""
+    return f"[{normalized_speaker}] {normalized_body}"
 
 
 def get_history(message: AgentMessage) -> List[Dict[str, Any]]:
@@ -269,6 +248,27 @@ def stream_enabled(message: AgentMessage) -> bool:
     return bool(get_request_overrides(message).get("stream", True))
 
 
+def _render_tool_call_text(payload: Dict[str, Any]) -> str:
+    tool_name = str(payload.get("tool_name") or "tool").strip()
+    arguments = payload.get("arguments")
+    rendered_args = _coerce_text(arguments) or _safe_json(arguments)
+    if rendered_args:
+        return f"我调用了工具 {tool_name}，参数是：{rendered_args}"
+    return f"我调用了工具 {tool_name}。"
+
+
+def _render_tool_result_text(payload: Dict[str, Any]) -> str:
+    tool_name = str(payload.get("tool_name") or "tool").strip()
+    ok = payload.get("ok")
+    if ok is False:
+        error_text = _coerce_text(payload.get("error")) or "工具执行失败。"
+        return f"工具 {tool_name} 执行失败：{error_text}"
+    output_text = _coerce_text(payload.get("output"))
+    if output_text:
+        return f"工具 {tool_name} 返回：{output_text}"
+    return f"工具 {tool_name} 已执行完成。"
+
+
 def _safe_json(value: Any) -> str:
     try:
         return json.dumps(value, ensure_ascii=False)
@@ -284,7 +284,16 @@ def _coerce_text(value: Any) -> str:
     if isinstance(value, (int, float, bool)):
         return str(value)
     if isinstance(value, dict):
-        for key in ("content", "reply", "result", "text", "error", "value", "output"):
+        for key in (
+            "content",
+            "reply",
+            "result",
+            "text",
+            "error",
+            "value",
+            "output",
+            "summary_text",
+        ):
             text = _coerce_text(value.get(key))
             if text:
                 return text

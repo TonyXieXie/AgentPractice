@@ -59,7 +59,7 @@ class AssistantAgent(AgentBase):
         self.directive_runner = DirectiveRunner(
             self,
             run_manager=getattr(self.center, "run_manager", None),
-            message_center_repository=getattr(self.center, "message_center_repository", None),
+            shared_fact_repository=getattr(self.center, "shared_fact_repository", None),
         )
         if task_handler is not None:
             self.register_rpc_handler("task.run", task_handler)
@@ -196,6 +196,7 @@ class AssistantAgent(AgentBase):
             message_id=message.id,
             visibility="internal",
             level="error",
+            metadata={"session_id": message.session_id},
         )
         if message.message_type == "rpc" and message.rpc_phase == "request":
             await self.reply_rpc(

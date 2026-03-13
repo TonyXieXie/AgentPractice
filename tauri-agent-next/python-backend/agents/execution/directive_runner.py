@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from agents.execution.directives import ExecutionDirective
 
 if TYPE_CHECKING:
     from agents.base import AgentBase
     from agents.message import AgentMessage
-    from repositories.message_center_repository import MessageCenterRepository
+    from repositories.shared_fact_repository import SharedFactRepository
     from run_manager import RunManager
 
 
@@ -17,11 +17,11 @@ class DirectiveRunner:
         agent: "AgentBase",
         *,
         run_manager: Optional["RunManager"] = None,
-        message_center_repository: Optional["MessageCenterRepository"] = None,
+        shared_fact_repository: Optional["SharedFactRepository"] = None,
     ) -> None:
         self.agent = agent
         self.run_manager = run_manager
-        self.message_center_repository = message_center_repository
+        self.shared_fact_repository = shared_fact_repository
 
     async def execute(
         self,
@@ -68,24 +68,32 @@ class DirectiveRunner:
         if not session_id:
             raise RuntimeError("send_rpc_response requires session_id")
         reply_to_message_id = self._optional_text(args.get("reply_to_message_id"))
-        if not reply_to_message_id:
-            raise RuntimeError("reply_to_message_id is required")
         request = None
-        if source_message.id == reply_to_message_id:
+        if (
+            reply_to_message_id is None
+            and source_message.message_type == "rpc"
+            and source_message.rpc_phase == "request"
+        ):
             request = source_message
-        elif self.message_center_repository is not None:
-            request = await self.message_center_repository.get_shared_message(
+        elif source_message.id == reply_to_message_id:
+            request = source_message
+        elif self.shared_fact_repository is not None and reply_to_message_id is not None:
+            fact = await self.shared_fact_repository.get_by_message_id(
                 session_id,
                 reply_to_message_id,
             )
+            if fact is not None:
+                request = self.shared_fact_repository.to_agent_message(fact)
         if request is None:
-            raise RuntimeError(f"reply target message not found: {reply_to_message_id}")
+            raise RuntimeError(
+                f"reply target message not found: {reply_to_message_id or source_message.id}"
+            )
         if request.message_type != "rpc" or request.rpc_phase != "request":
             raise RuntimeError("send_rpc_response can only reply to rpc request messages")
         return await self.agent.reply_rpc(
             request,
             self._as_dict(args.get("payload")),
-            ok=bool(args.get("ok")),
+            ok=bool(args.get("ok", True)),
             visibility=self._optional_text(args.get("visibility")) or None,
             level=self._optional_text(args.get("level")) or "info",
         )

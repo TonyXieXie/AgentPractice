@@ -54,7 +54,7 @@ class UserProxyAgent(AgentBase):
         self.directive_runner = DirectiveRunner(
             self,
             run_manager=self.run_manager,
-            message_center_repository=getattr(self.center, "message_center_repository", None),
+            shared_fact_repository=getattr(self.center, "shared_fact_repository", None),
         )
 
     async def send_user_message(
@@ -335,6 +335,7 @@ class UserProxyAgent(AgentBase):
             message_id=message.id,
             visibility="internal",
             level="error",
+            metadata={"session_id": message.session_id},
         )
         if not message.run_id:
             return

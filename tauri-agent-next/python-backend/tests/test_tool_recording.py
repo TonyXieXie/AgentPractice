@@ -6,9 +6,11 @@ from pathlib import Path
 
 from agents.execution.directives import MESSAGE_DIRECTIVE_KINDS
 from agents.execution.tool_executor import ToolExecutor
-from agents.execution.tool_recorder import ConversationToolRecorder
-from repositories.conversation_repository import ConversationRepository
+from agents.execution.tool_recorder import PrivateExecutionRecorder
+from observation.center import ObservationCenter
+from repositories.agent_private_event_repository import AgentPrivateEventRepository
 from repositories.session_repository import SessionRepository
+from repositories.shared_fact_repository import SharedFactRepository
 from repositories.sqlite_store import SqliteStore
 from tools.base import Tool, ToolParameter, ToolRegistry
 
@@ -44,7 +46,12 @@ class ToolRecordingTests(unittest.IsolatedAsyncioTestCase):
         self.store = SqliteStore(runtime_dir / "agent_next.db")
         await self.store.initialize()
         self.session_repo = SessionRepository(self.store)
-        self.conversation_repo = ConversationRepository(self.store)
+        self.shared_repo = SharedFactRepository(self.store)
+        self.private_repo = AgentPrivateEventRepository(self.store)
+        self.observation_center = ObservationCenter(
+            shared_fact_repository=self.shared_repo,
+            agent_private_event_repository=self.private_repo,
+        )
         self.session_id = "session-1"
         await self.session_repo.create(session_id=self.session_id)
         ToolRegistry.clear()
@@ -54,9 +61,21 @@ class ToolRecordingTests(unittest.IsolatedAsyncioTestCase):
         ToolRegistry.clear()
         self._temp_dir.cleanup()
 
-    async def test_tool_calls_are_recorded(self) -> None:
+    async def test_tool_calls_are_recorded_as_private_events(self) -> None:
         tool_executor = ToolExecutor(
-            recorder=ConversationToolRecorder(self.conversation_repo, max_payload_bytes=64 * 1024)
+            recorder=PrivateExecutionRecorder(
+                self.observation_center,
+                max_payload_bytes=64 * 1024,
+            )
+        )
+        trigger_fact = await self.observation_center.append_shared_fact(
+            session_id=self.session_id,
+            run_id="run-1",
+            sender_id="UserProxy",
+            target_agent_id="assistant-1",
+            topic="task.run",
+            fact_type="rpc_request",
+            payload_json={"content": "hello"},
         )
         result = await tool_executor.execute(
             agent_id="assistant-1",
@@ -64,17 +83,22 @@ class ToolRecordingTests(unittest.IsolatedAsyncioTestCase):
             message_id="msg-1",
             session_id=self.session_id,
             work_path=None,
-            metadata={},
+            metadata={"task_id": "task-1", "trigger_fact_id": trigger_fact.fact_id},
             tool_name="echo_record",
             arguments={"text": "hello"},
             tool_call_id="call-1",
         )
         self.assertTrue(result.ok)
 
-        events = await self.conversation_repo.list_latest(self.session_id, limit=10)
-        kinds = [event.kind for event in events]
-        self.assertIn("tool_call", kinds)
-        self.assertIn("tool_result", kinds)
+        events = await self.private_repo.list(
+            self.session_id,
+            owner_agent_id="assistant-1",
+            after_id=0,
+            limit=10,
+        )
+        self.assertEqual([event.kind for event in events], ["tool_call", "tool_result"])
+        self.assertEqual([event.trigger_fact_id for event in events], [trigger_fact.fact_id] * 2)
+        self.assertEqual([event.task_id for event in events], ["task-1", "task-1"])
 
     async def test_reserved_directive_tool_names_cannot_be_overridden(self) -> None:
         ToolRegistry.clear()

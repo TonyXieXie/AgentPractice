@@ -5,8 +5,7 @@ from typing import Any, Dict, Optional
 
 from agents.instance import AgentInstance, AgentStatus
 from agents.message import AgentMessage, SeverityLevel, VisibilityLevel
-from observation.events import ExecutionEvent
-from observation.observer import ExecutionObserver, NullExecutionObserver
+from observation.center import ObservationCenter
 
 
 class AgentBase(ABC):
@@ -14,11 +13,11 @@ class AgentBase(ABC):
         self,
         instance: AgentInstance,
         center: "AgentCenter",
-        observer: Optional[ExecutionObserver] = None,
+        observer: Optional[ObservationCenter] = None,
     ) -> None:
         self.instance = instance
         self.center = center
-        self.observer = observer or getattr(center, "observer", None) or NullExecutionObserver()
+        self.observer = observer or getattr(center, "observation_center", None)
 
     @property
     def agent_id(self) -> str:
@@ -29,20 +28,6 @@ class AgentBase(ABC):
         return self.instance.run_id
 
     async def receive(self, message: AgentMessage):
-        await self.observe(
-            "message.received",
-            payload={
-                "topic": message.topic,
-                "message_type": message.message_type,
-                "rpc_phase": message.rpc_phase,
-                "sender_id": message.sender_id,
-                "object_type": message.object_type,
-            },
-            run_id=message.run_id or self.run_id,
-            message_id=message.id,
-            level=message.level,
-            visibility=message.visibility,
-        )
         return await self.on_message(message)
 
     async def send_event(
@@ -174,7 +159,7 @@ class AgentBase(ABC):
         )
         resolved_metadata = dict(metadata or {})
         resolved_metadata.update(target_metadata)
-        message = AgentMessage.build_rpc_request(
+        return AgentMessage.build_rpc_request(
             topic=topic,
             sender_id=self.agent_id,
             target_id=target_id,
@@ -187,7 +172,6 @@ class AgentBase(ABC):
             level=level,
             metadata=resolved_metadata,
         )
-        return message
 
     async def observe(
         self,
@@ -204,22 +188,39 @@ class AgentBase(ABC):
         source_id: Optional[str] = None,
         tags: Optional[list[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> ExecutionEvent:
-        event = ExecutionEvent(
-            event_type=event_type,
+    ):
+        observation_center = self.observer
+        resolved_metadata = dict(metadata or {})
+        session_id = self._resolve_session_id(payload, resolved_metadata)
+        if observation_center is None or not session_id:
+            return None
+        private_kind = self._private_kind_for_event_type(
+            event_type,
+            payload=payload or {},
+            level=level,
+        )
+        if private_kind is None:
+            return None
+        return await observation_center.append_private_event(
+            session_id=session_id,
+            owner_agent_id=agent_id or self.agent_id,
             run_id=run_id or self.run_id,
-            agent_id=agent_id or self.agent_id,
+            task_id=self._optional_text(resolved_metadata.get("task_id")),
             message_id=message_id,
             tool_call_id=tool_call_id,
-            visibility=visibility,
-            level=level,
-            source_type=source_type or "agent",
-            source_id=source_id or (agent_id or self.agent_id),
-            tags=list(tags or []),
-            payload=payload or {},
-            metadata=metadata or {},
+            trigger_fact_id=self._optional_text(resolved_metadata.get("trigger_fact_id")),
+            kind=private_kind,
+            payload_json=self._private_payload_for_event(
+                event_type=event_type,
+                payload=payload or {},
+                metadata=resolved_metadata,
+                source_type=source_type,
+                source_id=source_id,
+                tags=tags,
+                level=level,
+                visibility=visibility,
+            ),
         )
-        return await self.observer.emit(event)
 
     async def update_status(
         self,
@@ -227,7 +228,7 @@ class AgentBase(ABC):
         *,
         reason: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> ExecutionEvent:
+    ):
         merged_metadata = dict(metadata or {})
         if reason:
             merged_metadata["reason"] = reason
@@ -241,6 +242,7 @@ class AgentBase(ABC):
             },
             level="info" if status != "error" else "error",
             source_type="agent",
+            metadata=merged_metadata,
         )
 
     @abstractmethod
@@ -263,3 +265,73 @@ class AgentBase(ABC):
         if normalized_target_id is not None:
             normalized_target_profile = None
         return normalized_target_id, normalized_target_profile, metadata
+
+    def _private_kind_for_event_type(
+        self,
+        event_type: str,
+        *,
+        payload: Dict[str, Any],
+        level: SeverityLevel,
+    ) -> str | None:
+        if event_type in {"assistant.protocol_error", "user_proxy.protocol_error", "agent.error"}:
+            return "execution_error"
+        if event_type == "agent.state_changed":
+            return "reasoning_note"
+        if event_type == "llm.updated":
+            step_type = str(payload.get("step_type") or "").strip()
+            if step_type == "thought":
+                return "reasoning_note"
+            if step_type == "answer":
+                return "reasoning_summary"
+            return None
+        if level == "error":
+            return "execution_error"
+        return None
+
+    def _private_payload_for_event(
+        self,
+        *,
+        event_type: str,
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        source_type: Optional[str],
+        source_id: Optional[str],
+        tags: Optional[list[str]],
+        level: SeverityLevel,
+        visibility: VisibilityLevel,
+    ) -> Dict[str, Any]:
+        result = dict(payload)
+        result.update(
+            {
+                "event_type": event_type,
+                "source_type": source_type,
+                "source_id": source_id,
+                "tags": list(tags or []),
+                "level": level,
+                "visibility": visibility,
+            }
+        )
+        if metadata:
+            result["metadata"] = metadata
+        return result
+
+    def _resolve_session_id(
+        self,
+        payload: Optional[Dict[str, Any]],
+        metadata: Dict[str, Any],
+    ) -> str | None:
+        if metadata.get("session_id"):
+            return self._optional_text(metadata.get("session_id"))
+        if isinstance(payload, dict) and payload.get("session_id"):
+            return self._optional_text(payload.get("session_id"))
+        return None
+
+    def _optional_text(self, value: Any) -> str | None:
+        text = str(value or "").strip()
+        return text or None
+
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agents.center import AgentCenter

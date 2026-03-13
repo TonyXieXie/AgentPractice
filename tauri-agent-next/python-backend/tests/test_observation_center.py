@@ -5,75 +5,126 @@ import unittest
 from pathlib import Path
 
 from observation.center import ObservationCenter
-from observation.events import ExecutionEvent
-from repositories.event_repository import FileEventStore
-from transport.ws.ws_hub import WsHub
-from transport.ws.ws_types import SubscriptionScope
-
-
-class FakeWebSocket:
-    def __init__(self) -> None:
-        self.messages = []
-
-    async def send_json(self, payload):
-        self.messages.append(payload)
+from observation.facts import ObservationScope
+from observation.query_service import FactQueryService
+from repositories.agent_private_event_repository import AgentPrivateEventRepository
+from repositories.session_repository import SessionRepository
+from repositories.shared_fact_repository import SharedFactRepository
+from repositories.sqlite_store import SqliteStore
 
 
 class ObservationCenterTests(unittest.IsolatedAsyncioTestCase):
-    async def test_assigns_per_run_seq_and_routes_by_scope(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            hub = WsHub()
-            store = FileEventStore(Path(temp_dir) / "runs")
-            center = ObservationCenter(event_store=store, ws_hub=hub)
+    async def asyncSetUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self.store = SqliteStore(Path(self._temp_dir.name) / "agent_next.db")
+        await self.store.initialize()
+        self.session_repo = SessionRepository(self.store)
+        await self.session_repo.create(session_id="session-1")
+        self.shared_repo = SharedFactRepository(self.store)
+        self.private_repo = AgentPrivateEventRepository(self.store)
+        self.query_service = FactQueryService(
+            shared_fact_repository=self.shared_repo,
+            agent_private_event_repository=self.private_repo,
+        )
+        self.center = ObservationCenter(
+            shared_fact_repository=self.shared_repo,
+            agent_private_event_repository=self.private_repo,
+            fact_query_service=self.query_service,
+        )
 
-            ws_run = FakeWebSocket()
-            ws_internal = FakeWebSocket()
-            conn_run = await hub.register(ws_run)
-            conn_internal = await hub.register(ws_internal)
-            await hub.set_scope(conn_run, [SubscriptionScope(run_id="run-1")])
-            await hub.set_scope(
-                conn_internal,
-                [SubscriptionScope(run_id="run-1", visibility="internal", level="error")],
-            )
+    async def asyncTearDown(self) -> None:
+        self._temp_dir.cleanup()
 
-            event_a = await center.emit(
-                ExecutionEvent(
-                    event_type="run.started",
-                    run_id="run-1",
-                    agent_id="assistant-1",
-                )
-            )
-            event_b = await center.emit(
-                ExecutionEvent(
-                    event_type="run.started",
-                    run_id="run-2",
-                    agent_id="assistant-2",
-                )
-            )
-            event_c = await center.emit(
-                ExecutionEvent(
-                    event_type="run.error",
-                    run_id="run-1",
-                    agent_id="assistant-1",
-                    visibility="internal",
-                    level="error",
-                    payload={"status": "error", "error": "boom"},
-                )
-            )
+    async def test_shared_facts_append_and_list_in_fact_seq_order(self) -> None:
+        fact_a = await self.center.append_shared_fact(
+            session_id="session-1",
+            run_id="run-1",
+            message_id="msg-1",
+            sender_id="UserProxy",
+            target_agent_id="Planner",
+            topic="task.plan",
+            fact_type="event_handoff",
+            payload_json={"content": "交给 Planner"},
+        )
+        fact_b = await self.center.append_shared_fact(
+            session_id="session-1",
+            run_id="run-1",
+            message_id="msg-2",
+            sender_id="Planner",
+            target_agent_id="Coder",
+            topic="task.code",
+            fact_type="event_handoff",
+            payload_json={"content": "交给 Coder"},
+        )
 
-            self.assertEqual(event_a.seq, 1)
-            self.assertEqual(event_b.seq, 1)
-            self.assertEqual(event_c.seq, 2)
+        facts = await self.center.list_shared(
+            ObservationScope(session_id="session-1", run_id="run-1"),
+            after_seq=0,
+            limit=10,
+        )
 
-            self.assertEqual(len(ws_run.messages), 2)
-            self.assertEqual(len(ws_internal.messages), 1)
-            self.assertEqual(ws_internal.messages[0]["event_type"], "run.error")
+        self.assertEqual([fact.fact_seq for fact in facts], [fact_a.fact_seq, fact_b.fact_seq])
+        self.assertEqual([fact.topic for fact in facts], ["task.plan", "task.code"])
 
-            snapshot = await center.get_snapshot("run-1")
-            self.assertIsNotNone(snapshot)
-            self.assertEqual(snapshot.status, "error")
-            self.assertEqual(snapshot.latest_seq, 2)
+    async def test_private_events_append_and_filter_by_agent_and_trigger_fact(self) -> None:
+        trigger_fact = await self.center.append_shared_fact(
+            session_id="session-1",
+            run_id="run-1",
+            message_id="msg-1",
+            sender_id="UserProxy",
+            target_agent_id="Planner",
+            topic="task.plan",
+            fact_type="event_handoff",
+            payload_json={"content": "交给 Planner"},
+        )
+        event_a = await self.center.append_private_event(
+            session_id="session-1",
+            owner_agent_id="Planner",
+            run_id="run-1",
+            message_id="msg-1",
+            trigger_fact_id=trigger_fact.fact_id,
+            kind="tool_call",
+            payload_json={"tool_name": "read_file"},
+        )
+        event_b = await self.center.append_private_event(
+            session_id="session-1",
+            owner_agent_id="Planner",
+            run_id="run-1",
+            message_id="msg-1",
+            trigger_fact_id=trigger_fact.fact_id,
+            kind="tool_result",
+            payload_json={"tool_name": "read_file", "ok": True},
+        )
+        await self.center.append_private_event(
+            session_id="session-1",
+            owner_agent_id="Coder",
+            run_id="run-1",
+            message_id="msg-2",
+            kind="tool_call",
+            payload_json={"tool_name": "write_file"},
+        )
 
-            projections = await center.get_projection_state("run-1")
-            self.assertIsNotNone(projections.run_projection)
-            self.assertEqual(projections.run_projection.latest_seq, 2)
+        events = await self.center.list_private(
+            ObservationScope(
+                session_id="session-1",
+                run_id="run-1",
+                agent_id="Planner",
+                include_private=True,
+            ),
+            after_id=0,
+            limit=10,
+        )
+
+        self.assertEqual(
+            [event.private_event_id for event in events],
+            [event_a.private_event_id, event_b.private_event_id],
+        )
+
+        filtered = await self.private_repo.list(
+            "session-1",
+            owner_agent_id="Planner",
+            trigger_fact_id=trigger_fact.fact_id,
+            after_id=0,
+            limit=10,
+        )
+        self.assertEqual([event.kind for event in filtered], ["tool_call", "tool_result"])

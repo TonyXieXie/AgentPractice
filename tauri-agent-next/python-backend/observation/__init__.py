@@ -4,21 +4,17 @@ from importlib import import_module
 
 
 _EXPORTS = {
-    "AgentProjection": ("observation.events", "AgentProjection"),
-    "AgentSnapshot": ("observation.events", "AgentSnapshot"),
     "ExecutionEvent": ("observation.events", "ExecutionEvent"),
     "ExecutionObserver": ("observation.observer", "ExecutionObserver"),
     "ExecutionProjectionState": ("observation.events", "ExecutionProjectionState"),
     "ExecutionSnapshot": ("observation.events", "ExecutionSnapshot"),
-    "ObservationCenter": ("observation.center", "ObservationCenter"),
-    "ProjectionBuilder": ("observation.projection_builder", "ProjectionBuilder"),
-    "RunProjection": ("observation.events", "RunProjection"),
-    "SnapshotBuilder": ("observation.snapshot_builder", "SnapshotBuilder"),
-    "SubscriptionRouter": ("observation.router", "SubscriptionRouter"),
+    "FactQueryService": ("observation.query_service", "FactQueryService"),
     "InMemoryExecutionObserver": ("observation.observer", "InMemoryExecutionObserver"),
     "NullExecutionObserver": ("observation.observer", "NullExecutionObserver"),
-    "ToolCallSnapshot": ("observation.events", "ToolCallSnapshot"),
-    "ToolCallProjection": ("observation.events", "ToolCallProjection"),
+    "ObservationCenter": ("observation.center", "ObservationCenter"),
+    "ObservationScope": ("observation.facts", "ObservationScope"),
+    "PrivateExecutionEvent": ("observation.facts", "PrivateExecutionEvent"),
+    "SharedFact": ("observation.facts", "SharedFact"),
 }
 
 __all__ = list(_EXPORTS.keys())

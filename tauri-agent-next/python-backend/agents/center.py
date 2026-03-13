@@ -5,25 +5,30 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 from uuid import uuid4
 
 from agents.message import AgentMessage
-from observation.events import ExecutionEvent
-from observation.observer import ExecutionObserver, NullExecutionObserver
-from repositories.message_center_repository import MessageCenterRepository
+from observation.center import ObservationCenter
+from observation.facts import SharedFact
 from repositories.session_repository import SessionRepository
 
 
 HTTP_INGRESS_SENDER_ID = "external:http"
+AGENT_CENTER_SENDER_ID = "AgentCenter"
 
 
 class AgentCenter:
     def __init__(
         self,
-        observer: Optional[ExecutionObserver] = None,
-        message_center_repository: Optional[MessageCenterRepository] = None,
+        observation_center: Optional[ObservationCenter] = None,
+        *,
         roster_manager: Optional["AgentRosterManager"] = None,
         session_repository: Optional[SessionRepository] = None,
     ) -> None:
-        self.observer = observer or NullExecutionObserver()
-        self.message_center_repository = message_center_repository
+        self.observation_center = observation_center
+        self.observer = observation_center
+        self.shared_fact_repository = (
+            observation_center.shared_fact_repository
+            if observation_center is not None
+            else None
+        )
         self.roster_manager = roster_manager
         self.session_repository = session_repository
         self.run_manager: Optional["RunManager"] = None
@@ -31,7 +36,6 @@ class AgentCenter:
         self._pending_rpcs: Dict[str, asyncio.Future[AgentMessage]] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._lock = asyncio.Lock()
-        self._seq = 0
 
     async def register(self, agent: "AgentBase") -> None:
         async with self._lock:
@@ -93,7 +97,9 @@ class AgentCenter:
         roster_manager = self.roster_manager
         if roster_manager is None:
             raise RuntimeError("AgentRosterManager is required for run ingress")
-        user_proxy = await roster_manager.ensure_primary_user_proxy(resolved_request.session_id or "")
+        user_proxy = await roster_manager.ensure_primary_user_proxy(
+            resolved_request.session_id or ""
+        )
         response = await self._send_external_rpc(
             target_agent_id=user_proxy.agent_id,
             topic="run.submit",
@@ -145,46 +151,40 @@ class AgentCenter:
 
     async def route(self, message: AgentMessage):
         if message.object_type == "broadcast":
-            message = await self._assign_seq(message)
-            await self._observe_message(message, "message.sent")
-            recipients = await self._resolve_broadcast_targets(message)
-            await self._persist_message(message)
+            shared_fact = await self._persist_shared_fact(message)
+            routed_message = self._attach_trigger_fact(message, shared_fact)
+            recipients = await self._resolve_broadcast_targets(routed_message)
             delivered = 0
             for agent in recipients:
-                routed_message = message.model_copy(
+                delivered_message = routed_message.model_copy(
                     update={"target": AgentMessage.TargetRef(agent_id=agent.agent_id)}
                 )
-                await agent.receive(routed_message)
+                await agent.receive(delivered_message)
                 delivered += 1
             return delivered
 
         if message.message_type == "rpc" and message.rpc_phase == "response":
-            message = await self._assign_seq(message)
-            await self._observe_message(message, "message.sent")
-            await self._persist_message(message)
-            future = await self._pop_pending_rpc(message.correlation_id)
+            shared_fact = await self._persist_shared_fact(message)
+            routed_message = self._attach_trigger_fact(message, shared_fact)
+            future = await self._pop_pending_rpc(routed_message.correlation_id)
             if future is not None and not future.done():
-                future.set_result(message)
-            target = await self.get(message.target_id or "") if message.target_id else None
+                future.set_result(routed_message)
+            target = await self.get(routed_message.target_id or "") if routed_message.target_id else None
             if target is not None:
-                self._spawn_background_task(self._deliver_rpc_response(target, message))
+                self._spawn_background_task(self._deliver_rpc_response(target, routed_message))
             elif future is None:
-                await self._emit_undeliverable_rpc_response(message)
-            return message
+                await self._emit_undeliverable_rpc_response(routed_message)
+            return routed_message
 
         target, routed_message = await self._resolve_target_message(message)
-        routed_message = await self._assign_seq(routed_message)
-        await self._observe_message(routed_message, "message.sent")
-        await self._persist_message(routed_message)
+        shared_fact = await self._persist_shared_fact(routed_message)
+        routed_message = self._attach_trigger_fact(routed_message, shared_fact)
 
         if routed_message.message_type == "rpc" and routed_message.rpc_phase == "request":
             self._spawn_background_task(self._deliver_rpc_request(target, routed_message))
             return routed_message
 
         return await target.receive(routed_message)
-
-    async def emit(self, event: ExecutionEvent) -> ExecutionEvent:
-        return await self.observer.emit(event)
 
     async def _resolve_run_request(self, request: "CreateRunRequest") -> "CreateRunRequest":
         session_repo = self.session_repository
@@ -273,41 +273,6 @@ class AgentCenter:
         finally:
             await self.clear_rpc_waiter(correlation_id, future)
 
-    async def _assign_seq(self, message: AgentMessage) -> AgentMessage:
-        async with self._lock:
-            self._seq += 1
-            seq = self._seq
-        return message.model_copy(update={"seq": seq})
-
-    async def _observe_message(self, message: AgentMessage, event_type: str) -> ExecutionEvent:
-        target_profile = _extract_target_profile(message)
-        return await self.emit(
-            ExecutionEvent(
-                event_type=event_type,
-                run_id=message.run_id,
-                agent_id=message.sender_id,
-                message_id=message.id,
-                visibility=message.visibility,
-                level=message.level,
-                source_type="center",
-                source_id=message.sender_id,
-                tags=[
-                    message.message_type,
-                    message.object_type,
-                    *( [str(message.rpc_phase)] if message.rpc_phase else [] ),
-                ],
-                payload={
-                    "topic": message.topic,
-                    "message_type": message.message_type,
-                    "object_type": message.object_type,
-                    "rpc_phase": message.rpc_phase,
-                    "target_agent_id": message.target_id,
-                    "target_profile": target_profile,
-                    "correlation_id": message.correlation_id,
-                },
-            )
-        )
-
     async def _resolve_broadcast_targets(self, message: AgentMessage) -> List["AgentBase"]:
         if self.roster_manager is not None:
             return await self.roster_manager.list_broadcast_targets(message)
@@ -342,23 +307,57 @@ class AgentCenter:
         )
         return target, routed_message
 
-    async def _persist_message(self, message: AgentMessage) -> None:
-        repo = self.message_center_repository
-        if repo is None:
-            return
+    async def _persist_shared_fact(self, message: AgentMessage) -> SharedFact:
+        observation_center = self.observation_center
         session_id = _extract_session_id(message)
-        if not session_id:
-            return
-        try:
-            await repo.append_shared_message(
-                session_id=session_id,
-                message=message,
+        if observation_center is None or not session_id:
+            return SharedFact(
+                session_id=session_id or "",
+                run_id=message.run_id,
+                message_id=message.id,
+                sender_id=message.sender_id,
+                target_agent_id=message.target_id,
+                target_profile_id=_extract_target_profile(message),
+                topic=message.topic,
+                fact_type=_fact_type_for_message(message),
+                payload_json=dict(message.payload or {}),
+                metadata_json=_metadata_for_shared_fact(message),
+                visibility=message.visibility,
+                level=message.level,
             )
-        except Exception:
-            return
+        return await observation_center.append_shared_fact(
+            session_id=session_id,
+            run_id=message.run_id,
+            message_id=message.id,
+            sender_id=message.sender_id,
+            target_agent_id=message.target_id,
+            target_profile_id=_extract_target_profile(message),
+            topic=message.topic,
+            fact_type=_fact_type_for_message(message),
+            payload_json=dict(message.payload or {}),
+            metadata_json=_metadata_for_shared_fact(message),
+            visibility=message.visibility,
+            level=message.level,
+        )
+
+    def _attach_trigger_fact(
+        self,
+        message: AgentMessage,
+        fact: SharedFact,
+    ) -> AgentMessage:
+        metadata = dict(message.metadata or {})
+        if fact.fact_id:
+            metadata["trigger_fact_id"] = fact.fact_id
+        return message.model_copy(
+            update={
+                "seq": fact.fact_seq or message.seq,
+                "metadata": metadata,
+            }
+        )
 
     async def _pop_pending_rpc(
-        self, correlation_id: Optional[str]
+        self,
+        correlation_id: Optional[str],
     ) -> Optional[asyncio.Future[AgentMessage]]:
         if not correlation_id:
             return None
@@ -392,44 +391,51 @@ class AgentCenter:
             if isinstance(maybe_followup, AgentMessage):
                 await self.route(maybe_followup)
         except Exception as exc:
-            await self.emit(
-                ExecutionEvent(
-                    event_type="agent.error",
-                    run_id=message.run_id,
-                    agent_id=target.agent_id,
-                    message_id=message.id,
-                    visibility="internal",
-                    level="error",
-                    source_type="center",
-                    source_id=target.agent_id,
-                    tags=["rpc", "response", "delivery_error"],
-                    payload={
-                        "topic": message.topic,
-                        "message_type": message.message_type,
-                        "rpc_phase": message.rpc_phase,
-                        "error": str(exc),
-                    },
-                )
+            await self._append_center_error_fact(
+                message,
+                topic="message.delivery_error",
+                payload={
+                    "topic": message.topic,
+                    "message_type": message.message_type,
+                    "rpc_phase": message.rpc_phase,
+                    "error": str(exc),
+                    "target_agent_id": target.agent_id,
+                },
             )
 
     async def _emit_undeliverable_rpc_response(self, message: AgentMessage) -> None:
-        await self.emit(
-            ExecutionEvent(
-                event_type="message.undeliverable",
-                run_id=message.run_id,
-                agent_id=message.sender_id,
-                message_id=message.id,
-                visibility="internal",
-                level="warning",
-                source_type="center",
-                source_id=message.sender_id,
-                tags=["rpc", "response", "undeliverable"],
-                payload={
-                    "topic": message.topic,
-                    "target_agent_id": message.target_id,
-                    "correlation_id": message.correlation_id,
-                },
-            )
+        await self._append_center_error_fact(
+            message,
+            topic="message.undeliverable",
+            payload={
+                "topic": message.topic,
+                "target_agent_id": message.target_id,
+                "correlation_id": message.correlation_id,
+            },
+        )
+
+    async def _append_center_error_fact(
+        self,
+        message: AgentMessage,
+        *,
+        topic: str,
+        payload: dict,
+    ) -> None:
+        session_id = _extract_session_id(message)
+        if self.observation_center is None or not session_id:
+            return
+        await self.observation_center.append_shared_fact(
+            session_id=session_id,
+            run_id=message.run_id,
+            sender_id=AGENT_CENTER_SENDER_ID,
+            target_agent_id=message.target_id,
+            target_profile_id=_extract_target_profile(message),
+            topic=topic,
+            fact_type="event_handoff",
+            payload_json=payload,
+            metadata_json={"source_message_id": message.id},
+            visibility="internal",
+            level="error",
         )
 
 
@@ -453,6 +459,28 @@ def _extract_target_profile(message: AgentMessage) -> Optional[str]:
     if isinstance(metadata, dict) and metadata.get("target_profile"):
         return str(metadata.get("target_profile"))
     return None
+
+
+def _fact_type_for_message(message: AgentMessage) -> str:
+    if message.message_type == "event":
+        return "event_handoff"
+    if message.rpc_phase == "response":
+        return "rpc_response"
+    return "rpc_request"
+
+
+def _metadata_for_shared_fact(message: AgentMessage) -> dict:
+    metadata = dict(message.metadata or {})
+    metadata.update(
+        {
+            "message_type": message.message_type,
+            "object_type": message.object_type,
+            "rpc_phase": message.rpc_phase,
+            "correlation_id": message.correlation_id,
+            "ok": message.ok,
+        }
+    )
+    return metadata
 
 
 if TYPE_CHECKING:

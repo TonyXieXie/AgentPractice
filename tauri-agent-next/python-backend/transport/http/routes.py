@@ -10,10 +10,11 @@ from models import (
     CreateRunRequest,
     CreateRunResponse,
     HealthResponse,
-    ListRunEventsResponse,
-    RunSnapshotResponse,
+    SessionPrivateFactsResponse,
+    SessionSharedFactsResponse,
     StopRunResponse,
 )
+from observation.facts import ObservationScope
 from runtime_paths import ensure_runtime_dirs
 from run_manager import SessionBusyError, SessionNotFoundError
 
@@ -69,49 +70,60 @@ async def stop_run(request: Request, run_id: str) -> StopRunResponse:
     return response
 
 
-@router.get("/runs/{run_id}/snapshot", response_model=RunSnapshotResponse)
-async def get_run_snapshot(request: Request, run_id: str) -> RunSnapshotResponse:
-    services = request.app.state.services
-    snapshot = await services.observation_center.get_snapshot(run_id)
-    if snapshot is None:
-        raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
-    projections = await services.observation_center.get_projection_state(run_id)
-    return RunSnapshotResponse(
-        run_id=run_id,
-        snapshot=snapshot,
-        run_projection=projections.run_projection,
-        agent_projections=projections.agent_projections,
-        tool_call_projections=projections.tool_call_projections,
-    )
-
-
-@router.get("/runs/{run_id}/events", response_model=ListRunEventsResponse)
-async def list_run_events(
+@router.get(
+    "/sessions/{session_id}/facts/shared",
+    response_model=SessionSharedFactsResponse,
+)
+async def list_session_shared_facts(
     request: Request,
-    run_id: str,
+    session_id: str,
     after_seq: int = Query(default=0, ge=0),
-    limit: int = Query(default=100, ge=1, le=500),
-    agent_id: str | None = None,
-    visibility: str | None = None,
-    level: str | None = None,
-) -> ListRunEventsResponse:
+    limit: int = Query(default=100, ge=1, le=1000),
+    run_id: str | None = None,
+) -> SessionSharedFactsResponse:
     services = request.app.state.services
-    snapshot = await services.observation_center.get_snapshot(run_id)
-    if snapshot is None:
-        raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
-    events = await services.observation_center.list_events(
-        run_id,
+    scope = ObservationScope(session_id=session_id, run_id=run_id)
+    shared_facts = await services.fact_query_service.list_shared(
+        scope,
         after_seq=after_seq,
         limit=limit,
-        agent_id=agent_id,
-        visibility=visibility,
-        level=level,
     )
-    next_after_seq = after_seq
-    if events:
-        next_after_seq = int(events[-1].seq or after_seq)
-    return ListRunEventsResponse(
-        run_id=run_id,
-        events=events,
+    next_after_seq = shared_facts[-1].fact_seq if shared_facts else after_seq
+    return SessionSharedFactsResponse(
+        session_id=session_id,
+        shared_facts=shared_facts,
         next_after_seq=next_after_seq,
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/facts/private",
+    response_model=SessionPrivateFactsResponse,
+)
+async def list_session_private_facts(
+    request: Request,
+    session_id: str,
+    agent_id: str = Query(..., min_length=1),
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=1000),
+    run_id: str | None = None,
+) -> SessionPrivateFactsResponse:
+    services = request.app.state.services
+    scope = ObservationScope(
+        session_id=session_id,
+        run_id=run_id,
+        agent_id=agent_id,
+        include_private=True,
+    )
+    private_events = await services.fact_query_service.list_private(
+        scope,
+        after_id=after_id,
+        limit=limit,
+    )
+    next_after_id = private_events[-1].private_event_id if private_events else after_id
+    return SessionPrivateFactsResponse(
+        session_id=session_id,
+        agent_id=agent_id,
+        private_events=private_events,
+        next_after_id=next_after_id,
     )

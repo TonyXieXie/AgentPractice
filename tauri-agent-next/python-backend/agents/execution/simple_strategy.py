@@ -13,6 +13,8 @@ from agents.execution.message_utils import (
     render_current_message,
     stream_enabled,
 )
+from agents.execution.prompt_assembler import PromptAssembler
+from agents.execution.prompt_ir import PromptIR
 from agents.execution.strategy import AgentStrategy, ExecutionContext, ExecutionStep
 from agents.execution.tool_executor import ToolExecutor
 
@@ -66,19 +68,45 @@ class SimpleStrategy(AgentStrategy):
         if memory is None:
             raise RuntimeError("AgentMemory is required for llm execution")
 
-        build_view_kwargs = {
-            "agent_id": agent_id,
-            "llm_client": llm_client,
-            "default_system_prompt": (
+        assembler = PromptAssembler()
+        history_messages = await memory.build_history_for_agent(
+            message,
+            agent_id=agent_id,
+            llm_client=llm_client,
+            max_history_events=self.max_history,
+        )
+        system_messages = assembler.build_system_messages(
+            message,
+            default_system_prompt=(
                 execution_context.system_prompt
                 if execution_context is not None and execution_context.system_prompt
                 else self.system_prompt
             ),
-            "max_history_events": self.max_history,
-        }
-        if execution_context is not None:
-            build_view_kwargs["tool_policy_text"] = execution_context.tool_policy_text
-        prompt_ir = await memory.build_view(message, **build_view_kwargs)
+            tool_policy_text=(
+                execution_context.tool_policy_text
+                if execution_context is not None
+                else ""
+            ),
+            llm_client=llm_client,
+        )
+        current_input = assembler.build_current_input(message)
+        prompt_ir = PromptIR(
+            messages=assembler.assemble(
+                system_messages=system_messages,
+                history_messages=history_messages,
+                current_input=current_input,
+            ),
+            budget={},
+            trace={"cfg": memory._resolve_cfg(None), "actions": []},
+        )
+        prompt_ir = await memory.ensure_budget_for_view(
+            prompt_ir,
+            llm_client=llm_client,
+            session_id=get_session_id(message),
+            agent_id=agent_id,
+            run_id=message.run_id,
+            phase="build_view",
+        )
         llm_overrides = build_llm_request_overrides(message)
         stream = stream_enabled(message)
         if not stream:
