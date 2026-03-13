@@ -241,3 +241,7 @@ class AgentMemoryTests(unittest.IsolatedAsyncioTestCase):
         trace = await self.prompt_trace_repo.get_latest(self.session_id, agent_id=agent_id)
         self.assertIsNotNone(trace)
         self.assertEqual(trace.actions.get("phase"), "build_view")
+        assert trace is not None
+        self.assertEqual(trace.request_messages[0]["role"], "system")
+        self.assertEqual(trace.request_messages[1]["role"], "user")
+        self.assertEqual(trace.request_messages[-1]["role"], "assistant")

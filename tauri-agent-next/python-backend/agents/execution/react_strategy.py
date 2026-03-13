@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
+from app_config import get_app_config
 from agents.execution.message_utils import (
     build_llm_request_overrides,
     get_execution_metadata,
     get_session_id,
+    get_tool_name,
     get_work_path,
 )
 from agents.execution.providers import (
@@ -23,6 +25,22 @@ from agents.execution.strategy import AgentStrategy, ExecutionContext, Execution
 from agents.execution.tool_executor import ToolExecutor
 
 
+_DEFAULT_REACT_MAX_ITERATIONS = 100
+
+
+def _resolve_max_iterations(max_iterations: Optional[int]) -> int:
+    candidate = max_iterations
+    if candidate is None:
+        agent_cfg = get_app_config().get("agent", {})
+        if isinstance(agent_cfg, dict):
+            candidate = agent_cfg.get("react_max_iterations")
+    try:
+        value = int(candidate if candidate is not None else _DEFAULT_REACT_MAX_ITERATIONS)
+    except (TypeError, ValueError):
+        value = _DEFAULT_REACT_MAX_ITERATIONS
+    return max(1, value)
+
+
 class ReactStrategy(AgentStrategy):
     name = "react"
 
@@ -30,14 +48,14 @@ class ReactStrategy(AgentStrategy):
         self,
         *,
         system_prompt: Optional[str] = None,
-        max_iterations: int = 4,
+        max_iterations: Optional[int] = None,
         providers: Optional[List[ProviderAdapter]] = None,
     ) -> None:
         self.system_prompt = system_prompt or (
             "You are a reasoning and acting assistant. "
             "Use tools when they are necessary, otherwise answer directly."
         )
-        self.max_iterations = max(1, max_iterations)
+        self.max_iterations = _resolve_max_iterations(max_iterations)
         self._fallback = SimpleStrategy()
         self._providers = list(
             providers
@@ -63,6 +81,17 @@ class ReactStrategy(AgentStrategy):
             if execution_context is not None and execution_context.tool_executor is not None
             else tool_executor
         )
+        if get_tool_name(message):
+            async for step in self._fallback.execute(
+                message,
+                agent_id=agent_id,
+                llm_client=llm_client,
+                tool_executor=resolved_tool_executor,
+                memory=memory,
+                execution_context=execution_context,
+            ):
+                yield step
+            return
         if llm_client is None:
             async for step in self._fallback.execute(
                 message,
@@ -205,6 +234,17 @@ class ReactStrategy(AgentStrategy):
                         },
                     )
                     if parse_error is not None:
+                        await resolved_tool_executor.record_failed_tool_invocation(
+                            agent_id=agent_id,
+                            run_id=message.run_id,
+                            message_id=message.id,
+                            session_id=get_session_id(message),
+                            metadata=get_execution_metadata(message),
+                            tool_name=tool_name,
+                            arguments=call.arguments,
+                            error=parse_error,
+                            tool_call_id=call_id,
+                        )
                         yield ExecutionStep(
                             "observation",
                             parse_error,

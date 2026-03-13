@@ -292,6 +292,7 @@ class AgentMemory:
                     prompt_budget=prompt_budget,
                     estimated_prompt_tokens=estimated,
                     rendered_message_count=len(prompt_ir.messages),
+                    request_messages=deepcopy(prompt_ir.messages),
                     actions=deepcopy(trace_context),
                 )
             except Exception:

@@ -2,6 +2,8 @@
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 set PYTHONUTF8=1
+set "TAURI_AGENT_NEXT_LOG_BACKEND_LOGIC=1"
+set "TAURI_AGENT_NEXT_LOG_FRONTEND_BACKEND=0"
 title tauri-agent-next Backend
 set "ROOT_DIR=%~dp0"
 set "BACKEND_DIR=%ROOT_DIR%python-backend"
@@ -19,6 +21,8 @@ echo ========================================
 echo.
 echo Runtime data dir: %TAURI_AGENT_NEXT_DATA_DIR%
 echo Starting FastAPI server on port %BACKEND_PORT%...
+echo Backend logic log: enabled
+echo Frontend-backend log: disabled
 echo Press Ctrl+C to stop the server
 echo.
 python -m uvicorn main:app --reload --host 127.0.0.1 --port %BACKEND_PORT%

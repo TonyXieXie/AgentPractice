@@ -49,7 +49,7 @@ test("creates a run from the task form and hydrates the run view", async ({ page
             fact_type: "message",
             payload_json: {
               content: taskPrompt,
-              strategy: "simple",
+              strategy: "react",
               controller_agent_id: controllerAgentId,
               user_agent_id: userAgentId,
               assistant_agent_id: assistantAgentId,
@@ -72,7 +72,7 @@ test("creates a run from the task form and hydrates the run view", async ({ page
             fact_type: "event",
             payload_json: {
               status: "running",
-              strategy: "simple",
+              strategy: "react",
               controller_agent_id: controllerAgentId,
               user_agent_id: userAgentId,
               assistant_agent_id: assistantAgentId,
@@ -102,7 +102,7 @@ test("creates a run from the task form and hydrates the run view", async ({ page
 
   expect(submittedPayload).toEqual({
     content: taskPrompt,
-    strategy: "simple",
+    strategy: "react",
     request_overrides: {},
   });
 });

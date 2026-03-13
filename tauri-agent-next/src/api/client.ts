@@ -2,6 +2,7 @@ import { buildApiError } from "./base";
 import type {
   CreateRunResponse,
   SessionPrivateFactsResponse,
+  SessionPromptTraceResponse,
   SessionSharedFactsResponse,
   StopRunResponse,
 } from "../types";
@@ -80,6 +81,21 @@ export function getSessionPrivateFacts(
       agent_id: agentId,
       after_id: afterId,
       limit,
+      run_id: runId,
+    })}`,
+  );
+}
+
+export function getLatestSessionPromptTrace(
+  baseUrl: string,
+  sessionId: string,
+  agentId: string,
+  runId?: string | null,
+): Promise<SessionPromptTraceResponse> {
+  return fetchJson<SessionPromptTraceResponse>(
+    baseUrl,
+    `/sessions/${encodeURIComponent(sessionId)}/prompt-trace/latest${buildQuery({
+      agent_id: agentId,
       run_id: runId,
     })}`,
   );

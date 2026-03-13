@@ -9,6 +9,7 @@ from agents.base import AgentBase
 from agents.execution import ExecutionEngine, TaskManager, ToolExecutor
 from agents.instance import AgentInstance
 from agents.user_proxy import UserProxyAgent
+from app_logging import log_debug, log_info
 from repositories.agent_instance_repository import AgentInstanceRecord, AgentInstanceRepository
 from repositories.agent_profile_repository import AgentProfileRepository
 
@@ -63,6 +64,11 @@ class AgentRosterManager:
             session_agents = self._session_agents.setdefault(session_id, {})
             existing = session_agents.get(record.id)
             if isinstance(existing, UserProxyAgent):
+                log_debug(
+                    "roster.user_proxy.reused",
+                    session_id=session_id,
+                    agent_id=record.id,
+                )
                 return existing
 
         agent = self._instantiate_agent(record, run_id=None)
@@ -73,9 +79,15 @@ class AgentRosterManager:
             session_agents = self._session_agents.setdefault(session_id, {})
             existing = session_agents.get(record.id)
             if isinstance(existing, UserProxyAgent):
+                log_debug(
+                    "roster.user_proxy.reused_after_lock",
+                    session_id=session_id,
+                    agent_id=record.id,
+                )
                 return existing
             session_agents[record.id] = agent
         await self.agent_center.register(agent)
+        log_info("roster.user_proxy.ready", session_id=session_id, agent_id=record.id)
         return agent
 
     async def ensure_primary_entry_assistant(self, session_id: str) -> AgentInstanceRecord:
@@ -103,6 +115,12 @@ class AgentRosterManager:
 
         for agent in runtime_agents.values():
             await self.agent_center.register(agent)
+        log_info(
+            "roster.run_hydrated",
+            session_id=session_id,
+            run_id=run_id,
+            assistant_count=len(runtime_agents),
+        )
         return runtime_agents
 
     async def resolve_target_instance(self, message) -> AgentBase:
@@ -157,6 +175,13 @@ class AgentRosterManager:
         )
         agent = self._instantiate_agent(record, run_id=run_id)
         await self.attach_runtime_agent(run_id, agent)
+        log_info(
+            "roster.profile_instance.created",
+            session_id=session_id,
+            run_id=run_id,
+            profile_id=profile_id,
+            agent_id=agent.agent_id,
+        )
         return agent
 
     async def attach_runtime_agent(self, run_id: str, agent: AgentBase) -> None:
@@ -166,6 +191,7 @@ class AgentRosterManager:
                 raise ValueError(f"Active run roster not found: {run_id}")
             roster.runtime_agents[agent.agent_id] = agent
         await self.agent_center.register(agent)
+        log_debug("roster.runtime_agent.attached", run_id=run_id, agent_id=agent.agent_id)
 
     async def list_broadcast_targets(self, message) -> list[AgentBase]:
         sender_id = _normalize_text(getattr(message, "sender_id", None))
@@ -198,6 +224,12 @@ class AgentRosterManager:
             return
         for agent_id in list(roster.runtime_agents.keys()):
             await self.agent_center.unregister(agent_id)
+        log_info(
+            "roster.run_torn_down",
+            run_id=run_id,
+            session_id=roster.session_id,
+            agent_count=len(roster.runtime_agents),
+        )
 
     async def shutdown(self) -> None:
         async with self._lock:

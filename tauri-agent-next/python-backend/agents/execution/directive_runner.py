@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from agents.execution.directives import ExecutionDirective
+from agents.execution.directives import ExecutionDirective, TERMINAL_DIRECTIVE_KINDS
+from agents.execution.handoff_support import resolve_handoff_target
 
 if TYPE_CHECKING:
     from agents.base import AgentBase
     from agents.message import AgentMessage
+    from repositories.agent_profile_repository import AgentProfileRepository
     from repositories.shared_fact_repository import SharedFactRepository
     from run_manager import RunManager
 
@@ -17,10 +19,12 @@ class DirectiveRunner:
         agent: "AgentBase",
         *,
         run_manager: Optional["RunManager"] = None,
+        profile_repository: Optional["AgentProfileRepository"] = None,
         shared_fact_repository: Optional["SharedFactRepository"] = None,
     ) -> None:
         self.agent = agent
         self.run_manager = run_manager
+        self.profile_repository = profile_repository
         self.shared_fact_repository = shared_fact_repository
 
     async def execute(
@@ -29,6 +33,7 @@ class DirectiveRunner:
         directive: ExecutionDirective,
     ) -> Any:
         handlers = {
+            "handoff": self._handoff,
             "send_rpc_request": self._send_rpc_request,
             "send_rpc_response": self._send_rpc_response,
             "send_event": self._send_event,
@@ -114,6 +119,50 @@ class DirectiveRunner:
             level=self._optional_text(args.get("level")) or "info",
         )
 
+    async def _handoff(
+        self,
+        source_message: "AgentMessage",
+        args: Dict[str, Any],
+    ) -> Any:
+        resolved = await resolve_handoff_target(
+            self.profile_repository,
+            target_profile=str(args.get("target_profile") or ""),
+            current_profile_id=self._current_profile_id(),
+        )
+        instruction = self._required_text(args.get("instruction"), "handoff requires instruction")
+        reason = self._optional_text(args.get("reason"))
+        context = self._as_dict(args.get("context"))
+
+        payload: Dict[str, Any] = {
+            "content": instruction,
+            "handoff_from_agent_id": self.agent.agent_id,
+            "handoff_to_profile": resolved.profile.id,
+        }
+        current_profile_id = self._current_profile_id()
+        if current_profile_id is not None:
+            payload["handoff_from_profile"] = current_profile_id
+        if reason is not None:
+            payload["handoff_reason"] = reason
+        if context:
+            payload["handoff_context"] = context
+            request_overrides = context.get("request_overrides")
+            if isinstance(request_overrides, dict):
+                payload["request_overrides"] = await self._normalize_handoff_request_overrides(
+                    source_message,
+                    request_overrides,
+                    fallback_instruction=instruction,
+                )
+
+        return await self.agent.send_event(
+            resolved.topic,
+            payload,
+            target_profile=resolved.profile.id,
+            run_id=source_message.run_id,
+            session_id=source_message.session_id,
+            visibility=self._optional_text(args.get("visibility")) or "public",
+            level=self._optional_text(args.get("level")) or "info",
+        )
+
     async def _broadcast_event(
         self,
         source_message: "AgentMessage",
@@ -188,6 +237,71 @@ class DirectiveRunner:
         text = str(value or "").strip()
         return text or None
 
+    def _required_text(self, value: Any, error_text: str) -> str:
+        text = self._optional_text(value)
+        if text is None:
+            raise RuntimeError(error_text)
+        return text
+
+    async def _normalize_handoff_request_overrides(
+        self,
+        source_message: "AgentMessage",
+        request_overrides: Dict[str, Any],
+        *,
+        fallback_instruction: str,
+    ) -> Dict[str, Any]:
+        normalized = dict(request_overrides)
+        tool_name = self._optional_text(normalized.get("tool_name"))
+        if tool_name not in TERMINAL_DIRECTIVE_KINDS:
+            return normalized
+
+        controller_agent_id = await self._resolve_controller_agent_id(source_message.run_id)
+        if controller_agent_id is None:
+            raise RuntimeError("handoff terminal relay requires active controller agent")
+
+        relay_payload: Dict[str, Any] = {
+            "content": self._relay_content_for_terminal_override(
+                tool_name,
+                normalized,
+                fallback_instruction=fallback_instruction,
+            ),
+            "request_overrides": normalized,
+        }
+        return {
+            "tool_name": "send_event",
+            "tool_arguments": {
+                "topic": "run.controller.input",
+                "target_agent_id": controller_agent_id,
+                "payload": relay_payload,
+            },
+        }
+
+    async def _resolve_controller_agent_id(self, run_id: Optional[str]) -> Optional[str]:
+        normalized_run_id = self._optional_text(run_id)
+        if normalized_run_id is None or self.run_manager is None:
+            return None
+        active_run = await self.run_manager.get_active_run(normalized_run_id)
+        if active_run is None:
+            return None
+        return self._optional_text(active_run.controller_agent_id)
+
+    def _relay_content_for_terminal_override(
+        self,
+        tool_name: str,
+        request_overrides: Dict[str, Any],
+        *,
+        fallback_instruction: str,
+    ) -> str:
+        arguments = request_overrides.get("tool_arguments")
+        args = dict(arguments) if isinstance(arguments, dict) else {}
+        if tool_name == "finish_run":
+            return self._optional_text(args.get("reply")) or fallback_instruction
+        if tool_name == "fail_run":
+            return self._optional_text(args.get("error")) or fallback_instruction
+        if tool_name == "stop_run":
+            return self._optional_text(args.get("reason")) or fallback_instruction
+        return fallback_instruction
+
     def _optional_int(self, value: Any) -> Optional[int]:
         if value is None or value == "":
             return None
@@ -195,3 +309,7 @@ class DirectiveRunner:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _current_profile_id(self) -> Optional[str]:
+        value = getattr(getattr(self.agent, "instance", None), "profile_id", None)
+        return self._optional_text(value)

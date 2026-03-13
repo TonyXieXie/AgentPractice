@@ -383,19 +383,23 @@ class LLMClient:
                                     call["id"] = event.get("call_id")
                                 if event.get("name"):
                                     call["name"] = event.get("name")
-                                if event.get("arguments") is not None:
-                                    call["arguments"] = event.get("arguments")
                                 delta = str(event.get("delta", "") or "")
-                                if delta:
-                                    call["arguments"] = f"{call['arguments']}{delta}"
-                                yield {
+                                call["arguments"] = self._merge_streamed_tool_arguments(
+                                    current_arguments=call.get("arguments", ""),
+                                    arguments=event.get("arguments"),
+                                    delta=delta,
+                                )
+                                tool_event = {
                                     "type": "tool_call_delta",
                                     "index": output_index,
                                     "id": call.get("id"),
                                     "name": call.get("name", ""),
-                                    "arguments_delta": delta,
-                                    "arguments": call.get("arguments", ""),
                                 }
+                                if delta:
+                                    tool_event["arguments_delta"] = delta
+                                elif event.get("arguments") is not None:
+                                    tool_event["arguments"] = call.get("arguments", "")
+                                yield tool_event
                         yield {
                             "type": "done",
                             "content": full_text,
@@ -476,8 +480,34 @@ class LLMClient:
             "id": tool_call.get("id"),
             "name": function.get("name", ""),
             "arguments_delta": function.get("arguments", ""),
-            "arguments": function.get("arguments", ""),
         }
+
+    def _merge_streamed_tool_arguments(
+        self,
+        *,
+        current_arguments: Any,
+        arguments: Any,
+        delta: Any,
+    ) -> str:
+        current_text = self._coerce_text(current_arguments)
+        delta_text = self._coerce_text(delta)
+        if arguments is None:
+            if not delta_text:
+                return current_text
+            return f"{current_text}{delta_text}"
+
+        explicit_text = self._coerce_text(arguments)
+        if not explicit_text:
+            if not delta_text:
+                return ""
+            return f"{current_text}{delta_text}"
+        if not delta_text:
+            return explicit_text
+        if explicit_text == delta_text:
+            if current_text and not explicit_text.startswith(current_text):
+                return f"{current_text}{delta_text}"
+            return explicit_text
+        return explicit_text
 
     def _coerce_text(self, value: Any) -> str:
         if value is None:

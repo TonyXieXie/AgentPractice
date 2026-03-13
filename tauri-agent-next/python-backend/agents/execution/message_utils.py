@@ -49,14 +49,14 @@ def get_execution_metadata(message: AgentMessage) -> Dict[str, Any]:
     return metadata
 
 
-def get_strategy_name(message: AgentMessage, *, default: str = "simple") -> str:
+def get_strategy_name(message: AgentMessage, *, default: str = "react") -> str:
     payload = _payload(message)
     request_overrides = get_request_overrides(message)
     return str(
         payload.get("strategy")
         or request_overrides.get("strategy")
         or default
-        or "simple"
+        or "react"
     ).lower()
 
 
@@ -207,6 +207,9 @@ def render_payload_text(
     fallback_topic: Optional[str] = None,
 ) -> str:
     normalized_payload = deepcopy(payload) if isinstance(payload, dict) else {}
+    handoff_text = _render_handoff_payload_text(normalized_payload)
+    if handoff_text:
+        return handoff_text
     return (
         _coerce_text(normalized_payload.get("content"))
         or _coerce_text(normalized_payload.get("text"))
@@ -217,6 +220,25 @@ def render_payload_text(
         or _safe_json(normalized_payload)
         or str(fallback_topic or "").strip()
     ).strip()
+
+
+def _render_handoff_payload_text(payload: Dict[str, Any]) -> str:
+    if not (
+        payload.get("handoff_to_profile")
+        or payload.get("handoff_from_profile")
+        or payload.get("handoff_reason")
+        or payload.get("handoff_context")
+    ):
+        return ""
+    content = _coerce_text(payload.get("content")) or ""
+    lines = [content.strip()] if content.strip() else []
+    reason = _coerce_text(payload.get("handoff_reason")) or ""
+    if reason.strip():
+        lines.append(f"Handoff reason: {reason.strip()}")
+    context = payload.get("handoff_context")
+    if isinstance(context, dict) and context:
+        lines.append(f"Handoff context: {_safe_json(context)}")
+    return "\n".join(line for line in lines if line).strip()
 
 
 def render_speaker_line(speaker: str, body: str) -> str:

@@ -14,6 +14,8 @@ $backendDir = Join-Path $rootDir "python-backend"
 
 $Host.UI.RawUI.WindowTitle = "tauri-agent-next backend"
 $env:PYTHONUTF8 = "1"
+$env:TAURI_AGENT_NEXT_LOG_BACKEND_LOGIC = "1"
+$env:TAURI_AGENT_NEXT_LOG_FRONTEND_BACKEND = "0"
 $env:TAURI_AGENT_NEXT_DATA_DIR = $DataDir
 
 Set-Location $backendDir
@@ -24,6 +26,8 @@ Write-Host "========================================"
 Write-Host
 Write-Host ("Runtime data dir: {0}" -f $DataDir)
 Write-Host ("Starting FastAPI server on port {0}..." -f $Port)
+Write-Host "Backend logic log: enabled"
+Write-Host "Frontend-backend log: disabled"
 Write-Host "Press Ctrl+C to stop the server"
 Write-Host
 

@@ -15,6 +15,11 @@ from agents.execution import (
 )
 from agents.execution.message_utils import get_session_id, get_tool_name
 from agents.execution.directives import RESERVED_DIRECTIVE_TOOL_NAMES
+from agents.execution.handoff_support import (
+    render_handoff_catalog_text,
+    render_tool_availability_text,
+    resolve_handoff_target,
+)
 from agents.message import AgentMessage
 from agents.profile import AgentProfile
 from repositories.agent_profile_repository import AgentProfileRepository
@@ -25,10 +30,11 @@ RpcHandler = Callable[[AgentMessage], Awaitable[Dict[str, Any]] | Dict[str, Any]
 ASSISTANT_SYSTEM_PROMPT = (
     "You are an assistant agent in a message-driven multi-agent runtime.\n"
     "- Every time you are awakened, choose exactly one control tool.\n"
-    "- Your only allowed control tools are send_rpc_request, send_rpc_response, send_event, and broadcast_event.\n"
+    "- The only control tool you may call is handoff when available.\n"
+    "- Low-level RPC and event routing are handled by the backend.\n"
     "- You must not finish, fail, or stop the run directly.\n"
     "- Do not answer without selecting one of the allowed control tools.\n"
-    "- Prefer explicit target delivery over broadcast unless broadcast is required.\n"
+    "- Use handoff only when another assistant profile should take over task ownership.\n"
 )
 
 
@@ -59,6 +65,7 @@ class AssistantAgent(AgentBase):
         self.directive_runner = DirectiveRunner(
             self,
             run_manager=getattr(self.center, "run_manager", None),
+            profile_repository=self.profile_repository,
             shared_fact_repository=getattr(self.center, "shared_fact_repository", None),
         )
         if task_handler is not None:
@@ -77,9 +84,16 @@ class AssistantAgent(AgentBase):
         prompt_parts = [ASSISTANT_SYSTEM_PROMPT]
         if profile is not None and profile.system_prompt:
             prompt_parts.append(profile.system_prompt)
-        tool_hint = _render_tool_availability_text(filtered_tool_executor)
+        tool_hint = render_tool_availability_text(filtered_tool_executor)
         if tool_hint:
             prompt_parts.append(tool_hint)
+        if filtered_tool_executor.get_tool("handoff") is not None:
+            handoff_hint = await render_handoff_catalog_text(
+                self.profile_repository,
+                current_profile_id=profile.id if profile is not None else None,
+            )
+            if handoff_hint:
+                prompt_parts.append(handoff_hint)
         return ExecutionContext(
             resolved_profile=profile,
             system_prompt="\n\n".join(part for part in prompt_parts if part).strip(),
@@ -174,7 +188,34 @@ class AssistantAgent(AgentBase):
         if result.protocol_violation is not None:
             await self._handle_protocol_violation(message, result)
             return
+        if not result.ok:
+            await self._handle_execution_failure(message, result)
+            return
+        if result.directive is None:
+            return
         await self.directive_runner.execute(message, result.directive)
+
+    async def validate_execution_directive(
+        self,
+        message: AgentMessage,
+        directive,
+        execution_context: Optional[ExecutionContext] = None,
+    ) -> None:
+        if directive.kind != "handoff":
+            return
+        instruction = str(directive.args.get("instruction") or "").strip()
+        if not instruction:
+            raise RuntimeError("handoff requires instruction")
+        current_profile_id = None
+        if execution_context is not None and execution_context.resolved_profile is not None:
+            current_profile_id = execution_context.resolved_profile.id
+        elif self.instance.profile_id:
+            current_profile_id = str(self.instance.profile_id).strip() or None
+        await resolve_handoff_target(
+            self.profile_repository,
+            target_profile=str(directive.args.get("target_profile") or ""),
+            current_profile_id=current_profile_id,
+        )
 
     async def _handle_protocol_violation(self, message: AgentMessage, result) -> None:
         attempted_directive_kind = self._attempted_directive_kind(message, result)
@@ -226,6 +267,49 @@ class AssistantAgent(AgentBase):
             level="error",
         )
 
+    async def _handle_execution_failure(self, message: AgentMessage, result) -> None:
+        payload = {
+            "offending_agent_id": self.agent_id,
+            "source_message_id": message.id,
+            "source_message_type": message.message_type,
+            "source_rpc_phase": message.rpc_phase,
+            "source_topic": message.topic,
+            "reason": str(result.payload.get("error") or result.payload.get("reply") or "assistant execution failed"),
+        }
+        await self.observe(
+            "agent.error",
+            payload=payload,
+            run_id=message.run_id,
+            message_id=message.id,
+            visibility="internal",
+            level="error",
+            metadata={"session_id": message.session_id},
+        )
+        if message.message_type == "rpc" and message.rpc_phase == "request":
+            await self.reply_rpc(
+                message,
+                {
+                    "error": payload["reason"],
+                    "status": "execution_error",
+                },
+                ok=False,
+                level="error",
+                visibility="internal",
+            )
+            return
+        controller_agent_id = await self._resolve_controller_agent_id(message.run_id)
+        if not controller_agent_id:
+            return
+        await self.send_event(
+            "agent.execution_error",
+            payload,
+            target_agent_id=controller_agent_id,
+            run_id=message.run_id,
+            session_id=message.session_id,
+            visibility="internal",
+            level="error",
+        )
+
     async def _resolve_controller_agent_id(self, run_id: Optional[str]) -> Optional[str]:
         normalized_run_id = str(run_id or "").strip()
         if not normalized_run_id:
@@ -253,15 +337,4 @@ class AssistantAgent(AgentBase):
             or (result.final_step.content if result.final_step is not None else "")
             or ""
         )
-
-
-def _render_tool_availability_text(tool_executor: ToolExecutor) -> str:
-    tool_names = [tool.name for tool in tool_executor.list_tools() if str(tool.name or "").strip()]
-    if not tool_names:
-        return "No tools are available for this profile."
-    return (
-        "Available tools for this profile: "
-        + ", ".join(tool_names)
-        + ". Do not call tools outside this set."
-    )
 

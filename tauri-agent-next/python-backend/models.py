@@ -36,6 +36,17 @@ class HealthResponse(BaseModel):
     runtime_data_dir: str
 
 
+class LogConfigRequest(BaseModel):
+    backend_logic: Optional[bool] = None
+    frontend_backend: Optional[bool] = None
+
+
+class LogConfigResponse(BaseModel):
+    ok: bool = True
+    backend_logic: bool
+    frontend_backend: bool
+
+
 class CreateRunRequest(BaseModel):
     content: str
     strategy: Optional[str] = None
@@ -78,3 +89,25 @@ class SessionPrivateFactsResponse(BaseModel):
     agent_id: str
     private_events: List[PrivateExecutionEvent] = Field(default_factory=list)
     next_after_id: int = 0
+
+
+class PromptTraceSnapshot(BaseModel):
+    id: int
+    session_id: str
+    run_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    llm_model: Optional[str] = None
+    max_context_tokens: int
+    prompt_budget: int
+    estimated_prompt_tokens: int
+    rendered_message_count: int
+    request_messages: List[Dict[str, Any]] = Field(default_factory=list)
+    actions: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class SessionPromptTraceResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    agent_id: str
+    prompt_trace: Optional[PromptTraceSnapshot] = None

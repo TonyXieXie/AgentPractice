@@ -7,6 +7,7 @@ from pathlib import Path
 DATA_DIR_ENV = "TAURI_AGENT_NEXT_DATA_DIR"
 CONFIG_PATH_ENV = "TAURI_AGENT_NEXT_CONFIG_PATH"
 DB_PATH_ENV = "TAURI_AGENT_NEXT_DB_PATH"
+DEMO_DB_PATH_ENV = "TAURI_AGENT_NEXT_DEMO_DB_PATH"
 
 
 def get_project_root() -> Path:
@@ -52,3 +53,13 @@ def get_database_path(*, base_dir: Path | None = None) -> Path:
         return _normalize_data_file_path(Path(override).expanduser().resolve(), "agent_next.db")
     resolved_base = (base_dir or get_runtime_data_dir()).expanduser().resolve()
     return resolved_base / "agent_next.db"
+
+
+def get_demo_database_path() -> Path:
+    override = os.getenv(DEMO_DB_PATH_ENV)
+    if override:
+        return _normalize_data_file_path(
+            Path(override).expanduser().resolve(),
+            "chat_app.db",
+        )
+    return get_project_root().parent / "tauri-agent-demo" / ".tauri-agent-data" / "chat_app.db"

@@ -2,6 +2,13 @@ from __future__ import annotations
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app_logging import (
+    LOG_CATEGORY_FRONTEND_BACKEND,
+    log_debug,
+    log_error,
+    log_info,
+    log_warning,
+)
 from transport.ws.ws_types import (
     WsAckFrame,
     WsErrorFrame,
@@ -23,6 +30,11 @@ async def websocket_gateway(websocket: WebSocket) -> None:
     services = websocket.app.state.services
     manager = services.ws_session_manager
     session = await manager.register(websocket)
+    log_info(
+        "ws.connected",
+        category=LOG_CATEGORY_FRONTEND_BACKEND,
+        ws_session_id=session.ws_session_id,
+    )
     await websocket.send_json(
         WsAckFrame(
             ws_session_id=session.ws_session_id,
@@ -35,6 +47,11 @@ async def websocket_gateway(websocket: WebSocket) -> None:
             kind = str(raw_message.get("kind") or "").strip()
             if kind == "heartbeat":
                 WsHeartbeatMessage.model_validate(raw_message)
+                log_debug(
+                    "ws.heartbeat",
+                    category=LOG_CATEGORY_FRONTEND_BACKEND,
+                    ws_session_id=session.ws_session_id,
+                )
                 await websocket.send_json(
                     WsHeartbeatFrame(
                         ws_session_id=session.ws_session_id,
@@ -43,6 +60,15 @@ async def websocket_gateway(websocket: WebSocket) -> None:
                 continue
             if kind == "set_scope":
                 message = WsSetScopeMessage.model_validate(raw_message)
+                log_info(
+                    "ws.set_scope",
+                    category=LOG_CATEGORY_FRONTEND_BACKEND,
+                    ws_session_id=session.ws_session_id,
+                    target_session_id=message.target_session_id,
+                    selected_run_id=message.selected_run_id,
+                    selected_agent_id=message.selected_agent_id,
+                    include_private=message.include_private,
+                )
                 await manager.set_scope(
                     session,
                     viewer_id=message.viewer_id,
@@ -66,6 +92,13 @@ async def websocket_gateway(websocket: WebSocket) -> None:
                 continue
             if kind == "request_bootstrap":
                 message = WsRequestBootstrapMessage.model_validate(raw_message)
+                log_info(
+                    "ws.request_bootstrap",
+                    category=LOG_CATEGORY_FRONTEND_BACKEND,
+                    ws_session_id=session.ws_session_id,
+                    shared_limit=message.shared_limit,
+                    private_limit=message.private_limit,
+                )
                 shared_after_seq, private_after_id = await manager.request_bootstrap(
                     session,
                     shared_limit=message.shared_limit,
@@ -84,6 +117,13 @@ async def websocket_gateway(websocket: WebSocket) -> None:
                 continue
             if kind == "resume_shared":
                 message = WsResumeSharedMessage.model_validate(raw_message)
+                log_debug(
+                    "ws.resume_shared",
+                    category=LOG_CATEGORY_FRONTEND_BACKEND,
+                    ws_session_id=session.ws_session_id,
+                    after_seq=message.after_seq,
+                    limit=message.limit,
+                )
                 replayed = await manager.resume_shared(
                     session,
                     after_seq=message.after_seq,
@@ -99,6 +139,13 @@ async def websocket_gateway(websocket: WebSocket) -> None:
                 continue
             if kind == "resume_private":
                 message = WsResumePrivateMessage.model_validate(raw_message)
+                log_debug(
+                    "ws.resume_private",
+                    category=LOG_CATEGORY_FRONTEND_BACKEND,
+                    ws_session_id=session.ws_session_id,
+                    after_id=message.after_id,
+                    limit=message.limit,
+                )
                 replayed = await manager.resume_private(
                     session,
                     after_id=message.after_id,
@@ -112,6 +159,12 @@ async def websocket_gateway(websocket: WebSocket) -> None:
                     ).model_dump(mode="json")
                 )
                 continue
+            log_warning(
+                "ws.unsupported_message",
+                category=LOG_CATEGORY_FRONTEND_BACKEND,
+                ws_session_id=session.ws_session_id,
+                kind=kind or "(empty)",
+            )
             await websocket.send_json(
                 WsErrorFrame(
                     ws_session_id=session.ws_session_id,
@@ -119,8 +172,19 @@ async def websocket_gateway(websocket: WebSocket) -> None:
                 ).model_dump(mode="json")
             )
     except WebSocketDisconnect:
+        log_info(
+            "ws.disconnected",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            ws_session_id=session.ws_session_id,
+        )
         await manager.unregister(session)
     except Exception as exc:
+        log_error(
+            "ws.error",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            ws_session_id=session.ws_session_id,
+            error=str(exc),
+        )
         await websocket.send_json(
             WsErrorFrame(
                 ws_session_id=session.ws_session_id,

@@ -69,6 +69,7 @@ class AppConfigTests(unittest.TestCase):
         config = get_default_app_config()
         profiles = config["agent"]["profiles"]
 
+        self.assertEqual(config["agent"]["react_max_iterations"], 100)
         self.assertIn("planner", profiles)
         self.assertIn("coder", profiles)
         self.assertEqual(profiles["planner"]["agent_type"], "assistant")

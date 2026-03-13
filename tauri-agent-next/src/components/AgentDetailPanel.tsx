@@ -1,5 +1,6 @@
 import { Activity, Bot, ChevronLeft, TerminalSquare, type LucideIcon } from "lucide-react";
 import { useEffect, useRef } from "react";
+import type { PromptTraceSnapshot } from "../types";
 import type { AgentTaskGroupView, AgentStepView, RunActorView } from "../workbench";
 import { formatTime, statusTone, stringifyJson } from "../workbench";
 import { MetricTile } from "./WorkbenchPrimitives";
@@ -14,9 +15,20 @@ function iconForStepKind(kind: AgentStepView["kind"]): LucideIcon {
   return Activity;
 }
 
+function renderPromptMessageContent(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (content === null || content === undefined) {
+    return "";
+  }
+  return stringifyJson(content);
+}
+
 export function AgentDetailPanel({
   actor,
   groups,
+  promptTrace,
   selectedStepId,
   selectedStep,
   onBack,
@@ -25,6 +37,7 @@ export function AgentDetailPanel({
 }: {
   actor: RunActorView;
   groups: readonly AgentTaskGroupView[];
+  promptTrace: PromptTraceSnapshot | null;
   selectedStepId: string | null;
   selectedStep: AgentStepView | null;
   onBack: () => void;
@@ -126,6 +139,42 @@ export function AgentDetailPanel({
             <div className="empty-box">当前 Agent 暂无执行步骤。</div>
           )}
         </div>
+      </section>
+
+      <section className="detail-section">
+        <div className="section-head">
+          <h3>LLM Request</h3>
+          <span>{promptTrace ? formatTime(promptTrace.created_at) : "none"}</span>
+        </div>
+        {promptTrace ? (
+          <div className="llm-request-stack">
+            <div className="metric-grid">
+              <MetricTile label="model" value={promptTrace.llm_model || "-"} />
+              <MetricTile label="messages" value={String(promptTrace.rendered_message_count)} />
+              <MetricTile label="est_tokens" value={String(promptTrace.estimated_prompt_tokens)} />
+              <MetricTile label="budget" value={String(promptTrace.prompt_budget)} />
+            </div>
+            <div className="llm-request-list">
+              {promptTrace.request_messages.map((message, index) => {
+                const role = typeof message.role === "string" ? message.role : "unknown";
+                const content = renderPromptMessageContent(message.content);
+                return (
+                  <article key={`${promptTrace.id}-${index}`} className="llm-request-message">
+                    <div className="llm-request-head">
+                      <span className={`llm-request-role is-${role}`}>{role}</span>
+                      <span className="step-meta">message {index + 1}</span>
+                    </div>
+                    <pre className="llm-request-content">
+                      {content || stringifyJson(message)}
+                    </pre>
+                  </article>
+                );
+              })}
+            </div>
+          </div>
+        ) : (
+          <div className="empty-box">当前 Agent 暂无已记录的 LLM 请求。</div>
+        )}
       </section>
 
       <section className="detail-section">

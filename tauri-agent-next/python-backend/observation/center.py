@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from app_logging import log_debug
 from observation.facts import ObservationScope, PrivateExecutionEvent, SharedFact
 from observation.query_service import FactQueryService
 from repositories.agent_private_event_repository import AgentPrivateEventRepository
@@ -44,6 +45,16 @@ class ObservationCenter:
         visibility: str = "public",
         level: str = "info",
     ) -> SharedFact:
+        log_debug(
+            "observation.shared_fact.append",
+            session_id=session_id,
+            run_id=run_id,
+            sender_id=sender_id,
+            target_agent_id=target_agent_id,
+            topic=topic,
+            fact_type=fact_type,
+            level=level,
+        )
         fact = await self.shared_fact_repository.append(
             session_id=session_id,
             run_id=run_id,
@@ -76,6 +87,14 @@ class ObservationCenter:
         trigger_fact_id: Optional[str] = None,
         parent_private_event_id: Optional[int] = None,
     ) -> PrivateExecutionEvent:
+        log_debug(
+            "observation.private_event.append",
+            session_id=session_id,
+            run_id=run_id,
+            owner_agent_id=owner_agent_id,
+            task_id=task_id,
+            kind=kind,
+        )
         event = await self.agent_private_event_repository.append(
             session_id=session_id,
             owner_agent_id=owner_agent_id,

@@ -43,6 +43,7 @@ class ToolExecutor:
         self._tools: List[Tool] = list(tools or [])
         self._allowed_builtin_tool_names = _normalize_tool_names(allowed_builtin_tool_names)
         self._allowed_tool_names = _normalize_tool_names(allowed_tool_names)
+        self._all_builtin_tools: List[Tool] = build_control_tools()
         self._builtin_tools: List[Tool] = build_control_tools(
             allowed_directive_kinds=self._allowed_builtin_tool_names,
         )
@@ -87,9 +88,21 @@ class ToolExecutor:
         return tools
 
     def get_tool(self, tool_name: str) -> Optional[Tool]:
+        return self._resolve_tool(tool_name)
+
+    def _resolve_tool(
+        self,
+        tool_name: str,
+        *,
+        allow_hidden_builtin_tools: bool = False,
+    ) -> Optional[Tool]:
         for tool in self.list_tools():
             if tool.name == tool_name:
                 return tool
+        if allow_hidden_builtin_tools and str(tool_name or "").strip() in RESERVED_DIRECTIVE_TOOL_NAMES:
+            for tool in self._all_builtin_tools:
+                if tool.name == tool_name:
+                    return tool
         return None
 
     def _is_tool_allowed(self, tool_name: str) -> bool:
@@ -109,9 +122,13 @@ class ToolExecutor:
         tool_name: str,
         arguments: Dict[str, Any],
         tool_call_id: Optional[str] = None,
+        allow_hidden_builtin_tools: bool = False,
     ) -> ToolExecutionResult:
         resolved_call_id = tool_call_id or uuid4().hex
-        tool = self.get_tool(tool_name)
+        tool = self._resolve_tool(
+            tool_name,
+            allow_hidden_builtin_tools=allow_hidden_builtin_tools,
+        )
         if tool is None:
             await self._record_tool_call(
                 session_id=session_id,
@@ -269,6 +286,49 @@ class ToolExecutor:
         if isinstance(output, str):
             return output
         return str(output)
+
+    async def record_failed_tool_invocation(
+        self,
+        *,
+        agent_id: str,
+        run_id: Optional[str],
+        message_id: Optional[str],
+        session_id: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        tool_name: str,
+        arguments: Dict[str, Any] | Any,
+        error: str,
+        tool_call_id: Optional[str] = None,
+    ) -> ToolExecutionResult:
+        resolved_call_id = tool_call_id or uuid4().hex
+        await self._record_tool_call(
+            session_id=session_id,
+            run_id=run_id,
+            agent_id=agent_id,
+            message_id=message_id,
+            tool_call_id=resolved_call_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            metadata=metadata,
+        )
+        await self._record_tool_result(
+            session_id=session_id,
+            run_id=run_id,
+            agent_id=agent_id,
+            message_id=message_id,
+            tool_call_id=resolved_call_id,
+            tool_name=tool_name,
+            ok=False,
+            output=None,
+            error=error,
+            metadata=metadata,
+        )
+        return ToolExecutionResult(
+            tool_call_id=resolved_call_id,
+            tool_name=tool_name,
+            ok=False,
+            error=error,
+        )
 
     async def _record_tool_call(
         self,

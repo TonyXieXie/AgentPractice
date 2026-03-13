@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from observation.facts import ObservationScope, PrivateExecutionEvent, SharedFact
 from repositories.agent_private_event_repository import AgentPrivateEventRepository
+from repositories.prompt_trace_repository import PromptTraceRecord, PromptTraceRepository
 from repositories.shared_fact_repository import SharedFactRepository
 
 
@@ -11,9 +12,11 @@ class FactQueryService:
         *,
         shared_fact_repository: SharedFactRepository,
         agent_private_event_repository: AgentPrivateEventRepository,
+        prompt_trace_repository: PromptTraceRepository | None = None,
     ) -> None:
         self.shared_fact_repository = shared_fact_repository
         self.agent_private_event_repository = agent_private_event_repository
+        self.prompt_trace_repository = prompt_trace_repository
 
     async def list_shared(
         self,
@@ -53,3 +56,15 @@ class FactQueryService:
         payload = fact.payload
         status = str(payload.get("status") or "").strip()
         return status or None
+
+    async def get_latest_prompt_trace(
+        self,
+        scope: ObservationScope,
+    ) -> PromptTraceRecord | None:
+        if self.prompt_trace_repository is None or not scope.agent_id:
+            return None
+        return await self.prompt_trace_repository.get_latest(
+            scope.session_id,
+            agent_id=scope.agent_id,
+            run_id=scope.run_id,
+        )

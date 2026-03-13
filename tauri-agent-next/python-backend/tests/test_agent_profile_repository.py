@@ -123,11 +123,11 @@ class AgentProfileRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coder.agent_type, "assistant")
         self.assertEqual(
             planner.allowed_tool_names,
-            ["send_event", "send_rpc_request", "send_rpc_response"],
+            ["handoff"],
         )
         self.assertEqual(
             coder.allowed_tool_names,
-            ["send_event", "send_rpc_request", "send_rpc_response"],
+            ["handoff"],
         )
         self.assertEqual(planner.executable_event_topics, ["task.plan"])
         self.assertEqual(coder.executable_event_topics, ["task.code"])

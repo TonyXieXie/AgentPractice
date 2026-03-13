@@ -5,6 +5,12 @@ from typing import Optional
 
 from fastapi import WebSocket
 
+from app_logging import (
+    LOG_CATEGORY_FRONTEND_BACKEND,
+    log_debug,
+    log_info,
+    log_warning,
+)
 from observation.facts import ObservationScope, PrivateExecutionEvent, SharedFact
 from observation.query_service import FactQueryService
 from transport.ws.session import WsSession
@@ -27,6 +33,11 @@ class WsSessionManager:
         session = WsSession(websocket=websocket)
         async with self._lock:
             self._sessions[session.ws_session_id] = session
+        log_info(
+            "ws_session.registered",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            ws_session_id=session.ws_session_id,
+        )
         return session
 
     async def unregister(self, session: Optional[WsSession]) -> None:
@@ -34,6 +45,11 @@ class WsSessionManager:
             return
         async with self._lock:
             self._sessions.pop(session.ws_session_id, None)
+        log_info(
+            "ws_session.unregistered",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            ws_session_id=session.ws_session_id,
+        )
 
     async def set_scope(
         self,
@@ -56,6 +72,15 @@ class WsSessionManager:
             existing.include_private = include_private
             existing.shared_after_seq = 0
             existing.private_after_id = 0
+        log_info(
+            "ws_session.scope_set",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            ws_session_id=session.ws_session_id,
+            target_session_id=target_session_id,
+            selected_run_id=selected_run_id,
+            selected_agent_id=selected_agent_id,
+            include_private=include_private,
+        )
 
     async def request_bootstrap(
         self,
@@ -103,6 +128,15 @@ class WsSessionManager:
                 private_after_id=session.private_after_id,
             ).model_dump(mode="json"),
         )
+        log_info(
+            "ws_session.bootstrap_sent",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            ws_session_id=session.ws_session_id,
+            shared_count=len(shared_facts),
+            private_count=len(private_events),
+            shared_after_seq=session.shared_after_seq,
+            private_after_id=session.private_after_id,
+        )
         return session.shared_after_seq, session.private_after_id
 
     async def resume_shared(
@@ -125,6 +159,13 @@ class WsSessionManager:
                 session.shared_after_seq,
                 shared_facts[-1].fact_seq,
             )
+        log_debug(
+            "ws_session.resume_shared.completed",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            ws_session_id=session.ws_session_id,
+            count=len(shared_facts),
+            shared_after_seq=session.shared_after_seq,
+        )
         return len(shared_facts)
 
     async def resume_private(
@@ -147,6 +188,13 @@ class WsSessionManager:
                 session.private_after_id,
                 private_events[-1].private_event_id,
             )
+        log_debug(
+            "ws_session.resume_private.completed",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            ws_session_id=session.ws_session_id,
+            count=len(private_events),
+            private_after_id=session.private_after_id,
+        )
         return len(private_events)
 
     async def publish_shared_fact(self, fact: SharedFact) -> int:
@@ -156,6 +204,13 @@ class WsSessionManager:
             await self._send_shared_fact(session, fact)
             session.shared_after_seq = max(session.shared_after_seq, fact.fact_seq)
             delivered += 1
+        log_debug(
+            "ws_session.publish_shared.completed",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            fact_seq=fact.fact_seq,
+            session_id=fact.session_id,
+            delivered=delivered,
+        )
         return delivered
 
     async def publish_private_event(self, event: PrivateExecutionEvent) -> int:
@@ -165,6 +220,13 @@ class WsSessionManager:
             await self._send_private_event(session, event)
             session.private_after_id = max(session.private_after_id, event.private_event_id)
             delivered += 1
+        log_debug(
+            "ws_session.publish_private.completed",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            private_event_id=event.private_event_id,
+            session_id=event.session_id,
+            delivered=delivered,
+        )
         return delivered
 
     def _scope_for_session(self, session: WsSession) -> ObservationScope:
@@ -235,4 +297,9 @@ class WsSessionManager:
         try:
             await session.websocket.send_json(payload)
         except Exception:
+            log_warning(
+                "ws_session.send_failed",
+                category=LOG_CATEGORY_FRONTEND_BACKEND,
+                ws_session_id=session.ws_session_id,
+            )
             await self.unregister(session)

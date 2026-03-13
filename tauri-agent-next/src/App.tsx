@@ -13,6 +13,7 @@ import { resolveApiBaseUrl } from "./api/base";
 import {
   createRun,
   getSessionPrivateFacts,
+  getLatestSessionPromptTrace,
   getSessionSharedFacts,
   stopRun,
   type CreateRunPayload,
@@ -25,7 +26,9 @@ import { MetricTile, StatusPill } from "./components/WorkbenchPrimitives";
 import type {
   CreateRunResponse,
   PrivateExecutionEvent,
+  PromptTraceSnapshot,
   SessionPrivateFactsResponse,
+  SessionPromptTraceResponse,
   SessionSharedFactsResponse,
   SharedFact,
   WsFrame,
@@ -121,7 +124,7 @@ export default function App() {
   const [scope, setScope] = useState<ScopeState>(initialScope);
   const scopeRef = useRef(initialScope);
   const [promptValue, setPromptValue] = useState("");
-  const [strategy, setStrategy] = useState("simple");
+  const [strategy, setStrategy] = useState("react");
   const [workPath, setWorkPath] = useState("");
   const [sessionIdInput, setSessionIdInput] = useState(initialScope.sessionId || "");
   const [wsConnected, setWsConnected] = useState(false);
@@ -131,6 +134,9 @@ export default function App() {
   const sharedFactsRef = useRef<SharedFact[]>([]);
   const [privateEventsByAgent, setPrivateEventsByAgent] = useState<Record<string, PrivateExecutionEvent[]>>({});
   const privateEventsByAgentRef = useRef<Record<string, PrivateExecutionEvent[]>>({});
+  const [promptTraceByAgent, setPromptTraceByAgent] = useState<Record<string, PromptTraceSnapshot | null>>({});
+  const promptTraceByAgentRef = useRef<Record<string, PromptTraceSnapshot | null>>({});
+  const promptTraceLoadTokenRef = useRef(0);
   const [selectedExchangeId, setSelectedExchangeId] = useState<string | null>(null);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [autoFollow, setAutoFollow] = useState(true);
@@ -166,6 +172,10 @@ export default function App() {
   const activeAgent = useMemo(
     () => (scope.agentId ? actorMap.get(scope.agentId) || null : null),
     [actorMap, scope.agentId],
+  );
+  const activePromptTrace = useMemo(
+    () => (scope.agentId ? promptTraceByAgent[scope.agentId] ?? null : null),
+    [promptTraceByAgent, scope.agentId],
   );
   const activeGroups = useMemo(
     () => (activeAgent ? deriveAgentTaskGroups(activeAgent.id, sharedFacts, currentPrivateEvents, runInfo) : []),
@@ -235,15 +245,25 @@ export default function App() {
     setPrivateEventsByAgent(nextMap);
   }
 
+  function replacePromptTraceState(nextMap: Record<string, PromptTraceSnapshot | null>) {
+    promptTraceByAgentRef.current = nextMap;
+    setPromptTraceByAgent(nextMap);
+  }
+
   function replacePrivateEventsForAgent(agentId: string, events: PrivateExecutionEvent[]) {
     const merged = mergePrivateEvents([], events);
     const nextMap = { ...privateEventsByAgentRef.current, [agentId]: merged };
     replacePrivateEventState(nextMap);
   }
 
+  function replacePromptTraceForAgent(agentId: string, trace: PromptTraceSnapshot | null) {
+    replacePromptTraceState({ ...promptTraceByAgentRef.current, [agentId]: trace });
+  }
+
   function resetFactState() {
     replaceSharedFactState([]);
     replacePrivateEventState({});
+    replacePromptTraceState({});
   }
 
   function upsertSharedFact(fact: SharedFact) {
@@ -301,6 +321,41 @@ export default function App() {
     replacePrivateEventsForAgent(agentId, mergePrivateEvents(existing, hydrated));
     if (!options.silent) {
       setFeedback(`Agent ${agentId} private facts hydrated.`);
+    }
+  }
+
+  async function hydrateLatestPromptTrace(
+    sessionId: string,
+    agentId: string,
+    runId: string | null,
+    options: { silent?: boolean } = {},
+  ) {
+    if (!baseUrl || !sessionId || !agentId) {
+      return;
+    }
+    const token = ++promptTraceLoadTokenRef.current;
+    try {
+      const response: SessionPromptTraceResponse = await getLatestSessionPromptTrace(
+        baseUrl,
+        sessionId,
+        agentId,
+        runId,
+      );
+      if (token !== promptTraceLoadTokenRef.current) {
+        return;
+      }
+      replacePromptTraceForAgent(agentId, response.prompt_trace);
+      if (!options.silent && response.prompt_trace) {
+        setFeedback(`Loaded latest LLM request for ${agentId}.`);
+      }
+    } catch (error) {
+      if (token !== promptTraceLoadTokenRef.current) {
+        return;
+      }
+      replacePromptTraceForAgent(agentId, null);
+      if (!options.silent) {
+        setFeedback(`Load latest LLM request failed: ${formatError(error)}`);
+      }
     }
   }
 
@@ -474,6 +529,10 @@ export default function App() {
   }, [privateEventsByAgent]);
 
   useEffect(() => {
+    promptTraceByAgentRef.current = promptTraceByAgent;
+  }, [promptTraceByAgent]);
+
+  useEffect(() => {
     autoFollowRef.current = autoFollow;
   }, [autoFollow]);
 
@@ -528,6 +587,20 @@ export default function App() {
     }
     void hydratePrivateAgent(scope.sessionId, scope.agentId, scope.runId, { silent: true });
   }, [baseUrl, ready, scope.agentId, scope.runId, scope.sessionId]);
+
+  useEffect(() => {
+    if (!ready || !baseUrl || !scope.sessionId || !scope.agentId) {
+      return;
+    }
+    void hydrateLatestPromptTrace(scope.sessionId, scope.agentId, scope.runId, { silent: true });
+  }, [
+    baseUrl,
+    ready,
+    scope.agentId,
+    scope.runId,
+    scope.sessionId,
+    currentPrivateEvents.length,
+  ]);
 
   useEffect(() => {
     if (!ready || !baseUrl) {
@@ -731,8 +804,8 @@ export default function App() {
                 <label className="field">
                   <span>Strategy</span>
                   <select value={strategy} onChange={(event) => setStrategy(event.currentTarget.value)}>
-                    <option value="simple">simple</option>
                     <option value="react">react</option>
+                    <option value="simple">simple</option>
                   </select>
                 </label>
                 <label className="field">
@@ -980,6 +1053,7 @@ export default function App() {
                 <AgentDetailPanel
                   actor={activeAgent}
                   groups={activeGroups}
+                  promptTrace={activePromptTrace}
                   selectedStepId={selectedStepId}
                   selectedStep={selectedStep}
                   onBack={() =>

@@ -10,6 +10,7 @@ from agents.base import AgentBase
 from agents.center import AgentCenter
 from agents.execution import TaskManager
 from agents.roster_manager import AgentRosterManager
+from app_logging import log_debug, log_error, log_info, log_warning
 from models import StopRunResponse
 from observation.center import ObservationCenter
 
@@ -74,9 +75,22 @@ class RunManager:
         entry_assistant_id: Optional[str] = None,
     ) -> ActiveRun:
         run_id = uuid4().hex
+        log_info(
+            "run.open.requested",
+            run_id=run_id,
+            session_id=session_id,
+            controller_agent_id=controller_agent_id,
+            entry_assistant_id=entry_assistant_id,
+        )
         async with self._lock:
             active_run_id = self._busy_sessions.get(session_id)
             if active_run_id:
+                log_warning(
+                    "run.open.busy",
+                    session_id=session_id,
+                    active_run_id=active_run_id,
+                    requested_run_id=run_id,
+                )
                 raise SessionBusyError(session_id, active_run_id)
             self._busy_sessions[session_id] = run_id
             self._known_run_sessions[run_id] = session_id
@@ -108,8 +122,21 @@ class RunManager:
                 reply="",
                 message_id=None,
             )
+            log_info(
+                "run.open.completed",
+                run_id=run_id,
+                session_id=session_id,
+                roster_size=len(runtime_agents),
+                strategy=active_run.metadata.get("strategy"),
+            )
             return active_run
-        except Exception:
+        except Exception as exc:
+            log_error(
+                "run.open.failed",
+                run_id=run_id,
+                session_id=session_id,
+                error=str(exc),
+            )
             await self.agent_roster_manager.teardown_run(run_id)
             async with self._lock:
                 self._active_runs.pop(run_id, None)
@@ -125,8 +152,10 @@ class RunManager:
         async with self._lock:
             active_run = self._active_runs.get(run_id)
             if active_run is None:
+                log_warning("run.root_task.attach_missing", run_id=run_id)
                 return None
             active_run.root_task = root_task
+            log_debug("run.root_task.attached", run_id=run_id, task_done=root_task.done())
             return active_run
 
     async def finish_run(
@@ -137,6 +166,7 @@ class RunManager:
     ) -> None:
         active_run = await self.get_active_run(run_id)
         if active_run is None:
+            log_warning("run.finish.missing", run_id=run_id)
             return
         status = str(result_payload.get("status") or "completed")
         reply = str(
@@ -155,10 +185,16 @@ class RunManager:
             strategy=str(
                 result_payload.get("strategy")
                 or active_run.metadata.get("strategy")
-                or "simple"
+                or "react"
             ),
         )
         await self._finalize_run(active_run)
+        log_info(
+            "run.finish.completed",
+            run_id=run_id,
+            session_id=active_run.session_id,
+            status=status,
+        )
 
     async def fail_run(
         self,
@@ -170,6 +206,7 @@ class RunManager:
     ) -> None:
         active_run = await self.get_active_run(run_id)
         if active_run is None:
+            log_warning("run.fail.missing", run_id=run_id, error=error_text)
             return
         payload = dict(result_payload or {})
         await self._append_run_lifecycle_fact(
@@ -179,19 +216,34 @@ class RunManager:
             reply=str(error_text),
             message_id=message_id,
             error=str(error_text),
-            strategy=str(payload.get("strategy") or active_run.metadata.get("strategy") or "simple"),
+            strategy=str(payload.get("strategy") or active_run.metadata.get("strategy") or "react"),
         )
         await self._finalize_run(active_run)
+        log_error(
+            "run.fail.completed",
+            run_id=run_id,
+            session_id=active_run.session_id,
+            error=error_text,
+        )
 
     async def stop_run(self, run_id: str) -> Optional[StopRunResponse]:
+        log_info("run.stop.requested", run_id=run_id)
         active_run = await self.get_active_run(run_id)
         if active_run is None:
             session_id = await self.lookup_session_id(run_id)
             if not session_id:
+                log_warning("run.stop.unknown", run_id=run_id)
                 return None
             status = await self.observation_center.fact_query_service.get_latest_run_status(run_id)
             if not status:
+                log_warning("run.stop.status_missing", run_id=run_id, session_id=session_id)
                 return None
+            log_info(
+                "run.stop.already_settled",
+                run_id=run_id,
+                session_id=session_id,
+                status=status,
+            )
             return StopRunResponse(run_id=run_id, status=status)
 
         await self.task_manager.stop_hosted_tasks(run_id)
@@ -203,9 +255,15 @@ class RunManager:
             topic="run.finished",
             status="stopped",
             reply="run cancelled",
-            strategy=str(active_run.metadata.get("strategy") or "simple"),
+            strategy=str(active_run.metadata.get("strategy") or "react"),
         )
         await self._finalize_run(active_run)
+        log_info(
+            "run.stop.accepted",
+            run_id=run_id,
+            session_id=active_run.session_id,
+            status="stopping",
+        )
         return StopRunResponse(run_id=run_id, status="stopping")
 
     async def get_active_run(self, run_id: str) -> Optional[ActiveRun]:
@@ -226,11 +284,13 @@ class RunManager:
     async def shutdown(self) -> None:
         async with self._lock:
             active_runs = list(self._active_runs.values())
+        log_info("run.shutdown.begin", active_run_count=len(active_runs))
         for active_run in active_runs:
             await self.stop_run(active_run.run_id)
         for active_run in active_runs:
             if active_run.root_task is not None:
                 await asyncio.gather(active_run.root_task, return_exceptions=True)
+        log_info("run.shutdown.complete", active_run_count=len(active_runs))
 
     async def _finalize_run(self, active_run: ActiveRun) -> None:
         await self.agent_roster_manager.teardown_run(active_run.run_id)
@@ -238,6 +298,11 @@ class RunManager:
             self._active_runs.pop(active_run.run_id, None)
             if self._busy_sessions.get(active_run.session_id) == active_run.run_id:
                 self._busy_sessions.pop(active_run.session_id, None)
+        log_debug(
+            "run.finalize.completed",
+            run_id=active_run.run_id,
+            session_id=active_run.session_id,
+        )
 
     async def _append_run_lifecycle_fact(
         self,
@@ -250,7 +315,7 @@ class RunManager:
         error: Optional[str] = None,
         strategy: Optional[str] = None,
     ) -> None:
-        resolved_strategy = str(strategy or active_run.metadata.get("strategy") or "simple")
+        resolved_strategy = str(strategy or active_run.metadata.get("strategy") or "react")
         payload = {
             "status": status,
             "reply": reply,
@@ -262,6 +327,14 @@ class RunManager:
         }
         if error:
             payload["error"] = error
+        log_debug(
+            "run.lifecycle_fact.append",
+            run_id=active_run.run_id,
+            session_id=active_run.session_id,
+            topic=topic,
+            status=status,
+            strategy=resolved_strategy,
+        )
         await self.observation_center.append_shared_fact(
             session_id=active_run.session_id,
             run_id=active_run.run_id,

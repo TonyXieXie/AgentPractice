@@ -5,6 +5,13 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 from uuid import uuid4
 
 from agents.message import AgentMessage
+from app_logging import (
+    LOG_CATEGORY_FRONTEND_BACKEND,
+    log_debug,
+    log_error,
+    log_info,
+    log_warning,
+)
 from observation.center import ObservationCenter
 from observation.facts import SharedFact
 from repositories.session_repository import SessionRepository
@@ -93,6 +100,12 @@ class AgentCenter:
             return self._pending_rpcs.pop(normalized, None)
 
     async def ingress_run_request(self, request: "CreateRunRequest") -> "CreateRunResponse":
+        log_info(
+            "agent_center.ingress_run.begin",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            requested_session_id=request.session_id,
+            strategy=request.strategy,
+        )
         resolved_request = await self._resolve_run_request(request)
         roster_manager = self.roster_manager
         if roster_manager is None:
@@ -111,23 +124,53 @@ class AgentCenter:
             if status == "busy":
                 from run_manager import SessionBusyError
 
+                log_warning(
+                    "agent_center.ingress_run.busy",
+                    category=LOG_CATEGORY_FRONTEND_BACKEND,
+                    session_id=response.payload.get("session_id") or resolved_request.session_id,
+                    active_run_id=response.payload.get("active_run_id"),
+                )
                 raise SessionBusyError(
                     str(response.payload.get("session_id") or resolved_request.session_id or ""),
                     str(response.payload.get("active_run_id") or ""),
                 )
+            log_error(
+                "agent_center.ingress_run.rejected",
+                category=LOG_CATEGORY_FRONTEND_BACKEND,
+                session_id=resolved_request.session_id,
+                error=response.payload.get("error"),
+                status=status,
+            )
             raise RuntimeError(str(response.payload.get("error") or "run submit failed"))
         from models import CreateRunAcceptedResponse
 
+        log_info(
+            "agent_center.ingress_run.accepted",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            session_id=resolved_request.session_id,
+            run_id=response.payload.get("run_id"),
+            user_agent_id=response.payload.get("user_agent_id"),
+        )
         return CreateRunAcceptedResponse.model_validate(response.payload)
 
     async def ingress_stop_request(self, run_id: str) -> Optional["StopRunResponse"]:
         normalized_run_id = str(run_id or "").strip()
         if not normalized_run_id:
             return None
+        log_info(
+            "agent_center.ingress_stop.begin",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            run_id=normalized_run_id,
+        )
         if self.run_manager is None:
             raise RuntimeError("RunManager is required for stop ingress")
         session_id = await self.run_manager.lookup_session_id(normalized_run_id)
         if not session_id:
+            log_warning(
+                "agent_center.ingress_stop.unknown_run",
+                category=LOG_CATEGORY_FRONTEND_BACKEND,
+                run_id=normalized_run_id,
+            )
             return None
         roster_manager = self.roster_manager
         if roster_manager is None:
@@ -143,13 +186,43 @@ class AgentCenter:
         if not response.ok:
             status = str(response.payload.get("status") or "")
             if status == "not_found":
+                log_warning(
+                    "agent_center.ingress_stop.not_found",
+                    category=LOG_CATEGORY_FRONTEND_BACKEND,
+                    run_id=normalized_run_id,
+                )
                 return None
+            log_error(
+                "agent_center.ingress_stop.failed",
+                category=LOG_CATEGORY_FRONTEND_BACKEND,
+                run_id=normalized_run_id,
+                error=response.payload.get("error"),
+                status=status,
+            )
             raise RuntimeError(str(response.payload.get("error") or "run stop failed"))
         from models import StopRunResponse
 
+        log_info(
+            "agent_center.ingress_stop.accepted",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            run_id=normalized_run_id,
+            status=response.payload.get("status"),
+        )
         return StopRunResponse.model_validate(response.payload)
 
     async def route(self, message: AgentMessage):
+        log_debug(
+            "agent_center.route.received",
+            message_id=message.id,
+            topic=message.topic,
+            sender_id=message.sender_id,
+            target_id=message.target_id,
+            run_id=message.run_id,
+            session_id=message.session_id,
+            message_type=message.message_type,
+            rpc_phase=message.rpc_phase,
+            object_type=message.object_type,
+        )
         if message.object_type == "broadcast":
             shared_fact = await self._persist_shared_fact(message)
             routed_message = self._attach_trigger_fact(message, shared_fact)
@@ -161,6 +234,12 @@ class AgentCenter:
                 )
                 await agent.receive(delivered_message)
                 delivered += 1
+            log_debug(
+                "agent_center.route.broadcast_delivered",
+                message_id=message.id,
+                delivered=delivered,
+                topic=message.topic,
+            )
             return delivered
 
         if message.message_type == "rpc" and message.rpc_phase == "response":
@@ -174,6 +253,13 @@ class AgentCenter:
                 self._spawn_background_task(self._deliver_rpc_response(target, routed_message))
             elif future is None:
                 await self._emit_undeliverable_rpc_response(routed_message)
+            log_debug(
+                "agent_center.route.rpc_response_delivered",
+                message_id=message.id,
+                correlation_id=message.correlation_id,
+                target_id=routed_message.target_id,
+                had_future=future is not None,
+            )
             return routed_message
 
         target, routed_message = await self._resolve_target_message(message)
@@ -182,8 +268,20 @@ class AgentCenter:
 
         if routed_message.message_type == "rpc" and routed_message.rpc_phase == "request":
             self._spawn_background_task(self._deliver_rpc_request(target, routed_message))
+            log_debug(
+                "agent_center.route.rpc_request_queued",
+                message_id=routed_message.id,
+                target_id=target.agent_id,
+                topic=routed_message.topic,
+            )
             return routed_message
 
+        log_debug(
+            "agent_center.route.direct_delivery",
+            message_id=routed_message.id,
+            target_id=target.agent_id,
+            topic=routed_message.topic,
+        )
         return await target.receive(routed_message)
 
     async def _resolve_run_request(self, request: "CreateRunRequest") -> "CreateRunRequest":
@@ -195,6 +293,10 @@ class AgentCenter:
 
             session = await session_repo.get(request.session_id)
             if session is None:
+                log_warning(
+                    "agent_center.resolve_run_request.session_not_found",
+                    session_id=request.session_id,
+                )
                 raise SessionNotFoundError(request.session_id)
             if (
                 request.system_prompt is not None
@@ -238,6 +340,7 @@ class AgentCenter:
             work_path=request.work_path,
             llm_config=request.llm_config,
         )
+        log_info("agent_center.resolve_run_request.session_created", session_id=session_id)
         return request.model_copy(
             update={
                 "session_id": session_id,
@@ -266,6 +369,15 @@ class AgentCenter:
             visibility="internal",
         )
         correlation_id = message.correlation_id or message.id
+        log_debug(
+            "agent_center.external_rpc.dispatch",
+            category=LOG_CATEGORY_FRONTEND_BACKEND,
+            correlation_id=correlation_id,
+            topic=topic,
+            target_agent_id=target_agent_id,
+            run_id=run_id,
+            session_id=session_id,
+        )
         future = await self.expect_rpc_response(correlation_id)
         try:
             await self.route(message)
@@ -375,6 +487,13 @@ class AgentCenter:
             if isinstance(maybe_response, AgentMessage):
                 await self.route(maybe_response)
         except Exception as exc:
+            log_error(
+                "agent_center.rpc_request.failed",
+                message_id=message.id,
+                topic=message.topic,
+                target_agent_id=target.agent_id,
+                error=str(exc),
+            )
             error_response = AgentMessage.build_rpc_response(
                 request=message,
                 sender_id=target.agent_id,
@@ -391,6 +510,13 @@ class AgentCenter:
             if isinstance(maybe_followup, AgentMessage):
                 await self.route(maybe_followup)
         except Exception as exc:
+            log_error(
+                "agent_center.rpc_response.failed",
+                message_id=message.id,
+                topic=message.topic,
+                target_agent_id=target.agent_id,
+                error=str(exc),
+            )
             await self._append_center_error_fact(
                 message,
                 topic="message.delivery_error",
@@ -404,6 +530,13 @@ class AgentCenter:
             )
 
     async def _emit_undeliverable_rpc_response(self, message: AgentMessage) -> None:
+        log_warning(
+            "agent_center.rpc_response.undeliverable",
+            message_id=message.id,
+            topic=message.topic,
+            target_agent_id=message.target_id,
+            correlation_id=message.correlation_id,
+        )
         await self._append_center_error_fact(
             message,
             topic="message.undeliverable",

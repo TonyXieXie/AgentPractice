@@ -7,12 +7,15 @@ from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 from agents.execution.directives import (
     ExecutionDirective,
     allowed_directive_kinds_for_agent,
+    visible_directive_kinds_for_agent,
 )
 from agents.execution.message_utils import (
     get_llm_config,
     get_strategy_name,
+    get_tool_name,
     render_current_message,
 )
+from llm.default_config import get_default_llm_config
 from agents.execution.react_strategy import ReactStrategy
 from agents.execution.simple_strategy import SimpleStrategy
 from agents.execution.step_emitter import StepEmitter
@@ -53,9 +56,13 @@ class ExecutionEngine:
             agent_type=getattr(agent.instance, "agent_type", None),
             role=getattr(agent.instance, "role", None),
         )
+        self.visible_directive_kinds = visible_directive_kinds_for_agent(
+            agent_type=getattr(agent.instance, "agent_type", None),
+            role=getattr(agent.instance, "role", None),
+        )
         base_tool_executor = tool_executor or ToolExecutor()
         self.tool_executor = base_tool_executor.clone(
-            allowed_builtin_tool_names=self.allowed_directive_kinds,
+            allowed_builtin_tool_names=self.visible_directive_kinds,
         )
         self.step_emitter = step_emitter or StepEmitter(agent)
         self._strategies: Dict[str, AgentStrategy] = {
@@ -71,6 +78,7 @@ class ExecutionEngine:
     async def execute(self, message: "AgentMessage") -> ExecutionResult:
         agent_id = self.agent.agent_id
         strategy = self._resolve_strategy(message)
+        execution_context: Optional[ExecutionContext] = None
 
         reply = ""
         ok = True
@@ -106,6 +114,13 @@ class ExecutionEngine:
                     terminal_status = str(step.metadata.get("status") or "error")
                     reply = step.content
 
+            if directive is not None:
+                await self._validate_directive(
+                    message,
+                    directive,
+                    execution_context=execution_context,
+                )
+
             if not reply and ok:
                 reply = render_current_message(message)
         except asyncio.CancelledError:
@@ -119,11 +134,12 @@ class ExecutionEngine:
             ok = False
             terminal_status = "error"
             reply = str(exc)
+            directive = None
             final_step = ExecutionStep("error", reply, {"status": "error"})
             await self.step_emitter.emit_step(message, agent_id=agent_id, step=final_step)
 
-        if terminal_status != "stopped":
-            protocol_violation = self._protocol_violation_reason(directive)
+        if terminal_status != "stopped" and ok:
+            protocol_violation = self._protocol_violation_reason(message, directive)
             if protocol_violation is not None:
                 ok = False
                 terminal_status = "error"
@@ -137,7 +153,7 @@ class ExecutionEngine:
             "status": terminal_status if not ok else "completed",
         }
         agent_status = "idle" if ok else "error"
-        if directive is not None and protocol_violation is None:
+        if directive is not None and ok and protocol_violation is None:
             payload = self._payload_for_directive(directive, agent_id=agent_id, strategy_name=strategy.name)
             agent_status = self._agent_status_for_directive(directive)
         elif protocol_violation is not None:
@@ -162,10 +178,30 @@ class ExecutionEngine:
             protocol_violation=protocol_violation,
         )
 
+    async def _validate_directive(
+        self,
+        message: "AgentMessage",
+        directive: ExecutionDirective,
+        *,
+        execution_context: Optional[ExecutionContext],
+    ) -> None:
+        validator = getattr(self.agent, "validate_execution_directive", None)
+        if not callable(validator):
+            return
+        result = validator(
+            message,
+            directive,
+            execution_context=execution_context,
+        )
+        if asyncio.iscoroutine(result):
+            await result
+
     def _build_llm_client(self, message: "AgentMessage"):
+        llm_config = get_llm_config(message)
+        if llm_config is None:
+            llm_config = get_default_llm_config()
         if self.llm_client_factory is not None:
             return self.llm_client_factory(message)
-        llm_config = get_llm_config(message)
         if not llm_config:
             return None
         from llm.client import create_llm_client
@@ -184,10 +220,14 @@ class ExecutionEngine:
         return ExecutionContext(tool_executor=self.tool_executor)
 
     def _resolve_strategy(self, message: "AgentMessage") -> AgentStrategy:
-        strategy = self._strategies.get(get_strategy_name(message))
+        strategy = self._strategies.get(get_strategy_name(message, default="react"))
         if strategy is not None:
             return strategy
-        return self._strategies["simple"]
+        for fallback_name in ("react", "simple"):
+            fallback = self._strategies.get(fallback_name)
+            if fallback is not None:
+                return fallback
+        return next(iter(self._strategies.values()))
 
     def _payload_for_directive(
         self,
@@ -220,6 +260,7 @@ class ExecutionEngine:
 
     def _protocol_violation_reason(
         self,
+        message: "AgentMessage",
         directive: Optional[ExecutionDirective],
     ) -> Optional[str]:
         if directive is None:
@@ -227,7 +268,13 @@ class ExecutionEngine:
                 f"{self.agent.instance.role or self.agent.instance.agent_type} execution must emit "
                 "exactly one allowed control directive"
             )
-        if directive.kind not in self.allowed_directive_kinds:
+        requested_tool_name = get_tool_name(message)
+        allowed_kinds = (
+            self.allowed_directive_kinds
+            if requested_tool_name in self.allowed_directive_kinds
+            else self.visible_directive_kinds
+        )
+        if directive.kind not in allowed_kinds:
             return (
                 f"directive not allowed for "
                 f"{self.agent.instance.role or self.agent.instance.agent_type}: {directive.kind}"

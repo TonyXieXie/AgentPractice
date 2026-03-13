@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional
 from uuid import uuid4
 
+from agents.execution.directives import RESERVED_DIRECTIVE_TOOL_NAMES
 from agents.execution.message_utils import (
     build_llm_request_overrides,
     get_execution_metadata,
@@ -187,6 +188,7 @@ class SimpleStrategy(AgentStrategy):
             tool_name=tool_name,
             arguments=get_tool_arguments(message),
             tool_call_id=tool_call_id,
+            allow_hidden_builtin_tools=tool_name in RESERVED_DIRECTIVE_TOOL_NAMES,
         )
         if result.directive is not None:
             yield ExecutionStep(

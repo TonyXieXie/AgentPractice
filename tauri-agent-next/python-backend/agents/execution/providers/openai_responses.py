@@ -12,6 +12,33 @@ from agents.execution.providers.base import (
 from tools import Tool, tool_to_openai_responses_tool
 
 
+def _merge_streamed_arguments(
+    existing_arguments: Any,
+    *,
+    arguments: Any,
+    arguments_delta: Any,
+) -> str:
+    current_text = str(existing_arguments or "")
+    delta_text = str(arguments_delta or "")
+    if arguments is None:
+        if not delta_text:
+            return current_text
+        return f"{current_text}{delta_text}"
+
+    explicit_text = str(arguments or "")
+    if not explicit_text:
+        if not delta_text:
+            return ""
+        return f"{current_text}{delta_text}"
+    if not delta_text:
+        return explicit_text
+    if explicit_text == delta_text:
+        if current_text and not explicit_text.startswith(current_text):
+            return f"{current_text}{delta_text}"
+        return explicit_text
+    return explicit_text
+
+
 class OpenAIResponsesAdapter(ProviderAdapter):
     name = "openai_responses"
 
@@ -103,15 +130,17 @@ class OpenAIResponsesAdapter(ProviderAdapter):
     ) -> ProviderToolCall:
         key = str(event.get("id") or event.get("call_id") or event.get("index") or len(tool_calls))
         current = tool_calls.get(key)
+        merged_arguments = _merge_streamed_arguments(
+            getattr(current, "arguments", ""),
+            arguments=event.get("arguments"),
+            arguments_delta=event.get("arguments_delta"),
+        )
         call = ProviderToolCall(
             id=str(event.get("id") or event.get("call_id") or getattr(current, "id", key)),
             name=str(event.get("name") or getattr(current, "name", "") or ""),
-            arguments=str(event.get("arguments") or getattr(current, "arguments", "") or ""),
+            arguments=merged_arguments,
             index=int(event.get("index", getattr(current, "index", len(tool_calls))) or 0),
         )
-        delta = str(event.get("arguments_delta", "") or "")
-        if delta:
-            call.arguments = f"{call.arguments}{delta}"
         tool_calls[key] = call
         return call
 

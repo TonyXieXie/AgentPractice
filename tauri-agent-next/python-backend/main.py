@@ -7,6 +7,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from app_logging import log_error, log_info
 from app_config import get_app_config
 from app_services import AppServices, build_app_services
 from transport.http.routes import router as http_router
@@ -20,11 +21,15 @@ def create_app(*, services: AppServices | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.services = resolved_services
+        log_info("app.startup.begin", data_dir=str(resolved_services.data_dir))
         await resolved_services.startup()
         try:
+            log_info("app.startup.ready", data_dir=str(resolved_services.data_dir))
             yield
         finally:
+            log_info("app.shutdown.begin", data_dir=str(resolved_services.data_dir))
             await resolved_services.shutdown()
+            log_info("app.shutdown.complete", data_dir=str(resolved_services.data_dir))
 
     app = FastAPI(
         title="tauri-agent-next backend",
@@ -49,7 +54,12 @@ def main() -> None:
         port = int(http_config.get("port", 8000))
     except (TypeError, ValueError):
         port = 8000
-    uvicorn.run("main:app", host=host, port=port, reload=False)
+    log_info("server.run.begin", host=host, port=port)
+    try:
+        uvicorn.run("main:app", host=host, port=port, reload=False)
+    except Exception as exc:
+        log_error("server.run.failed", host=host, port=port, error=str(exc))
+        raise
 
 
 if __name__ == "__main__":

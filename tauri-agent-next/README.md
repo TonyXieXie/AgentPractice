@@ -34,10 +34,23 @@ StartDev.bat
 StartDev.bat --no-browser
 ```
 
-它会动态选择空闲端口并启动：
+这条链路会动态选择空闲端口并启动：
 
 - FastAPI backend
 - Vite frontend
+
+也就是说，`StartDev.bat` 默认是浏览器联调入口，不是桌面应用窗口。
+
+如果要直接以桌面应用方式启动，请运行：
+
+```text
+StartDesktop.bat
+```
+
+这条链路会启动：
+
+- FastAPI backend
+- Tauri desktop app
 
 实际端口会写入 `.tauri-agent-next-data/last-dev-ports.json`。
 
@@ -62,6 +75,12 @@ WebSocket 当前协议：
 - 初始加载走 HTTP facts 查询
 - 实时更新和断线续传走 WS
 - URL / 分享入口以 `session_id` 为主，`run_id` 只作为可选过滤条件
+
+## 桌面应用说明
+
+- `src-tauri/` 已经是 Tauri 桌面壳，不是纯 Web 前端。
+- 当前仓库可以直接以开发态桌面应用运行。
+- 当前打包配置还是关闭状态；`src-tauri/tauri.conf.json` 里 `bundle.active` 现在是 `false`，所以默认不是“可安装 exe 打包”流程。
 
 ## 观察页
 

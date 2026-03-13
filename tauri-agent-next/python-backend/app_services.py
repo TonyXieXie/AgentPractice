@@ -9,6 +9,7 @@ from agents.execution import TaskManager, ToolExecutor
 from agents.execution.agent_memory import AgentMemory
 from agents.execution.tool_recorder import PrivateExecutionRecorder
 from agents.roster_manager import AgentRosterManager
+from app_logging import log_info
 from observation.center import ObservationCenter
 from observation.query_service import FactQueryService
 from repositories.agent_instance_repository import AgentInstanceRepository
@@ -40,12 +41,16 @@ class AppServices:
     data_dir: Path
 
     async def startup(self) -> None:
+        log_info("services.startup.begin", data_dir=str(self.data_dir))
         self.data_dir.mkdir(parents=True, exist_ok=True)
         await self.sqlite_store.initialize()
+        log_info("services.startup.complete", data_dir=str(self.data_dir))
 
     async def shutdown(self) -> None:
+        log_info("services.shutdown.begin", data_dir=str(self.data_dir))
         await self.run_manager.shutdown()
         await self.agent_roster_manager.shutdown()
+        log_info("services.shutdown.complete", data_dir=str(self.data_dir))
 
 
 def build_app_services(*, data_dir: Optional[Path] = None) -> AppServices:
@@ -62,6 +67,7 @@ def build_app_services(*, data_dir: Optional[Path] = None) -> AppServices:
     fact_query_service = FactQueryService(
         shared_fact_repository=shared_fact_repository,
         agent_private_event_repository=agent_private_event_repository,
+        prompt_trace_repository=prompt_trace_repository,
     )
     ws_session_manager = WsSessionManager(fact_query_service=fact_query_service)
     observation_center = ObservationCenter(
@@ -104,6 +110,7 @@ def build_app_services(*, data_dir: Optional[Path] = None) -> AppServices:
     )
     agent_center.run_manager = run_manager
     agent_roster_manager.bind_runtime_services(run_manager=run_manager)
+    log_info("services.build.complete", data_dir=str(runtime_dir))
     return AppServices(
         sqlite_store=sqlite_store,
         observation_center=observation_center,

@@ -50,6 +50,18 @@ class SendRpcResponseTool(ControlTool):
         return bool(reply_to_message_id)
 
 
+class HandoffTool(ControlTool):
+    def validate_input(self, arguments: Dict[str, Any]) -> bool:
+        if not super().validate_input(arguments):
+            return False
+        target_profile = str(arguments.get("target_profile") or "").strip()
+        instruction = str(arguments.get("instruction") or "").strip()
+        context = arguments.get("context")
+        return bool(target_profile and instruction) and (
+            context is None or isinstance(context, dict)
+        )
+
+
 def build_control_tools(
     *,
     allowed_directive_kinds: Optional[Iterable[str]] = None,
@@ -158,6 +170,49 @@ def build_control_tools(
                     name="target_profile",
                     type="string",
                     description="Target agent profile id when routing by profile",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="visibility",
+                    type="string",
+                    description="Message visibility",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="level",
+                    type="string",
+                    description="Message severity level",
+                    required=False,
+                ),
+            ],
+        ),
+        HandoffTool(
+            name="handoff",
+            description=(
+                "Transfer task ownership to another assistant profile. "
+                "The current task ends after the handoff message is sent."
+            ),
+            parameters=[
+                ToolParameter(
+                    name="target_profile",
+                    type="string",
+                    description="Assistant profile id that should take over the task",
+                ),
+                ToolParameter(
+                    name="instruction",
+                    type="string",
+                    description="Instruction for the target profile",
+                ),
+                ToolParameter(
+                    name="reason",
+                    type="string",
+                    description="Optional reason for the handoff",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="context",
+                    type="object",
+                    description="Optional structured context for the target profile",
                     required=False,
                 ),
                 ToolParameter(

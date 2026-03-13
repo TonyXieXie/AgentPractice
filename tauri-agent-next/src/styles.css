@@ -683,6 +683,71 @@ select:focus {
   line-height: 1.7;
 }
 
+.llm-request-stack,
+.llm-request-list {
+  display: grid;
+  gap: 10px;
+}
+
+.llm-request-message {
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--panel-3);
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.llm-request-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.llm-request-role {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.03);
+  font-family: var(--mono);
+}
+
+.llm-request-role.is-system {
+  color: #f2c87c;
+  border-color: rgba(242, 200, 124, 0.18);
+  background: rgba(242, 200, 124, 0.08);
+}
+
+.llm-request-role.is-user {
+  color: #8bd2ff;
+  border-color: rgba(139, 210, 255, 0.18);
+  background: rgba(139, 210, 255, 0.08);
+}
+
+.llm-request-role.is-assistant {
+  color: #8fe2ab;
+  border-color: rgba(143, 226, 171, 0.18);
+  background: rgba(143, 226, 171, 0.08);
+}
+
+.llm-request-content {
+  margin: 0;
+  padding: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.7;
+  color: #d6d6d6;
+}
+
 .json-shell {
   overflow: auto;
   background: var(--panel-3);

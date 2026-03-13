@@ -19,11 +19,25 @@ class PromptTraceRecord:
     prompt_budget: int
     estimated_prompt_tokens: int
     rendered_message_count: int
+    request_messages: list[dict[str, Any]]
     actions: Dict[str, Any]
     created_at: str
 
 
 def _row_to_record(row) -> PromptTraceRecord:
+    raw_messages = str(row["request_messages_json"] or "")
+    try:
+        request_messages = json.loads(raw_messages) if raw_messages else []
+    except json.JSONDecodeError:
+        request_messages = []
+    if not isinstance(request_messages, list):
+        request_messages = []
+    normalized_messages = [
+        dict(item)
+        for item in request_messages
+        if isinstance(item, dict)
+    ]
+
     raw_actions = str(row["actions_json"] or "")
     try:
         actions = json.loads(raw_actions) if raw_actions else {}
@@ -41,6 +55,7 @@ def _row_to_record(row) -> PromptTraceRecord:
         prompt_budget=int(row["prompt_budget"]),
         estimated_prompt_tokens=int(row["estimated_prompt_tokens"]),
         rendered_message_count=int(row["rendered_message_count"]),
+        request_messages=normalized_messages,
         actions=actions,
         created_at=str(row["created_at"]),
     )
@@ -61,6 +76,7 @@ class PromptTraceRepository:
         prompt_budget: int,
         estimated_prompt_tokens: int,
         rendered_message_count: int,
+        request_messages: list[dict[str, Any]],
         actions: Dict[str, Any],
     ) -> int:
         now = utc_now_iso()
@@ -68,8 +84,9 @@ class PromptTraceRepository:
             """
             INSERT INTO prompt_traces
               (session_id, run_id, agent_id, llm_model, max_context_tokens, prompt_budget,
-               estimated_prompt_tokens, rendered_message_count, actions_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               estimated_prompt_tokens, rendered_message_count, request_messages_json,
+               actions_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """.strip(),
             (
                 session_id,
@@ -80,6 +97,7 @@ class PromptTraceRepository:
                 int(prompt_budget),
                 int(estimated_prompt_tokens),
                 int(rendered_message_count),
+                json.dumps(request_messages, ensure_ascii=False),
                 json.dumps(actions, ensure_ascii=False),
                 now,
             ),
@@ -93,12 +111,14 @@ class PromptTraceRepository:
         session_id: str,
         *,
         agent_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> Optional[PromptTraceRecord]:
-        if agent_id is None:
+        if agent_id is None and run_id is None:
             row = await self.store.fetchone(
                 """
                 SELECT id, session_id, run_id, agent_id, llm_model, max_context_tokens, prompt_budget,
-                       estimated_prompt_tokens, rendered_message_count, actions_json, created_at
+                       estimated_prompt_tokens, rendered_message_count, request_messages_json,
+                       actions_json, created_at
                 FROM prompt_traces
                 WHERE session_id = ?
                 ORDER BY id DESC
@@ -106,17 +126,44 @@ class PromptTraceRepository:
                 """.strip(),
                 (session_id,),
             )
-        else:
+        elif agent_id is None:
             row = await self.store.fetchone(
                 """
                 SELECT id, session_id, run_id, agent_id, llm_model, max_context_tokens, prompt_budget,
-                       estimated_prompt_tokens, rendered_message_count, actions_json, created_at
+                       estimated_prompt_tokens, rendered_message_count, request_messages_json,
+                       actions_json, created_at
+                FROM prompt_traces
+                WHERE session_id = ? AND run_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """.strip(),
+                (session_id, run_id),
+            )
+        elif run_id is None:
+            row = await self.store.fetchone(
+                """
+                SELECT id, session_id, run_id, agent_id, llm_model, max_context_tokens, prompt_budget,
+                       estimated_prompt_tokens, rendered_message_count, request_messages_json,
+                       actions_json, created_at
                 FROM prompt_traces
                 WHERE session_id = ? AND agent_id = ?
                 ORDER BY id DESC
                 LIMIT 1
                 """.strip(),
                 (session_id, agent_id),
+            )
+        else:
+            row = await self.store.fetchone(
+                """
+                SELECT id, session_id, run_id, agent_id, llm_model, max_context_tokens, prompt_budget,
+                       estimated_prompt_tokens, rendered_message_count, request_messages_json,
+                       actions_json, created_at
+                FROM prompt_traces
+                WHERE session_id = ? AND agent_id = ? AND run_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """.strip(),
+                (session_id, agent_id, run_id),
             )
         if row is None:
             return None

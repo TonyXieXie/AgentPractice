@@ -4,13 +4,19 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set
 
 
-MESSAGE_DIRECTIVE_KINDS = frozenset(
+VISIBLE_COLLABORATION_DIRECTIVE_KINDS = frozenset({"handoff"})
+
+INTERNAL_MESSAGE_DIRECTIVE_KINDS = frozenset(
     {
         "send_rpc_request",
         "send_rpc_response",
         "send_event",
         "broadcast_event",
     }
+)
+
+MESSAGE_DIRECTIVE_KINDS = frozenset(
+    VISIBLE_COLLABORATION_DIRECTIVE_KINDS | INTERNAL_MESSAGE_DIRECTIVE_KINDS
 )
 
 TERMINAL_DIRECTIVE_KINDS = frozenset(
@@ -36,6 +42,20 @@ def allowed_directive_kinds_for_agent(
     if normalized_agent_type == "user_proxy" or normalized_role == "user_proxy":
         return set(DIRECTIVE_KINDS)
     return set(MESSAGE_DIRECTIVE_KINDS)
+
+
+def visible_directive_kinds_for_agent(
+    *,
+    agent_type: Optional[str],
+    role: Optional[str],
+) -> Set[str]:
+    normalized_agent_type = str(agent_type or "").strip().lower()
+    normalized_role = str(role or "").strip().lower()
+    if normalized_agent_type == "user_proxy" or normalized_role == "user_proxy":
+        return set(VISIBLE_COLLABORATION_DIRECTIVE_KINDS | TERMINAL_DIRECTIVE_KINDS)
+    return set(VISIBLE_COLLABORATION_DIRECTIVE_KINDS)
+
+
 @dataclass(slots=True)
 class ExecutionDirective:
     kind: str

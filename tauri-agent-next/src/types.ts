@@ -66,6 +66,28 @@ export interface SessionPrivateFactsResponse {
   next_after_id: number;
 }
 
+export interface PromptTraceSnapshot {
+  id: number;
+  session_id: string;
+  run_id?: string | null;
+  agent_id?: string | null;
+  llm_model?: string | null;
+  max_context_tokens: number;
+  prompt_budget: number;
+  estimated_prompt_tokens: number;
+  rendered_message_count: number;
+  request_messages: JsonObject[];
+  actions: JsonObject;
+  created_at: string;
+}
+
+export interface SessionPromptTraceResponse {
+  ok: true;
+  session_id: string;
+  agent_id: string;
+  prompt_trace: PromptTraceSnapshot | null;
+}
+
 export interface WsAckFrame {
   kind: "ack";
   ws_session_id?: string | null;

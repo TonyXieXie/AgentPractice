@@ -39,9 +39,31 @@ StartDev.bat
 StartDev.bat --no-browser
 ```
 
+这会启动浏览器联调模式：
+
+- FastAPI backend
+- Vite frontend
+- 默认会打开浏览器
+
 脚本会自动选择空闲端口并把结果写入 `.tauri-agent-next-data/last-dev-ports.json`。
 
-## 6. Smoke checks
+## 6. Start as a desktop app
+
+```text
+StartDesktop.bat
+```
+
+这会启动：
+
+- FastAPI backend
+- Tauri desktop app
+
+说明：
+
+- 这是“应用程序窗口”模式，不是浏览器页面。
+- 当前是开发态桌面启动，不是打包后的安装版 exe。
+
+## 7. Smoke checks
 
 - HTTP health: `GET http://127.0.0.1:8000/healthz`
 - Read merged config: `GET http://127.0.0.1:8000/config`
@@ -57,7 +79,7 @@ StartDev.bat --no-browser
 - WS 只推 `append.shared_fact` / `append.private_event` 和 bootstrap/resume 相关控制帧
 - 不再提供旧的 run 快照/事件查询接口
 
-## 7. Run checks
+## 8. Run checks
 
 后端测试：
 

@@ -108,6 +108,12 @@ class SqliteStore:
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         self._ensure_column(conn, "conversation_events", "agent_id", "TEXT NULL")
         self._ensure_column(conn, "prompt_traces", "agent_id", "TEXT NULL")
+        self._ensure_column(
+            conn,
+            "prompt_traces",
+            "request_messages_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
         self._ensure_column(conn, "message_center_events", "target_profile", "TEXT NULL")
         self._ensure_column(conn, "message_center_events", "message_type", "TEXT NULL")
         self._ensure_column(conn, "message_center_events", "object_type", "TEXT NULL")
@@ -291,6 +297,7 @@ class SqliteStore:
             prompt_budget INTEGER NOT NULL,
             estimated_prompt_tokens INTEGER NOT NULL,
             rendered_message_count INTEGER NOT NULL,
+            request_messages_json TEXT NOT NULL DEFAULT '[]',
             actions_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE

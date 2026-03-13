@@ -19,7 +19,7 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
     },
     "agent": {
         "default_profile": "default",
-        "react_max_iterations": 16,
+        "react_max_iterations": 100,
         "profiles": {
             "default": {
                 "agent_type": "assistant",
@@ -41,9 +41,7 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 "system_prompt": "You are Planner. Break the task into a concise execution plan.",
                 "tool_policy_text": None,
                 "allowed_tool_names": [
-                    "send_event",
-                    "send_rpc_request",
-                    "send_rpc_response",
+                    "handoff",
                 ],
                 "extends": None,
                 "editable": False,
@@ -58,9 +56,7 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 "system_prompt": "You are Coder. Convert an approved plan into code-oriented output.",
                 "tool_policy_text": None,
                 "allowed_tool_names": [
-                    "send_event",
-                    "send_rpc_request",
-                    "send_rpc_response",
+                    "handoff",
                 ],
                 "extends": None,
                 "editable": False,
