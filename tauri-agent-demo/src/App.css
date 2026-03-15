@@ -176,6 +176,52 @@ body[data-platform="mac"] .app-titlebar {
   /* 防止容器本身滚动 */
 }
 
+.chat-workspace {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 14px;
+  align-items: stretch;
+  flex-wrap: nowrap;
+}
+
+.chat-workspace.has-team-overview .chat-main-column {
+  min-width: 0;
+}
+
+.chat-main-column {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.team-overview-float-toggle {
+  align-self: flex-start;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(18, 22, 29, 0.96);
+  color: #e2e8f0;
+  cursor: pointer;
+  box-shadow: 0 12px 24px rgba(0, 0, 0, 0.25);
+}
+
+.team-overview-float-toggle:hover {
+  background: rgba(30, 41, 59, 0.95);
+}
+
+.team-overview-float-toggle svg {
+  width: 16px;
+  height: 16px;
+}
+
 /* Header */
 .chat-header {
   display: flex;
@@ -1992,4 +2038,15 @@ body[data-platform="mac"] .app-titlebar {
 .reasoning-option.active {
   background: rgba(255, 255, 255, 0.12);
   border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+@media (max-width: 980px) {
+  .chat-workspace {
+    flex-direction: column;
+  }
+
+  .team-overview-float-toggle {
+    align-self: stretch;
+    justify-content: center;
+  }
 }

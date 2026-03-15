@@ -13,7 +13,7 @@ interface SessionListProps {
     onToggleSidebar?: () => void;
     debugActive: boolean;
     refreshTrigger?: number;
-    inFlightBySession?: Record<string, boolean>;
+    executingBySession?: Record<string, boolean>;
     unreadBySession?: Record<string, boolean>;
     pendingPermissionBySession?: Record<string, boolean>;
     agentConfig?: AgentConfig | null;
@@ -28,7 +28,7 @@ export default function SessionList({
     onToggleSidebar,
     debugActive,
     refreshTrigger,
-    inFlightBySession,
+    executingBySession,
     unreadBySession,
     pendingPermissionBySession,
     agentConfig,
@@ -429,11 +429,11 @@ export default function SessionList({
                             </div>
                             <div className="session-group-items">
                                 {flattenSessionTree(buildSessionTree(group.sessions)).map(({ session, depth }) => {
-                                    const isStreaming = Boolean(inFlightBySession?.[session.id]);
+                                    const isExecuting = Boolean(executingBySession?.[session.id]);
                                     const isPending = Boolean(pendingPermissionBySession?.[session.id]);
-                                    const isUnread = !isStreaming && Boolean(unreadBySession?.[session.id]) && currentSessionId !== session.id;
-                                    const showStatus = isPending || isStreaming || isUnread;
-                                    const statusClass = isPending ? 'permission' : isStreaming ? 'streaming' : 'unread';
+                                    const isUnread = !isExecuting && !isPending && Boolean(unreadBySession?.[session.id]) && currentSessionId !== session.id;
+                                    const showStatus = isPending || isExecuting || isUnread;
+                                    const statusClass = isPending ? 'permission' : isExecuting ? 'streaming' : 'unread';
                                     const isChild = depth > 0;
                                     const roleLabel = session.role_key || session.agent_profile;
                                     const leaderRole = session.agent_team_id ? teamLeaderById.get(session.agent_team_id) || null : null;

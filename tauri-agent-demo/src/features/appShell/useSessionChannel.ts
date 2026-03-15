@@ -7,16 +7,18 @@ import type { SessionMessageEvent, SubagentDoneEvent, SubagentStartedEvent } fro
 
 type UseAppShellSessionChannelParams = {
   currentSessionId: string | null;
+  subscribedSessionIds: string[];
   getSessionKey: (sessionId: string | null) => string;
   getCurrentSessionKey: () => string;
   updateSessionMessages: (sessionKey: string, updater: (prev: Message[]) => Message[]) => Message[];
   markSessionUnread: (sessionKey: string) => void;
   setSessionRefreshTrigger: Dispatch<SetStateAction<number>>;
   applyIncomingActiveAgent: (sessionId: string, profileId?: string | null) => void;
+  onSessionMessage?: (payload: SessionMessageEvent) => void;
 };
 
 export function useAppShellSessionChannel(params: UseAppShellSessionChannelParams) {
-  const wsSessionRef = useRef<string | null>(null);
+  const wsSessionIdsRef = useRef<Set<string>>(new Set());
   const paramsRef = useRef(params);
   paramsRef.current = params;
 
@@ -69,6 +71,7 @@ export function useAppShellSessionChannel(params: UseAppShellSessionChannelParam
           return [...prev, payload.message];
         });
         applyIncomingActiveAgent(payload.session_id, payload.active_agent_profile);
+        paramsRef.current.onSessionMessage?.(payload);
         if (sessionKey !== getCurrentSessionKey()) {
           markSessionUnread(sessionKey);
         }
@@ -83,13 +86,18 @@ export function useAppShellSessionChannel(params: UseAppShellSessionChannelParam
   }, []);
 
   useEffect(() => {
-    const prev = wsSessionRef.current;
-    if (prev && prev !== params.currentSessionId) {
-      wsClient.unsubscribe([prev]);
+    const next = new Set((params.subscribedSessionIds || []).filter(Boolean));
+    const prev = wsSessionIdsRef.current;
+    const toUnsubscribe = Array.from(prev).filter((sessionId) => !next.has(sessionId));
+    const toSubscribe = Array.from(next).filter((sessionId) => !prev.has(sessionId));
+
+    if (toUnsubscribe.length > 0) {
+      wsClient.unsubscribe(toUnsubscribe);
     }
-    if (params.currentSessionId) {
-      wsClient.subscribe([params.currentSessionId]);
+    if (toSubscribe.length > 0) {
+      wsClient.subscribe(toSubscribe);
     }
-    wsSessionRef.current = params.currentSessionId;
-  }, [params.currentSessionId]);
+
+    wsSessionIdsRef.current = next;
+  }, [params.subscribedSessionIds]);
 }

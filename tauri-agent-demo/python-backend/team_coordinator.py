@@ -293,6 +293,8 @@ class TeamCoordinator:
         artifact_summary: Optional[str] = None,
         changed_files: Optional[List[Dict[str, str]]] = None,
         artifact_source: Optional[str] = None,
+        artifact_owner_session_id: Optional[str] = None,
+        artifact_owner_role_key: Optional[str] = None,
         task_payload: Optional[str] = None,
         result_summary: Optional[str] = None,
         error: Optional[str] = None,
@@ -313,6 +315,8 @@ class TeamCoordinator:
                 artifact_summary=_normalize_text(artifact_summary) or None,
                 changed_files=_normalize_changed_files(changed_files) or None,
                 artifact_source=_normalize_artifact_source(artifact_source),
+                artifact_owner_session_id=_normalize_text(artifact_owner_session_id) or None,
+                artifact_owner_role_key=_normalize_text(artifact_owner_role_key) or None,
                 task_payload=task_payload,
                 result_summary=result_summary,
                 error=error,
@@ -448,6 +452,10 @@ class TeamCoordinator:
         if event.reason:
             lines.append(f"Assigned to [{to_label}]: {event.reason}")
         artifact_summary = _normalize_text(getattr(event, "artifact_summary", None))
+        artifact_owner_role = _normalize_text(getattr(event, "artifact_owner_role_key", None))
+        artifact_owner_label = self._format_role_label(artifact_owner_role) if artifact_owner_role else ""
+        if artifact_summary and artifact_owner_label and artifact_owner_role != from_role:
+            lines.append(f"Artifacts from [{artifact_owner_label}].")
         if artifact_summary:
             lines.append(f"Changed files: {artifact_summary}")
         if event.event_kind == "failed":
@@ -480,6 +488,12 @@ class TeamCoordinator:
         artifact_source = _normalize_artifact_source(getattr(event, "artifact_source", None))
         if artifact_source:
             metadata["artifact_source"] = artifact_source
+        artifact_owner_session_id = _normalize_text(getattr(event, "artifact_owner_session_id", None))
+        if artifact_owner_session_id:
+            metadata["artifact_owner_session_id"] = artifact_owner_session_id
+        if artifact_owner_role:
+            metadata["artifact_owner_role_key"] = artifact_owner_role
+            metadata["artifact_owner_label"] = artifact_owner_label
         if event.task_payload:
             metadata["task_payload"] = event.task_payload
         if event.result_summary:
@@ -502,6 +516,8 @@ class TeamCoordinator:
         artifact_summary: Optional[str] = None,
         changed_files: Optional[List[Dict[str, str]]] = None,
         artifact_source: Optional[str] = None,
+        artifact_owner_session_id: Optional[str] = None,
+        artifact_owner_role_key: Optional[str] = None,
         inline_session_message_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         inline_session_ids: Optional[Set[str]] = None,
     ) -> Any:
@@ -513,9 +529,16 @@ class TeamCoordinator:
         normalized_artifact_summary = _normalize_text(artifact_summary)
         normalized_changed_files = _normalize_changed_files(changed_files)
         normalized_artifact_source = _normalize_artifact_source(artifact_source)
+        normalized_artifact_owner_session_id = _normalize_text(artifact_owner_session_id) or None
+        normalized_artifact_owner_role_key = _normalize_text(artifact_owner_role_key) or None
         if not normalized_artifact_summary:
             normalized_artifact_summary = _build_artifact_summary(normalized_changed_files)
         normalized_content = _append_artifact_summary(normalized_content, normalized_artifact_summary)
+        artifact_owner_label = (
+            self._format_role_label(normalized_artifact_owner_role_key)
+            if normalized_artifact_owner_role_key
+            else ""
+        )
         rendered_content = self._prefix_role_report(
             to_role_key,
             normalized_content,
@@ -538,6 +561,9 @@ class TeamCoordinator:
                     "artifact_summary": normalized_artifact_summary or None,
                     "changed_files": normalized_changed_files or None,
                     "artifact_source": normalized_artifact_source,
+                    "artifact_owner_session_id": normalized_artifact_owner_session_id,
+                    "artifact_owner_role_key": normalized_artifact_owner_role_key,
+                    "artifact_owner_label": artifact_owner_label or None,
                 },
             )
         )
@@ -1196,6 +1222,8 @@ class TeamCoordinator:
             "artifact_summary": current_artifact_summary or None,
             "changed_files": current_changed_files or None,
             "artifact_source": current_artifact_source,
+            "artifact_owner_session_id": session.id,
+            "artifact_owner_role_key": current_profile,
         }
 
     def _build_role_session_turn_kwargs(
@@ -1418,6 +1446,8 @@ class TeamCoordinator:
                 artifact_summary=normalized_artifact_summary,
                 changed_files=normalized_changed_files,
                 artifact_source=normalized_artifact_source,
+                artifact_owner_session_id=source_session.id,
+                artifact_owner_role_key=from_agent,
                 result_summary=_summarize_result(return_summary),
             )
             await self.mirror_handoff_event_to_team_sessions(
@@ -1439,6 +1469,8 @@ class TeamCoordinator:
                 "artifact_summary": normalized_artifact_summary or None,
                 "changed_files": normalized_changed_files or None,
                 "artifact_source": normalized_artifact_source,
+                "artifact_owner_session_id": source_session.id,
+                "artifact_owner_role_key": from_agent,
             }
 
         try:
@@ -1462,6 +1494,8 @@ class TeamCoordinator:
             result_artifact_summary = _normalize_text(result.get("artifact_summary"))
             result_changed_files = _normalize_changed_files(result.get("changed_files"))
             result_artifact_source = _normalize_artifact_source(result.get("artifact_source"))
+            result_artifact_owner_session_id = _normalize_text(result.get("artifact_owner_session_id")) or None
+            result_artifact_owner_role_key = _normalize_text(result.get("artifact_owner_role_key")) or None
             if not result_artifact_summary:
                 result_artifact_summary = _build_artifact_summary(result_changed_files)
             if result.get("status") == "returned_to_leader":
@@ -1490,6 +1524,8 @@ class TeamCoordinator:
                     artifact_summary=result_artifact_summary,
                     changed_files=result_changed_files,
                     artifact_source=result_artifact_source,
+                    artifact_owner_session_id=result_artifact_owner_session_id,
+                    artifact_owner_role_key=result_artifact_owner_role_key,
                     result_summary=_summarize_result(return_summary),
                 )
                 await self.mirror_handoff_event_to_team_sessions(
@@ -1512,6 +1548,8 @@ class TeamCoordinator:
                         artifact_summary=result_artifact_summary,
                         changed_files=result_changed_files,
                         artifact_source=result_artifact_source,
+                        artifact_owner_session_id=result_artifact_owner_session_id,
+                        artifact_owner_role_key=result_artifact_owner_role_key,
                         inline_session_message_callback=inline_session_message_callback,
                         inline_session_ids=inline_session_ids,
                     )
@@ -1526,6 +1564,8 @@ class TeamCoordinator:
                         "artifact_summary": result_artifact_summary or None,
                         "changed_files": result_changed_files or None,
                         "artifact_source": result_artifact_source,
+                        "artifact_owner_session_id": result_artifact_owner_session_id,
+                        "artifact_owner_role_key": result_artifact_owner_role_key,
                     }
                 return {
                     "status": "returned_to_leader",
@@ -1540,6 +1580,8 @@ class TeamCoordinator:
                     "artifact_summary": result_artifact_summary or None,
                     "changed_files": result_changed_files or None,
                     "artifact_source": result_artifact_source,
+                    "artifact_owner_session_id": result_artifact_owner_session_id,
+                    "artifact_owner_role_key": result_artifact_owner_role_key,
                 }
             final_text = str(result.get("result") or result.get("error") or "").strip()
             if final_text and result.get("status") == "ok":
@@ -1557,6 +1599,8 @@ class TeamCoordinator:
                     artifact_summary=result_artifact_summary,
                     changed_files=result_changed_files,
                     artifact_source=result_artifact_source,
+                    artifact_owner_session_id=result_artifact_owner_session_id,
+                    artifact_owner_role_key=result_artifact_owner_role_key,
                     result_summary=_summarize_result(final_text),
                 )
                 await self.mirror_handoff_event_to_team_sessions(
@@ -1578,6 +1622,8 @@ class TeamCoordinator:
                     artifact_summary=result_artifact_summary,
                     changed_files=result_changed_files,
                     artifact_source=result_artifact_source,
+                    artifact_owner_session_id=result_artifact_owner_session_id,
+                    artifact_owner_role_key=result_artifact_owner_role_key,
                     inline_session_message_callback=inline_session_message_callback,
                     inline_session_ids=inline_session_ids,
                 )
@@ -1592,6 +1638,8 @@ class TeamCoordinator:
                     "artifact_summary": result_artifact_summary or None,
                     "changed_files": result_changed_files or None,
                     "artifact_source": result_artifact_source,
+                    "artifact_owner_session_id": result_artifact_owner_session_id,
+                    "artifact_owner_role_key": result_artifact_owner_role_key,
                 }
 
             error_text = final_text or "Delegated session produced no final answer"
@@ -1609,6 +1657,8 @@ class TeamCoordinator:
                 artifact_summary=result_artifact_summary,
                 changed_files=result_changed_files,
                 artifact_source=result_artifact_source,
+                artifact_owner_session_id=result_artifact_owner_session_id,
+                artifact_owner_role_key=result_artifact_owner_role_key,
                 error=error_text,
             )
             await self.mirror_handoff_event_to_team_sessions(
@@ -1630,6 +1680,8 @@ class TeamCoordinator:
                 artifact_summary=result_artifact_summary,
                 changed_files=result_changed_files,
                 artifact_source=result_artifact_source,
+                artifact_owner_session_id=result_artifact_owner_session_id,
+                artifact_owner_role_key=result_artifact_owner_role_key,
                 inline_session_message_callback=inline_session_message_callback,
                 inline_session_ids=inline_session_ids,
             )
@@ -1644,6 +1696,8 @@ class TeamCoordinator:
                 "artifact_summary": result_artifact_summary or None,
                 "changed_files": result_changed_files or None,
                 "artifact_source": result_artifact_source,
+                "artifact_owner_session_id": result_artifact_owner_session_id,
+                "artifact_owner_role_key": result_artifact_owner_role_key,
             }
         except Exception as exc:
             failed_event = self.append_handoff_event(

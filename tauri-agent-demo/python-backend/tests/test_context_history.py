@@ -199,6 +199,75 @@ class ContextHistoryTests(unittest.TestCase):
         self.assertLess(planner_index, tool_call_index)
         self.assertLess(tool_call_index, coder_report_index)
 
+    def test_list_messages_keeps_creation_order_when_timestamp_drifts(self):
+        session = session_repository.create_session(
+            ChatSessionCreate(
+                title="Ordered Session",
+                config_id=self.config.id,
+                agent_profile="planner",
+            )
+        )
+        first = chat_repository.create_message(
+            ChatMessageCreate(session_id=session.id, role="user", content="first")
+        )
+        second = chat_repository.create_message(
+            ChatMessageCreate(session_id=session.id, role="assistant", content="[Planner]: second")
+        )
+        third = chat_repository.create_message(
+            ChatMessageCreate(session_id=session.id, role="assistant", content="[Coder]: third")
+        )
+
+        conn = self.temp_db.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE chat_messages SET timestamp = ? WHERE id = ?",
+            ("9999-12-31T23:59:59", second.id),
+        )
+        conn.commit()
+        conn.close()
+
+        all_messages = chat_repository.list_messages(session.id)
+        latest_two = chat_repository.list_messages(session.id, limit=2)
+        before_third = chat_repository.list_messages_before(session.id, third.id, 10)
+
+        self.assertEqual([msg.id for msg in all_messages], [first.id, second.id, third.id])
+        self.assertEqual([msg.id for msg in latest_two], [second.id, third.id])
+        self.assertEqual([msg.id for msg in before_third], [first.id, second.id])
+
+    def test_updating_message_content_does_not_mutate_creation_timestamp(self):
+        session = session_repository.create_session(
+            ChatSessionCreate(
+                title="Timestamp Session",
+                config_id=self.config.id,
+                agent_profile="planner",
+            )
+        )
+        message = chat_repository.create_message(
+            ChatMessageCreate(
+                session_id=session.id,
+                role="assistant",
+                content="initial",
+                metadata={"event_type": "handoff", "handoff_id": "handoff-1"},
+            )
+        )
+        original_timestamp = message.timestamp
+
+        chat_repository.update_message_content(session.id, message.id, "updated once")
+        details_after_content = chat_repository.get_message_details(session.id, message.id)
+
+        chat_repository.update_message_content_and_metadata(
+            session.id,
+            message.id,
+            "updated twice",
+            {"event_type": "handoff", "handoff_id": "handoff-1", "event_kind": "completed"},
+        )
+        details_after_metadata = chat_repository.get_message_details(session.id, message.id)
+
+        self.assertEqual(details_after_content["timestamp"], original_timestamp)
+        self.assertEqual(details_after_metadata["timestamp"], original_timestamp)
+        self.assertEqual(details_after_metadata["content"], "updated twice")
+        self.assertEqual(details_after_metadata["metadata"]["event_kind"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

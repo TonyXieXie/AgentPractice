@@ -230,6 +230,8 @@ class RuntimeTeamTests(unittest.TestCase):
             ],
         )
         self.assertEqual(events[-1].artifact_source, "snapshot_diff")
+        self.assertEqual(events[-1].artifact_owner_role_key, "coder")
+        self.assertEqual(events[-1].artifact_owner_session_id, target.id)
 
         for session_id in (source_after.id, target.id):
             messages = session_repository.list_messages(session_id)
@@ -257,8 +259,11 @@ class RuntimeTeamTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(message.metadata.get("artifact_source"), "snapshot_diff")
+            self.assertEqual(message.metadata.get("artifact_owner_role_key"), "coder")
+            self.assertEqual(message.metadata.get("artifact_owner_session_id"), target.id)
             self.assertTrue(str(message.content or "").startswith("[Planner]:"))
             self.assertIn("Assigned to [Coder]: Implement the change", str(message.content or ""))
+            self.assertIn("Artifacts from [Coder].", str(message.content or ""))
             self.assertIn("Changed files: M src/main.cpp; A src/utils.cpp", str(message.content or ""))
 
         target_messages = session_repository.list_messages(target.id)
@@ -291,6 +296,8 @@ class RuntimeTeamTests(unittest.TestCase):
             ],
         )
         self.assertEqual(delegated_result_messages[0].metadata.get("artifact_source"), "snapshot_diff")
+        self.assertEqual(delegated_result_messages[0].metadata.get("artifact_owner_role_key"), "coder")
+        self.assertEqual(delegated_result_messages[0].metadata.get("artifact_owner_session_id"), target.id)
         self.assertTrue(str(delegated_result_messages[0].content or "").startswith("[Coder]:"))
         self.assertIn("coder handled: Implement the change", delegated_result_messages[0].content)
         self.assertIn("Changed files: M src/main.cpp; A src/utils.cpp", delegated_result_messages[0].content)
@@ -537,6 +544,8 @@ class RuntimeTeamTests(unittest.TestCase):
             ],
         )
         self.assertEqual(team_events[-1].artifact_source, "snapshot_diff")
+        self.assertEqual(team_events[-1].artifact_owner_role_key, "coder")
+        self.assertEqual(team_events[-1].artifact_owner_session_id, coder_session.id)
 
         planner_handoff_messages = [
             message for message in session_repository.list_messages(source.id)
@@ -545,6 +554,9 @@ class RuntimeTeamTests(unittest.TestCase):
             and message.metadata.get("handoff_id") == team_events[-1].handoff_id
         ]
         self.assertEqual(len(planner_handoff_messages), 1)
+        self.assertEqual(planner_handoff_messages[0].metadata.get("artifact_owner_role_key"), "coder")
+        self.assertEqual(planner_handoff_messages[0].metadata.get("artifact_owner_session_id"), coder_session.id)
+        self.assertNotIn("Artifacts from [Planner].", planner_handoff_messages[0].content)
         self.assertIn("Changed files: M src/main.cpp; A src/review_notes.md", planner_handoff_messages[0].content)
 
     def test_leader_receives_return_to_leader_report_instead_of_coder_completion(self):

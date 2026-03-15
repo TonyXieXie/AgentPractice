@@ -1,5 +1,4 @@
 import json
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from database import db
@@ -58,14 +57,13 @@ def get_message_details(session_id: str, message_id: int) -> Optional[Dict[str, 
 def update_message_content(session_id: str, message_id: int, content: str) -> None:
     conn = db.get_connection()
     cursor = conn.cursor()
-    now = datetime.now().isoformat()
     cursor.execute(
         '''
         UPDATE chat_messages
-        SET content = ?, timestamp = ?
+        SET content = ?
         WHERE id = ? AND session_id = ?
         ''',
-        (content, now, message_id, session_id),
+        (content, message_id, session_id),
     )
     conn.commit()
     conn.close()
@@ -79,17 +77,15 @@ def update_message_content_and_metadata(
 ) -> None:
     conn = db.get_connection()
     cursor = conn.cursor()
-    now = datetime.now().isoformat()
     cursor.execute(
         '''
         UPDATE chat_messages
-        SET content = ?, metadata = ?, timestamp = ?
+        SET content = ?, metadata = ?
         WHERE id = ? AND session_id = ?
         ''',
         (
             content,
             json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
-            now,
             message_id,
             session_id,
         ),

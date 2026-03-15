@@ -246,6 +246,8 @@ class Database:
                 artifact_summary TEXT,
                 changed_files TEXT,
                 artifact_source TEXT,
+                artifact_owner_session_id TEXT,
+                artifact_owner_role_key TEXT,
                 task_payload TEXT,
                 result_summary TEXT,
                 error TEXT,
@@ -271,6 +273,16 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE team_handoff_events ADD COLUMN artifact_source TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE team_handoff_events ADD COLUMN artifact_owner_session_id TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE team_handoff_events ADD COLUMN artifact_owner_role_key TEXT')
         except sqlite3.OperationalError:
             pass
         
@@ -853,9 +865,11 @@ class Database:
             INSERT INTO team_handoff_events (
                 team_id, handoff_id, parent_handoff_id, event_kind,
                 from_session_id, from_role_key, to_session_id, to_role_key,
-                reason, work_summary, artifact_summary, changed_files, artifact_source, task_payload, result_summary, error, created_at
+                reason, work_summary, artifact_summary, changed_files, artifact_source,
+                artifact_owner_session_id, artifact_owner_role_key,
+                task_payload, result_summary, error, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''',
             (
                 event.team_id,
@@ -871,6 +885,8 @@ class Database:
                 event.artifact_summary,
                 changed_files_json,
                 event.artifact_source,
+                event.artifact_owner_session_id,
+                event.artifact_owner_role_key,
                 event.task_payload,
                 event.result_summary,
                 event.error,
@@ -903,6 +919,8 @@ class Database:
             artifact_summary=event.artifact_summary,
             changed_files=event.changed_files,
             artifact_source=event.artifact_source,
+            artifact_owner_session_id=event.artifact_owner_session_id,
+            artifact_owner_role_key=event.artifact_owner_role_key,
             task_payload=event.task_payload,
             result_summary=event.result_summary,
             error=event.error,
@@ -1380,14 +1398,14 @@ class Database:
             cursor.execute('''
                 SELECT * FROM chat_messages 
                 WHERE session_id = ? 
-                ORDER BY timestamp DESC 
+                ORDER BY id DESC 
                 LIMIT ?
             ''', (session_id, limit))
         else:
             cursor.execute('''
                 SELECT * FROM chat_messages 
                 WHERE session_id = ? 
-                ORDER BY timestamp ASC
+                ORDER BY id ASC
             ''', (session_id,))
         
         rows = cursor.fetchall()
@@ -1444,7 +1462,7 @@ class Database:
         cursor.execute('''
             SELECT * FROM chat_messages
             WHERE session_id = ? AND id < ?
-            ORDER BY timestamp DESC
+            ORDER BY id DESC
             LIMIT ?
         ''', (session_id, before_id, limit))
 

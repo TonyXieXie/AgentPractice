@@ -306,10 +306,72 @@ export interface TeamHandoffEvent {
     work_summary?: string | null;
     artifact_summary?: string | null;
     changed_files?: ChangedFileSummary[] | null;
+    artifact_source?: 'snapshot_diff' | 'tool_calls_fallback' | string | null;
+    artifact_owner_session_id?: string | null;
+    artifact_owner_role_key?: string | null;
     task_payload?: string | null;
     result_summary?: string | null;
     error?: string | null;
     created_at?: string | null;
+}
+
+export interface SessionExecutionStatus {
+    session_id: string;
+    state: 'executing' | 'idle';
+    source?: 'request' | 'streaming' | 'handoff';
+    team_id?: string | null;
+    updated_at?: string | null;
+}
+
+export interface GroupedHandoffItem {
+    handoff_id: string;
+    team_id: string;
+    parent_handoff_id?: string | null;
+    latest_event_kind: 'requested' | 'started' | 'completed' | 'failed';
+    from_session_id?: string | null;
+    from_role_key?: string | null;
+    to_session_id?: string | null;
+    to_role_key?: string | null;
+    reason?: string | null;
+    work_summary?: string | null;
+    artifact_summary?: string | null;
+    changed_files?: ChangedFileSummary[] | null;
+    artifact_source?: 'snapshot_diff' | 'tool_calls_fallback' | string | null;
+    artifact_owner_session_id?: string | null;
+    artifact_owner_role_key?: string | null;
+    task_payload?: string | null;
+    result_summary?: string | null;
+    error?: string | null;
+    latest_created_at?: string | null;
+    has_terminal_state: boolean;
+}
+
+export interface TeamOverviewMemberState {
+    session_id: string;
+    title: string;
+    role_key?: string | null;
+    role_name?: string | null;
+    is_leader: boolean;
+    is_executing: boolean;
+    has_unread: boolean;
+    has_permission: boolean;
+    updated_at?: string | null;
+}
+
+export interface TeamOverviewState {
+    team_id: string;
+    team_name: string;
+    leader_role_key?: string | null;
+    leader_role_name?: string | null;
+    current_role_key?: string | null;
+    current_role_name?: string | null;
+    overall_state: 'running' | 'waiting' | 'idle' | 'failed';
+    current_executor_session_id?: string | null;
+    current_executor_role_key?: string | null;
+    current_executor_role_name?: string | null;
+    current_executor_title?: string | null;
+    members: TeamOverviewMemberState[];
+    handoffs: GroupedHandoffItem[];
 }
 
 export interface LLMCall {

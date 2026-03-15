@@ -11,10 +11,13 @@ import { exportConfigFile, importConfigFile } from './configExchange';
 import {
   Message,
   MessageAttachment,
+  ChatSession,
   ChangedFileSummary,
   LLMConfig,
   LLMCall,
   SessionToolStats,
+  TeamHandoffEvent,
+  TeamOverviewState,
   ToolPermissionRequest,
   ReasoningEffort,
   AgentMode,
@@ -26,6 +29,7 @@ import {
 import {
   sendMessageAgentStream,
   getConfig,
+  getSessions,
   getSession,
   getSessionMessages,
   getSessionLLMCalls,
@@ -45,6 +49,7 @@ import {
   getAstSettings,
   updateAstSettings,
   notifyAstChanges,
+  getTeamHandoffs,
 } from './api';
 import ConfigManager from './components/ConfigManager';
 import SessionList from './components/SessionList';
@@ -52,6 +57,7 @@ import DebugPanel from './components/DebugPanel';
 import PtyPanel from './components/PtyPanel';
 import AgentStepView from './components/AgentStepView';
 import ConfirmDialog from './components/ConfirmDialog';
+import TeamOverviewSidebar from './components/TeamOverviewSidebar';
 import type { PtyInteractionController, ResolveStepPtyBinding } from './components/ptyInteraction';
 import { loadExtraWorkPaths, migrateExtraWorkPaths, saveExtraWorkPaths } from './workdirStorage';
 import { ptyStore } from './ptyStore';
@@ -80,6 +86,12 @@ import {
   resolveRelativePath,
   stripExistingSkillCommands,
 } from './features/appShell/helpers';
+import {
+  buildTeamOverviewState,
+  deriveCurrentTeamExecutor,
+  extractRelatedTeamSessionIds,
+  groupTeamHandoffItems,
+} from './features/appShell/teamState';
 import { useAppShellBootstrap } from './features/appShell/useBootstrap';
 import { useAppShellPtyStream } from './features/appShell/usePtyStream';
 import { useAppShellSessionChannel } from './features/appShell/useSessionChannel';
@@ -105,6 +117,7 @@ const IS_MAC = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAge
 const MAX_CONCURRENT_STREAMS = 10;
 const MAIN_WINDOW_BOUNDS_KEY = 'mainWindowBounds';
 const SIDEBAR_OPEN_KEY = 'sessionSidebarOpen';
+const TEAM_OVERVIEW_OPEN_KEY = 'teamOverviewSidebarOpen';
 const WORKDIR_DEFAULT_WIDTH = 1200;
 const WORKDIR_DEFAULT_HEIGHT = 800;
 const DEFAULT_PTY_PANEL_WIDTH = 380;
@@ -286,6 +299,17 @@ function App() {
     }
     return true;
   });
+  const [showTeamOverview, setShowTeamOverview] = useState(() => {
+    try {
+      const raw = localStorage.getItem(TEAM_OVERVIEW_OPEN_KEY);
+      if (raw !== null) {
+        return raw === '1' || raw.toLowerCase() === 'true';
+      }
+    } catch {
+      // ignore
+    }
+    return true;
+  });
   const [allConfigs, setAllConfigs] = useState<LLMConfig[]>([]);
   const [showConfigSelector, setShowConfigSelector] = useState(false);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
@@ -299,6 +323,9 @@ function App() {
   const [toolStats, setToolStats] = useState<SessionToolStats | null>(null);
   const [pendingContextEstimate, setPendingContextEstimate] = useState<PendingContextEstimate | null>(null);
   const [contextEstimateBySession, setContextEstimateBySession] = useState<Record<string, ContextEstimate>>({});
+  const [sessionInventory, setSessionInventory] = useState<ChatSession[]>([]);
+  const [teamHandoffsByTeam, setTeamHandoffsByTeam] = useState<Record<string, TeamHandoffEvent[]>>({});
+  const [discoveredTeamSessionIdsByTeam, setDiscoveredTeamSessionIdsByTeam] = useState<Record<string, string[]>>({});
   const [ptyOwnerBySession, setPtyOwnerBySession] = useState<PtyOwnerMapBySession>({});
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [heightTick, setHeightTick] = useState(0);
@@ -387,6 +414,8 @@ function App() {
   const lastWorkFileOpenRef = useRef<{ key: string; at: number } | null>(null);
   const astWatchRef = useRef<UnwatchFn | null>(null);
   const astNotifyRef = useRef<{ timer: number | null; paths: Set<string> }>({ timer: null, paths: new Set() });
+  const sessionInventoryRefreshTimerRef = useRef<number | null>(null);
+  const teamHandoffRefreshTimerRef = useRef<Record<string, number | null>>({});
   const appWindow = useMemo(() => getCurrentWindow(), []);
   const {
     resolveAgentTeam,
@@ -415,6 +444,100 @@ function App() {
 
   const toggleSidebar = useCallback(() => {
     setShowSidebar((prev) => !prev);
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(TEAM_OVERVIEW_OPEN_KEY, showTeamOverview ? '1' : '0');
+    } catch {
+      // ignore
+    }
+  }, [showTeamOverview]);
+
+  const toggleTeamOverview = useCallback(() => {
+    setShowTeamOverview((prev) => !prev);
+  }, []);
+
+  const refreshSessionInventory = useCallback(async () => {
+    try {
+      const sessions = await getSessions();
+      setSessionInventory(sessions);
+    } catch (error) {
+      console.error('Failed to load session inventory:', error);
+    }
+  }, []);
+
+  const scheduleSessionInventoryRefresh = useCallback((delayMs: number = 120) => {
+    if (sessionInventoryRefreshTimerRef.current != null) {
+      window.clearTimeout(sessionInventoryRefreshTimerRef.current);
+      sessionInventoryRefreshTimerRef.current = null;
+    }
+    sessionInventoryRefreshTimerRef.current = window.setTimeout(() => {
+      sessionInventoryRefreshTimerRef.current = null;
+      void refreshSessionInventory();
+    }, Math.max(0, delayMs));
+  }, [refreshSessionInventory]);
+
+  const refreshTeamHandoffs = useCallback(async (teamId: string) => {
+    if (!teamId) return;
+    try {
+      const events = await getTeamHandoffs(teamId);
+      setTeamHandoffsByTeam((prev) => ({ ...prev, [teamId]: events }));
+    } catch (error) {
+      console.error(`Failed to load team handoffs for ${teamId}:`, error);
+    }
+  }, []);
+
+  const scheduleTeamHandoffRefresh = useCallback((teamId: string, delayMs: number = 120) => {
+    if (!teamId) return;
+    const existingTimer = teamHandoffRefreshTimerRef.current[teamId];
+    if (existingTimer != null) {
+      window.clearTimeout(existingTimer);
+    }
+    teamHandoffRefreshTimerRef.current[teamId] = window.setTimeout(() => {
+      teamHandoffRefreshTimerRef.current[teamId] = null;
+      void refreshTeamHandoffs(teamId);
+    }, Math.max(0, delayMs));
+  }, [refreshTeamHandoffs]);
+
+  const rememberDiscoveredTeamSessions = useCallback((teamId: string | null, sessionIds: string[]) => {
+    if (!teamId || sessionIds.length === 0) return;
+    setDiscoveredTeamSessionIdsByTeam((prev) => {
+      const existing = new Set(prev[teamId] || []);
+      let changed = false;
+      sessionIds.forEach((sessionId) => {
+        if (!sessionId || existing.has(sessionId)) return;
+        existing.add(sessionId);
+        changed = true;
+      });
+      if (!changed) return prev;
+      return { ...prev, [teamId]: Array.from(existing) };
+    });
+  }, []);
+
+  useEffect(() => {
+    scheduleSessionInventoryRefresh(0);
+    return () => {
+      if (sessionInventoryRefreshTimerRef.current != null) {
+        window.clearTimeout(sessionInventoryRefreshTimerRef.current);
+        sessionInventoryRefreshTimerRef.current = null;
+      }
+    };
+  }, [scheduleSessionInventoryRefresh]);
+
+  useEffect(() => {
+    scheduleSessionInventoryRefresh();
+  }, [sessionRefreshTrigger, scheduleSessionInventoryRefresh]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(teamHandoffRefreshTimerRef.current).forEach((timerId) => {
+        if (timerId != null) {
+          window.clearTimeout(timerId);
+        }
+      });
+      teamHandoffRefreshTimerRef.current = {};
+    };
   }, []);
 
   const adjustWindowWidth = useCallback(async (delta: number) => {
@@ -1574,6 +1697,92 @@ function App() {
     return next;
   }, [permissionTick]);
 
+  const currentTeamSessions = useMemo(
+    () => (currentSessionTeamId ? sessionInventory.filter((session) => session.team_id === currentSessionTeamId) : []),
+    [currentSessionTeamId, sessionInventory]
+  );
+
+  const currentTeamHandoffEvents = useMemo(
+    () => (currentSessionTeamId ? teamHandoffsByTeam[currentSessionTeamId] || [] : []),
+    [currentSessionTeamId, teamHandoffsByTeam]
+  );
+
+  const currentGroupedHandoffs = useMemo(
+    () => groupTeamHandoffItems(currentTeamHandoffEvents),
+    [currentTeamHandoffEvents]
+  );
+
+  const currentTeamHandoffDisplayTimeById = useMemo(() => {
+    const byId = new Map<string, string>();
+    currentTeamHandoffEvents.forEach((event) => {
+      const handoffId = typeof event.handoff_id === 'string' ? event.handoff_id.trim() : '';
+      const createdAt = typeof event.created_at === 'string' ? event.created_at.trim() : '';
+      if (!handoffId || !createdAt) return;
+      const existing = byId.get(handoffId);
+      if (!existing || createdAt < existing) {
+        byId.set(handoffId, createdAt);
+      }
+    });
+    return byId;
+  }, [currentTeamHandoffEvents]);
+
+  const currentTeamDiscoveredSessionIds = useMemo(
+    () => (currentSessionTeamId ? discoveredTeamSessionIdsByTeam[currentSessionTeamId] || [] : []),
+    [currentSessionTeamId, discoveredTeamSessionIdsByTeam]
+  );
+
+  const subscribedSessionIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (currentSessionId) {
+      ids.add(currentSessionId);
+    }
+    if (currentSessionTeamId) {
+      currentTeamSessions.forEach((session) => ids.add(session.id));
+      currentTeamDiscoveredSessionIds.forEach((sessionId) => ids.add(sessionId));
+    }
+    return Array.from(ids);
+  }, [currentSessionId, currentSessionTeamId, currentTeamDiscoveredSessionIds, currentTeamSessions]);
+
+  const currentTeamExecutor = useMemo(
+    () =>
+      deriveCurrentTeamExecutor({
+        teamId: currentSessionTeamId,
+        teamSessions: currentTeamSessions,
+        groupedHandoffs: currentGroupedHandoffs,
+        messagesBySession: messagesCacheRef.current,
+      }),
+    [currentGroupedHandoffs, currentSessionTeamId, currentTeamSessions, sessionRefreshTrigger]
+  );
+
+  const executingBySession = useMemo(() => {
+    const next = { ...inFlightBySession };
+    if (!currentSessionTeamId || currentTeamSessions.length === 0) {
+      return next;
+    }
+    currentTeamSessions.forEach((session) => {
+      delete next[session.id];
+    });
+    if (currentTeamExecutor?.session_id) {
+      next[currentTeamExecutor.session_id] = true;
+    }
+    return next;
+  }, [currentSessionTeamId, currentTeamExecutor, currentTeamSessions, inFlightBySession]);
+
+  useEffect(() => {
+    if (!currentSessionTeamId) return;
+    scheduleTeamHandoffRefresh(currentSessionTeamId, 0);
+  }, [currentSessionTeamId, scheduleTeamHandoffRefresh]);
+
+  useEffect(() => {
+    if (!currentSessionTeamId || currentTeamHandoffEvents.length === 0) return;
+    const sessionIds = currentTeamHandoffEvents.flatMap((event) =>
+      [event.from_session_id, event.to_session_id].filter(
+        (sessionId): sessionId is string => typeof sessionId === 'string' && sessionId.trim().length > 0
+      )
+    );
+    rememberDiscoveredTeamSessions(currentSessionTeamId, sessionIds);
+  }, [currentSessionTeamId, currentTeamHandoffEvents, rememberDiscoveredTeamSessions]);
+
   const clearPendingContextForItem = (queueId: string) => {
     setPendingContextEstimate((prev) => {
       if (!prev || prev.queueId !== queueId) return prev;
@@ -1687,14 +1896,32 @@ function App() {
     }
   }, []);
 
+  const handleIncomingSessionMessage = useCallback((payload: { session_id: string; message: Message }) => {
+    const message = payload?.message;
+    if (!message) return;
+    const metadata = ((message as any).metadata || {}) as Record<string, unknown>;
+    const eventType = typeof metadata.event_type === 'string' ? metadata.event_type : '';
+    const { teamId, sessionIds } = extractRelatedTeamSessionIds(message);
+
+    if (teamId && sessionIds.length > 0) {
+      rememberDiscoveredTeamSessions(teamId, sessionIds);
+    }
+    if (teamId && (eventType === 'handoff' || eventType === 'delegated_result')) {
+      scheduleTeamHandoffRefresh(teamId);
+      scheduleSessionInventoryRefresh();
+    }
+  }, [rememberDiscoveredTeamSessions, scheduleSessionInventoryRefresh, scheduleTeamHandoffRefresh]);
+
   useAppShellSessionChannel({
     currentSessionId,
+    subscribedSessionIds,
     getSessionKey,
     getCurrentSessionKey,
     updateSessionMessages,
     markSessionUnread,
     setSessionRefreshTrigger,
     applyIncomingActiveAgent,
+    onSessionMessage: handleIncomingSessionMessage,
   });
 
   useAppShellPtyStream({
@@ -1840,11 +2067,11 @@ function App() {
         if ('message' in chunk && (chunk as any).message && typeof (chunk as any).message.id === 'number') {
           const payload = chunk as { session_id?: string; message?: Message; active_agent_profile?: string | null };
           const payloadSessionId = payload.session_id || newSessionId || undefined;
-          if (payloadSessionId && payload.message) {
-            const sessionKey = getSessionKey(payloadSessionId);
-            updateSessionMessages(sessionKey, (prev) => {
-              if (prev.some((msg) => msg.id === payload.message?.id)) return prev;
-              return [...prev, payload.message as Message];
+            if (payloadSessionId && payload.message) {
+              const sessionKey = getSessionKey(payloadSessionId);
+              updateSessionMessages(sessionKey, (prev) => {
+                if (prev.some((msg) => msg.id === payload.message?.id)) return prev;
+                return [...prev, payload.message as Message];
             });
             if (payloadSessionId === currentSessionIdRef.current) {
               const handoffTeamId = payload.message.metadata?.event_type === 'handoff'
@@ -1855,6 +2082,7 @@ function App() {
               }
             }
             applyIncomingActiveAgent(payloadSessionId, payload.active_agent_profile);
+            handleIncomingSessionMessage({ session_id: payloadSessionId, message: payload.message as Message });
             setSessionRefreshTrigger((prev) => prev + 1);
           }
           continue;
@@ -1915,6 +2143,7 @@ function App() {
             setCurrentSessionTeamId(null);
             applyIncomingActiveAgent(newSessionId, activeAgentProfile);
             setSessionRefreshTrigger((prev) => prev + 1);
+            scheduleSessionInventoryRefresh();
           }
           if (activeSessionKey === DRAFT_SESSION_KEY && newSessionId) {
             migrateSessionKey(activeSessionKey, newSessionId);
@@ -3132,6 +3361,16 @@ function App() {
       mark('session');
       setCurrentSessionParentId(session.team_id ? null : (session.parent_session_id || null));
       setCurrentSessionTeamId(session.team_id || null);
+      setSessionInventory((prev) => {
+        const index = prev.findIndex((item) => item.id === session.id);
+        if (index < 0) return [session, ...prev];
+        const next = [...prev];
+        next[index] = session;
+        return next;
+      });
+      if (session.team_id) {
+        rememberDiscoveredTeamSessions(session.team_id, [session.id]);
+      }
       const sessionWorkPath = session.work_path || '';
       workPathBySessionRef.current[session.id] = sessionWorkPath;
       setCurrentWorkPath(sessionWorkPath);
@@ -3632,12 +3871,56 @@ function App() {
   );
   const currentActiveAgentProfile =
     agentProfiles.find((profile) => profile.id === resolvedActiveAgentProfileId) || null;
+  const roleLabelById = useMemo(() => {
+    const next = new Map<string, string>();
+    agentProfiles.forEach((profile) => {
+      if (profile?.id) {
+        next.set(profile.id, profile.name || profile.id);
+      }
+    });
+    return next;
+  }, [agentProfiles]);
+  const currentTeamSession =
+    (currentSessionId ? sessionInventory.find((session) => session.id === currentSessionId) || null : null);
+  const currentRuntimeTeamConfig =
+    (currentTeamSession?.agent_team_id
+      ? resolveAgentTeam(agentConfig, currentTeamSession.agent_team_id)
+      : null) || selectedAgentTeam;
   const currentRoleProfileId = currentActiveAgentProfileId || resolvedActiveAgentProfileId || null;
-  const currentTeamLeaderProfileId = currentSessionTeamId ? selectedAgentTeam?.leader_profile_id || null : null;
+  const currentSelectedRoleKey = currentTeamSession?.role_key || currentTeamSession?.agent_profile || currentRoleProfileId || null;
+  const currentTeamLeaderProfileId = currentSessionTeamId ? currentRuntimeTeamConfig?.leader_profile_id || null : null;
   const currentTeamLeaderProfile =
     currentTeamLeaderProfileId
       ? agentProfiles.find((profile) => profile.id === currentTeamLeaderProfileId) || null
       : null;
+  const teamOverviewState = useMemo<TeamOverviewState | null>(
+    () =>
+      buildTeamOverviewState({
+        teamId: currentSessionTeamId,
+        teamName: currentRuntimeTeamConfig?.name || currentSessionTeamId || '',
+        leaderRoleKey: currentRuntimeTeamConfig?.leader_profile_id || null,
+        currentRoleKey: currentSelectedRoleKey,
+        teamSessions: currentTeamSessions,
+        groupedHandoffs: currentGroupedHandoffs,
+        currentExecutor: currentTeamExecutor,
+        unreadBySession,
+        pendingPermissionBySession,
+        inFlightBySession,
+        roleLabelById,
+      }),
+    [
+      currentGroupedHandoffs,
+      currentRuntimeTeamConfig,
+      currentSelectedRoleKey,
+      currentSessionTeamId,
+      currentTeamExecutor,
+      currentTeamSessions,
+      inFlightBySession,
+      pendingPermissionBySession,
+      roleLabelById,
+      unreadBySession,
+    ]
+  );
   const isReadonlyTeamRoleSession = Boolean(
     currentSessionTeamId &&
       currentTeamLeaderProfileId &&
@@ -3813,7 +4096,7 @@ function App() {
           onToggleSidebar={toggleSidebar}
           debugActive={showDebugPanel}
           refreshTrigger={sessionRefreshTrigger}
-          inFlightBySession={inFlightBySession}
+          executingBySession={executingBySession}
           unreadBySession={unreadBySession}
           pendingPermissionBySession={pendingPermissionBySession}
           agentConfig={agentConfig}
@@ -3822,7 +4105,9 @@ function App() {
 
       <div className="main-content">
         <div className="chat-container">
-          <div className="messages-wrapper">
+          <div className={`chat-workspace${teamOverviewState ? ' has-team-overview' : ''}`}>
+            <div className="chat-main-column">
+              <div className="messages-wrapper">
             <div
               className="messages"
               ref={messagesContainerRef}
@@ -3872,7 +4157,27 @@ function App() {
                     })();
                     const messageMetadata = ((msg as any).metadata || {}) as Record<string, unknown>;
                     const eventType = typeof messageMetadata.event_type === 'string' ? messageMetadata.event_type : '';
+                    const isEventMessage =
+                      msg.role === 'assistant' && (eventType === 'handoff' || eventType === 'delegated_result');
                     const isHandoffCard = msg.role === 'assistant' && eventType === 'handoff';
+                    const handoffId = typeof messageMetadata.handoff_id === 'string' ? messageMetadata.handoff_id : '';
+                    const artifactOwnerLabel = isHandoffCard
+                      ? (
+                          typeof messageMetadata.artifact_owner_label === 'string'
+                            ? messageMetadata.artifact_owner_label
+                            : typeof messageMetadata.artifact_owner_role_key === 'string'
+                              ? messageMetadata.artifact_owner_role_key
+                              : typeof messageMetadata.to_agent_label === 'string'
+                                ? messageMetadata.to_agent_label
+                                : typeof messageMetadata.to_agent === 'string'
+                                  ? messageMetadata.to_agent
+                                  : typeof messageMetadata.from_agent_label === 'string'
+                                    ? messageMetadata.from_agent_label
+                                    : typeof messageMetadata.from_agent === 'string'
+                                      ? messageMetadata.from_agent
+                                      : ''
+                        )
+                      : '';
                     const changedFiles = isHandoffCard ? normalizeChangedFiles(messageMetadata.changed_files) : [];
                     const artifactSummary = isHandoffCard
                       ? (
@@ -3882,6 +4187,10 @@ function App() {
                         )
                       : '';
                     const handoffBody = isHandoffCard ? stripHandoffChangedFilesLine(String(msg.content || '')) : String(msg.content || '');
+                    const displayTimestamp =
+                      isHandoffCard && handoffId
+                        ? currentTeamHandoffDisplayTimeById.get(handoffId) || msg.timestamp
+                        : msg.timestamp;
 
                     return (
                       <MeasuredMessage
@@ -3891,7 +4200,7 @@ function App() {
                         className={`message ${msg.role}`}
                       >
                         <div className="message-content">
-                          {msg.role === 'assistant' && (steps.length > 0 || showPermission) ? (
+                          {msg.role === 'assistant' && !isEventMessage && (steps.length > 0 || showPermission) ? (
                             <AgentStepView
                               steps={steps}
                               sessionId={msg.session_id || currentSessionId || undefined}
@@ -3964,7 +4273,7 @@ function App() {
                               {(changedFiles.length > 0 || artifactSummary) && (
                                 <details className="handoff-files-panel">
                                   <summary className="handoff-files-summary">
-                                    <span>Changed files</span>
+                                    <span>{artifactOwnerLabel ? `Changed by ${artifactOwnerLabel}` : 'Changed files'}</span>
                                     <span className="handoff-files-count">
                                       {changedFiles.length > 0 ? `${changedFiles.length}` : 'View'}
                                     </span>
@@ -3993,7 +4302,7 @@ function App() {
                             msg.content
                           )}
                         </div>
-                        <div className="message-time">{new Date(msg.timestamp).toLocaleTimeString()}</div>
+                        <div className="message-time">{new Date(displayTimestamp).toLocaleTimeString()}</div>
                       </MeasuredMessage>
                     );
                   })}
@@ -4594,6 +4903,29 @@ function App() {
                 )}
               </div>
             </div>
+            </div>
+            </div>
+            {teamOverviewState && showTeamOverview && (
+              <TeamOverviewSidebar
+                overview={teamOverviewState}
+                onSelectSession={(sessionId) => void handleSelectSession(sessionId)}
+                onToggle={toggleTeamOverview}
+              />
+            )}
+            {teamOverviewState && !showTeamOverview && (
+              <button
+                type="button"
+                className="team-overview-float-toggle"
+                onClick={toggleTeamOverview}
+                aria-label="Expand team overview"
+                title="Expand team overview"
+              >
+                <span>Team</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                </svg>
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -4623,6 +4955,7 @@ function App() {
           onWidthChange={(width) => handlePanelWidthChange('debug', width)}
         />
       )}
+      </div>
       </div>
 
       {showConfigManager && (
@@ -4811,7 +5144,6 @@ function App() {
         </div>
       )}
 
-    </div>
     </div>
   );
 }
