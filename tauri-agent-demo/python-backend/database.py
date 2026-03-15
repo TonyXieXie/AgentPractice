@@ -243,6 +243,9 @@ class Database:
                 to_role_key TEXT,
                 reason TEXT,
                 work_summary TEXT,
+                artifact_summary TEXT,
+                changed_files TEXT,
+                artifact_source TEXT,
                 task_payload TEXT,
                 result_summary TEXT,
                 error TEXT,
@@ -253,6 +256,21 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE team_handoff_events ADD COLUMN work_summary TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE team_handoff_events ADD COLUMN artifact_summary TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE team_handoff_events ADD COLUMN changed_files TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE team_handoff_events ADD COLUMN artifact_source TEXT')
         except sqlite3.OperationalError:
             pass
         
@@ -829,14 +847,15 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         created_at = event.created_at or datetime.now().isoformat()
+        changed_files_json = json.dumps(event.changed_files, ensure_ascii=False) if event.changed_files else None
         cursor.execute(
             '''
             INSERT INTO team_handoff_events (
                 team_id, handoff_id, parent_handoff_id, event_kind,
                 from_session_id, from_role_key, to_session_id, to_role_key,
-                reason, work_summary, task_payload, result_summary, error, created_at
+                reason, work_summary, artifact_summary, changed_files, artifact_source, task_payload, result_summary, error, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''',
             (
                 event.team_id,
@@ -849,6 +868,9 @@ class Database:
                 event.to_role_key,
                 event.reason,
                 event.work_summary,
+                event.artifact_summary,
+                changed_files_json,
+                event.artifact_source,
                 event.task_payload,
                 event.result_summary,
                 event.error,
@@ -878,6 +900,9 @@ class Database:
             to_role_key=event.to_role_key,
             reason=event.reason,
             work_summary=event.work_summary,
+            artifact_summary=event.artifact_summary,
+            changed_files=event.changed_files,
+            artifact_source=event.artifact_source,
             task_payload=event.task_payload,
             result_summary=event.result_summary,
             error=event.error,
@@ -900,7 +925,17 @@ class Database:
         )
         rows = cursor.fetchall()
         conn.close()
-        return [TeamHandoffEvent(**dict(row)) for row in rows]
+        results: List[TeamHandoffEvent] = []
+        for row in rows:
+            data = dict(row)
+            changed_files_raw = data.get("changed_files")
+            if changed_files_raw:
+                try:
+                    data["changed_files"] = json.loads(changed_files_raw)
+                except Exception:
+                    data["changed_files"] = None
+            results.append(TeamHandoffEvent(**data))
+        return results
 
     def has_team_handoff_events_since(self, team_id: str, timestamp: str) -> bool:
         if not team_id or not timestamp:
@@ -1822,8 +1857,26 @@ class Database:
         tool_call_id = cursor.lastrowid
         conn.commit()
         conn.close()
-        
+
         return tool_call_id
+
+    def get_tool_calls_for_message(self, message_id: int) -> List[Dict[str, Any]]:
+        if not message_id:
+            return []
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, message_id, agent_profile, tool_name, tool_input, tool_output, timestamp
+            FROM tool_calls
+            WHERE message_id = ?
+            ORDER BY id ASC
+            ''',
+            (message_id,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
 
     # ==================== Tool Permission Requests ====================
 

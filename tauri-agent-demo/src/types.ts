@@ -287,6 +287,11 @@ export interface Team {
     updated_at?: string | null;
 }
 
+export interface ChangedFileSummary {
+    path: string;
+    status: 'added' | 'modified' | 'deleted' | string;
+}
+
 export interface TeamHandoffEvent {
     id?: number | null;
     team_id: string;
@@ -299,6 +304,8 @@ export interface TeamHandoffEvent {
     to_role_key?: string | null;
     reason?: string | null;
     work_summary?: string | null;
+    artifact_summary?: string | null;
+    changed_files?: ChangedFileSummary[] | null;
     task_payload?: string | null;
     result_summary?: string | null;
     error?: string | null;

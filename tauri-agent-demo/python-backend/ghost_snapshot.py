@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 from repositories import chat_repository
 
@@ -133,6 +133,41 @@ def create_snapshot_tree(work_path: str) -> str:
         return tree_hash
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def diff_snapshot_trees(work_path: str, base_tree_hash: str, target_tree_hash: str) -> List[Dict[str, str]]:
+    if not work_path or not base_tree_hash or not target_tree_hash:
+        return []
+
+    ctx = _get_repo_context(work_path)
+    root = ctx["root"]
+    base_env = ctx.get("env")
+    output = _run_git(
+        ["diff", "--name-status", "--no-renames", base_tree_hash, target_tree_hash],
+        cwd=root,
+        env=base_env,
+    )
+    changed_files: List[Dict[str, str]] = []
+    for line in output.splitlines():
+        normalized = str(line or "").strip()
+        if not normalized:
+            continue
+        parts = normalized.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        raw_status, path = parts
+        path = str(path or "").strip()
+        if not path:
+            continue
+        status_code = str(raw_status or "").strip().upper()[:1]
+        if status_code == "A":
+            status = "added"
+        elif status_code == "D":
+            status = "deleted"
+        else:
+            status = "modified"
+        changed_files.append({"path": path, "status": status})
+    return changed_files
 
 
 def ensure_snapshot(session_id: str, message_id: int, work_path: str) -> Optional[str]:

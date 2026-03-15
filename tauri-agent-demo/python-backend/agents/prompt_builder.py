@@ -273,7 +273,8 @@ def _build_team_prompt_prefix(
         "If you are not the leader, never treat your local completion as the final user completion. "
         "If you are not the leader, do not tell the user the task is fully complete, solved, shipped, or finished. "
         "Your answer should be a work report for the delegating or upstream agent, including completed work, key results, remaining risks or blockers, and a recommended next step. "
-        "If the overall task still needs more work, hand off to the most suitable teammate instead of announcing final completion."
+        "If the overall task still needs more work, hand off to the most suitable teammate instead of announcing final completion. "
+        "When your work changes code or files, explicitly mention the key modified files in your work report."
     )
     if leader_profile_id and current_profile_id == leader_profile_id:
         prompt += (

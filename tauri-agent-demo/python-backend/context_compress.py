@@ -335,25 +335,37 @@ def _filter_message_for_history(session_id: str, msg: Dict[str, Any]) -> Optiona
     return msg_for_history
 
 
-def _list_global_history_messages(
+def _list_history_source_messages(
     session_id: str,
     after_message_id: Optional[int],
     current_user_message_id: Optional[int],
 ) -> List[Dict[str, Any]]:
     messages = chat_repository.list_dialogue_messages_after(session_id, after_message_id)
-    filtered: List[Dict[str, Any]] = []
+    source_messages: List[Dict[str, Any]] = []
     for msg in messages:
         if current_user_message_id and msg.get("id") == current_user_message_id:
             continue
+        msg_for_history = dict(msg)
+        if current_user_message_id:
+            try:
+                message_id = int(msg.get("id"))
+                if message_id > int(current_user_message_id):
+                    msg_for_history["_after_user"] = True
+            except (TypeError, ValueError):
+                pass
+        source_messages.append(msg_for_history)
+    return source_messages
+
+
+def _list_global_history_messages(
+    session_id: str,
+    after_message_id: Optional[int],
+    current_user_message_id: Optional[int],
+) -> List[Dict[str, Any]]:
+    filtered: List[Dict[str, Any]] = []
+    for msg in _list_history_source_messages(session_id, after_message_id, current_user_message_id):
         msg_for_history = _filter_message_for_history(session_id, msg)
         if msg_for_history is not None:
-            if current_user_message_id:
-                try:
-                    message_id = int(msg.get("id"))
-                    if message_id > int(current_user_message_id):
-                        msg_for_history["_after_user"] = True
-                except (TypeError, ValueError):
-                    pass
             filtered.append(msg_for_history)
     return filtered
 
@@ -363,11 +375,17 @@ def _append_step_history_messages(
     steps: List[Dict[str, Any]],
     trunc_cfg: Optional[Dict[str, Any]],
     call_prefix: str,
+    after_user: bool = False,
 ) -> None:
     if not steps:
         return
     pending_calls: List[Dict[str, str]] = []
     tool_call_counter = 0
+
+    def _append_history_message(item: Dict[str, Any]) -> None:
+        if after_user:
+            item["_after_user"] = True
+        history.append(item)
 
     def _next_call_id(sequence: Optional[int], tool_name: str, step_id: Optional[int]) -> str:
         nonlocal tool_call_counter
@@ -388,7 +406,7 @@ def _append_step_history_messages(
             tool_input = metadata.get("input")
             call_id = _next_call_id(step.get("sequence"), str(tool_name), step.get("id"))
             pending_calls.append({"tool": str(tool_name), "id": call_id})
-            history.append({
+            _append_history_message({
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
@@ -412,7 +430,7 @@ def _append_step_history_messages(
                     break
             if call_id is None:
                 call_id = _next_call_id(step.get("sequence"), str(tool_name), step.get("id"))
-                history.append({
+                _append_history_message({
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [
@@ -426,7 +444,7 @@ def _append_step_history_messages(
                         }
                     ]
                 })
-            history.append({
+            _append_history_message({
                 "role": "tool",
                 "content": tool_output,
                 "tool_call_id": call_id,
@@ -457,23 +475,26 @@ def build_history_for_llm(
     private_summary: Optional[str] = None,
     private_after_step_id: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    filtered = _list_global_history_messages(session_id, after_message_id, current_user_message_id)
-    assistant_ids = [msg.get("id") for msg in filtered if msg.get("role") == "assistant"]
-    ordered_steps: List[Dict[str, Any]] = []
-    if assistant_ids:
+    source_messages = _list_history_source_messages(session_id, after_message_id, current_user_message_id)
+    steps_by_message_id: Dict[int, List[Dict[str, Any]]] = {}
+    if current_agent_profile:
+        assistant_ids = [msg.get("id") for msg in source_messages if msg.get("role") == "assistant"]
         steps = chat_repository.list_agent_steps_for_messages(session_id, assistant_ids)
         for step in steps:
-            if current_agent_profile:
-                if str(step.get("agent_profile") or "").strip() != str(current_agent_profile).strip():
-                    continue
-                if private_after_step_id is not None:
-                    step_id = step.get("id")
-                    try:
-                        if step_id is not None and int(step_id) <= int(private_after_step_id):
-                            continue
-                    except (TypeError, ValueError):
-                        pass
-            ordered_steps.append(step)
+            if str(step.get("agent_profile") or "").strip() != str(current_agent_profile).strip():
+                continue
+            if private_after_step_id is not None:
+                step_id = step.get("id")
+                try:
+                    if step_id is not None and int(step_id) <= int(private_after_step_id):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            try:
+                message_id = int(step.get("message_id"))
+            except (TypeError, ValueError):
+                continue
+            steps_by_message_id.setdefault(message_id, []).append(step)
 
     def _step_sort_key(step: Dict[str, Any]) -> Tuple[str, int]:
         timestamp = str(step.get("timestamp") or "")
@@ -483,40 +504,51 @@ def build_history_for_llm(
             step_id = 0
         return timestamp, step_id
 
-    pending_steps = sorted(ordered_steps, key=_step_sort_key)
-    pending_index = 0
+    for message_id, steps in steps_by_message_id.items():
+        steps_by_message_id[message_id] = sorted(steps, key=_step_sort_key)
 
     history: List[Dict[str, Any]] = []
-    for msg in filtered:
-        msg_timestamp = str(msg.get("timestamp") or "")
-        if current_agent_profile and pending_index < len(pending_steps):
-            ready_steps: List[Dict[str, Any]] = []
-            while pending_index < len(pending_steps):
-                step = pending_steps[pending_index]
-                step_timestamp = str(step.get("timestamp") or "")
-                if msg_timestamp and step_timestamp and step_timestamp > msg_timestamp:
-                    break
-                ready_steps.append(step)
-                pending_index += 1
+    for msg in source_messages:
+        if current_agent_profile:
+            try:
+                message_id = int(msg.get("id"))
+            except (TypeError, ValueError):
+                message_id = None
+            if message_id is not None:
+                ready_steps = steps_by_message_id.get(message_id) or []
+                if ready_steps:
+                    _append_step_history_messages(
+                        history,
+                        ready_steps,
+                        trunc_cfg,
+                        f"hist_call_{message_id}",
+                        after_user=bool(msg.get("_after_user")),
+                    )
+
+        filtered_msg = _filter_message_for_history(session_id, msg)
+        if filtered_msg is not None:
+            history_message = {"role": filtered_msg.get("role"), "content": filtered_msg.get("content")}
+            if filtered_msg.get("_after_user"):
+                history_message["_after_user"] = True
+            history.append(history_message)
+
+    if current_agent_profile:
+        consumed_ids = {
+            int(msg.get("id"))
+            for msg in source_messages
+            if isinstance(msg.get("id"), int)
+        }
+        tail_steps: List[Dict[str, Any]] = []
+        for message_id, steps in steps_by_message_id.items():
+            if message_id not in consumed_ids:
+                tail_steps.extend(steps)
+        if tail_steps:
             _append_step_history_messages(
                 history,
-                ready_steps,
+                sorted(tail_steps, key=_step_sort_key),
                 trunc_cfg,
-                f"hist_call_{msg.get('id')}"
+                "hist_call_tail",
             )
-
-        history_message = {"role": msg.get("role"), "content": msg.get("content")}
-        if msg.get("_after_user"):
-            history_message["_after_user"] = True
-        history.append(history_message)
-
-    if current_agent_profile and pending_index < len(pending_steps):
-        _append_step_history_messages(
-            history,
-            pending_steps[pending_index:],
-            trunc_cfg,
-            "hist_call_tail"
-        )
 
     if summary:
         history.insert(0, {"role": "assistant", "content": f"{CONTEXT_SUMMARY_MARKER}\n{summary}"})

@@ -149,6 +149,9 @@ class TeamHandoffEvent(BaseModel):
     to_role_key: Optional[str] = None
     reason: Optional[str] = None
     work_summary: Optional[str] = None
+    artifact_summary: Optional[str] = None
+    changed_files: Optional[List[Dict[str, str]]] = None
+    artifact_source: Optional[str] = None
     task_payload: Optional[str] = None
     result_summary: Optional[str] = None
     error: Optional[str] = None

@@ -211,7 +211,7 @@ class MultiAgentRuntimeSemanticsTests(unittest.TestCase):
                 ChatMessageCreate(
                     session_id=source_session_id,
                     role="assistant",
-                    content="[Planner]: Reviewed the task and planned the implementation.\nRequested from [Coder]: Implement the change",
+                    content="[Planner]: Reviewed the task and planned the implementation.\nAssigned to [Coder]: Implement the change",
                     metadata={
                         "event_type": "handoff",
                         "team_id": "runtime-team-1",

@@ -249,6 +249,10 @@ def save_tool_call(
     return db.save_tool_call(message_id, tool_name, tool_input, tool_output, agent_profile=agent_profile)
 
 
+def get_tool_calls_for_message(message_id: int) -> List[Dict[str, Any]]:
+    return db.get_tool_calls_for_message(message_id)
+
+
 def get_llm_call_metas_after(session_id: str, after_id: int = 0) -> List[Dict[str, Any]]:
     return db.get_llm_call_metas_after(session_id, after_id)
 

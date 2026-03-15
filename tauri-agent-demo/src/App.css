@@ -512,6 +512,117 @@ body[data-platform="mac"] .app-titlebar {
   border-bottom-left-radius: 4px;
 }
 
+.handoff-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.handoff-files-panel {
+  margin: 0;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 12px;
+  background: rgba(148, 163, 184, 0.06);
+  overflow: hidden;
+  white-space: normal;
+}
+
+.handoff-files-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  font-size: 0.92rem;
+  color: #dbe5f0;
+}
+
+.handoff-files-summary::-webkit-details-marker {
+  display: none;
+}
+
+.handoff-files-summary::after {
+  content: '▾';
+  margin-left: auto;
+  font-size: 0.8rem;
+  color: #9fb2c8;
+  transition: transform 0.18s ease;
+}
+
+.handoff-files-panel[open] .handoff-files-summary::after {
+  transform: rotate(180deg);
+}
+
+.handoff-files-count {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.5);
+  color: #9fb2c8;
+  font-size: 0.78rem;
+}
+
+.handoff-files-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 12px 12px;
+}
+
+.handoff-file-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.handoff-file-badge {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  background: rgba(148, 163, 184, 0.14);
+  color: #dbe5f0;
+}
+
+.handoff-file-badge.added {
+  background: rgba(34, 197, 94, 0.18);
+  color: #86efac;
+}
+
+.handoff-file-badge.modified {
+  background: rgba(56, 189, 248, 0.16);
+  color: #7dd3fc;
+}
+
+.handoff-file-badge.deleted {
+  background: rgba(248, 113, 113, 0.16);
+  color: #fca5a5;
+}
+
+.handoff-file-path {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 0.84rem;
+  color: #d5dee8;
+}
+
+.handoff-files-fallback {
+  padding: 0 12px 12px;
+  color: #cbd5e1;
+  font-size: 0.86rem;
+  white-space: pre-wrap;
+}
+
 .message.system .message-content {
   background: rgba(157, 179, 199, 0.08);
   color: #c9d4df;

@@ -2,7 +2,7 @@ import asyncio
 import inspect
 import json
 import uuid
-from typing import Any, Awaitable, Callable, Dict, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from fastapi import HTTPException
 
@@ -17,6 +17,7 @@ from context_compress import (
     maybe_compress_context,
     maybe_compress_private_context,
 )
+from ghost_snapshot import create_snapshot_tree, diff_snapshot_trees
 from llm_client import create_llm_client
 from message_processor import message_processor
 from models import ChatMessageCreate, ChatSessionCreate, ChatSessionUpdate, TeamHandoffEvent
@@ -86,6 +87,101 @@ def _summarize_result(text: Optional[str], max_chars: int = 800) -> str:
     return value[: max(0, max_chars - 15)].rstrip() + "\n...[truncated]"
 
 
+def _normalize_changed_file_status(value: Any) -> Optional[str]:
+    normalized = _normalize_text(value).lower()
+    if normalized in {"a", "add", "added"}:
+        return "added"
+    if normalized in {"d", "delete", "deleted", "remove", "removed"}:
+        return "deleted"
+    if normalized in {"m", "modify", "modified", "update", "updated"}:
+        return "modified"
+    return None
+
+
+def _normalize_artifact_source(value: Any) -> Optional[str]:
+    normalized = _normalize_text(value).lower()
+    if normalized in {"snapshot_diff", "snapshot"}:
+        return "snapshot_diff"
+    if normalized in {"tool_calls_fallback", "tool_calls", "tool_call_fallback"}:
+        return "tool_calls_fallback"
+    return None
+
+
+def _normalize_changed_files(changed_files: Any) -> List[Dict[str, str]]:
+    if not isinstance(changed_files, list):
+        return []
+    deduped: Dict[str, str] = {}
+    for item in changed_files:
+        if not isinstance(item, dict):
+            continue
+        path = _normalize_text(item.get("path"))
+        status = _normalize_changed_file_status(item.get("status"))
+        if not path or not status:
+            continue
+        deduped[path] = status
+    return [{"path": path, "status": status} for path, status in deduped.items()]
+
+
+def _build_artifact_summary(changed_files: Any, max_files: int = 10) -> str:
+    normalized_files = _normalize_changed_files(changed_files)
+    if not normalized_files:
+        return ""
+    status_codes = {
+        "added": "A",
+        "modified": "M",
+        "deleted": "D",
+    }
+    visible_files = normalized_files[:max_files]
+    parts = [f"{status_codes.get(item['status'], 'M')} {item['path']}" for item in visible_files]
+    remaining = len(normalized_files) - len(visible_files)
+    if remaining > 0:
+        parts.append(f"+ {remaining} more files")
+    return "; ".join(parts)
+
+
+def _append_artifact_summary(content: Optional[str], artifact_summary: Optional[str]) -> str:
+    base_text = str(content or "").strip()
+    summary_text = _normalize_text(artifact_summary)
+    if not summary_text:
+        return base_text
+    changed_line = f"Changed files: {summary_text}"
+    if changed_line in base_text:
+        return base_text
+    if not base_text:
+        return changed_line
+    return f"{base_text}\n{changed_line}"
+
+
+def _parse_tool_input_json(raw_input: Any) -> Dict[str, Any]:
+    text = str(raw_input or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _extract_changed_files_from_patch_text(patch_text: Any) -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+    header_prefixes = {
+        "*** Add File: ": "added",
+        "*** Update File: ": "modified",
+        "*** Delete File: ": "deleted",
+    }
+    for raw_line in str(patch_text or "").splitlines():
+        line = str(raw_line or "").strip()
+        for prefix, status in header_prefixes.items():
+            if not line.startswith(prefix):
+                continue
+            path = _normalize_text(line[len(prefix):])
+            if path:
+                results.append({"path": path, "status": status})
+            break
+    return results
+
+
 class TeamCoordinator:
     def __init__(self, app_config: Optional[Dict[str, Any]] = None):
         self.app_config = app_config if isinstance(app_config, dict) else get_app_config()
@@ -138,7 +234,13 @@ class TeamCoordinator:
         for event in events:
             await self._mirror_event_to_session(session_id, event, emit=False)
 
-    async def resolve_or_create_role_session(self, team_id: str, role_key: str, source_session: Any) -> Tuple[Any, bool]:
+    async def resolve_or_create_role_session(
+        self,
+        team_id: str,
+        role_key: str,
+        source_session: Any,
+        backfill_history: bool = True,
+    ) -> Tuple[Any, bool]:
         existing = session_repository.get_session_by_runtime_team_role(team_id, role_key)
         if existing:
             updates: Dict[str, Any] = {}
@@ -166,7 +268,8 @@ class TeamCoordinator:
                 parent_session_id=source_session.id,
             )
         )
-        await self._backfill_team_history_to_session(created.id, team_id)
+        if backfill_history:
+            await self._backfill_team_history_to_session(created.id, team_id)
         return created, True
 
     def resolve_leader_role(self, agent_team_id: Optional[str], fallback_role: Optional[str] = None) -> Optional[str]:
@@ -187,6 +290,9 @@ class TeamCoordinator:
         to_role_key: Optional[str] = None,
         reason: Optional[str] = None,
         work_summary: Optional[str] = None,
+        artifact_summary: Optional[str] = None,
+        changed_files: Optional[List[Dict[str, str]]] = None,
+        artifact_source: Optional[str] = None,
         task_payload: Optional[str] = None,
         result_summary: Optional[str] = None,
         error: Optional[str] = None,
@@ -204,6 +310,9 @@ class TeamCoordinator:
                 to_role_key=to_role_key,
                 reason=reason,
                 work_summary=work_summary,
+                artifact_summary=_normalize_text(artifact_summary) or None,
+                changed_files=_normalize_changed_files(changed_files) or None,
+                artifact_source=_normalize_artifact_source(artifact_source),
                 task_payload=task_payload,
                 result_summary=result_summary,
                 error=error,
@@ -247,6 +356,59 @@ class TeamCoordinator:
         lines.append("Only the leader may decide whether the overall user task is complete.")
         return "\n".join(lines)
 
+    def _capture_tree_hash(self, work_path: Optional[str]) -> Optional[str]:
+        normalized_path = _normalize_text(work_path)
+        if not normalized_path:
+            return None
+        try:
+            return create_snapshot_tree(normalized_path)
+        except Exception:
+            return None
+
+    def _extract_changed_files_from_tool_calls(self, assistant_message_id: Optional[int]) -> List[Dict[str, str]]:
+        if not assistant_message_id:
+            return []
+        changed_files: List[Dict[str, str]] = []
+        for tool_call in chat_repository.get_tool_calls_for_message(int(assistant_message_id)):
+            tool_name = _normalize_text(tool_call.get("tool_name")).lower()
+            tool_input = tool_call.get("tool_input")
+            if tool_name == "write_file":
+                payload = _parse_tool_input_json(tool_input)
+                path = _normalize_text(payload.get("path") or tool_input)
+                if path and "\n" not in path:
+                    changed_files.append({"path": path, "status": "modified"})
+            elif tool_name == "apply_patch":
+                payload = _parse_tool_input_json(tool_input)
+                patch_text = payload.get("patch") if payload else tool_input
+                changed_files.extend(_extract_changed_files_from_patch_text(patch_text))
+        return _normalize_changed_files(changed_files)
+
+    def _collect_turn_artifacts(
+        self,
+        work_path: Optional[str],
+        baseline_tree_hash: Optional[str],
+        assistant_message_id: Optional[int],
+    ) -> Tuple[str, List[Dict[str, str]], Optional[str]]:
+        changed_files: List[Dict[str, str]] = []
+        artifact_source: Optional[str] = None
+        normalized_path = _normalize_text(work_path)
+        if normalized_path and baseline_tree_hash:
+            try:
+                end_tree_hash = create_snapshot_tree(normalized_path)
+                changed_files = _normalize_changed_files(
+                    diff_snapshot_trees(normalized_path, baseline_tree_hash, end_tree_hash)
+                )
+                if changed_files:
+                    artifact_source = "snapshot_diff"
+            except Exception:
+                changed_files = []
+        if not changed_files:
+            changed_files = self._extract_changed_files_from_tool_calls(assistant_message_id)
+            if changed_files:
+                artifact_source = "tool_calls_fallback"
+        artifact_summary = _build_artifact_summary(changed_files)
+        return artifact_summary, changed_files, artifact_source
+
     def _prefix_role_report(
         self,
         role_key: Optional[str],
@@ -284,7 +446,10 @@ class TeamCoordinator:
 
         lines = [first_line]
         if event.reason:
-            lines.append(f"Requested from [{to_label}]: {event.reason}")
+            lines.append(f"Assigned to [{to_label}]: {event.reason}")
+        artifact_summary = _normalize_text(getattr(event, "artifact_summary", None))
+        if artifact_summary:
+            lines.append(f"Changed files: {artifact_summary}")
         if event.event_kind == "failed":
             lines.append(f"Handoff error: {event.error}" if event.error else "Handoff error: unknown failure.")
 
@@ -307,6 +472,14 @@ class TeamCoordinator:
         }
         if event.work_summary:
             metadata["work_summary"] = event.work_summary
+        if artifact_summary:
+            metadata["artifact_summary"] = artifact_summary
+        normalized_changed_files = _normalize_changed_files(getattr(event, "changed_files", None))
+        if normalized_changed_files:
+            metadata["changed_files"] = normalized_changed_files
+        artifact_source = _normalize_artifact_source(getattr(event, "artifact_source", None))
+        if artifact_source:
+            metadata["artifact_source"] = artifact_source
         if event.task_payload:
             metadata["task_payload"] = event.task_payload
         if event.result_summary:
@@ -326,6 +499,9 @@ class TeamCoordinator:
         target_session_id: str,
         content: str,
         status: str = "ok",
+        artifact_summary: Optional[str] = None,
+        changed_files: Optional[List[Dict[str, str]]] = None,
+        artifact_source: Optional[str] = None,
         inline_session_message_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         inline_session_ids: Optional[Set[str]] = None,
     ) -> Any:
@@ -334,6 +510,12 @@ class TeamCoordinator:
             normalized_content = "Delegated agent returned no result."
         if status != "ok":
             normalized_content = f"Encountered an error while handling the task.\n{normalized_content}"
+        normalized_artifact_summary = _normalize_text(artifact_summary)
+        normalized_changed_files = _normalize_changed_files(changed_files)
+        normalized_artifact_source = _normalize_artifact_source(artifact_source)
+        if not normalized_artifact_summary:
+            normalized_artifact_summary = _build_artifact_summary(normalized_changed_files)
+        normalized_content = _append_artifact_summary(normalized_content, normalized_artifact_summary)
         rendered_content = self._prefix_role_report(
             to_role_key,
             normalized_content,
@@ -353,6 +535,9 @@ class TeamCoordinator:
                     "source_session_id": source_session_id,
                     "target_session_id": target_session_id,
                     "status": status,
+                    "artifact_summary": normalized_artifact_summary or None,
+                    "changed_files": normalized_changed_files or None,
+                    "artifact_source": normalized_artifact_source,
                 },
             )
         )
@@ -600,6 +785,8 @@ class TeamCoordinator:
         if not config:
             raise HTTPException(status_code=404, detail="Config not found")
 
+        baseline_tree_hash = self._capture_tree_hash(getattr(session, "work_path", None))
+
         if processed_message is None:
             user_msg_id, processed_message = await self._create_delegated_user_message(
                 session_id=session.id,
@@ -652,6 +839,9 @@ class TeamCoordinator:
         handoff_count = 0
         max_handoffs = 16
         transferred_result: Optional[Dict[str, Any]] = None
+        current_artifact_summary = ""
+        current_changed_files: List[Dict[str, str]] = []
+        current_artifact_source: Optional[str] = None
 
         context_summary = getattr(session, "context_summary", None) or ""
         last_compressed_call_id = getattr(session, "last_compressed_llm_call_id", None)
@@ -929,6 +1119,11 @@ class TeamCoordinator:
                     final_answer = "Too many agent handoffs in a single delegated turn."
                     had_error = True
                     break
+                current_artifact_summary, current_changed_files, current_artifact_source = self._collect_turn_artifacts(
+                    getattr(session, "work_path", None),
+                    baseline_tree_hash,
+                    assistant_msg_id,
+                )
                 final_answer = ""
                 chat_repository.update_message_content_and_metadata(
                     session.id,
@@ -948,15 +1143,20 @@ class TeamCoordinator:
                     active_agent_profile=current_profile,
                 )
                 transferred_result = await self.execute_delegated_turn(
-                    source_session_id=session.id,
-                    from_agent=current_profile,
-                    to_agent=handoff_request["target_agent"],
-                    reason=handoff_request["reason"],
-                    work_summary=handoff_request.get("work_summary") or "",
-                    task_payload=task_payload,
-                    parent_handoff_id=handoff_id,
-                    inline_session_message_callback=inline_session_message_callback,
-                    inline_session_ids=inline_session_ids,
+                    **self._build_execute_delegated_turn_kwargs(
+                        source_session_id=session.id,
+                        from_agent=current_profile,
+                        to_agent=handoff_request["target_agent"],
+                        reason=handoff_request["reason"],
+                        work_summary=handoff_request.get("work_summary") or "",
+                        task_payload=task_payload,
+                        parent_handoff_id=handoff_id,
+                        artifact_summary=current_artifact_summary or None,
+                        changed_files=current_changed_files or None,
+                        artifact_source=current_artifact_source,
+                        inline_session_message_callback=inline_session_message_callback,
+                        inline_session_ids=inline_session_ids,
+                    )
                 )
                 break
 
@@ -968,6 +1168,12 @@ class TeamCoordinator:
             break
 
         final_text = final_answer or ""
+        if not transferred_result and not current_changed_files and not current_artifact_summary:
+            current_artifact_summary, current_changed_files, current_artifact_source = self._collect_turn_artifacts(
+                getattr(session, "work_path", None),
+                baseline_tree_hash,
+                assistant_msg_id,
+            )
         chat_repository.update_message_content_and_metadata(
             session.id,
             assistant_msg_id,
@@ -975,7 +1181,11 @@ class TeamCoordinator:
             {"agent_profile": current_profile},
         )
         if transferred_result is not None:
-            return transferred_result
+            transferred_payload = dict(transferred_result)
+            transferred_payload["artifact_summary"] = current_artifact_summary or None
+            transferred_payload["changed_files"] = current_changed_files or None
+            transferred_payload["artifact_source"] = current_artifact_source
+            return transferred_payload
         return {
             "status": "ok" if final_text and not had_error else "error",
             "result": final_text if not had_error else "",
@@ -983,6 +1193,9 @@ class TeamCoordinator:
             "assistant_message_id": assistant_msg_id,
             "session_id": session.id,
             "agent_profile": current_profile,
+            "artifact_summary": current_artifact_summary or None,
+            "changed_files": current_changed_files or None,
+            "artifact_source": current_artifact_source,
         }
 
     def _build_role_session_turn_kwargs(
@@ -1038,6 +1251,60 @@ class TeamCoordinator:
             kwargs["inline_session_ids"] = inline_session_ids
         return kwargs
 
+    def _build_execute_delegated_turn_kwargs(
+        self,
+        source_session_id: str,
+        from_agent: str,
+        to_agent: str,
+        reason: str,
+        work_summary: str,
+        task_payload: str,
+        parent_handoff_id: Optional[str] = None,
+        artifact_summary: Optional[str] = None,
+        changed_files: Optional[List[Dict[str, str]]] = None,
+        artifact_source: Optional[str] = None,
+        inline_session_message_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        inline_session_ids: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "source_session_id": source_session_id,
+            "from_agent": from_agent,
+            "to_agent": to_agent,
+            "reason": reason,
+            "work_summary": work_summary,
+            "task_payload": task_payload,
+            "parent_handoff_id": parent_handoff_id,
+        }
+        try:
+            signature = inspect.signature(self.execute_delegated_turn)
+        except (TypeError, ValueError):
+            signature = None
+
+        if signature is None:
+            if artifact_summary is not None:
+                kwargs["artifact_summary"] = artifact_summary
+            if changed_files is not None:
+                kwargs["changed_files"] = changed_files
+            if artifact_source is not None:
+                kwargs["artifact_source"] = artifact_source
+            kwargs["inline_session_message_callback"] = inline_session_message_callback
+            kwargs["inline_session_ids"] = inline_session_ids
+            return kwargs
+
+        parameters = signature.parameters
+        accepts_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+        if artifact_summary is not None and (accepts_var_kwargs or "artifact_summary" in parameters):
+            kwargs["artifact_summary"] = artifact_summary
+        if changed_files is not None and (accepts_var_kwargs or "changed_files" in parameters):
+            kwargs["changed_files"] = changed_files
+        if artifact_source is not None and (accepts_var_kwargs or "artifact_source" in parameters):
+            kwargs["artifact_source"] = artifact_source
+        if accepts_var_kwargs or "inline_session_message_callback" in parameters:
+            kwargs["inline_session_message_callback"] = inline_session_message_callback
+        if accepts_var_kwargs or "inline_session_ids" in parameters:
+            kwargs["inline_session_ids"] = inline_session_ids
+        return kwargs
+
     async def execute_delegated_turn(
         self,
         source_session_id: str,
@@ -1047,9 +1314,17 @@ class TeamCoordinator:
         work_summary: str,
         task_payload: str,
         parent_handoff_id: Optional[str] = None,
+        artifact_summary: Optional[str] = None,
+        changed_files: Optional[List[Dict[str, str]]] = None,
+        artifact_source: Optional[str] = None,
         inline_session_message_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         inline_session_ids: Optional[Set[str]] = None,
     ) -> Dict[str, Any]:
+        normalized_artifact_summary = _normalize_text(artifact_summary)
+        normalized_changed_files = _normalize_changed_files(changed_files)
+        normalized_artifact_source = _normalize_artifact_source(artifact_source)
+        if not normalized_artifact_summary:
+            normalized_artifact_summary = _build_artifact_summary(normalized_changed_files)
         source_session = session_repository.get_session(source_session_id, include_count=False)
         self.team.ensure_handoff_allowed(
             from_agent,
@@ -1063,7 +1338,12 @@ class TeamCoordinator:
             getattr(source_session, "role_key", None) or getattr(source_session, "agent_profile", None)
         )
 
-        target_session, _ = await self.resolve_or_create_role_session(runtime_team.id, to_agent, source_session)
+        target_session, target_created = await self.resolve_or_create_role_session(
+            runtime_team.id,
+            to_agent,
+            source_session,
+            backfill_history=False,
+        )
         delegated_user_message_id: Optional[int] = None
         processed_task_payload: Optional[str] = None
         if not (leader_role and to_agent == leader_role and source_role_key and source_role_key != leader_role):
@@ -1080,6 +1360,8 @@ class TeamCoordinator:
                 inline_session_message_callback=inline_session_message_callback,
                 inline_session_ids=inline_session_ids,
             )
+        if target_created:
+            await self._backfill_team_history_to_session(target_session.id, runtime_team.id)
         requested_event = self.append_handoff_event(
             team_id=runtime_team.id,
             handoff_id=handoff_id,
@@ -1133,6 +1415,9 @@ class TeamCoordinator:
                 to_role_key=to_agent,
                 reason=reason,
                 work_summary=work_summary,
+                artifact_summary=normalized_artifact_summary,
+                changed_files=normalized_changed_files,
+                artifact_source=normalized_artifact_source,
                 result_summary=_summarize_result(return_summary),
             )
             await self.mirror_handoff_event_to_team_sessions(
@@ -1151,6 +1436,9 @@ class TeamCoordinator:
                 "reason": reason,
                 "work_summary": work_summary,
                 "return_summary": return_summary,
+                "artifact_summary": normalized_artifact_summary or None,
+                "changed_files": normalized_changed_files or None,
+                "artifact_source": normalized_artifact_source,
             }
 
         try:
@@ -1171,6 +1459,11 @@ class TeamCoordinator:
                     inline_session_ids=inline_session_ids,
                 )
             )
+            result_artifact_summary = _normalize_text(result.get("artifact_summary"))
+            result_changed_files = _normalize_changed_files(result.get("changed_files"))
+            result_artifact_source = _normalize_artifact_source(result.get("artifact_source"))
+            if not result_artifact_summary:
+                result_artifact_summary = _build_artifact_summary(result_changed_files)
             if result.get("status") == "returned_to_leader":
                 returning_role = _normalize_text(result.get("from_role_key")) or to_agent
                 leader_target = _normalize_text(result.get("to_role_key")) or (leader_role or from_agent)
@@ -1194,6 +1487,9 @@ class TeamCoordinator:
                     to_role_key=to_agent,
                     reason=reason,
                     work_summary=work_summary,
+                    artifact_summary=result_artifact_summary,
+                    changed_files=result_changed_files,
+                    artifact_source=result_artifact_source,
                     result_summary=_summarize_result(return_summary),
                 )
                 await self.mirror_handoff_event_to_team_sessions(
@@ -1213,6 +1509,9 @@ class TeamCoordinator:
                         target_session_id=target_session.id,
                         content=return_summary,
                         status="ok",
+                        artifact_summary=result_artifact_summary,
+                        changed_files=result_changed_files,
+                        artifact_source=result_artifact_source,
                         inline_session_message_callback=inline_session_message_callback,
                         inline_session_ids=inline_session_ids,
                     )
@@ -1224,6 +1523,9 @@ class TeamCoordinator:
                         "target_session_id": target_session.id,
                         "from_role_key": leader_role,
                         "to_role_key": returning_role,
+                        "artifact_summary": result_artifact_summary or None,
+                        "changed_files": result_changed_files or None,
+                        "artifact_source": result_artifact_source,
                     }
                 return {
                     "status": "returned_to_leader",
@@ -1235,6 +1537,9 @@ class TeamCoordinator:
                     "reason": result.get("reason"),
                     "work_summary": result.get("work_summary"),
                     "return_summary": return_summary,
+                    "artifact_summary": result_artifact_summary or None,
+                    "changed_files": result_changed_files or None,
+                    "artifact_source": result_artifact_source,
                 }
             final_text = str(result.get("result") or result.get("error") or "").strip()
             if final_text and result.get("status") == "ok":
@@ -1249,6 +1554,9 @@ class TeamCoordinator:
                     to_role_key=to_agent,
                     reason=reason,
                     work_summary=work_summary,
+                    artifact_summary=result_artifact_summary,
+                    changed_files=result_changed_files,
+                    artifact_source=result_artifact_source,
                     result_summary=_summarize_result(final_text),
                 )
                 await self.mirror_handoff_event_to_team_sessions(
@@ -1267,6 +1575,9 @@ class TeamCoordinator:
                     target_session_id=target_session.id,
                     content=final_text,
                     status="ok",
+                    artifact_summary=result_artifact_summary,
+                    changed_files=result_changed_files,
+                    artifact_source=result_artifact_source,
                     inline_session_message_callback=inline_session_message_callback,
                     inline_session_ids=inline_session_ids,
                 )
@@ -1278,6 +1589,9 @@ class TeamCoordinator:
                     "target_session_id": target_session.id,
                     "from_role_key": from_agent,
                     "to_role_key": to_agent,
+                    "artifact_summary": result_artifact_summary or None,
+                    "changed_files": result_changed_files or None,
+                    "artifact_source": result_artifact_source,
                 }
 
             error_text = final_text or "Delegated session produced no final answer"
@@ -1292,6 +1606,9 @@ class TeamCoordinator:
                 to_role_key=to_agent,
                 reason=reason,
                 work_summary=work_summary,
+                artifact_summary=result_artifact_summary,
+                changed_files=result_changed_files,
+                artifact_source=result_artifact_source,
                 error=error_text,
             )
             await self.mirror_handoff_event_to_team_sessions(
@@ -1310,6 +1627,9 @@ class TeamCoordinator:
                 target_session_id=target_session.id,
                 content=error_text,
                 status="error",
+                artifact_summary=result_artifact_summary,
+                changed_files=result_changed_files,
+                artifact_source=result_artifact_source,
                 inline_session_message_callback=inline_session_message_callback,
                 inline_session_ids=inline_session_ids,
             )
@@ -1321,6 +1641,9 @@ class TeamCoordinator:
                 "target_session_id": target_session.id,
                 "from_role_key": from_agent,
                 "to_role_key": to_agent,
+                "artifact_summary": result_artifact_summary or None,
+                "changed_files": result_changed_files or None,
+                "artifact_source": result_artifact_source,
             }
         except Exception as exc:
             failed_event = self.append_handoff_event(

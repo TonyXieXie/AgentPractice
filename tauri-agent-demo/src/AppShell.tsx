@@ -11,6 +11,7 @@ import { exportConfigFile, importConfigFile } from './configExchange';
 import {
   Message,
   MessageAttachment,
+  ChangedFileSummary,
   LLMConfig,
   LLMCall,
   SessionToolStats,
@@ -158,6 +159,39 @@ const MeasuredMessage = ({ rowKey, className, onHeight, children }: MeasuredMess
     </div>
   );
 };
+
+const HANDOFF_CHANGED_FILES_LINE_RE = /\n?Changed files:\s*[^\n]*/gi;
+
+function extractHandoffChangedFilesSummary(content: string): string {
+  const matches = content.match(HANDOFF_CHANGED_FILES_LINE_RE);
+  if (!matches || matches.length === 0) return '';
+  const lastMatch = matches[matches.length - 1] || '';
+  return lastMatch.replace(/^.*Changed files:\s*/i, '').trim();
+}
+
+function stripHandoffChangedFilesLine(content: string): string {
+  return content.replace(HANDOFF_CHANGED_FILES_LINE_RE, '').trim();
+}
+
+function normalizeChangedFiles(value: unknown): ChangedFileSummary[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+      const path = typeof (item as any).path === 'string' ? (item as any).path.trim() : '';
+      const status = typeof (item as any).status === 'string' ? (item as any).status.trim().toLowerCase() : '';
+      if (!path || !status) return null;
+      if (!['added', 'modified', 'deleted'].includes(status)) return null;
+      return { path, status } as ChangedFileSummary;
+    })
+    .filter((item): item is ChangedFileSummary => Boolean(item));
+}
+
+function getChangedFileBadge(status: string): string {
+  if (status === 'added') return 'A';
+  if (status === 'deleted') return 'D';
+  return 'M';
+}
 
 type PendingAttachment = {
   id: string;
@@ -3836,6 +3870,18 @@ function App() {
                       }
                       return null;
                     })();
+                    const messageMetadata = ((msg as any).metadata || {}) as Record<string, unknown>;
+                    const eventType = typeof messageMetadata.event_type === 'string' ? messageMetadata.event_type : '';
+                    const isHandoffCard = msg.role === 'assistant' && eventType === 'handoff';
+                    const changedFiles = isHandoffCard ? normalizeChangedFiles(messageMetadata.changed_files) : [];
+                    const artifactSummary = isHandoffCard
+                      ? (
+                          typeof messageMetadata.artifact_summary === 'string'
+                            ? messageMetadata.artifact_summary.trim()
+                            : extractHandoffChangedFilesSummary(String(msg.content || ''))
+                        )
+                      : '';
+                    const handoffBody = isHandoffCard ? stripHandoffChangedFilesLine(String(msg.content || '')) : String(msg.content || '');
 
                     return (
                       <MeasuredMessage
@@ -3912,6 +3958,37 @@ function App() {
                                 </svg>
                               </button>
                             </>
+                          ) : isHandoffCard ? (
+                            <div className="handoff-card">
+                              {handoffBody && <div className="message-text">{handoffBody}</div>}
+                              {(changedFiles.length > 0 || artifactSummary) && (
+                                <details className="handoff-files-panel">
+                                  <summary className="handoff-files-summary">
+                                    <span>Changed files</span>
+                                    <span className="handoff-files-count">
+                                      {changedFiles.length > 0 ? `${changedFiles.length}` : 'View'}
+                                    </span>
+                                  </summary>
+                                  {changedFiles.length > 0 ? (
+                                    <div className="handoff-files-list">
+                                      {changedFiles.map((item, itemIndex) => (
+                                        <div
+                                          key={`${item.path}-${item.status}-${itemIndex}`}
+                                          className="handoff-file-row"
+                                        >
+                                          <span className={`handoff-file-badge ${item.status}`}>
+                                            {getChangedFileBadge(item.status)}
+                                          </span>
+                                          <code className="handoff-file-path">{item.path}</code>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <div className="handoff-files-fallback">{artifactSummary}</div>
+                                  )}
+                                </details>
+                              )}
+                            </div>
                           ) : (
                             msg.content
                           )}

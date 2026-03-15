@@ -66,6 +66,7 @@ class PromptBuilderTeamPrefixTests(unittest.TestCase):
         self.assertIn("Only the leader may decide that the user's overall task is complete.", prompt)
         self.assertIn("do not tell the user the task is fully complete", prompt)
         self.assertIn("work report for the delegating or upstream agent", prompt)
+        self.assertIn("explicitly mention the key modified files", prompt)
         self.assertIn("hand off back to the leader with a concise work summary", prompt)
         self.assertIn("You are a helpful assistant.", prompt)
 
@@ -102,6 +103,7 @@ class PromptBuilderTeamPrefixTests(unittest.TestCase):
         self.assertIn("Your responsibility is: Act as the Planner specialist for the team.", prompt)
         self.assertIn("Only the leader may decide that the user's overall task is complete.", prompt)
         self.assertIn("do not tell the user the task is fully complete", prompt)
+        self.assertIn("explicitly mention the key modified files", prompt)
         self.assertIn("decide whether to ask the user directly or send a follow-up task", prompt)
         self.assertIn("You may hand work back to the same teammate", prompt)
         self.assertIn("Do not output raw handoff event logs", prompt)

@@ -187,6 +187,12 @@ class RuntimeTeamTests(unittest.TestCase):
                 "assistant_message_id": 1,
                 "session_id": session_id,
                 "agent_profile": target_role,
+                "artifact_summary": "M src/main.cpp; A src/utils.cpp",
+                "changed_files": [
+                    {"path": "src/main.cpp", "status": "modified"},
+                    {"path": "src/utils.cpp", "status": "added"},
+                ],
+                "artifact_source": "snapshot_diff",
             }
 
         coordinator = self._make_coordinator(fake_runner)
@@ -215,6 +221,15 @@ class RuntimeTeamTests(unittest.TestCase):
         events = team_repository.list_handoff_events(source_after.team_id)
         self.assertEqual([event.event_kind for event in events], ["requested", "started", "completed"])
         self.assertTrue(all(event.work_summary == "Reviewed the request and prepared the implementation plan." for event in events))
+        self.assertEqual(events[-1].artifact_summary, "M src/main.cpp; A src/utils.cpp")
+        self.assertEqual(
+            events[-1].changed_files,
+            [
+                {"path": "src/main.cpp", "status": "modified"},
+                {"path": "src/utils.cpp", "status": "added"},
+            ],
+        )
+        self.assertEqual(events[-1].artifact_source, "snapshot_diff")
 
         for session_id in (source_after.id, target.id):
             messages = session_repository.list_messages(session_id)
@@ -233,8 +248,18 @@ class RuntimeTeamTests(unittest.TestCase):
                 message.metadata.get("work_summary"),
                 "Reviewed the request and prepared the implementation plan.",
             )
+            self.assertEqual(message.metadata.get("artifact_summary"), "M src/main.cpp; A src/utils.cpp")
+            self.assertEqual(
+                message.metadata.get("changed_files"),
+                [
+                    {"path": "src/main.cpp", "status": "modified"},
+                    {"path": "src/utils.cpp", "status": "added"},
+                ],
+            )
+            self.assertEqual(message.metadata.get("artifact_source"), "snapshot_diff")
             self.assertTrue(str(message.content or "").startswith("[Planner]:"))
-            self.assertIn("Requested from [Coder]: Implement the change", str(message.content or ""))
+            self.assertIn("Assigned to [Coder]: Implement the change", str(message.content or ""))
+            self.assertIn("Changed files: M src/main.cpp; A src/utils.cpp", str(message.content or ""))
 
         target_messages = session_repository.list_messages(target.id)
         delegated_user_messages = [
@@ -258,8 +283,17 @@ class RuntimeTeamTests(unittest.TestCase):
         self.assertEqual(len(delegated_result_messages), 1)
         self.assertEqual(delegated_result_messages[0].metadata.get("from_role_key"), "planner")
         self.assertEqual(delegated_result_messages[0].metadata.get("to_role_key"), "coder")
+        self.assertEqual(
+            delegated_result_messages[0].metadata.get("changed_files"),
+            [
+                {"path": "src/main.cpp", "status": "modified"},
+                {"path": "src/utils.cpp", "status": "added"},
+            ],
+        )
+        self.assertEqual(delegated_result_messages[0].metadata.get("artifact_source"), "snapshot_diff")
         self.assertTrue(str(delegated_result_messages[0].content or "").startswith("[Coder]:"))
         self.assertIn("coder handled: Implement the change", delegated_result_messages[0].content)
+        self.assertIn("Changed files: M src/main.cpp; A src/utils.cpp", delegated_result_messages[0].content)
 
         second = asyncio.run(
             coordinator.execute_delegated_turn(
@@ -347,6 +381,82 @@ class RuntimeTeamTests(unittest.TestCase):
         self.assertTrue(all(event.from_role_key == "coder" for event in child_events))
         self.assertTrue(all(event.to_role_key == "tester" for event in child_events))
 
+    def test_new_role_session_places_delegated_user_before_backfilled_handoffs(self):
+        source = self._create_session(title="Planner Root", agent_profile="planner")
+
+        async def fake_runner(
+            self,
+            session_id,
+            source_role,
+            target_role,
+            leader_role,
+            reason,
+            work_summary,
+            task_payload,
+            handoff_id,
+            parent_handoff_id=None,
+        ):
+            return {
+                "status": "ok",
+                "result": f"{target_role} handled: {reason}",
+                "assistant_message_id": 1,
+                "session_id": session_id,
+                "agent_profile": target_role,
+                "artifact_summary": "M src/main.cpp",
+                "changed_files": [
+                    {"path": "src/main.cpp", "status": "modified"},
+                ],
+                "artifact_source": "snapshot_diff",
+            }
+
+        coordinator = self._make_coordinator(fake_runner)
+
+        first = asyncio.run(
+            coordinator.execute_delegated_turn(
+                source_session_id=source.id,
+                from_agent="planner",
+                to_agent="coder",
+                reason="Implement the change",
+                work_summary="Planner prepared the implementation task.",
+                task_payload="写一个LangGraph的框架",
+            )
+        )
+        self.assertEqual(first["status"], "ok")
+
+        second = asyncio.run(
+            coordinator.execute_delegated_turn(
+                source_session_id=source.id,
+                from_agent="planner",
+                to_agent="tester",
+                reason="Validate the implementation",
+                work_summary="Coder finished the implementation and needs verification.",
+                task_payload="写一个LangGraph的框架",
+            )
+        )
+        self.assertEqual(second["status"], "ok")
+
+        source_after = session_repository.get_session(source.id, include_count=False)
+        tester_session = session_repository.get_session_by_runtime_team_role(source_after.team_id, "tester")
+        self.assertIsNotNone(tester_session)
+
+        tester_messages = session_repository.list_messages(tester_session.id)
+        delegated_user_messages = [
+            message for message in tester_messages
+            if message.role == "user" and isinstance(message.metadata, dict) and message.metadata.get("delegated_turn")
+        ]
+        self.assertEqual(len(delegated_user_messages), 1)
+        delegated_user = delegated_user_messages[0]
+
+        backfilled_handoff_messages = [
+            message for message in tester_messages
+            if message.role == "assistant"
+            and isinstance(message.metadata, dict)
+            and message.metadata.get("event_type") == "handoff"
+            and message.metadata.get("handoff_id") == first["handoff_id"]
+        ]
+        self.assertGreaterEqual(len(backfilled_handoff_messages), 1)
+        self.assertTrue(all(delegated_user.id < message.id for message in backfilled_handoff_messages))
+
     def test_non_leader_handoff_to_leader_skips_recursive_leader_turn(self):
         source = self._create_session(
             title="Planner Root",
@@ -390,6 +500,12 @@ class RuntimeTeamTests(unittest.TestCase):
                 reason="Need leader decision",
                 work_summary="Implemented a draft and need leader approval.",
                 task_payload="User asked for an implementation.",
+                artifact_summary="M src/main.cpp; A src/review_notes.md",
+                changed_files=[
+                    {"path": "src/main.cpp", "status": "modified"},
+                    {"path": "src/review_notes.md", "status": "added"},
+                ],
+                artifact_source="snapshot_diff",
             )
         )
 
@@ -398,11 +514,38 @@ class RuntimeTeamTests(unittest.TestCase):
         self.assertEqual(result["to_role_key"], "planner")
         self.assertEqual(runner_calls["count"], 0)
         self.assertIn("Returned control to [Planner]", result["return_summary"])
+        self.assertEqual(result["artifact_summary"], "M src/main.cpp; A src/review_notes.md")
+        self.assertEqual(
+            result["changed_files"],
+            [
+                {"path": "src/main.cpp", "status": "modified"},
+                {"path": "src/review_notes.md", "status": "added"},
+            ],
+        )
+        self.assertEqual(result["artifact_source"], "snapshot_diff")
 
         team_events = team_repository.list_handoff_events(runtime_team.id)
         self.assertEqual([event.event_kind for event in team_events[-3:]], ["requested", "started", "completed"])
         self.assertEqual(team_events[-1].from_role_key, "coder")
         self.assertEqual(team_events[-1].to_role_key, "planner")
+        self.assertEqual(team_events[-1].artifact_summary, "M src/main.cpp; A src/review_notes.md")
+        self.assertEqual(
+            team_events[-1].changed_files,
+            [
+                {"path": "src/main.cpp", "status": "modified"},
+                {"path": "src/review_notes.md", "status": "added"},
+            ],
+        )
+        self.assertEqual(team_events[-1].artifact_source, "snapshot_diff")
+
+        planner_handoff_messages = [
+            message for message in session_repository.list_messages(source.id)
+            if isinstance(message.metadata, dict)
+            and message.metadata.get("event_type") == "handoff"
+            and message.metadata.get("handoff_id") == team_events[-1].handoff_id
+        ]
+        self.assertEqual(len(planner_handoff_messages), 1)
+        self.assertIn("Changed files: M src/main.cpp; A src/review_notes.md", planner_handoff_messages[0].content)
 
     def test_leader_receives_return_to_leader_report_instead_of_coder_completion(self):
         source = self._create_session(
@@ -668,6 +811,14 @@ class RuntimeTeamTests(unittest.TestCase):
         self._patch_attr(team_coordinator_module, "append_reasoning_summary_prompt", lambda prompt, _summary: prompt)
         self._patch_attr(team_coordinator_module, "create_agent_executor", lambda *args, **kwargs: fake_executor)
         test_case = self
+        coordinator._collect_turn_artifacts = types.MethodType(
+            lambda self, work_path, baseline_tree_hash, assistant_message_id: (
+                "M src/main.cpp",
+                [{"path": "src/main.cpp", "status": "modified"}],
+                "snapshot_diff",
+            ),
+            coordinator,
+        )
 
         async def fake_execute_delegated_turn(
             self,
@@ -678,6 +829,9 @@ class RuntimeTeamTests(unittest.TestCase):
             work_summary,
             task_payload,
             parent_handoff_id=None,
+            artifact_summary=None,
+            changed_files=None,
+            artifact_source=None,
             inline_session_message_callback=None,
             inline_session_ids=None,
         ):
@@ -687,6 +841,9 @@ class RuntimeTeamTests(unittest.TestCase):
             test_case.assertEqual(last_target_event["message"]["role"], "assistant")
             test_case.assertFalse(last_target_event["message"]["metadata"].get("agent_streaming"))
             test_case.assertEqual(last_target_event["message"]["content"], "")
+            test_case.assertEqual(artifact_summary, "M src/main.cpp")
+            test_case.assertEqual(changed_files, [{"path": "src/main.cpp", "status": "modified"}])
+            test_case.assertEqual(artifact_source, "snapshot_diff")
             return {
                 "status": "ok",
                 "result": "Planner provided the final decision",
@@ -695,6 +852,7 @@ class RuntimeTeamTests(unittest.TestCase):
                 "target_session_id": "planner-session",
                 "from_role_key": from_agent,
                 "to_role_key": to_agent,
+                "artifact_source": artifact_source,
             }
 
         coordinator.execute_delegated_turn = types.MethodType(fake_execute_delegated_turn, coordinator)
@@ -783,6 +941,67 @@ class RuntimeTeamTests(unittest.TestCase):
         self.assertIsNone(session_repository.get_session(target.id, include_count=False))
         self.assertIsNone(team_repository.get_team(source_after.team_id))
         self.assertEqual(team_repository.list_handoff_events(source_after.team_id), [])
+
+    def test_collect_turn_artifacts_uses_snapshot_diff(self):
+        workdir = Path(self.tempdir.name) / "artifacts"
+        workdir.mkdir(parents=True, exist_ok=True)
+        (workdir / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+        (workdir / "old.txt").write_text("obsolete\n", encoding="utf-8")
+
+        coordinator = TeamCoordinator(copy.deepcopy(self.app_config))
+        baseline = coordinator._capture_tree_hash(str(workdir))
+        self.assertTrue(baseline)
+
+        (workdir / "main.cpp").write_text("int main() { return 1; }\n", encoding="utf-8")
+        (workdir / "utils.cpp").write_text("void helper() {}\n", encoding="utf-8")
+        (workdir / "old.txt").unlink()
+
+        artifact_summary, changed_files, artifact_source = coordinator._collect_turn_artifacts(str(workdir), baseline, None)
+
+        self.assertEqual(
+            changed_files,
+            [
+                {"path": "main.cpp", "status": "modified"},
+                {"path": "old.txt", "status": "deleted"},
+                {"path": "utils.cpp", "status": "added"},
+            ],
+        )
+        self.assertEqual(artifact_summary, "M main.cpp; D old.txt; A utils.cpp")
+        self.assertEqual(artifact_source, "snapshot_diff")
+
+    def test_collect_turn_artifacts_falls_back_to_tool_calls(self):
+        coordinator = TeamCoordinator(copy.deepcopy(self.app_config))
+        session = self._create_session(title="Coder Role", agent_profile="coder")
+        assistant_message = chat_repository.create_message(
+            ChatMessageCreate(session_id=session.id, role="assistant", content="")
+        )
+        chat_repository.save_tool_call(
+            message_id=assistant_message.id,
+            tool_name="write_file",
+            tool_input=json.dumps({"path": "src/generated.cpp", "content": "int x = 1;\n"}, ensure_ascii=False),
+            tool_output="",
+            agent_profile="coder",
+        )
+        chat_repository.save_tool_call(
+            message_id=assistant_message.id,
+            tool_name="apply_patch",
+            tool_input="*** Begin Patch\n*** Update File: src/main.cpp\n@@\n- old\n+ new\n*** Add File: src/new.hpp\n+// header\n*** End Patch",
+            tool_output="",
+            agent_profile="coder",
+        )
+
+        artifact_summary, changed_files, artifact_source = coordinator._collect_turn_artifacts(None, None, assistant_message.id)
+
+        self.assertEqual(
+            changed_files,
+            [
+                {"path": "src/generated.cpp", "status": "modified"},
+                {"path": "src/main.cpp", "status": "modified"},
+                {"path": "src/new.hpp", "status": "added"},
+            ],
+        )
+        self.assertEqual(artifact_summary, "M src/generated.cpp; M src/main.cpp; A src/new.hpp")
+        self.assertEqual(artifact_source, "tool_calls_fallback")
 
 def _async_return(factory):
     async def _wrapper(*args, **kwargs):
