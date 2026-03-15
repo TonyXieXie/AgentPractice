@@ -4,10 +4,31 @@ import os
 from datetime import datetime
 import sqlite3
 import uuid
-from models import LLMConfig, LLMConfigCreate, LLMConfigUpdate, ChatMessage, ChatMessageCreate, ChatSession, ChatSessionCreate, ChatSessionUpdate
+from models import (
+    LLMConfig,
+    LLMConfigCreate,
+    LLMConfigUpdate,
+    ChatMessage,
+    ChatMessageCreate,
+    ChatSession,
+    ChatSessionCreate,
+    ChatSessionUpdate,
+    Team,
+    TeamHandoffEvent,
+)
 from runtime_paths import get_database_path
 
 DATABASE_PATH = str(get_database_path())
+
+
+def _get_model_fields_set(model: Any) -> Set[str]:
+    fields = getattr(model, "model_fields_set", None)
+    if fields is None:
+        fields = getattr(model, "__fields_set__", None)
+    if not fields:
+        return set()
+    return {str(field) for field in fields}
+
 
 class Database:
     def __init__(self, db_path: str = DATABASE_PATH):
@@ -130,6 +151,9 @@ class Database:
                 config_id TEXT NOT NULL,
                 work_path TEXT,
                 agent_profile TEXT,
+                agent_team_id TEXT,
+                team_id TEXT,
+                role_key TEXT,
                 parent_session_id TEXT,
                 context_summary TEXT,
                 last_compressed_llm_call_id INTEGER,
@@ -157,6 +181,21 @@ class Database:
             pass
 
         try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN agent_team_id TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN team_id TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN role_key TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN parent_session_id TEXT')
         except sqlite3.OperationalError:
             pass
@@ -178,6 +217,42 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN context_estimate_at TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_teams (
+                id TEXT PRIMARY KEY,
+                root_session_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (root_session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS team_handoff_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                team_id TEXT NOT NULL,
+                handoff_id TEXT NOT NULL,
+                parent_handoff_id TEXT,
+                event_kind TEXT NOT NULL,
+                from_session_id TEXT,
+                from_role_key TEXT,
+                to_session_id TEXT,
+                to_role_key TEXT,
+                reason TEXT,
+                work_summary TEXT,
+                task_payload TEXT,
+                result_summary TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (team_id) REFERENCES chat_teams(id) ON DELETE CASCADE
+            )
+        ''')
+
+        try:
+            cursor.execute('ALTER TABLE team_handoff_events ADD COLUMN work_summary TEXT')
         except sqlite3.OperationalError:
             pass
         
@@ -214,6 +289,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS agent_steps (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id INTEGER NOT NULL,
+                agent_profile TEXT,
                 step_type TEXT NOT NULL,
                 content TEXT NOT NULL,
                 metadata TEXT,
@@ -227,6 +303,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS tool_calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id INTEGER NOT NULL,
+                agent_profile TEXT,
                 tool_name TEXT NOT NULL,
                 tool_input TEXT,
                 tool_output TEXT,
@@ -241,6 +318,7 @@ class Database:
                 session_id TEXT,
                 message_id INTEGER,
                 agent_type TEXT,
+                agent_profile TEXT,
                 iteration INTEGER,
                 stream INTEGER NOT NULL,
                 api_type TEXT,
@@ -287,11 +365,23 @@ class Database:
                 session_id TEXT NOT NULL,
                 message_id INTEGER,
                 agent_type TEXT,
+                agent_profile TEXT,
                 iteration INTEGER,
                 tool_name TEXT NOT NULL,
                 success INTEGER NOT NULL,
                 failure_reason TEXT,
                 created_at TEXT NOT NULL
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS agent_private_contexts (
+                session_id TEXT NOT NULL,
+                agent_profile TEXT NOT NULL,
+                context_summary TEXT,
+                last_compressed_step_id INTEGER,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, agent_profile)
             )
         ''')
 
@@ -314,19 +404,53 @@ class Database:
             cursor.execute('ALTER TABLE chat_messages ADD COLUMN raw_response TEXT')
         except sqlite3.OperationalError:
             pass
+
+        try:
+            cursor.execute('ALTER TABLE agent_steps ADD COLUMN agent_profile TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE tool_calls ADD COLUMN agent_profile TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE llm_calls ADD COLUMN agent_profile TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE session_tool_call_history ADD COLUMN agent_profile TEXT')
+        except sqlite3.OperationalError:
+            pass
         
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_attachments_message ON message_attachments(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_config ON chat_sessions(config_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_parent ON chat_sessions(parent_session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_team ON chat_sessions(agent_team_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_runtime_team ON chat_sessions(team_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_runtime_team_role ON chat_sessions(team_id, role_key)')
+        cursor.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_runtime_team_role_unique
+            ON chat_sessions(team_id, role_key)
+            WHERE team_id IS NOT NULL AND role_key IS NOT NULL
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_teams_root_session ON chat_teams(root_session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_team_handoff_events_team ON team_handoff_events(team_id, id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_team_handoff_events_handoff ON team_handoff_events(handoff_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_steps_message ON agent_steps(message_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_steps_session_profile ON agent_steps(agent_profile)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_llm_calls_session ON llm_calls(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_llm_calls_session_profile ON llm_calls(session_id, agent_profile)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_permission_status ON tool_permission_requests(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_session ON file_snapshots(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_message ON file_snapshots(session_id, message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_history_session ON session_tool_call_history(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_history_session_tool ON session_tool_call_history(session_id, tool_name)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_private_contexts_session_profile ON agent_private_contexts(session_id, agent_profile)')
         
         conn.commit()
         conn.close()
@@ -521,9 +645,23 @@ class Database:
         now = datetime.now().isoformat()
 
         cursor.execute('''
-            INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, parent_session_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (session_id, session.title, session.config_id, session.work_path, session.agent_profile, session.parent_session_id, now, now))
+            INSERT INTO chat_sessions (
+                id, title, config_id, work_path, agent_profile, agent_team_id, team_id, role_key, parent_session_id, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            session_id,
+            session.title,
+            session.config_id,
+            session.work_path,
+            session.agent_profile,
+            session.agent_team_id,
+            session.team_id,
+            session.role_key,
+            session.parent_session_id,
+            now,
+            now,
+        ))
         
         conn.commit()
         conn.close()
@@ -582,6 +720,205 @@ class Database:
                     data["context_estimate"] = None
             sessions.append(ChatSession(**data))
         return sessions
+
+    def get_sessions_by_runtime_team(self, team_id: str) -> List[ChatSession]:
+        if not team_id:
+            return []
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT s.*, COUNT(m.id) as message_count
+            FROM chat_sessions s
+            LEFT JOIN chat_messages m ON s.id = m.session_id
+            WHERE s.team_id = ?
+            GROUP BY s.id
+            ORDER BY s.created_at ASC, s.id ASC
+            ''',
+            (team_id,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        sessions: List[ChatSession] = []
+        for row in rows:
+            data = dict(row)
+            estimate_raw = data.get("context_estimate")
+            if estimate_raw:
+                try:
+                    data["context_estimate"] = json.loads(estimate_raw)
+                except Exception:
+                    data["context_estimate"] = None
+            sessions.append(ChatSession(**data))
+        return sessions
+
+    def get_session_by_runtime_team_role(self, team_id: str, role_key: str) -> Optional[ChatSession]:
+        if not team_id or not role_key:
+            return None
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT *
+            FROM chat_sessions
+            WHERE team_id = ? AND role_key = ?
+            ORDER BY created_at ASC
+            LIMIT 1
+            ''',
+            (team_id, role_key),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        data = dict(row)
+        estimate_raw = data.get("context_estimate")
+        if estimate_raw:
+            try:
+                data["context_estimate"] = json.loads(estimate_raw)
+            except Exception:
+                data["context_estimate"] = None
+        return ChatSession(**data)
+
+    def create_team(self, root_session_id: str) -> Team:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        team_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        cursor.execute(
+            '''
+            INSERT INTO chat_teams (id, root_session_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ''',
+            (team_id, root_session_id, now, now),
+        )
+        conn.commit()
+        conn.close()
+        return Team(id=team_id, root_session_id=root_session_id, created_at=now, updated_at=now)
+
+    def get_team(self, team_id: str) -> Optional[Team]:
+        if not team_id:
+            return None
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM chat_teams WHERE id = ?', (team_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return Team(**dict(row))
+
+    def touch_team(self, team_id: str) -> Optional[Team]:
+        if not team_id:
+            return None
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute(
+            '''
+            UPDATE chat_teams
+            SET updated_at = ?
+            WHERE id = ?
+            ''',
+            (now, team_id),
+        )
+        conn.commit()
+        conn.close()
+        return self.get_team(team_id)
+
+    def create_team_handoff_event(self, event: TeamHandoffEvent) -> TeamHandoffEvent:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        created_at = event.created_at or datetime.now().isoformat()
+        cursor.execute(
+            '''
+            INSERT INTO team_handoff_events (
+                team_id, handoff_id, parent_handoff_id, event_kind,
+                from_session_id, from_role_key, to_session_id, to_role_key,
+                reason, work_summary, task_payload, result_summary, error, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                event.team_id,
+                event.handoff_id,
+                event.parent_handoff_id,
+                event.event_kind,
+                event.from_session_id,
+                event.from_role_key,
+                event.to_session_id,
+                event.to_role_key,
+                event.reason,
+                event.work_summary,
+                event.task_payload,
+                event.result_summary,
+                event.error,
+                created_at,
+            ),
+        )
+        event_id = cursor.lastrowid
+        cursor.execute(
+            '''
+            UPDATE chat_teams
+            SET updated_at = ?
+            WHERE id = ?
+            ''',
+            (created_at, event.team_id),
+        )
+        conn.commit()
+        conn.close()
+        return TeamHandoffEvent(
+            id=event_id,
+            team_id=event.team_id,
+            handoff_id=event.handoff_id,
+            parent_handoff_id=event.parent_handoff_id,
+            event_kind=event.event_kind,
+            from_session_id=event.from_session_id,
+            from_role_key=event.from_role_key,
+            to_session_id=event.to_session_id,
+            to_role_key=event.to_role_key,
+            reason=event.reason,
+            work_summary=event.work_summary,
+            task_payload=event.task_payload,
+            result_summary=event.result_summary,
+            error=event.error,
+            created_at=created_at,
+        )
+
+    def get_team_handoff_events(self, team_id: str) -> List[TeamHandoffEvent]:
+        if not team_id:
+            return []
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT *
+            FROM team_handoff_events
+            WHERE team_id = ?
+            ORDER BY id ASC
+            ''',
+            (team_id,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [TeamHandoffEvent(**dict(row)) for row in rows]
+
+    def has_team_handoff_events_since(self, team_id: str, timestamp: str) -> bool:
+        if not team_id or not timestamp:
+            return False
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT 1
+            FROM team_handoff_events
+            WHERE team_id = ? AND created_at >= ?
+            LIMIT 1
+            ''',
+            (team_id, timestamp),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return bool(row)
     
     def update_session(self, session_id: str, update: ChatSessionUpdate) -> Optional[ChatSession]:
         """Update session"""
@@ -589,12 +926,13 @@ class Database:
         cursor = conn.cursor()
         fields = []
         values = []
+        fields_set = _get_model_fields_set(update)
 
         if update.title is not None:
             fields.append("title = ?")
             values.append(update.title)
 
-        if update.work_path is not None:
+        if "work_path" in fields_set:
             fields.append("work_path = ?")
             values.append(update.work_path)
 
@@ -602,11 +940,23 @@ class Database:
             fields.append("config_id = ?")
             values.append(update.config_id)
 
-        if update.agent_profile is not None:
+        if "agent_profile" in fields_set:
             fields.append("agent_profile = ?")
             values.append(update.agent_profile)
 
-        if update.parent_session_id is not None:
+        if "agent_team_id" in fields_set:
+            fields.append("agent_team_id = ?")
+            values.append(update.agent_team_id)
+
+        if "team_id" in fields_set:
+            fields.append("team_id = ?")
+            values.append(update.team_id)
+
+        if "role_key" in fields_set:
+            fields.append("role_key = ?")
+            values.append(update.role_key)
+
+        if "parent_session_id" in fields_set:
             fields.append("parent_session_id = ?")
             values.append(update.parent_session_id)
 
@@ -637,8 +987,10 @@ class Database:
 
             cursor.execute(
                 '''
-                INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, parent_session_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_sessions (
+                    id, title, config_id, work_path, agent_profile, agent_team_id, team_id, role_key, parent_session_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 (
                     new_session_id,
@@ -646,6 +998,9 @@ class Database:
                     source['config_id'],
                     source['work_path'],
                     source['agent_profile'],
+                    source['agent_team_id'] if 'agent_team_id' in source.keys() else None,
+                    None,
+                    None,
                     None,
                     now,
                     now,
@@ -907,9 +1262,15 @@ class Database:
         """Delete session and its messages"""
         conn = self.get_connection()
         cursor = conn.cursor()
+        cursor.execute('SELECT 1 FROM chat_sessions WHERE id = ?', (session_id,))
+        session_exists = cursor.fetchone() is not None
+        cursor.execute('SELECT id FROM chat_teams WHERE root_session_id = ?', (session_id,))
+        runtime_team_row = cursor.fetchone()
         cursor.execute('SELECT id FROM chat_sessions WHERE parent_session_id = ?', (session_id,))
         child_rows = cursor.fetchall()
         conn.close()
+        if not session_exists:
+            return False
         for row in child_rows:
             try:
                 child_id = row["id"]
@@ -928,6 +1289,10 @@ class Database:
         ''', (session_id,))
         cursor.execute('DELETE FROM session_tool_call_history WHERE session_id = ?', (session_id,))
         cursor.execute('DELETE FROM chat_messages WHERE session_id = ?', (session_id,))
+        if runtime_team_row:
+            runtime_team_id = runtime_team_row["id"]
+            cursor.execute('DELETE FROM team_handoff_events WHERE team_id = ?', (runtime_team_id,))
+            cursor.execute('DELETE FROM chat_teams WHERE id = ?', (runtime_team_id,))
         cursor.execute('DELETE FROM chat_sessions WHERE id = ?', (session_id,))
         deleted = cursor.rowcount > 0
         conn.commit()
@@ -1115,7 +1480,7 @@ class Database:
         cursor.execute('''
             SELECT id, role, content, timestamp, metadata
             FROM chat_messages
-            WHERE session_id = ? AND id >= ? AND id <= ? AND role IN ('user', 'assistant')
+            WHERE session_id = ? AND id >= ? AND id <= ? AND role IN ('user', 'assistant', 'system')
             ORDER BY id ASC
         ''', (session_id, start_id, end_id))
         rows = cursor.fetchall()
@@ -1131,6 +1496,12 @@ class Database:
                     item["metadata"] = {}
             else:
                 item["metadata"] = {}
+            role = str(item.get("role") or "")
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            if role == "system":
+                event_type = str(metadata.get("event_type") or "").strip()
+                if event_type not in {"handoff", "delegated_result"}:
+                    continue
             result.append(item)
         return result
 
@@ -1145,14 +1516,14 @@ class Database:
             cursor.execute('''
                 SELECT id, role, content, timestamp, metadata
                 FROM chat_messages
-                WHERE session_id = ? AND role IN ('user', 'assistant')
+                WHERE session_id = ? AND role IN ('user', 'assistant', 'system')
                 ORDER BY id ASC
             ''', (session_id,))
         else:
             cursor.execute('''
                 SELECT id, role, content, timestamp, metadata
                 FROM chat_messages
-                WHERE session_id = ? AND id > ? AND role IN ('user', 'assistant')
+                WHERE session_id = ? AND id > ? AND role IN ('user', 'assistant', 'system')
                 ORDER BY id ASC
             ''', (session_id, after_id))
         rows = cursor.fetchall()
@@ -1168,6 +1539,12 @@ class Database:
                     item["metadata"] = {}
             else:
                 item["metadata"] = {}
+            role = str(item.get("role") or "")
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            if role == "system":
+                event_type = str(metadata.get("event_type") or "").strip()
+                if event_type not in {"handoff", "delegated_result"}:
+                    continue
             result.append(item)
         return result
 
@@ -1235,7 +1612,15 @@ class Database:
     
     # ==================== Agent Steps + Tool Calls ====================
     
-    def save_agent_step(self, message_id: int, step_type: str, content: str, sequence: int, metadata: Dict[str, Any] = None) -> int:
+    def save_agent_step(
+        self,
+        message_id: int,
+        step_type: str,
+        content: str,
+        sequence: int,
+        metadata: Dict[str, Any] = None,
+        agent_profile: Optional[str] = None
+    ) -> int:
         """Save agent step"""
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -1244,9 +1629,9 @@ class Database:
         metadata_json = json.dumps(metadata) if metadata else None
         
         cursor.execute('''
-            INSERT INTO agent_steps (message_id, step_type, content, metadata, sequence, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (message_id, step_type, content, metadata_json, sequence, timestamp))
+            INSERT INTO agent_steps (message_id, agent_profile, step_type, content, metadata, sequence, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (message_id, agent_profile, step_type, content, metadata_json, sequence, timestamp))
         
         step_id = cursor.lastrowid
         conn.commit()
@@ -1259,7 +1644,7 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT s.message_id, s.step_type, s.content, s.metadata, s.sequence, s.timestamp
+            SELECT s.id, s.message_id, s.agent_profile, s.step_type, s.content, s.metadata, s.sequence, s.timestamp
             FROM agent_steps s
             JOIN chat_messages m ON s.message_id = m.id
             WHERE m.session_id = ?
@@ -1270,7 +1655,9 @@ class Database:
 
         return [
             {
+                "id": row["id"],
                 "message_id": row["message_id"],
+                "agent_profile": row["agent_profile"] if "agent_profile" in row.keys() else None,
                 "step_type": row["step_type"],
                 "content": row["content"],
                 "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
@@ -1289,7 +1676,7 @@ class Database:
         placeholders = ",".join(["?"] * len(message_ids))
         cursor.execute(
             f'''
-            SELECT s.message_id, s.step_type, s.content, s.metadata, s.sequence, s.timestamp
+            SELECT s.id, s.message_id, s.agent_profile, s.step_type, s.content, s.metadata, s.sequence, s.timestamp
             FROM agent_steps s
             JOIN chat_messages m ON s.message_id = m.id
             WHERE m.session_id = ? AND s.message_id IN ({placeholders})
@@ -1301,12 +1688,55 @@ class Database:
         conn.close()
         return [
             {
+                "id": row["id"],
                 "message_id": row["message_id"],
+                "agent_profile": row["agent_profile"] if "agent_profile" in row.keys() else None,
                 "step_type": row["step_type"],
                 "content": row["content"],
                 "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
                 "sequence": row["sequence"],
                 "timestamp": row["timestamp"]
+            }
+            for row in rows
+        ]
+
+    def get_agent_steps_for_profile_after(
+        self,
+        session_id: str,
+        agent_profile: str,
+        after_step_id: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        if not session_id or not agent_profile:
+            return []
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        params: List[Any] = [session_id, agent_profile]
+        where = "m.session_id = ? AND COALESCE(s.agent_profile, '') = ?"
+        if after_step_id is not None:
+            where += " AND s.id > ?"
+            params.append(after_step_id)
+        cursor.execute(
+            f'''
+            SELECT s.id, s.message_id, s.agent_profile, s.step_type, s.content, s.metadata, s.sequence, s.timestamp
+            FROM agent_steps s
+            JOIN chat_messages m ON s.message_id = m.id
+            WHERE {where}
+            ORDER BY s.id ASC
+            ''',
+            params
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [
+            {
+                "id": row["id"],
+                "message_id": row["message_id"],
+                "agent_profile": row["agent_profile"] if "agent_profile" in row.keys() else None,
+                "step_type": row["step_type"],
+                "content": row["content"],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                "sequence": row["sequence"],
+                "timestamp": row["timestamp"],
             }
             for row in rows
         ]
@@ -1370,7 +1800,14 @@ class Database:
                         results.append(child_id)
         return results
     
-    def save_tool_call(self, message_id: int, tool_name: str, tool_input: str, tool_output: str) -> int:
+    def save_tool_call(
+        self,
+        message_id: int,
+        tool_name: str,
+        tool_input: str,
+        tool_output: str,
+        agent_profile: Optional[str] = None
+    ) -> int:
         """Save tool call record"""
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -1378,9 +1815,9 @@ class Database:
         timestamp = datetime.now().isoformat()
         
         cursor.execute('''
-            INSERT INTO tool_calls (message_id, tool_name, tool_input, tool_output, timestamp)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (message_id, tool_name, tool_input, tool_output, timestamp))
+            INSERT INTO tool_calls (message_id, agent_profile, tool_name, tool_input, tool_output, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (message_id, agent_profile, tool_name, tool_input, tool_output, timestamp))
         
         tool_call_id = cursor.lastrowid
         conn.commit()
@@ -1529,6 +1966,7 @@ class Database:
         session_id: str,
         message_id: int,
         agent_type: str,
+        agent_profile: Optional[str],
         iteration: int,
         stream: bool,
         api_profile: str,
@@ -1544,14 +1982,15 @@ class Database:
         timestamp = datetime.now().isoformat()
         cursor.execute('''
             INSERT INTO llm_calls (
-                session_id, message_id, agent_type, iteration, stream,
+                session_id, message_id, agent_type, agent_profile, iteration, stream,
                 api_type, api_profile, api_format, model, request_json, response_json,
                 response_text, processed_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             session_id,
             message_id,
             agent_type,
+            agent_profile,
             iteration,
             int(bool(stream)),
             api_profile,
@@ -1597,6 +2036,7 @@ class Database:
                 "session_id": row["session_id"],
                 "message_id": row["message_id"],
                 "agent_type": row["agent_type"],
+                "agent_profile": row["agent_profile"] if "agent_profile" in row.keys() else None,
                 "iteration": row["iteration"],
                 "stream": bool(row["stream"]),
                 "api_type": row["api_type"],
@@ -1618,6 +2058,7 @@ class Database:
         success: bool,
         message_id: Optional[int] = None,
         agent_type: Optional[str] = None,
+        agent_profile: Optional[str] = None,
         iteration: Optional[int] = None,
         failure_reason: Optional[str] = None
     ) -> int:
@@ -1626,13 +2067,14 @@ class Database:
         timestamp = datetime.now().isoformat()
         cursor.execute('''
             INSERT INTO session_tool_call_history (
-                session_id, message_id, agent_type, iteration, tool_name, success, failure_reason, created_at
+                session_id, message_id, agent_type, agent_profile, iteration, tool_name, success, failure_reason, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             session_id,
             message_id,
             agent_type,
+            agent_profile,
             iteration,
             tool_name,
             1 if success else 0,
@@ -1643,6 +2085,51 @@ class Database:
         conn.commit()
         conn.close()
         return row_id
+
+    def get_agent_private_context(self, session_id: str, agent_profile: str) -> Optional[Dict[str, Any]]:
+        if not session_id or not agent_profile:
+            return None
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT session_id, agent_profile, context_summary, last_compressed_step_id, updated_at
+            FROM agent_private_contexts
+            WHERE session_id = ? AND agent_profile = ?
+            ''',
+            (session_id, agent_profile)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def upsert_agent_private_context(
+        self,
+        session_id: str,
+        agent_profile: str,
+        context_summary: Optional[str],
+        last_compressed_step_id: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        if not session_id or not agent_profile:
+            return None
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        updated_at = datetime.now().isoformat()
+        cursor.execute(
+            '''
+            INSERT INTO agent_private_contexts (
+                session_id, agent_profile, context_summary, last_compressed_step_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, agent_profile) DO UPDATE SET
+                context_summary = excluded.context_summary,
+                last_compressed_step_id = excluded.last_compressed_step_id,
+                updated_at = excluded.updated_at
+            ''',
+            (session_id, agent_profile, context_summary, last_compressed_step_id, updated_at)
+        )
+        conn.commit()
+        conn.close()
+        return self.get_agent_private_context(session_id, agent_profile)
 
     def get_session_tool_stats(self, session_id: str) -> Dict[str, Any]:
         conn = self.get_connection()

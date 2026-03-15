@@ -3,7 +3,7 @@ import type { Dispatch, SetStateAction } from 'react';
 
 import type { Message } from '../../types';
 import { wsClient } from '../../wsClient';
-import type { SubagentDoneEvent, SubagentStartedEvent } from '../../wsTypes';
+import type { SessionMessageEvent, SubagentDoneEvent, SubagentStartedEvent } from '../../wsTypes';
 
 type UseAppShellSessionChannelParams = {
   currentSessionId: string | null;
@@ -12,6 +12,7 @@ type UseAppShellSessionChannelParams = {
   updateSessionMessages: (sessionKey: string, updater: (prev: Message[]) => Message[]) => Message[];
   markSessionUnread: (sessionKey: string) => void;
   setSessionRefreshTrigger: Dispatch<SetStateAction<number>>;
+  applyIncomingActiveAgent: (sessionId: string, profileId?: string | null) => void;
 };
 
 export function useAppShellSessionChannel(params: UseAppShellSessionChannelParams) {
@@ -22,7 +23,14 @@ export function useAppShellSessionChannel(params: UseAppShellSessionChannelParam
   useEffect(() => {
     wsClient.connect();
     const cleanupEvents = wsClient.onEvent((event) => {
-      const { getSessionKey, getCurrentSessionKey, updateSessionMessages, markSessionUnread, setSessionRefreshTrigger } = paramsRef.current;
+      const {
+        getSessionKey,
+        getCurrentSessionKey,
+        updateSessionMessages,
+        markSessionUnread,
+        setSessionRefreshTrigger,
+        applyIncomingActiveAgent,
+      } = paramsRef.current;
       if (event.type === 'subagent_done') {
         const payload = event as SubagentDoneEvent;
         if (!payload.session_id || !payload.message) return;
@@ -40,6 +48,30 @@ export function useAppShellSessionChannel(params: UseAppShellSessionChannelParam
       if (event.type === 'subagent_started') {
         const payload = event as SubagentStartedEvent;
         if (!payload.session_id) return;
+        setSessionRefreshTrigger((prev) => prev + 1);
+        return;
+      }
+      if (event.type === 'session_message') {
+        const payload = event as SessionMessageEvent;
+        if (!payload.session_id || !payload.message) return;
+        const sessionKey = getSessionKey(payload.session_id);
+        updateSessionMessages(sessionKey, (prev) => {
+          const index = prev.findIndex((msg) => msg.id === payload.message.id);
+          if (index >= 0) {
+            const next = [...prev];
+            next[index] = {
+              ...next[index],
+              ...payload.message,
+              metadata: payload.message.metadata ?? next[index].metadata,
+            };
+            return next;
+          }
+          return [...prev, payload.message];
+        });
+        applyIncomingActiveAgent(payload.session_id, payload.active_agent_profile);
+        if (sessionKey !== getCurrentSessionKey()) {
+          markSessionUnread(sessionKey);
+        }
         setSessionRefreshTrigger((prev) => prev + 1);
       }
     });

@@ -5,3 +5,4 @@ export * from './config';
 export * from './permissions';
 export * from './pty';
 export * from './sessions';
+export * from './teams';

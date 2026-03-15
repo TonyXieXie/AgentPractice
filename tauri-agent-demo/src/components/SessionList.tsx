@@ -1,5 +1,5 @@
 import { useMemo, useState, useEffect, useRef, type CSSProperties } from 'react';
-import { ChatSession } from '../types';
+import { AgentConfig, ChatSession } from '../types';
 import { getSessions, deleteSession, updateSession, copySession } from '../shared/api/sessions';
 import ConfirmDialog from './ConfirmDialog';
 import './SessionList.css';
@@ -16,6 +16,7 @@ interface SessionListProps {
     inFlightBySession?: Record<string, boolean>;
     unreadBySession?: Record<string, boolean>;
     pendingPermissionBySession?: Record<string, boolean>;
+    agentConfig?: AgentConfig | null;
 }
 
 export default function SessionList({
@@ -29,7 +30,8 @@ export default function SessionList({
     refreshTrigger,
     inFlightBySession,
     unreadBySession,
-    pendingPermissionBySession
+    pendingPermissionBySession,
+    agentConfig,
 }: SessionListProps) {
     const [sessions, setSessions] = useState<ChatSession[]>([]);
     const [editingId, setEditingId] = useState<string | null>(null);
@@ -49,6 +51,11 @@ export default function SessionList({
     const buildSessionTree = (items: ChatSession[]): SessionNode[] => {
         const order = new Map<string, number>();
         items.forEach((item, idx) => order.set(item.id, idx));
+        const getCreatedSortKey = (item: ChatSession) => {
+            const raw = item.created_at || item.updated_at || '';
+            const stamp = raw ? Date.parse(raw) : Number.NaN;
+            return Number.isFinite(stamp) ? stamp : Number.MAX_SAFE_INTEGER;
+        };
 
         const nodes = new Map<string, SessionNode>();
         items.forEach((item) => {
@@ -56,18 +63,55 @@ export default function SessionList({
         });
 
         const roots: SessionNode[] = [];
-        items.forEach((item) => {
+        const standalone = items.filter((item) => !item.team_id);
+        const standaloneIds = new Set(standalone.map((item) => item.id));
+        standalone.forEach((item) => {
             const node = nodes.get(item.id)!;
             const parentId = item.parent_session_id;
-            if (parentId && nodes.has(parentId)) {
+            if (parentId && standaloneIds.has(parentId) && nodes.has(parentId)) {
                 nodes.get(parentId)!.children.push(node);
             } else {
                 roots.push(node);
             }
         });
 
+        const sessionsByTeam = new Map<string, ChatSession[]>();
+        items.forEach((item) => {
+            const runtimeTeamId = item.team_id;
+            if (!runtimeTeamId) return;
+            if (!sessionsByTeam.has(runtimeTeamId)) {
+                sessionsByTeam.set(runtimeTeamId, []);
+            }
+            sessionsByTeam.get(runtimeTeamId)!.push(item);
+        });
+        sessionsByTeam.forEach((teamSessions) => {
+            const sorted = [...teamSessions].sort((a, b) => {
+                const createdDelta = getCreatedSortKey(a) - getCreatedSortKey(b);
+                if (createdDelta !== 0) return createdDelta;
+                return (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0);
+            });
+            if (sorted.length === 0) return;
+            const root = nodes.get(sorted[0].id);
+            if (!root) return;
+            roots.push(root);
+            sorted.slice(1).forEach((item) => {
+                const child = nodes.get(item.id);
+                if (child) {
+                    root.children.push(child);
+                }
+            });
+        });
+
         const sortNodes = (list: SessionNode[]) => {
-            list.sort((a, b) => (order.get(a.session.id) ?? 0) - (order.get(b.session.id) ?? 0));
+            list.sort((a, b) => {
+                const aTeam = a.session.team_id || '';
+                const bTeam = b.session.team_id || '';
+                if (aTeam && bTeam && aTeam === bTeam) {
+                    const createdDelta = getCreatedSortKey(a.session) - getCreatedSortKey(b.session);
+                    if (createdDelta !== 0) return createdDelta;
+                }
+                return (order.get(a.session.id) ?? 0) - (order.get(b.session.id) ?? 0);
+            });
             list.forEach((node) => sortNodes(node.children));
         };
         sortNodes(roots);
@@ -257,6 +301,16 @@ export default function SessionList({
         return result;
     }, [sessions]);
 
+    const teamLeaderById = useMemo(() => {
+        const map = new Map<string, string>();
+        for (const team of agentConfig?.teams || []) {
+            if (team?.id && team?.leader_profile_id) {
+                map.set(team.id, team.leader_profile_id);
+            }
+        }
+        return map;
+    }, [agentConfig]);
+
     return (
         <div className="session-list">
             <div className="session-list-header">
@@ -381,6 +435,9 @@ export default function SessionList({
                                     const showStatus = isPending || isStreaming || isUnread;
                                     const statusClass = isPending ? 'permission' : isStreaming ? 'streaming' : 'unread';
                                     const isChild = depth > 0;
+                                    const roleLabel = session.role_key || session.agent_profile;
+                                    const leaderRole = session.agent_team_id ? teamLeaderById.get(session.agent_team_id) || null : null;
+                                    const isLeaderRole = Boolean(session.team_id && roleLabel && leaderRole && roleLabel === leaderRole);
 
                                     return (
                                         <div
@@ -415,7 +472,15 @@ export default function SessionList({
                                                             >
                                                                 {showStatus && <span className="session-status-indicator" />}
                                                             </span>
-                                                            <div className="session-title">{session.title}</div>
+                                                            <div className="session-title-wrap">
+                                                                <div className="session-title">{session.title}</div>
+                                                                {roleLabel && (
+                                                                    <span className="session-role-pill">{roleLabel}</span>
+                                                                )}
+                                                                {isLeaderRole && (
+                                                                    <span className="session-role-pill">leader</span>
+                                                                )}
+                                                            </div>
                                                             <div className="session-right">
                                                                 <span className="session-time">
                                                                     {formatDate(session.updated_at || session.created_at)}

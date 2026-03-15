@@ -135,7 +135,11 @@ def _resolve_tool_list(abilities: List[Dict[str, Any]], all_tools: List[Tool], i
                 tool_names.append(normalized)
 
     if include_all:
-        return list(all_tools)
+        return [
+            tool
+            for tool in all_tools
+            if bool(getattr(tool, "expose_by_default", True))
+        ]
 
     selected_names = set(tool_names)
     selected_names.update(mcp_tool_names)
@@ -178,6 +182,113 @@ def _build_prompt_context(
     return context
 
 
+def _profile_label(profile_map: Dict[str, Dict[str, Any]], profile_id: str) -> str:
+    profile = profile_map.get(profile_id) or {}
+    profile_name = _normalize_text(profile.get("name"))
+    if profile_name and profile_name != profile_id:
+        return f"{profile_id} ({profile_name})"
+    return profile_id
+
+
+def _build_team_prompt_prefix(
+    agent_config: Dict[str, Any],
+    profile: Dict[str, Any],
+    extra_context: Optional[Dict[str, Any]] = None
+) -> str:
+    current_profile_id = _normalize_text(profile.get("id"))
+    if not current_profile_id:
+        return ""
+
+    profile_map: Dict[str, Dict[str, Any]] = {}
+    for item in _as_list(agent_config.get("profiles")):
+        if not isinstance(item, dict):
+            continue
+        profile_id = _normalize_text(item.get("id"))
+        if profile_id:
+            profile_map[profile_id] = item
+
+    active_team_id = ""
+    if isinstance(extra_context, dict):
+        active_team_id = _normalize_text(
+            extra_context.get("active_team_id") or extra_context.get("current_agent_team_id")
+        )
+
+    team_name = ""
+    member_ids: List[str] = []
+    leader_profile_id = ""
+    if active_team_id:
+        for selectable_team in _as_list(agent_config.get("teams")):
+            if not isinstance(selectable_team, dict):
+                continue
+            selectable_team_id = _normalize_text(selectable_team.get("id"))
+            if selectable_team_id != active_team_id:
+                continue
+            raw_member_ids = _as_list(selectable_team.get("member_profile_ids"))
+            member_ids = [
+                member_id
+                for member_id in [_normalize_text(item) for item in raw_member_ids]
+                if member_id and member_id in profile_map
+            ]
+            team_name = _normalize_text(selectable_team.get("name") or selectable_team.get("id"))
+            leader_profile_id = _normalize_text(selectable_team.get("leader_profile_id"))
+            break
+
+    if not member_ids:
+        legacy_team = _as_dict(agent_config.get("team"))
+        raw_members = _as_list(legacy_team.get("members"))
+        member_ids = []
+        for member in raw_members:
+            if not isinstance(member, dict):
+                continue
+            member_id = _normalize_text(member.get("profile_id"))
+            if member_id and member_id in profile_map and member_id not in member_ids:
+                member_ids.append(member_id)
+        if current_profile_id in member_ids:
+            team_name = _normalize_text(legacy_team.get("name") or legacy_team.get("id")) or "the configured team"
+            leader_profile_id = _normalize_text(legacy_team.get("leader_profile_id") or legacy_team.get("default_agent"))
+
+    if current_profile_id not in member_ids:
+        return ""
+
+    teammate_labels = [
+        _profile_label(profile_map, member_id)
+        for member_id in member_ids
+        if member_id != current_profile_id
+    ]
+    teammates_text = ", ".join(teammate_labels) if teammate_labels else "none"
+
+    responsibility = _normalize_text(profile.get("description"))
+    if not responsibility:
+        profile_name = _normalize_text(profile.get("name")) or current_profile_id
+        responsibility = f"Act as the {profile_name} specialist for the team."
+
+    leader_label = _profile_label(profile_map, leader_profile_id) if leader_profile_id in profile_map else (leader_profile_id or "unknown")
+    current_role_label = _normalize_text(profile.get("name")) or current_profile_id
+    prompt = (
+        f"You are [{current_role_label}], a team member of {team_name}. "
+        f"The leader role is: {leader_label}. "
+        f"Your teammates are: {teammates_text}. "
+        f"Your responsibility is: {responsibility}. "
+        "Team workflow rules: Only the leader may decide that the user's overall task is complete. "
+        "If you are not the leader, never treat your local completion as the final user completion. "
+        "If you are not the leader, do not tell the user the task is fully complete, solved, shipped, or finished. "
+        "Your answer should be a work report for the delegating or upstream agent, including completed work, key results, remaining risks or blockers, and a recommended next step. "
+        "If the overall task still needs more work, hand off to the most suitable teammate instead of announcing final completion."
+    )
+    if leader_profile_id and current_profile_id == leader_profile_id:
+        prompt += (
+            " As the leader, when a teammate returns a work report, you must decide the next step yourself. "
+            "If the report says more user information is needed, decide whether to ask the user directly or send a follow-up task to the most suitable teammate. "
+            "You may hand work back to the same teammate when a follow-up implementation or revision is needed, but make the next instruction explicit. "
+            "Your final user-facing answer must summarize the decision in normal dialogue. Do not output raw handoff event logs, transcript markers, or '[Role] Handoff to [...]' text as the final answer."
+        )
+    else:
+        prompt += (
+            " If you need the leader to decide the next step or ask the user for missing information, hand off back to the leader with a concise work summary."
+        )
+    return prompt
+
+
 def build_system_prompt(
     agent_config: Dict[str, Any],
     profile: Dict[str, Any],
@@ -188,6 +299,7 @@ def build_system_prompt(
 ) -> str:
     base_prompt = _normalize_text(agent_config.get("base_system_prompt"))
     has_tools = include_tools and bool(tools)
+    team_prompt_prefix = _build_team_prompt_prefix(agent_config, profile, extra_context)
 
     prompt_context = _build_prompt_context(profile, tools, extra_context)
     profile_params = _as_dict(profile.get("params"))
@@ -205,6 +317,8 @@ def build_system_prompt(
             module_chunks.setdefault(ability_type, []).append(rendered)
 
     lines: List[str] = []
+    if team_prompt_prefix:
+        lines.append(team_prompt_prefix)
     if base_prompt:
         lines.append(base_prompt)
 

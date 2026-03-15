@@ -16,7 +16,16 @@ CONTEXT_SUMMARY_PROMPT = (
     "- 输出纯摘要文本，不要添加标题或前缀"
 )
 
+PRIVATE_CONTEXT_SUMMARY_PROMPT = (
+    "You summarize an agent's private execution history for future continuations.\n"
+    "- Summarize only tool usage, intermediate observations, and private execution state\n"
+    "- Keep important decisions, failed attempts, file paths, commands, and unresolved work\n"
+    "- Do not invent user-visible dialogue that did not happen\n"
+    "- Output summary text only"
+)
+
 CONTEXT_SUMMARY_MARKER = "[Context Summary]"
+PRIVATE_CONTEXT_SUMMARY_MARKER = "[Agent Private Summary]"
 CONTEXT_COMPRESS_KEEP_RECENT_CALLS = 10
 CONTEXT_COMPRESS_STEP_CALLS = 5
 TRUNCATION_MARKER_START = "[TRUNCATED_START]"
@@ -54,6 +63,9 @@ def _format_dialogue_for_summary(messages: List[Dict[str, Any]]) -> str:
     lines = []
     for msg in messages:
         role = msg.get("role")
+        metadata = msg.get("metadata")
+        if isinstance(metadata, dict) and str(metadata.get("event_type") or "").strip() in {"handoff", "delegated_result"}:
+            continue
         content = str(msg.get("content") or "").strip()
         if not content:
             continue
@@ -63,6 +75,28 @@ def _format_dialogue_for_summary(messages: List[Dict[str, Any]]) -> str:
             prefix = "Assistant"
         else:
             continue
+        lines.append(f"{prefix}: {content}")
+    return "\n".join(lines)
+
+
+def _format_messages_for_summary(messages: List[Dict[str, Any]]) -> str:
+    lines = []
+    for msg in messages:
+        role = str(msg.get("role") or "").lower()
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            prefix = "User"
+        elif role == "assistant":
+            prefix = "Assistant"
+        elif role == "tool":
+            name = str(msg.get("name") or "tool").strip() or "tool"
+            prefix = f"Tool:{name}"
+        elif role == "system":
+            prefix = "System"
+        else:
+            prefix = role.capitalize() or "Message"
         lines.append(f"{prefix}: {content}")
     return "\n".join(lines)
 
@@ -250,115 +284,257 @@ async def summarize_dialogue(
     return await _run_context_summary(llm_client, summary, dialogue_messages)
 
 
+async def summarize_private_dialogue(
+    llm_client: Any,
+    summary: str,
+    dialogue_messages: List[Dict[str, Any]]
+) -> Optional[str]:
+    dialogue_text = _format_messages_for_summary(dialogue_messages)
+    if not dialogue_text and not summary:
+        return None
+    parts = []
+    if summary:
+        parts.append(f"Existing summary:\n{summary}")
+    if dialogue_text:
+        parts.append(f"New private history:\n{dialogue_text}")
+    prompt = "\n\n".join(parts).strip() or "Summarize the private agent history."
+    try:
+        result = await llm_client.chat(
+            [
+                {"role": "system", "content": PRIVATE_CONTEXT_SUMMARY_PROMPT},
+                {"role": "user", "content": f"{prompt}\n\nReturn only the updated summary."},
+            ]
+        )
+    except Exception as exc:
+        print(f"[Context Compress] Private summary request failed: {exc}")
+        return None
+    content = str(result.get("content") or "").strip()
+    return content or None
+
+
+def _filter_message_for_history(session_id: str, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    msg_for_history = dict(msg)
+    role = str(msg_for_history.get("role") or "")
+    metadata = msg_for_history.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        msg_for_history["metadata"] = metadata
+
+    event_type = str(metadata.get("event_type") or "").strip()
+    if role == "system":
+        if event_type != "delegated_result":
+            return None
+
+    if role == "assistant":
+        content_text = str(msg_for_history.get("content") or "")
+        if not content_text.strip():
+            persistent_content = _resolve_persistent_pty_content(session_id, msg_for_history)
+            if persistent_content is None:
+                return None
+            msg_for_history["content"] = persistent_content
+    return msg_for_history
+
+
+def _list_global_history_messages(
+    session_id: str,
+    after_message_id: Optional[int],
+    current_user_message_id: Optional[int],
+) -> List[Dict[str, Any]]:
+    messages = chat_repository.list_dialogue_messages_after(session_id, after_message_id)
+    filtered: List[Dict[str, Any]] = []
+    for msg in messages:
+        if current_user_message_id and msg.get("id") == current_user_message_id:
+            continue
+        msg_for_history = _filter_message_for_history(session_id, msg)
+        if msg_for_history is not None:
+            if current_user_message_id:
+                try:
+                    message_id = int(msg.get("id"))
+                    if message_id > int(current_user_message_id):
+                        msg_for_history["_after_user"] = True
+                except (TypeError, ValueError):
+                    pass
+            filtered.append(msg_for_history)
+    return filtered
+
+
+def _append_step_history_messages(
+    history: List[Dict[str, Any]],
+    steps: List[Dict[str, Any]],
+    trunc_cfg: Optional[Dict[str, Any]],
+    call_prefix: str,
+) -> None:
+    if not steps:
+        return
+    pending_calls: List[Dict[str, str]] = []
+    tool_call_counter = 0
+
+    def _next_call_id(sequence: Optional[int], tool_name: str, step_id: Optional[int]) -> str:
+        nonlocal tool_call_counter
+        tool_call_counter += 1
+        seq = sequence if isinstance(sequence, int) else tool_call_counter
+        safe_step_id = step_id if isinstance(step_id, int) else tool_call_counter
+        return f"{call_prefix}_{safe_step_id}_{seq}_{tool_call_counter}"
+
+    for step in steps:
+        step_type = step.get("step_type")
+        metadata = step.get("metadata") or {}
+        tool_name = _normalize_tool_name_for_llm(metadata.get("tool"))
+        if not tool_name:
+            continue
+        if step_type == "observation" and metadata.get("context_compress"):
+            continue
+        if step_type == "action":
+            tool_input = metadata.get("input")
+            call_id = _next_call_id(step.get("sequence"), str(tool_name), step.get("id"))
+            pending_calls.append({"tool": str(tool_name), "id": call_id})
+            history.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": str(tool_name),
+                            "arguments": _format_tool_arguments(str(tool_name), tool_input, trunc_cfg)
+                        }
+                    }
+                ]
+            })
+        elif step_type == "observation":
+            tool_output = _truncate_text_middle(step.get("content") or "", trunc_cfg)
+            call_id = None
+            for idx, item in enumerate(pending_calls):
+                if item.get("tool") == str(tool_name):
+                    call_id = item.get("id")
+                    pending_calls.pop(idx)
+                    break
+            if call_id is None:
+                call_id = _next_call_id(step.get("sequence"), str(tool_name), step.get("id"))
+                history.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": str(tool_name),
+                                "arguments": _format_tool_arguments(str(tool_name), None, trunc_cfg)
+                            }
+                        }
+                    ]
+                })
+            history.append({
+                "role": "tool",
+                "content": tool_output,
+                "tool_call_id": call_id,
+                "name": str(tool_name)
+            })
+
+
+def build_private_history_for_llm(
+    session_id: str,
+    agent_profile: str,
+    after_step_id: Optional[int],
+    trunc_cfg: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    steps = chat_repository.list_agent_steps_for_profile_after(session_id, agent_profile, after_step_id)
+    history: List[Dict[str, Any]] = []
+    _append_step_history_messages(history, steps, trunc_cfg, f"priv_{agent_profile}")
+    return history
+
+
 def build_history_for_llm(
     session_id: str,
     after_message_id: Optional[int],
     current_user_message_id: Optional[int],
     summary: str,
     code_map: Optional[str],
-    trunc_cfg: Optional[Dict[str, Any]] = None
+    trunc_cfg: Optional[Dict[str, Any]] = None,
+    current_agent_profile: Optional[str] = None,
+    private_summary: Optional[str] = None,
+    private_after_step_id: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    messages = chat_repository.list_dialogue_messages_after(session_id, after_message_id)
-    filtered = []
-    for msg in messages:
-        msg_for_history = dict(msg)
-        if current_user_message_id and msg.get("id") == current_user_message_id:
-            continue
-        if msg_for_history.get("role") == "assistant":
-            content_text = str(msg_for_history.get("content") or "")
-            if not content_text.strip():
-                persistent_content = _resolve_persistent_pty_content(session_id, msg_for_history)
-                if persistent_content is None:
-                    continue
-                msg_for_history["content"] = persistent_content
-        filtered.append(msg_for_history)
+    filtered = _list_global_history_messages(session_id, after_message_id, current_user_message_id)
     assistant_ids = [msg.get("id") for msg in filtered if msg.get("role") == "assistant"]
-    steps_by_message: Dict[int, List[Dict[str, Any]]] = {}
+    ordered_steps: List[Dict[str, Any]] = []
     if assistant_ids:
         steps = chat_repository.list_agent_steps_for_messages(session_id, assistant_ids)
         for step in steps:
-            message_id = step.get("message_id")
-            if not message_id:
-                continue
-            steps_by_message.setdefault(message_id, []).append(step)
+            if current_agent_profile:
+                if str(step.get("agent_profile") or "").strip() != str(current_agent_profile).strip():
+                    continue
+                if private_after_step_id is not None:
+                    step_id = step.get("id")
+                    try:
+                        if step_id is not None and int(step_id) <= int(private_after_step_id):
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+            ordered_steps.append(step)
+
+    def _step_sort_key(step: Dict[str, Any]) -> Tuple[str, int]:
+        timestamp = str(step.get("timestamp") or "")
+        try:
+            step_id = int(step.get("id"))
+        except (TypeError, ValueError):
+            step_id = 0
+        return timestamp, step_id
+
+    pending_steps = sorted(ordered_steps, key=_step_sort_key)
+    pending_index = 0
 
     history: List[Dict[str, Any]] = []
-    tool_call_counter = 0
     for msg in filtered:
-        if msg.get("role") == "assistant":
-            msg_id = msg.get("id")
-            steps = steps_by_message.get(msg_id, [])
-            pending_calls: List[Dict[str, str]] = []
+        msg_timestamp = str(msg.get("timestamp") or "")
+        if current_agent_profile and pending_index < len(pending_steps):
+            ready_steps: List[Dict[str, Any]] = []
+            while pending_index < len(pending_steps):
+                step = pending_steps[pending_index]
+                step_timestamp = str(step.get("timestamp") or "")
+                if msg_timestamp and step_timestamp and step_timestamp > msg_timestamp:
+                    break
+                ready_steps.append(step)
+                pending_index += 1
+            _append_step_history_messages(
+                history,
+                ready_steps,
+                trunc_cfg,
+                f"hist_call_{msg.get('id')}"
+            )
 
-            def _next_call_id(sequence: Optional[int], tool_name: str) -> str:
-                nonlocal tool_call_counter
-                tool_call_counter += 1
-                seq = sequence if isinstance(sequence, int) else tool_call_counter
-                return f"hist_call_{msg_id}_{seq}_{tool_call_counter}"
+        history_message = {"role": msg.get("role"), "content": msg.get("content")}
+        if msg.get("_after_user"):
+            history_message["_after_user"] = True
+        history.append(history_message)
 
-            for step in steps:
-                step_type = step.get("step_type")
-                metadata = step.get("metadata") or {}
-                tool_name = _normalize_tool_name_for_llm(metadata.get("tool"))
-                if not tool_name:
-                    continue
-                if step_type == "observation" and metadata.get("context_compress"):
-                    continue
-                if step_type == "action":
-                    tool_input = metadata.get("input")
-                    call_id = _next_call_id(step.get("sequence"), str(tool_name))
-                    pending_calls.append({"tool": str(tool_name), "id": call_id})
-                    history.append({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [
-                            {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": str(tool_name),
-                                    "arguments": _format_tool_arguments(str(tool_name), tool_input, trunc_cfg)
-                                }
-                            }
-                        ]
-                    })
-                elif step_type == "observation":
-                    tool_output = _truncate_text_middle(step.get("content") or "", trunc_cfg)
-                    call_id = None
-                    for idx, item in enumerate(pending_calls):
-                        if item.get("tool") == str(tool_name):
-                            call_id = item.get("id")
-                            pending_calls.pop(idx)
-                            break
-                    if call_id is None:
-                        call_id = _next_call_id(step.get("sequence"), str(tool_name))
-                        history.append({
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [
-                                {
-                                    "id": call_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": str(tool_name),
-                                        "arguments": _format_tool_arguments(str(tool_name), None, trunc_cfg)
-                                    }
-                                }
-                            ]
-                        })
-                    history.append({
-                        "role": "tool",
-                        "content": tool_output,
-                        "tool_call_id": call_id,
-                        "name": str(tool_name)
-                    })
-
-        history.append({"role": msg.get("role"), "content": msg.get("content")})
+    if current_agent_profile and pending_index < len(pending_steps):
+        _append_step_history_messages(
+            history,
+            pending_steps[pending_index:],
+            trunc_cfg,
+            "hist_call_tail"
+        )
 
     if summary:
         history.insert(0, {"role": "assistant", "content": f"{CONTEXT_SUMMARY_MARKER}\n{summary}"})
-    if code_map:
+    if private_summary and current_agent_profile:
         insert_index = 1 if summary else 0
+        history.insert(
+            insert_index,
+            {
+                "role": "assistant",
+                "content": f"{PRIVATE_CONTEXT_SUMMARY_MARKER} ({current_agent_profile})\n{private_summary}",
+            },
+        )
+    if code_map:
+        insert_index = 0
+        if summary:
+            insert_index += 1
+        if private_summary and current_agent_profile:
+            insert_index += 1
         history.insert(insert_index, {"role": "assistant", "content": code_map})
     return history
 
@@ -426,30 +602,11 @@ async def maybe_compress_context(
     )
 
     def build_uncompressed_messages(after_id: Optional[int]) -> List[Dict[str, Any]]:
-        messages = chat_repository.list_dialogue_messages_after(session_id, after_id)
-        filtered = []
-        for msg in messages:
-            msg_for_history = dict(msg)
-            if msg.get("id") == current_user_message_id:
-                continue
-            if msg_for_history.get("role") == "assistant":
-                content_text = str(msg_for_history.get("content") or "")
-                if not content_text.strip():
-                    persistent_content = _resolve_persistent_pty_content(session_id, msg_for_history)
-                    if persistent_content is None:
-                        continue
-                    msg_for_history["content"] = persistent_content
-            filtered.append(msg_for_history)
-        return filtered
+        return _list_global_history_messages(session_id, after_id, current_user_message_id)
 
-    history_for_llm = build_history_for_llm(
-        session_id,
-        last_message_id,
-        current_user_message_id,
-        summary,
-        None,
-        trunc_cfg
-    )
+    history_for_llm = build_uncompressed_messages(last_message_id)
+    if summary:
+        history_for_llm = [{"role": "assistant", "content": f"{CONTEXT_SUMMARY_MARKER}\n{summary}"}] + history_for_llm
     if current_total_tokens is not None:
         initial_tokens = int(current_total_tokens)
         _debug_log(f"using current_total_tokens={initial_tokens}")
@@ -560,14 +717,9 @@ async def maybe_compress_context(
         last_message_id = boundary_message_id
         did_compress = True
 
-        history_for_llm = build_history_for_llm(
-            session_id,
-            last_message_id,
-            current_user_message_id,
-            summary,
-            None,
-            trunc_cfg
-        )
+        history_for_llm = build_uncompressed_messages(last_message_id)
+        if summary:
+            history_for_llm = [{"role": "assistant", "content": f"{CONTEXT_SUMMARY_MARKER}\n{summary}"}] + history_for_llm
         token_count = _estimate_tokens_for_messages(history_for_llm)
         if current_user_text:
             token_count += _estimate_tokens_for_text(current_user_text)
@@ -579,3 +731,90 @@ async def maybe_compress_context(
         keep_window = max(0, keep_window - step_calls)
 
     return summary, last_call_id if did_compress else last_compressed_call_id, last_message_id, did_compress
+
+
+async def maybe_compress_private_context(
+    session_id: str,
+    agent_profile: Optional[str],
+    config: Any,
+    app_config: Dict[str, Any],
+    llm_client: Any,
+    current_summary: str,
+    last_compressed_step_id: Optional[int],
+    current_user_text: str = "",
+) -> Tuple[str, Optional[int], bool]:
+    agent_profile = str(agent_profile or "").strip()
+    if not session_id or not agent_profile:
+        return current_summary, last_compressed_step_id, False
+
+    context_cfg = app_config.get("context", {}) if isinstance(app_config, dict) else {}
+    if not context_cfg.get("compression_enabled"):
+        return current_summary, last_compressed_step_id, False
+
+    max_tokens = getattr(config, "max_context_tokens", 0) or 0
+    if max_tokens <= 0:
+        return current_summary, last_compressed_step_id, False
+
+    try:
+        start_pct = int(context_cfg.get("compress_start_pct", 75))
+    except (TypeError, ValueError):
+        start_pct = 75
+    try:
+        step_calls = int(context_cfg.get("step_calls", CONTEXT_COMPRESS_STEP_CALLS))
+    except (TypeError, ValueError):
+        step_calls = CONTEXT_COMPRESS_STEP_CALLS
+    if step_calls < 1:
+        step_calls = CONTEXT_COMPRESS_STEP_CALLS
+
+    trunc_cfg = _build_trunc_cfg(context_cfg)
+    private_history = build_private_history_for_llm(
+        session_id,
+        agent_profile,
+        last_compressed_step_id,
+        trunc_cfg,
+    )
+    token_count = _estimate_tokens_for_messages(private_history)
+    if current_summary:
+        token_count += _estimate_tokens_for_text(current_summary)
+    if current_user_text:
+        token_count += _estimate_tokens_for_text(current_user_text)
+    if token_count < (start_pct / 100.0) * max_tokens:
+        return current_summary, last_compressed_step_id, False
+
+    steps = chat_repository.list_agent_steps_for_profile_after(session_id, agent_profile, last_compressed_step_id)
+    if len(steps) <= step_calls * 2:
+        return current_summary, last_compressed_step_id, False
+
+    keep_recent_steps = max(2, step_calls * 2)
+    compress_steps = steps[:-keep_recent_steps]
+    if not compress_steps:
+        return current_summary, last_compressed_step_id, False
+
+    summary_messages: List[Dict[str, Any]] = []
+    _append_step_history_messages(
+        summary_messages,
+        compress_steps,
+        trunc_cfg,
+        f"priv_sum_{agent_profile}",
+    )
+    new_summary = await summarize_private_dialogue(llm_client, current_summary, summary_messages)
+    if not new_summary:
+        return current_summary, last_compressed_step_id, False
+
+    last_step_id = None
+    for step in compress_steps:
+        try:
+            step_id = int(step.get("id"))
+        except (TypeError, ValueError):
+            continue
+        last_step_id = step_id
+    if last_step_id is None:
+        return current_summary, last_compressed_step_id, False
+
+    chat_repository.upsert_agent_private_context(
+        session_id,
+        agent_profile,
+        new_summary,
+        last_step_id,
+    )
+    return new_summary, last_step_id, True

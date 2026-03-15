@@ -8,6 +8,7 @@ This module defines the core abstractions for the tool system:
 """
 
 from abc import ABC, abstractmethod
+import copy
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ class Tool(ABC):
         self.name: str = ""
         self.description: str = ""
         self.parameters: List[ToolParameter] = []
+        self.expose_by_default: bool = True
     
     @abstractmethod
     async def execute(self, input_data: str) -> str:
@@ -68,6 +70,25 @@ class Tool(ABC):
             "description": self.description,
             "parameters": [p.dict() for p in self.parameters]
         }
+
+    def clone(self, context: Optional[Dict[str, Any]] = None) -> Optional["Tool"]:
+        try:
+            cloned: Tool = self.__class__()  # type: ignore[call-arg]
+        except Exception:
+            cloned = copy.deepcopy(self)
+        bind_context = getattr(cloned, "bind_context", None)
+        if callable(bind_context):
+            result = bind_context(context or {})
+            if result is None:
+                return None
+        else:
+            refresh = getattr(cloned, "refresh_metadata", None)
+            if callable(refresh):
+                try:
+                    refresh(context=context or {})
+                except TypeError:
+                    refresh()
+        return cloned
 
 
 def _build_tool_parameters_schema(tool: "Tool") -> Dict[str, Any]:
@@ -186,7 +207,7 @@ class ToolRegistry:
             del cls._tools[tool_name]
     
     @classmethod
-    def get(cls, tool_name: str) -> Optional[Tool]:
+    def get(cls, tool_name: str, context: Optional[Dict[str, Any]] = None) -> Optional[Tool]:
         """
         Get tool by name.
         
@@ -196,24 +217,28 @@ class ToolRegistry:
         Returns:
             Tool instance or None if not found
         """
-        return cls._tools.get(tool_name)
+        tool = cls._tools.get(tool_name)
+        if tool is None:
+            return None
+        return tool.clone(context)
     
     @classmethod
-    def get_all(cls) -> List[Tool]:
+    def get_all(cls, context: Optional[Dict[str, Any]] = None) -> List[Tool]:
         """
         Get all registered tools.
         
         Returns:
             List of all registered tools
         """
-        tools = list(cls._tools.values())
-        for tool in tools:
-            refresh = getattr(tool, "refresh_metadata", None)
-            if callable(refresh):
-                try:
-                    refresh()
-                except Exception:
-                    pass
+        tools: List[Tool] = []
+        for prototype in cls._tools.values():
+            try:
+                cloned = prototype.clone(context)
+            except Exception:
+                cloned = None
+            if cloned is None:
+                continue
+            tools.append(cloned)
         return tools
     
     @classmethod

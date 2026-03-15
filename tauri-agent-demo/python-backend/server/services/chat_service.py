@@ -2,11 +2,13 @@
 import json
 import os
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 from fastapi.responses import Response, StreamingResponse
 
+from agent_team import AgentTeam
+from app_config import get_app_config
 from ghost_snapshot import restore_snapshot
 from llm_client import create_llm_client
 from message_processor import message_processor
@@ -35,6 +37,26 @@ from ..runtime_state import STREAM_REGISTRY
 from ..session_support import schedule_ast_scan
 
 
+def _resolve_request_selection(
+    session: Any = None,
+    request: ChatRequest = None,
+) -> Dict[str, Optional[str]]:
+    if request is None:
+        return {"agent_profile": None, "agent_team_id": None}
+    if request.agent_profile and request.agent_team_id:
+        raise HTTPException(status_code=400, detail="agent_profile and agent_team_id cannot both be set")
+    team = AgentTeam(get_app_config())
+    try:
+        return team.resolve_session_selection(
+            session_profile=getattr(session, "agent_profile", None) if session else None,
+            session_team_id=getattr(session, "agent_team_id", None) if session else None,
+            requested_profile=request.agent_profile,
+            requested_team_id=request.agent_team_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 async def chat(request: ChatRequest):
     try:
         new_session_created = False
@@ -42,8 +64,18 @@ async def chat(request: ChatRequest):
             session = session_repository.get_session(request.session_id)
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
-            if request.agent_profile is not None and request.agent_profile != getattr(session, "agent_profile", None):
-                session = session_repository.update_session(session.id, ChatSessionUpdate(agent_profile=request.agent_profile)) or session
+            selection = _resolve_request_selection(session=session, request=request)
+            if (
+                selection.get("agent_profile") != getattr(session, "agent_profile", None)
+                or selection.get("agent_team_id") != getattr(session, "agent_team_id", None)
+            ):
+                session = session_repository.update_session(
+                    session.id,
+                    ChatSessionUpdate(
+                        agent_profile=selection.get("agent_profile"),
+                        agent_team_id=selection.get("agent_team_id"),
+                    ),
+                ) or session
         else:
             config_id = request.config_id
             if not config_id:
@@ -55,13 +87,15 @@ async def chat(request: ChatRequest):
                     config_id = configs[0].id
                 else:
                     config_id = default_config.id
+            selection = _resolve_request_selection(request=request)
 
             session = session_repository.create_session(
                 ChatSessionCreate(
                     title="New Chat",
                     config_id=config_id,
                     work_path=request.work_path,
-                    agent_profile=request.agent_profile,
+                    agent_profile=selection.get("agent_profile"),
+                    agent_team_id=selection.get("agent_team_id"),
                 )
             )
             new_session_created = True
@@ -163,16 +197,28 @@ async def chat_stream(request: ChatRequest):
             session = session_repository.get_session(request.session_id)
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
-            if request.agent_profile is not None and request.agent_profile != getattr(session, "agent_profile", None):
-                session = session_repository.update_session(session.id, ChatSessionUpdate(agent_profile=request.agent_profile)) or session
+            selection = _resolve_request_selection(session=session, request=request)
+            if (
+                selection.get("agent_profile") != getattr(session, "agent_profile", None)
+                or selection.get("agent_team_id") != getattr(session, "agent_team_id", None)
+            ):
+                session = session_repository.update_session(
+                    session.id,
+                    ChatSessionUpdate(
+                        agent_profile=selection.get("agent_profile"),
+                        agent_team_id=selection.get("agent_team_id"),
+                    ),
+                ) or session
         else:
             config_id = request.config_id if request.config_id else config_repository.list_configs()[0].id
+            selection = _resolve_request_selection(request=request)
             session = session_repository.create_session(
                 ChatSessionCreate(
                     title="New Chat",
                     config_id=config_id,
                     work_path=request.work_path,
-                    agent_profile=request.agent_profile,
+                    agent_profile=selection.get("agent_profile"),
+                    agent_team_id=selection.get("agent_team_id"),
                 )
             )
             new_session_created = True
@@ -346,7 +392,12 @@ def export_chat_history(request: ExportRequest):
                     lines.append("")
                 lines.append("")
                 for msg in session_data["messages"]:
-                    role_name = "User" if msg["role"] == "user" else "Assistant"
+                    if msg["role"] == "user":
+                        role_name = "User"
+                    elif msg["role"] == "system":
+                        role_name = "System"
+                    else:
+                        role_name = "Assistant"
                     lines.append(f"[{msg['timestamp']}] {role_name}:")
                     lines.append(msg["content"])
                     lines.append("")
@@ -365,7 +416,12 @@ def export_chat_history(request: ExportRequest):
                     lines.append(session_data["session"]["context_summary"])
                 lines.append("\n---\n")
                 for msg in session_data["messages"]:
-                    role_name = "User" if msg["role"] == "user" else "Assistant"
+                    if msg["role"] == "user":
+                        role_name = "User"
+                    elif msg["role"] == "system":
+                        role_name = "System"
+                    else:
+                        role_name = "Assistant"
                     lines.append(f"## {role_name}")
                     lines.append(f"*{msg['timestamp']}*\n")
                     lines.append(msg["content"])
@@ -509,6 +565,7 @@ async def revert_patch(request: PatchRevertRequest):
             "tool": "apply_patch" if not snapshot_restored else "snapshot_restore",
             "patch_event": "revert",
         },
+        agent_profile=getattr(session, "agent_profile", None),
     )
     chat_repository.save_agent_step(
         message_id=assistant_msg.id,
@@ -516,6 +573,7 @@ async def revert_patch(request: PatchRevertRequest):
         content="Reverted the latest patch change.",
         sequence=1,
         metadata={"patch_event": "revert"},
+        agent_profile=getattr(session, "agent_profile", None),
     )
 
     return {

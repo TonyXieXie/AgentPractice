@@ -271,9 +271,38 @@ class ReActAgent(AgentStrategy):
             debug_ctx["session_id"] = session_id
         if "message_id" not in debug_ctx:
             debug_ctx["message_id"] = None
+        if "agent_profile" not in debug_ctx and request_overrides:
+            agent_profile = request_overrides.get("current_agent_profile")
+            if agent_profile:
+                debug_ctx["agent_profile"] = agent_profile
         debug_ctx["agent_type"] = agent_type
         debug_ctx["iteration"] = iteration
         return debug_ctx if debug_ctx else None
+
+    def _extract_handoff_payload(self, tool_name: Optional[str], tool_output: Any) -> Optional[Dict[str, str]]:
+        if str(tool_name or "").strip().lower() != "handoff":
+            return None
+        try:
+            payload = json.loads(str(tool_output or ""))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("status") or "").strip().lower() != "handoff":
+            return None
+        from_agent = str(payload.get("from_agent") or "").strip()
+        target_agent = str(payload.get("target_agent") or "").strip()
+        reason = str(payload.get("reason") or "").strip()
+        work_summary = str(payload.get("work_summary") or "").strip()
+        if not target_agent:
+            return None
+        return {
+            "handoff_requested": True,
+            "from_agent": from_agent,
+            "target_agent": target_agent,
+            "reason": reason,
+            "work_summary": work_summary,
+        }
 
     async def execute(
         self,
@@ -340,9 +369,29 @@ class ReActAgent(AgentStrategy):
         last_compressed_call_id = context_state.get("last_call_id")
         last_compressed_message_id = context_state.get("last_message_id")
         current_user_message_id = context_state.get("current_user_message_id")
+        current_agent_profile = str(
+            context_state.get("current_agent_profile")
+            or (request_overrides.get("current_agent_profile") if request_overrides else "")
+            or ""
+        ).strip() or None
+        private_summary = str(context_state.get("private_summary") or "")
+        private_after_step_id = context_state.get("private_after_step_id")
         code_map_prompt = request_overrides.get("_code_map_prompt") if request_overrides else None
         stop_event = request_overrides.get("_stop_event") if request_overrides else None
         current_turn_compresses = 0
+
+        def rebuild_history() -> List[Dict[str, Any]]:
+            return build_history_for_llm(
+                session_id,
+                last_compressed_message_id,
+                current_user_message_id,
+                context_summary,
+                code_map_prompt,
+                trunc_cfg,
+                current_agent_profile=current_agent_profile,
+                private_summary=private_summary,
+                private_after_step_id=private_after_step_id,
+            )
 
         def build_base_messages() -> List[Dict[str, Any]]:
             base_messages: List[Dict[str, Any]] = [{"role": prompt_role, "content": prompt}]
@@ -382,6 +431,9 @@ class ReActAgent(AgentStrategy):
         async def compress_current_turn_if_needed(
             current_total_tokens: Optional[int]
         ) -> Optional[AgentStep]:
+            # Current-turn tool traces are agent-private. Do not fold them into the
+            # shared session summary inside the agent loop.
+            return None
             nonlocal history, context_summary, last_compressed_call_id, last_compressed_message_id
             nonlocal dynamic_messages, dynamic_response_items, response_input, base_messages, messages
             nonlocal current_turn_compresses
@@ -474,19 +526,15 @@ class ReActAgent(AgentStrategy):
                     "summary": context_summary,
                     "last_call_id": last_compressed_call_id,
                     "last_message_id": last_compressed_message_id,
-                    "current_user_message_id": current_user_message_id
+                    "current_user_message_id": current_user_message_id,
+                    "current_agent_profile": current_agent_profile,
+                    "private_summary": private_summary,
+                    "private_after_step_id": private_after_step_id,
                 }
 
             dynamic_messages = []
             dynamic_response_items = []
-            history = build_history_for_llm(
-                session_id,
-                last_compressed_message_id,
-                current_user_message_id,
-                context_summary,
-                code_map_prompt,
-                trunc_cfg
-            )
+            history = rebuild_history()
             base_messages = build_base_messages()
             if openai_format == "openai_responses":
                 messages = list(base_messages)
@@ -535,7 +583,10 @@ class ReActAgent(AgentStrategy):
                         "summary": context_summary,
                         "last_call_id": last_compressed_call_id,
                         "last_message_id": last_compressed_message_id,
-                        "current_user_message_id": current_user_message_id
+                        "current_user_message_id": current_user_message_id,
+                        "current_agent_profile": current_agent_profile,
+                        "private_summary": private_summary,
+                        "private_after_step_id": private_after_step_id,
                     }
 
                 compress_step = AgentStep(
@@ -544,14 +595,7 @@ class ReActAgent(AgentStrategy):
                     metadata={"context_compress": True}
                 )
 
-                history = build_history_for_llm(
-                    session_id,
-                    last_compressed_message_id,
-                    current_user_message_id,
-                    context_summary,
-                    code_map_prompt,
-                    trunc_cfg
-                )
+                history = rebuild_history()
                 return True, compress_step
 
             return False, None
@@ -559,6 +603,9 @@ class ReActAgent(AgentStrategy):
         async def compress_current_turn_if_needed(
             current_total_tokens: Optional[int]
         ) -> Optional[AgentStep]:
+            # Current-turn tool traces are agent-private. Do not fold them into the
+            # shared session summary inside the agent loop.
+            return None
             nonlocal history, context_summary, last_compressed_call_id, last_compressed_message_id
             nonlocal dynamic_messages, dynamic_response_items, response_input, base_messages, messages
             nonlocal current_turn_compresses
@@ -649,19 +696,15 @@ class ReActAgent(AgentStrategy):
                     "summary": context_summary,
                     "last_call_id": last_compressed_call_id,
                     "last_message_id": last_compressed_message_id,
-                    "current_user_message_id": current_user_message_id
+                    "current_user_message_id": current_user_message_id,
+                    "current_agent_profile": current_agent_profile,
+                    "private_summary": private_summary,
+                    "private_after_step_id": private_after_step_id,
                 }
 
             dynamic_messages = []
             dynamic_response_items = []
-            history = build_history_for_llm(
-                session_id,
-                last_compressed_message_id,
-                current_user_message_id,
-                context_summary,
-                code_map_prompt,
-                trunc_cfg
-            )
+            history = rebuild_history()
             base_messages = build_base_messages()
             if openai_format == "openai_responses":
                 messages = list(base_messages)
@@ -721,6 +764,8 @@ class ReActAgent(AgentStrategy):
                 debug_message_id = debug_message_id if isinstance(debug_message_id, int) else None
                 debug_agent_type = debug_ctx.get("agent_type") if isinstance(debug_ctx, dict) else None
                 debug_agent_type = str(debug_agent_type or "react")
+                debug_agent_profile = debug_ctx.get("agent_profile") if isinstance(debug_ctx, dict) else None
+                debug_agent_profile = str(debug_agent_profile or "").strip() or None
 
                 if openai_format == "openai_responses":
                     base_overrides = dict(llm_overrides)
@@ -1024,6 +1069,7 @@ class ReActAgent(AgentStrategy):
                                 session_id=session_id,
                                 message_id=debug_message_id,
                                 agent_type=debug_agent_type,
+                                agent_profile=debug_agent_profile,
                                 iteration=iteration,
                                 tool_name=safe_label,
                                 success=success,
@@ -1082,6 +1128,7 @@ class ReActAgent(AgentStrategy):
                             )
 
                             tool_output = ""
+                            handoff_payload = None
                             if error_msg:
                                 tool_output = error_msg
                                 yield AgentStep(
@@ -1114,10 +1161,18 @@ class ReActAgent(AgentStrategy):
                                     tool_output = "(no output)"
                             else:
                                 tool_output = await self._execute_tool(tool, tool_input)
+                                observation_metadata = {
+                                    "tool": tool_meta_name,
+                                    "tool_display": tool_label,
+                                    "iteration": iteration,
+                                }
+                                handoff_payload = self._extract_handoff_payload(tool_meta_name, tool_output)
+                                if handoff_payload:
+                                    observation_metadata.update(handoff_payload)
                                 yield AgentStep(
                                     step_type="observation",
                                     content=tool_output,
-                                    metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
+                                    metadata=observation_metadata
                                 )
 
                             success, failure_reason = self._classify_tool_call_result(
@@ -1129,11 +1184,15 @@ class ReActAgent(AgentStrategy):
                                 session_id=session_id,
                                 message_id=debug_message_id,
                                 agent_type=debug_agent_type,
+                                agent_profile=debug_agent_profile,
                                 iteration=iteration,
                                 tool_name=tool_meta_name,
                                 success=success,
                                 failure_reason=failure_reason
                             )
+
+                            if handoff_payload:
+                                return
 
                             dynamic_response_items.append({
                                 "type": "function_call_output",
@@ -1393,6 +1452,7 @@ class ReActAgent(AgentStrategy):
                             }
                         )
                         tool_output = ""
+                        handoff_payload = None
                         if error_msg:
                             tool_output = error_msg
                             yield AgentStep(
@@ -1425,10 +1485,18 @@ class ReActAgent(AgentStrategy):
                                 tool_output = "(no output)"
                         else:
                             tool_output = await self._execute_tool(tool, tool_input)
+                            observation_metadata = {
+                                "tool": tool_meta_name,
+                                "tool_display": tool_label,
+                                "iteration": iteration,
+                            }
+                            handoff_payload = self._extract_handoff_payload(tool_meta_name, tool_output)
+                            if handoff_payload:
+                                observation_metadata.update(handoff_payload)
                             yield AgentStep(
                                 step_type="observation",
                                 content=tool_output,
-                                metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
+                                metadata=observation_metadata
                             )
 
                         success, failure_reason = self._classify_tool_call_result(
@@ -1440,11 +1508,15 @@ class ReActAgent(AgentStrategy):
                             session_id=session_id,
                             message_id=debug_message_id,
                             agent_type=debug_agent_type,
+                            agent_profile=debug_agent_profile,
                             iteration=iteration,
                             tool_name=tool_meta_name,
                             success=success,
                             failure_reason=failure_reason
                         )
+
+                        if handoff_payload:
+                            return
 
                         dynamic_messages.append({
                             "role": "tool",
@@ -1514,7 +1586,32 @@ class ReActAgent(AgentStrategy):
         last_compressed_call_id = context_state.get("last_call_id")
         last_compressed_message_id = context_state.get("last_message_id")
         current_user_message_id = context_state.get("current_user_message_id")
+        current_agent_profile = str(
+            context_state.get("current_agent_profile")
+            or (request_overrides.get("current_agent_profile") if request_overrides else "")
+            or ""
+        ).strip() or None
+        private_summary = str(context_state.get("private_summary") or "")
+        private_after_step_id = context_state.get("private_after_step_id")
         code_map_prompt = request_overrides.get("_code_map_prompt") if request_overrides else None
+
+        def rebuild_history() -> List[Dict[str, Any]]:
+            return build_history_for_llm(
+                session_id,
+                last_compressed_message_id,
+                current_user_message_id,
+                context_summary,
+                code_map_prompt,
+                trunc_cfg,
+                current_agent_profile=current_agent_profile,
+                private_summary=private_summary,
+                private_after_step_id=private_after_step_id,
+            )
+
+        async def compress_current_turn_if_needed(
+            current_total_tokens: Optional[int]
+        ) -> Optional[AgentStep]:
+            return None
 
         async def refresh_history_if_needed(
             current_total_tokens: Optional[int] = None
@@ -1550,7 +1647,10 @@ class ReActAgent(AgentStrategy):
                         "summary": context_summary,
                         "last_call_id": last_compressed_call_id,
                         "last_message_id": last_compressed_message_id,
-                        "current_user_message_id": current_user_message_id
+                        "current_user_message_id": current_user_message_id,
+                        "current_agent_profile": current_agent_profile,
+                        "private_summary": private_summary,
+                        "private_after_step_id": private_after_step_id,
                     }
 
                 compress_step = AgentStep(
@@ -1559,14 +1659,7 @@ class ReActAgent(AgentStrategy):
                     metadata={"context_compress": True}
                 )
 
-                history = build_history_for_llm(
-                    session_id,
-                    last_compressed_message_id,
-                    current_user_message_id,
-                    context_summary,
-                    code_map_prompt,
-                    trunc_cfg
-                )
+                history = rebuild_history()
                 return True, compress_step
 
             return False, None
@@ -1636,6 +1729,8 @@ class ReActAgent(AgentStrategy):
                 debug_message_id = debug_message_id if isinstance(debug_message_id, int) else None
                 debug_agent_type = debug_ctx.get("agent_type") if isinstance(debug_ctx, dict) else None
                 debug_agent_type = str(debug_agent_type or "react")
+                debug_agent_profile = debug_ctx.get("agent_profile") if isinstance(debug_ctx, dict) else None
+                debug_agent_profile = str(debug_agent_profile or "").strip() or None
 
                 max_tokens = getattr(llm_client.config, "max_context_tokens", 0) or 0
                 estimate = build_context_estimate(
@@ -1708,6 +1803,7 @@ class ReActAgent(AgentStrategy):
                 if tool:
                     try:
                         observation = ""
+                        handoff_payload = None
                         if str(action or "").lower() == "run_shell":
                             output_holder: Dict[str, str] = {}
                             stream_key = f"text-tool-{iteration}-{call_seq}"
@@ -1721,15 +1817,23 @@ class ReActAgent(AgentStrategy):
                                 stop_event=stop_event
                             ):
                                 yield obs_step
-                            observation = output_holder.get("output", "")
-                            if not str(observation or "").strip():
-                                observation = "(no output)"
+                                observation = output_holder.get("output", "")
+                                if not str(observation or "").strip():
+                                    observation = "(no output)"
                         else:
                             observation = await tool.execute(action_input)
+                            observation_metadata = {
+                                "tool": tool_meta_name,
+                                "tool_display": tool_label,
+                                "iteration": iteration,
+                            }
+                            handoff_payload = self._extract_handoff_payload(tool_meta_name, observation)
+                            if handoff_payload:
+                                observation_metadata.update(handoff_payload)
                             yield AgentStep(
                                 step_type="observation",
                                 content=observation,
-                                metadata={"tool": tool_meta_name, "tool_display": tool_label, "iteration": iteration}
+                                metadata=observation_metadata
                             )
                         scratchpad.append({"text": f"Observation: {observation}", "origin_call_seq": current_call_seq})
                         success, failure_reason = self._classify_tool_call_result(
@@ -1740,11 +1844,14 @@ class ReActAgent(AgentStrategy):
                             session_id=session_id,
                             message_id=debug_message_id,
                             agent_type=debug_agent_type,
+                            agent_profile=debug_agent_profile,
                             iteration=iteration,
                             tool_name=tool_meta_name,
                             success=success,
                             failure_reason=failure_reason
                         )
+                        if handoff_payload:
+                            return
                     except Exception as e:
                         error_msg = f"Tool execution failed: {str(e)}"
                         yield AgentStep(
@@ -1762,6 +1869,7 @@ class ReActAgent(AgentStrategy):
                             session_id=session_id,
                             message_id=debug_message_id,
                             agent_type=debug_agent_type,
+                            agent_profile=debug_agent_profile,
                             iteration=iteration,
                             tool_name=tool_meta_name,
                             success=success,
@@ -1784,6 +1892,7 @@ class ReActAgent(AgentStrategy):
                         session_id=session_id,
                         message_id=debug_message_id,
                         agent_type=debug_agent_type,
+                        agent_profile=debug_agent_profile,
                         iteration=iteration,
                         tool_name=tool_meta_name,
                         success=success,
@@ -2096,6 +2205,7 @@ class ReActAgent(AgentStrategy):
         session_id: Optional[str],
         message_id: Optional[int],
         agent_type: Optional[str],
+        agent_profile: Optional[str],
         iteration: Optional[int],
         tool_name: Optional[str],
         success: bool,
@@ -2110,6 +2220,7 @@ class ReActAgent(AgentStrategy):
                 session_id=session_id,
                 message_id=message_id,
                 agent_type=agent_type,
+                agent_profile=agent_profile,
                 iteration=iteration,
                 tool_name=normalized_tool_name,
                 success=success,

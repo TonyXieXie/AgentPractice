@@ -11,6 +11,7 @@ import {
     AgentConfig,
     AgentAbility,
     AgentProfile,
+    AgentTeamConfig,
     ToolDefinition,
     ToolsConfig,
     ReasoningSummary
@@ -146,6 +147,15 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
         isDefault: false,
         spawnable: false
     });
+    const [showTeamForm, setShowTeamForm] = useState(false);
+    const [editingTeamId, setEditingTeamId] = useState<string | null>(null);
+    const [teamForm, setTeamForm] = useState({
+        id: '',
+        name: '',
+        description: '',
+        leader_profile_id: '',
+        member_profile_ids: [] as string[]
+    });
     const [showForm, setShowForm] = useState(false);
     const [editingConfig, setEditingConfig] = useState<LLMConfig | null>(null);
     const [loading, setLoading] = useState(false);
@@ -183,12 +193,41 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                 : (profile.id === subagentProfileValue);
             return { ...profile, spawnable };
         });
+        const validProfileIds = new Set(
+            normalizedProfiles
+                .map((profile) => (profile && typeof profile === 'object' && typeof profile.id === 'string' ? profile.id : ''))
+                .filter(Boolean)
+        );
+        const normalizedTeams = Array.isArray(raw.teams)
+            ? raw.teams
+                .filter((team): team is AgentTeamConfig => Boolean(team && typeof team === 'object'))
+                .map((team) => {
+                    const memberIds = Array.isArray(team.member_profile_ids)
+                        ? team.member_profile_ids
+                            .filter((id): id is string => typeof id === 'string')
+                            .map((id) => id.trim())
+                            .filter((id) => id && validProfileIds.has(id))
+                        : [];
+                    const uniqueMembers = Array.from(new Set(memberIds));
+                    const leaderId = typeof team.leader_profile_id === 'string' ? team.leader_profile_id.trim() : '';
+                    const fallbackLeader = uniqueMembers.includes(leaderId) ? leaderId : uniqueMembers[0] || '';
+                    return {
+                        id: typeof team.id === 'string' ? team.id.trim() : '',
+                        name: typeof team.name === 'string' ? team.name.trim() || team.id : team.id,
+                        description: typeof team.description === 'string' ? team.description : undefined,
+                        leader_profile_id: fallbackLeader,
+                        member_profile_ids: uniqueMembers
+                    };
+                })
+                .filter((team) => team.id && team.name && team.member_profile_ids.length > 0 && team.leader_profile_id)
+            : [];
         return {
             ...raw,
             base_system_prompt: raw.base_system_prompt ?? '',
             react_max_iterations: reactMaxIterations,
             abilities: Array.isArray(raw.abilities) ? raw.abilities : [],
             profiles: normalizedProfiles,
+            teams: normalizedTeams,
             default_profile: raw.default_profile ?? '',
             subagent_profile: subagentProfileValue
         };
@@ -593,7 +632,10 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             const agent: Record<string, any> = { ...appConfig.agent };
             delete agent.abilities;
             delete agent.profiles;
+            delete agent.team;
+            delete agent.teams;
             delete agent.default_profile;
+            delete agent.subagent_profile;
             delete agent.base_system_prompt;
             if (Object.keys(agent).length > 0) {
                 payload.agent = agent;
@@ -647,7 +689,10 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             const agent: Record<string, any> = { ...candidate.agent };
             delete agent.abilities;
             delete agent.profiles;
+            delete agent.team;
+            delete agent.teams;
             delete agent.default_profile;
+            delete agent.subagent_profile;
             delete agent.base_system_prompt;
             if (Object.keys(agent).length > 0) {
                 payload.agent = agent;
@@ -1565,11 +1610,97 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
         return { merged, idMap };
     };
 
+    const mergeTeamsByName = (
+        current: AgentTeamConfig[],
+        incoming: AgentTeamConfig[],
+        profileIdMap: Map<string, string>
+    ): AgentTeamConfig[] => {
+        const merged = current.map((team) => ({ ...team, member_profile_ids: [...(team.member_profile_ids || [])] }));
+        const nameToIndex = new Map<string, number>();
+        const idToIndex = new Map<string, number>();
+        const existingIds = new Set<string>();
+
+        merged.forEach((team, index) => {
+            if (team.id) {
+                existingIds.add(team.id);
+                idToIndex.set(team.id, index);
+            }
+            if (team.name) {
+                nameToIndex.set(team.name.trim(), index);
+            }
+        });
+
+        incoming.forEach((rawTeam, index) => {
+            if (!rawTeam) return;
+            const rawName = typeof rawTeam.name === 'string' ? rawTeam.name.trim() : '';
+            const rawId = typeof rawTeam.id === 'string' ? rawTeam.id.trim() : '';
+            const nameKey = rawName || rawId || `team-${index + 1}`;
+            const mappedMembers = Array.isArray(rawTeam.member_profile_ids)
+                ? Array.from(
+                    new Set(
+                        rawTeam.member_profile_ids
+                            .map((profileId) => profileIdMap.get(profileId) || profileId)
+                            .filter((profileId): profileId is string => typeof profileId === 'string' && profileId.trim().length > 0)
+                    )
+                )
+                : [];
+            const mappedLeader = typeof rawTeam.leader_profile_id === 'string'
+                ? (profileIdMap.get(rawTeam.leader_profile_id) || rawTeam.leader_profile_id)
+                : '';
+            const leaderProfileId = mappedMembers.includes(mappedLeader)
+                ? mappedLeader
+                : mappedMembers[0] || '';
+            if (!rawId && !rawName) return;
+            if (!leaderProfileId || mappedMembers.length === 0) return;
+
+            const existingIndex =
+                (rawName && nameToIndex.has(rawName) ? nameToIndex.get(rawName) : undefined) ??
+                (rawId && idToIndex.has(rawId) ? idToIndex.get(rawId) : undefined);
+
+            if (existingIndex !== undefined) {
+                const existing = merged[existingIndex];
+                const finalId = existing.id || rawId || makeId(nameKey, Array.from(existingIds), 'team');
+                existingIds.add(finalId);
+                const next: AgentTeamConfig = {
+                    ...existing,
+                    ...rawTeam,
+                    id: finalId,
+                    name: rawName || existing.name || nameKey,
+                    leader_profile_id: leaderProfileId,
+                    member_profile_ids: mappedMembers,
+                };
+                merged[existingIndex] = next;
+                nameToIndex.set(next.name, existingIndex);
+                idToIndex.set(finalId, existingIndex);
+                return;
+            }
+
+            let finalId = rawId || makeId(nameKey, Array.from(existingIds), 'team');
+            if (existingIds.has(finalId)) {
+                finalId = makeId(nameKey, Array.from(existingIds), 'team');
+            }
+            existingIds.add(finalId);
+            const created: AgentTeamConfig = {
+                id: finalId,
+                name: rawName || nameKey || finalId,
+                description: rawTeam.description,
+                leader_profile_id: leaderProfileId,
+                member_profile_ids: mappedMembers,
+            };
+            merged.push(created);
+            nameToIndex.set(created.name, merged.length - 1);
+            idToIndex.set(finalId, merged.length - 1);
+        });
+
+        return merged;
+    };
+
     const mergeAgentConfigByName = (current: AgentConfig, incoming: AgentConfig): AgentConfig => {
         const currentNormalized = normalizeAgentConfig(current);
         const incomingRaw = isRecord(incoming) ? incoming : {};
         const incomingAbilities = Array.isArray(incomingRaw.abilities) ? (incomingRaw.abilities as AgentAbility[]) : [];
         const incomingProfiles = Array.isArray(incomingRaw.profiles) ? (incomingRaw.profiles as AgentProfile[]) : [];
+        const incomingTeams = Array.isArray(incomingRaw.teams) ? (incomingRaw.teams as AgentTeamConfig[]) : [];
 
         const { merged: abilities, idMap: abilityIdMap } = mergeAbilitiesByName(
             Array.isArray(currentNormalized.abilities) ? currentNormalized.abilities : [],
@@ -1579,6 +1710,11 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             Array.isArray(currentNormalized.profiles) ? currentNormalized.profiles : [],
             incomingProfiles,
             abilityIdMap
+        );
+        const teams = mergeTeamsByName(
+            Array.isArray(currentNormalized.teams) ? currentNormalized.teams : [],
+            incomingTeams,
+            profileIdMap
         );
 
         let defaultProfile = currentNormalized.default_profile || '';
@@ -1602,6 +1738,10 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                 : currentNormalized.base_system_prompt,
             abilities,
             profiles,
+            team: incomingRaw.team && typeof incomingRaw.team === 'object'
+                ? incomingRaw.team
+                : currentNormalized.team,
+            teams,
             default_profile: defaultProfile,
             subagent_profile: hasIncomingSubagentProfile
                 ? incomingSubagentProfile
@@ -1728,6 +1868,30 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
         setShowProfileForm(true);
     };
 
+    const openNewTeamForm = () => {
+        setEditingTeamId(null);
+        setTeamForm({
+            id: '',
+            name: '',
+            description: '',
+            leader_profile_id: '',
+            member_profile_ids: []
+        });
+        setShowTeamForm(true);
+    };
+
+    const openEditTeamForm = (team: AgentTeamConfig) => {
+        setEditingTeamId(team.id);
+        setTeamForm({
+            id: team.id,
+            name: team.name || '',
+            description: team.description || '',
+            leader_profile_id: team.leader_profile_id || '',
+            member_profile_ids: Array.isArray(team.member_profile_ids) ? team.member_profile_ids : []
+        });
+        setShowTeamForm(true);
+    };
+
     const abilityTypeLabel = useMemo(() => {
         const map = new Map<string, string>();
         ABILITY_TYPE_OPTIONS.forEach((option) => map.set(option.value, option.label));
@@ -1798,7 +1962,8 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
         setAgentConfig((prev) => ({
             ...prev,
             profiles,
-            default_profile: defaultProfile
+            default_profile: defaultProfile,
+            subagent_profile: prev.subagent_profile === profileId ? '' : prev.subagent_profile
         }));
         setAgentSaved(false);
         setShowProfileForm(false);
@@ -1837,6 +2002,34 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
     const handleDeleteProfile = (profileId: string) => {
         if (!window.confirm('确定要删除这个 profile 吗？')) return;
         const profiles = (agentConfig.profiles || []).filter((profile) => profile.id !== profileId);
+        const legacyTeam = agentConfig.team
+            ? {
+                ...agentConfig.team,
+                default_agent: agentConfig.team.default_agent === profileId
+                    ? (profiles[0]?.id || '')
+                    : agentConfig.team.default_agent,
+                members: (agentConfig.team.members || [])
+                    .filter((member) => member.profile_id !== profileId)
+                    .map((member) => ({
+                        ...member,
+                        handoff_to: (member.handoff_to || []).filter((target) => target !== profileId)
+                    }))
+              }
+            : undefined;
+        const teams = (agentConfig.teams || [])
+            .map((team) => {
+                const memberProfileIds = (team.member_profile_ids || []).filter((memberId) => memberId !== profileId);
+                const leaderProfileId = memberProfileIds.includes(team.leader_profile_id)
+                    ? team.leader_profile_id
+                    : (memberProfileIds[0] || '');
+                if (!memberProfileIds.length || !leaderProfileId) return null;
+                return {
+                    ...team,
+                    leader_profile_id: leaderProfileId,
+                    member_profile_ids: memberProfileIds
+                };
+            })
+            .filter((team): team is AgentTeamConfig => Boolean(team));
         let defaultProfile = agentConfig.default_profile || '';
         if (defaultProfile === profileId) {
             defaultProfile = profiles[0]?.id || '';
@@ -1844,7 +2037,75 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
         setAgentConfig((prev) => ({
             ...prev,
             profiles,
+            team: legacyTeam,
+            teams,
             default_profile: defaultProfile
+        }));
+        setAgentSaved(false);
+    };
+
+    const handleSaveTeam = () => {
+        const teams = Array.isArray(agentConfig.teams) ? [...agentConfig.teams] : [];
+        const existingIds = teams
+            .filter((team) => team.id !== editingTeamId)
+            .map((team) => team.id);
+        const teamId = teamForm.id.trim();
+        const name = teamForm.name.trim();
+        const description = teamForm.description.trim();
+        const memberProfileIds = Array.from(new Set(teamForm.member_profile_ids.filter(Boolean)));
+        const leaderProfileId = teamForm.leader_profile_id.trim();
+
+        if (!teamId) {
+            alert('Team id is required.');
+            return;
+        }
+        if (!name) {
+            alert('Team name is required.');
+            return;
+        }
+        if (existingIds.includes(teamId)) {
+            alert(`Team id already exists: ${teamId}`);
+            return;
+        }
+        if (memberProfileIds.length === 0) {
+            alert('Select at least one team member.');
+            return;
+        }
+        if (!memberProfileIds.includes(leaderProfileId)) {
+            alert('Leader must be included in team members.');
+            return;
+        }
+
+        const nextTeam: AgentTeamConfig = {
+            id: teamId,
+            name,
+            description: description || undefined,
+            leader_profile_id: leaderProfileId,
+            member_profile_ids: memberProfileIds
+        };
+
+        if (editingTeamId) {
+            const index = teams.findIndex((team) => team.id === editingTeamId);
+            if (index >= 0) {
+                teams[index] = nextTeam;
+            }
+        } else {
+            teams.push(nextTeam);
+        }
+
+        setAgentConfig((prev) => ({
+            ...prev,
+            teams
+        }));
+        setAgentSaved(false);
+        setShowTeamForm(false);
+    };
+
+    const handleDeleteTeam = (teamId: string) => {
+        if (!window.confirm('纭畾瑕佸垹闄よ繖涓?team 鍚楋紵')) return;
+        setAgentConfig((prev) => ({
+            ...prev,
+            teams: (prev.teams || []).filter((team) => team.id !== teamId)
         }));
         setAgentSaved(false);
     };
@@ -2862,6 +3123,30 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                                 </div>
                             </div>
 
+                            <div className="form-group">
+                                <label>Team Execution Mode</label>
+                                <select
+                                    value={agentConfig.team?.execution_mode || 'single_session'}
+                                    onChange={(e) => {
+                                        const value = e.target.value === 'multi_session' ? 'multi_session' : 'single_session';
+                                        setAgentConfig((prev) => ({
+                                            ...prev,
+                                            team: {
+                                                ...(prev.team || {}),
+                                                execution_mode: value
+                                            }
+                                        }));
+                                        setAgentSaved(false);
+                                    }}
+                                >
+                                    <option value="single_session">single_session</option>
+                                    <option value="multi_session">multi_session</option>
+                                </select>
+                                <small>
+                                    single_session 浣跨敤鍚屼竴 session 鍐呯殑 handoff锛沵ulti_session 浣跨敤 runtime team 涓嬫寜 role 澶嶇敤 session 鍗忎綔銆?
+                                </small>
+                            </div>
+
                             <div className="agent-section">
                                 <div className="agent-section-header">
                                     <h4>Profiles</h4>
@@ -3056,6 +3341,183 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                                                         onClick={() => handleDeleteProfile(profile.id)}
                                                         type="button"
                                                         aria-label="Delete profile"
+                                                        title="Delete"
+                                                    >
+                                                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                                                            <path d="M6 7h12l-1 14H7L6 7z" />
+                                                            <path d="M9 4h6l1 2H8l1-2z" />
+                                                        </svg>
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                            </div>
+
+                            <div className="agent-section">
+                                <div className="agent-section-header">
+                                    <h4>Teams</h4>
+                                    <div className="agent-section-actions">
+                                        <button type="button" className="add-btn add-inline" onClick={openNewTeamForm}>
+                                            + Add Team
+                                        </button>
+                                    </div>
+                                </div>
+                                {showTeamForm && (
+                                    <div className="inline-modal">
+                                        <div className="modal-header">
+                                            <h2>{editingTeamId ? 'Edit Team' : 'Create Team'}</h2>
+                                            <button
+                                                type="button"
+                                                className="close-btn"
+                                                onClick={() => setShowTeamForm(false)}
+                                            >
+                                                X
+                                            </button>
+                                        </div>
+                                        <div className="modal-body">
+                                            <div className="config-form">
+                                                <div className="form-group">
+                                                    <label>Team ID *</label>
+                                                    <input
+                                                        type="text"
+                                                        value={teamForm.id}
+                                                        onChange={(e) => setTeamForm({ ...teamForm, id: e.target.value })}
+                                                        placeholder="delivery"
+                                                        required
+                                                    />
+                                                </div>
+                                                <div className="form-group">
+                                                    <label>Name *</label>
+                                                    <input
+                                                        type="text"
+                                                        value={teamForm.name}
+                                                        onChange={(e) => setTeamForm({ ...teamForm, name: e.target.value })}
+                                                        placeholder="Delivery Team"
+                                                        required
+                                                    />
+                                                </div>
+                                                <div className="form-group">
+                                                    <label>Description</label>
+                                                    <textarea
+                                                        rows={3}
+                                                        value={teamForm.description}
+                                                        onChange={(e) => setTeamForm({ ...teamForm, description: e.target.value })}
+                                                        placeholder="Describe this team"
+                                                    />
+                                                </div>
+                                                <div className="form-group">
+                                                    <label>Members</label>
+                                                    <div className="checkbox-grid">
+                                                        {(agentConfig.profiles || []).map((profile) => {
+                                                            const checked = teamForm.member_profile_ids.includes(profile.id);
+                                                            return (
+                                                                <label key={profile.id} className="checkbox-inline">
+                                                                    <input
+                                                                        type="checkbox"
+                                                                        checked={checked}
+                                                                        onChange={(e) => {
+                                                                            const next = new Set(teamForm.member_profile_ids);
+                                                                            if (e.target.checked) {
+                                                                                next.add(profile.id);
+                                                                            } else {
+                                                                                next.delete(profile.id);
+                                                                            }
+                                                                            const nextMembers = Array.from(next);
+                                                                            const nextLeader = nextMembers.includes(teamForm.leader_profile_id)
+                                                                                ? teamForm.leader_profile_id
+                                                                                : (nextMembers[0] || '');
+                                                                            setTeamForm({
+                                                                                ...teamForm,
+                                                                                member_profile_ids: nextMembers,
+                                                                                leader_profile_id: nextLeader
+                                                                            });
+                                                                        }}
+                                                                    />
+                                                                    {profile.name}
+                                                                </label>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                </div>
+                                                <div className="form-group">
+                                                    <label>Leader *</label>
+                                                    <select
+                                                        value={teamForm.leader_profile_id}
+                                                        onChange={(e) =>
+                                                            setTeamForm({ ...teamForm, leader_profile_id: e.target.value })
+                                                        }
+                                                        disabled={teamForm.member_profile_ids.length === 0}
+                                                    >
+                                                        <option value="">Select leader</option>
+                                                        {teamForm.member_profile_ids.map((profileId) => {
+                                                            const profile = (agentConfig.profiles || []).find((item) => item.id === profileId);
+                                                            return (
+                                                                <option key={profileId} value={profileId}>
+                                                                    {profile?.name || profileId}
+                                                                </option>
+                                                            );
+                                                        })}
+                                                    </select>
+                                                </div>
+                                                <div className="form-actions">
+                                                    <button type="button" onClick={() => setShowTeamForm(false)}>
+                                                        Cancel
+                                                    </button>
+                                                    <button type="button" onClick={handleSaveTeam}>
+                                                        Save
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                                <div className="agent-list">
+                                    {(agentConfig.teams || []).length === 0 ? (
+                                        <p className="empty-message">No teams yet.</p>
+                                    ) : (
+                                        (agentConfig.teams || []).map((team) => (
+                                            <div key={team.id} className="agent-item">
+                                                <div className="agent-info">
+                                                    <h4>{team.name}</h4>
+                                                    {team.description && (
+                                                        <p className="agent-detail">{team.description}</p>
+                                                    )}
+                                                    <p className="agent-detail">
+                                                        <strong>ID:</strong> {team.id}{' '}
+                                                        <strong>Leader:</strong>{' '}
+                                                        {(agentConfig.profiles || []).find((profile) => profile.id === team.leader_profile_id)?.name ||
+                                                            team.leader_profile_id}
+                                                    </p>
+                                                    <p className="agent-detail">
+                                                        <strong>Members:</strong>{' '}
+                                                        {team.member_profile_ids
+                                                            .map((profileId) => {
+                                                                const profile = (agentConfig.profiles || []).find((item) => item.id === profileId);
+                                                                return profile?.name || profileId;
+                                                            })
+                                                            .join(', ')}
+                                                    </p>
+                                                </div>
+                                                <div className="config-actions">
+                                                    <button
+                                                        className="icon-btn"
+                                                        onClick={() => openEditTeamForm(team)}
+                                                        type="button"
+                                                        aria-label="Edit team"
+                                                        title="Edit"
+                                                    >
+                                                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                                                            <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25z" />
+                                                            <path d="M20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" />
+                                                        </svg>
+                                                    </button>
+                                                    <button
+                                                        className="icon-btn delete-btn"
+                                                        onClick={() => handleDeleteTeam(team.id)}
+                                                        type="button"
+                                                        aria-label="Delete team"
                                                         title="Delete"
                                                     >
                                                         <svg viewBox="0 0 24 24" aria-hidden="true">

@@ -476,6 +476,11 @@ body[data-platform="mac"] .app-titlebar {
   align-self: flex-start;
 }
 
+.message.system {
+  align-self: center;
+  max-width: min(82%, 720px);
+}
+
 .message-content {
   padding: 10px 14px;
   border-radius: 16px;
@@ -505,6 +510,15 @@ body[data-platform="mac"] .app-titlebar {
   color: #e5e7eb;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-bottom-left-radius: 4px;
+}
+
+.message.system .message-content {
+  background: rgba(157, 179, 199, 0.08);
+  color: #c9d4df;
+  border: 1px dashed rgba(157, 179, 199, 0.28);
+  border-radius: 999px;
+  font-size: 0.92rem;
+  text-align: center;
 }
 
 .message-attachments {
@@ -1605,6 +1619,13 @@ body[data-platform="mac"] .app-titlebar {
   cursor: not-allowed;
 }
 
+.selector-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
 .agent-profile-dropdown-inline {
   position: absolute;
   bottom: 100%;
@@ -1620,6 +1641,15 @@ body[data-platform="mac"] .app-titlebar {
   overflow-y: auto;
   box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.28);
   min-width: 200px;
+}
+
+.agent-profile-section-label {
+  padding: 6px 12px 4px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #94a3b8;
 }
 
 .agent-profile-option {
@@ -1778,6 +1808,11 @@ body[data-platform="mac"] .app-titlebar {
 
 .selector-text {
   font-size: 0.86rem;
+}
+
+.selector-subtext {
+  font-size: 0.68rem;
+  color: #94a3b8;
 }
 
 .dropdown-arrow {

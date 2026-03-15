@@ -83,6 +83,7 @@ class SpawnSubagentTool(Tool):
     def __init__(self):
         super().__init__()
         self.name = "spawn_subagent"
+        self.expose_by_default = False
         self.description = _build_subagent_description()
         self.parameters = [
             ToolParameter(

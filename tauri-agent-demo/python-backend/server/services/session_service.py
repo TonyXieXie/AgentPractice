@@ -3,11 +3,26 @@ from typing import Optional
 
 from fastapi import HTTPException, Query
 
+from agent_team import AgentTeam
+from app_config import get_app_config
 from ghost_snapshot import restore_snapshot
 from models import ChatSessionCreate, ChatSessionUpdate, RollbackRequest
-from repositories import config_repository, session_repository
+from repositories import config_repository, session_repository, team_repository
 from ..session_support import build_copy_title, cleanup_spawned_subagents, schedule_ast_scan
 from tools.pty_manager import get_pty_manager
+
+
+def _model_dump(model):
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_unset=True)
+    return model.dict(exclude_unset=True)
+
+
+def _model_fields_set(model):
+    fields = getattr(model, "model_fields_set", None)
+    if fields is not None:
+        return set(fields)
+    return set(getattr(model, "__fields_set__", set()) or set())
 
 
 def get_sessions():
@@ -28,6 +43,24 @@ def create_session(session: ChatSessionCreate):
     config = config_repository.get_config(session.config_id)
     if not config:
         raise HTTPException(status_code=404, detail="Config not found")
+    team = AgentTeam(get_app_config())
+    try:
+        selection = team.resolve_session_selection(
+            requested_profile=session.agent_profile,
+            requested_team_id=session.agent_team_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    session = ChatSessionCreate(
+        **{
+            **_model_dump(session),
+            "agent_profile": selection.get("agent_profile"),
+            "agent_team_id": selection.get("agent_team_id"),
+            "team_id": None,
+            "role_key": None,
+            "parent_session_id": None,
+        }
+    )
     created = session_repository.create_session(session)
     schedule_ast_scan(created.work_path)
     return created
@@ -36,6 +69,47 @@ def create_session(session: ChatSessionCreate):
 def update_session(session_id: str, update: ChatSessionUpdate):
     if update.config_id is not None and not config_repository.get_config(update.config_id):
         raise HTTPException(status_code=404, detail="Config not found")
+    selection_fields = _model_fields_set(update)
+    internal_runtime_fields = {"team_id", "role_key", "parent_session_id"}
+    touched_internal_fields = sorted(field for field in internal_runtime_fields if field in selection_fields)
+    if touched_internal_fields:
+        field_list = ", ".join(touched_internal_fields)
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_list} is managed internally and cannot be updated through the session API.",
+        )
+    if "agent_profile" in selection_fields or "agent_team_id" in selection_fields:
+        current = session_repository.get_session(session_id, include_count=False)
+        if not current:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if getattr(current, "team_id", None):
+            requested_profile = update.agent_profile if "agent_profile" in selection_fields else getattr(current, "agent_profile", None)
+            requested_team_id = update.agent_team_id if "agent_team_id" in selection_fields else getattr(current, "agent_team_id", None)
+            if (
+                requested_profile != getattr(current, "agent_profile", None)
+                or requested_team_id != getattr(current, "agent_team_id", None)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Runtime team sessions have a fixed agent binding and cannot switch agent/team selection.",
+                )
+        team = AgentTeam(get_app_config())
+        try:
+            selection = team.resolve_session_selection(
+                session_profile=getattr(current, "agent_profile", None),
+                session_team_id=getattr(current, "agent_team_id", None),
+                requested_profile=update.agent_profile,
+                requested_team_id=update.agent_team_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        update = ChatSessionUpdate(
+            **{
+                **_model_dump(update),
+                "agent_profile": selection.get("agent_profile"),
+                "agent_team_id": selection.get("agent_team_id"),
+            }
+        )
     session = session_repository.update_session(session_id, update)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -136,6 +210,15 @@ async def rollback_session(session_id: str, request: RollbackRequest):
         raise HTTPException(status_code=404, detail="Message not found in session")
     if target.get("role") != "user":
         raise HTTPException(status_code=400, detail="Rollback target must be a user message.")
+
+    session = session_repository.get_session(session_id, include_count=False)
+    runtime_team_id = getattr(session, "team_id", None) if session else None
+    target_timestamp = str(target.get("timestamp") or "").strip()
+    if runtime_team_id and target_timestamp and team_repository.has_handoff_events_since(runtime_team_id, target_timestamp):
+        raise HTTPException(
+            status_code=400,
+            detail="Rollback is blocked for runtime team sessions after handoff events have been recorded.",
+        )
 
     try:
         child_session_ids = session_repository.list_spawned_subagent_child_sessions(

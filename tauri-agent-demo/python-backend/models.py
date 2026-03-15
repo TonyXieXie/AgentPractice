@@ -95,6 +95,9 @@ class ChatSession(BaseModel):
     config_id: str
     work_path: Optional[str] = None
     agent_profile: Optional[str] = None
+    agent_team_id: Optional[str] = None
+    team_id: Optional[str] = None
+    role_key: Optional[str] = None
     parent_session_id: Optional[str] = None
     context_summary: Optional[str] = None
     last_compressed_llm_call_id: Optional[int] = None
@@ -110,6 +113,9 @@ class ChatSessionCreate(BaseModel):
     config_id: str
     work_path: Optional[str] = None
     agent_profile: Optional[str] = None
+    agent_team_id: Optional[str] = None
+    team_id: Optional[str] = None
+    role_key: Optional[str] = None
     parent_session_id: Optional[str] = None
 
 
@@ -118,7 +124,35 @@ class ChatSessionUpdate(BaseModel):
     work_path: Optional[str] = None
     config_id: Optional[str] = None
     agent_profile: Optional[str] = None
+    agent_team_id: Optional[str] = None
+    team_id: Optional[str] = None
+    role_key: Optional[str] = None
     parent_session_id: Optional[str] = None
+
+
+class Team(BaseModel):
+    id: str
+    root_session_id: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class TeamHandoffEvent(BaseModel):
+    id: Optional[int] = None
+    team_id: str
+    handoff_id: str
+    parent_handoff_id: Optional[str] = None
+    event_kind: Literal["requested", "started", "completed", "failed"]
+    from_session_id: Optional[str] = None
+    from_role_key: Optional[str] = None
+    to_session_id: Optional[str] = None
+    to_role_key: Optional[str] = None
+    reason: Optional[str] = None
+    work_summary: Optional[str] = None
+    task_payload: Optional[str] = None
+    result_summary: Optional[str] = None
+    error: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class AttachmentInput(BaseModel):
@@ -136,6 +170,7 @@ class ChatRequest(BaseModel):
     config_id: Optional[str] = None
     work_path: Optional[str] = None
     agent_profile: Optional[str] = None
+    agent_team_id: Optional[str] = None
     extra_work_paths: Optional[List[str]] = None
     agent_mode: Optional[AgentMode] = None
     shell_unrestricted: Optional[bool] = None

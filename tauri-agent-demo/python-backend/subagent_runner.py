@@ -335,11 +335,19 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
         pty_prompt = "None."
         system_prompt, tools, resolved_profile_id, ability_ids = build_agent_prompt_and_tools(
             subagent_profile_id,
-            ToolRegistry.get_all(),
+            ToolRegistry.get_all(
+                {
+                    "app_config": app_config,
+                    "session_id": child_session.id,
+                    "agent_profile": subagent_profile_id,
+                    "current_agent_profile": subagent_profile_id,
+                }
+            ),
             include_tools=True,
             extra_context={"pty_sessions": pty_prompt},
             exclude_ability_ids=["code_map"]
         )
+        active_profile = resolved_profile_id or subagent_profile_id
         enabled_skills = get_enabled_skills()
         invoked_names = extract_skill_invocations(processed_message, max_count=1)
         invoked_skills = []
@@ -389,7 +397,8 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
             user_msg_id,
             "",
             code_map_prompt,
-            prompt_truncation_cfg
+            prompt_truncation_cfg,
+            current_agent_profile=active_profile,
         )
         if skills_prompt:
             skill_meta = {"skill_prompt": True}
@@ -412,14 +421,16 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
             assistant_msg_id = temp_assistant_msg.id
 
         request_overrides: Dict[str, Any] = {
-            "_debug": {"session_id": child_session.id, "message_id": assistant_msg_id},
+            "_debug": {"session_id": child_session.id, "message_id": assistant_msg_id, "agent_profile": active_profile},
+            "current_agent_profile": active_profile,
             "work_path": getattr(child_session, "work_path", None),
             "prompt_truncation": prompt_truncation_cfg,
             "_context_state": {
                 "summary": "",
                 "last_call_id": None,
                 "last_message_id": None,
-                "current_user_message_id": user_msg_id
+                "current_user_message_id": user_msg_id,
+                "current_agent_profile": active_profile,
             }
         }
         if code_map_prompt:
@@ -458,14 +469,16 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
                         step_type=step.step_type,
                         content=step.content,
                         sequence=sequence,
-                        metadata=step.metadata
+                        metadata=step.metadata,
+                        agent_profile=active_profile,
                     )
                     if step.step_type == "action" and isinstance(step.metadata, dict) and "tool" in step.metadata:
                         chat_repository.save_tool_call(
                             message_id=assistant_msg_id,
                             tool_name=step.metadata["tool"],
                             tool_input=step.metadata.get("input", ""),
-                            tool_output=""
+                            tool_output="",
+                            agent_profile=active_profile,
                         )
                     sequence += 1
 
@@ -485,7 +498,8 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
                     step_type="error",
                     content=final_answer,
                     sequence=sequence,
-                    metadata={"error": "cancelled", "cancelled": True}
+                    metadata={"error": "cancelled", "cancelled": True},
+                    agent_profile=active_profile,
                 )
             except Exception:
                 pass
@@ -497,7 +511,8 @@ async def execute_subagent_context(context: Dict[str, Any]) -> Dict[str, Any]:
                 step_type="error",
                 content=final_answer,
                 sequence=sequence,
-                metadata={"error": str(exc), "traceback": traceback.format_exc()}
+                metadata={"error": str(exc), "traceback": traceback.format_exc()},
+                agent_profile=active_profile,
             )
 
         if final_answer is None:

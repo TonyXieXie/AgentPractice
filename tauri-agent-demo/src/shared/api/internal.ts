@@ -5,3 +5,4 @@ export * from './internal/chat';
 export * from './internal/streaming';
 export * from './internal/pty';
 export * from './internal/permissions';
+export * from './internal/teams';

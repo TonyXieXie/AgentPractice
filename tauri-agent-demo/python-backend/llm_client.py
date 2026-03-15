@@ -308,6 +308,7 @@ class LLMClient:
 
         message_id = debug_ctx.get("message_id")
         agent_type = debug_ctx.get("agent_type")
+        agent_profile = debug_ctx.get("agent_profile")
         iteration = debug_ctx.get("iteration")
 
         response_payload = response_json if self._should_store_raw(debug_ctx) else None
@@ -315,6 +316,7 @@ class LLMClient:
             session_id=session_id,
             message_id=message_id,
             agent_type=agent_type,
+            agent_profile=agent_profile,
             iteration=iteration,
             stream=stream,
             api_profile=self._get_profile(),

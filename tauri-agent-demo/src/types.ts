@@ -23,6 +23,8 @@ export interface AgentPromptResponse {
     prompt: string;
     profile_id?: string | null;
     profile_name?: string | null;
+    team_id?: string | null;
+    team_name?: string | null;
     include_tools?: boolean;
     tool_names?: string[];
 }
@@ -81,6 +83,30 @@ export interface AgentProfile {
     spawnable?: boolean;
 }
 
+export interface AgentLegacyTeamMember {
+    profile_id: string;
+    handoff_to?: string[];
+}
+
+export interface AgentLegacyTeamConfig {
+    execution_mode?: 'single_session' | 'multi_session';
+    default_agent?: string;
+    members?: AgentLegacyTeamMember[];
+}
+
+export interface AgentTeamConfig {
+    id: string;
+    name: string;
+    description?: string;
+    leader_profile_id: string;
+    member_profile_ids: string[];
+}
+
+export interface AgentTargetSelection {
+    kind: 'profile' | 'team';
+    id: string;
+}
+
 export interface CodeMapConfig {
     enabled?: boolean;
     max_symbols?: number;
@@ -98,6 +124,8 @@ export interface AgentConfig {
     mcp?: MCPConfig;
     abilities?: AgentAbility[];
     profiles?: AgentProfile[];
+    team?: AgentLegacyTeamConfig;
+    teams?: AgentTeamConfig[];
     default_profile?: string;
     subagent_profile?: string;
 }
@@ -217,6 +245,9 @@ export interface ChatSession {
     config_id: string;
     work_path?: string | null;
     agent_profile?: string | null;
+    agent_team_id?: string | null;
+    team_id?: string | null;
+    role_key?: string | null;
     parent_session_id?: string | null;
     context_summary?: string | null;
     last_compressed_llm_call_id?: number | null;
@@ -232,6 +263,9 @@ export interface ChatSessionCreate {
     config_id: string;
     work_path?: string | null;
     agent_profile?: string | null;
+    agent_team_id?: string | null;
+    team_id?: string | null;
+    role_key?: string | null;
     parent_session_id?: string | null;
 }
 
@@ -240,7 +274,35 @@ export interface ChatSessionUpdate {
     work_path?: string | null;
     config_id?: string;
     agent_profile?: string | null;
+    agent_team_id?: string | null;
+    team_id?: string | null;
+    role_key?: string | null;
     parent_session_id?: string | null;
+}
+
+export interface Team {
+    id: string;
+    root_session_id: string;
+    created_at?: string | null;
+    updated_at?: string | null;
+}
+
+export interface TeamHandoffEvent {
+    id?: number | null;
+    team_id: string;
+    handoff_id: string;
+    parent_handoff_id?: string | null;
+    event_kind: 'requested' | 'started' | 'completed' | 'failed';
+    from_session_id?: string | null;
+    from_role_key?: string | null;
+    to_session_id?: string | null;
+    to_role_key?: string | null;
+    reason?: string | null;
+    work_summary?: string | null;
+    task_payload?: string | null;
+    result_summary?: string | null;
+    error?: string | null;
+    created_at?: string | null;
 }
 
 export interface LLMCall {
@@ -248,6 +310,7 @@ export interface LLMCall {
     session_id: string;
     message_id?: number | null;
     agent_type?: string | null;
+    agent_profile?: string | null;
     iteration?: number | null;
     stream: boolean;
     api_profile?: string | null;
@@ -413,6 +476,7 @@ export interface ChatRequest {
     config_id?: string;
     work_path?: string | null;
     agent_profile?: string | null;
+    agent_team_id?: string | null;
     extra_work_paths?: string[] | null;
     agent_mode?: AgentMode;
     shell_unrestricted?: boolean;

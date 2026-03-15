@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException, Query
 
 from agents.prompt_builder import build_agent_prompt_and_tools
+from agent_team import AgentTeam
 from app_config import get_app_config, update_app_config
 from mcp_tools import refresh_mcp_tools
 from models import LLMConfig, LLMConfigCreate, LLMConfigUpdate
@@ -116,11 +117,13 @@ def set_app_config(payload: Dict[str, Any]):
 
 def get_agent_prompt_route(
     profile_id: Optional[str] = Query(None),
+    team_id: Optional[str] = Query(None),
     session_id: Optional[str] = Query(None),
     include_tools: Optional[bool] = Query(None),
     agent_type: Optional[str] = Query(None),
 ):
     app_config = get_app_config()
+    team = AgentTeam(app_config)
     agent_cfg = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
     llm_app_config = app_config.get("llm", {}) if isinstance(app_config, dict) else {}
     global_reasoning_summary = llm_app_config.get("reasoning_summary")
@@ -129,10 +132,32 @@ def get_agent_prompt_route(
     if agent_type is not None:
         include = str(agent_type).lower() != "simple"
 
+    if profile_id and team_id:
+        raise HTTPException(status_code=400, detail="profile_id and team_id cannot both be set")
+
+    active_profile = team.resolve_active_agent(
+        requested_profile=profile_id,
+        requested_team_id=team_id,
+    )
+    resolved_team_id = None
+    if team_id:
+        selectable_team = team.get_selectable_team(team_id)
+        if not selectable_team:
+            raise HTTPException(status_code=400, detail=f"Unknown team: {team_id}")
+        resolved_team_id = str(selectable_team.get("id") or "").strip() or None
     pty_prompt = build_live_pty_prompt(session_id)
     system_prompt, tools, resolved_profile_id, _ = build_agent_prompt_and_tools(
-        profile_id,
-        ToolRegistry.get_all(),
+        active_profile,
+        ToolRegistry.get_all(
+            {
+                "app_config": app_config,
+                "session_id": session_id,
+                "agent_profile": active_profile,
+                "current_agent_profile": active_profile,
+                "agent_team_id": resolved_team_id,
+                "current_agent_team_id": resolved_team_id,
+            }
+        ),
         include_tools=include,
         extra_context={"pty_sessions": pty_prompt},
         exclude_ability_ids=["code_map"],
@@ -140,17 +165,24 @@ def get_agent_prompt_route(
     system_prompt = append_reasoning_summary_prompt(system_prompt, global_reasoning_summary)
 
     profile_name = None
+    team_name = None
     profiles = agent_cfg.get("profiles") if isinstance(agent_cfg, dict) else None
     if isinstance(profiles, list) and resolved_profile_id:
         for profile in profiles:
             if isinstance(profile, dict) and profile.get("id") == resolved_profile_id:
                 profile_name = profile.get("name") or resolved_profile_id
                 break
+    if resolved_team_id:
+        selectable_team = team.get_selectable_team(resolved_team_id)
+        if selectable_team:
+            team_name = selectable_team.get("name") or resolved_team_id
 
     return {
         "prompt": system_prompt,
         "profile_id": resolved_profile_id,
         "profile_name": profile_name,
+        "team_id": resolved_team_id,
+        "team_name": team_name,
         "include_tools": include,
         "tool_names": [tool.name for tool in tools],
     }

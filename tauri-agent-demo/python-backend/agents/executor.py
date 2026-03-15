@@ -90,6 +90,13 @@ class AgentExecutor:
                     debug_ctx = request_overrides.get("_debug")
                     if isinstance(debug_ctx, dict):
                         message_id = debug_ctx.get("message_id")
+            agent_profile = None
+            if request_overrides:
+                agent_profile = request_overrides.get("current_agent_profile")
+                if agent_profile is None:
+                    debug_ctx = request_overrides.get("_debug")
+                    if isinstance(debug_ctx, dict):
+                        agent_profile = debug_ctx.get("agent_profile")
 
             shell_unrestricted = False
             if agent_mode:
@@ -101,12 +108,17 @@ class AgentExecutor:
                 shell_unrestricted = bool(request_overrides.get("shell_unrestricted"))
 
             token = set_tool_context({
+                "app_config": request_overrides.get("app_config") if request_overrides else None,
                 "shell_unrestricted": shell_unrestricted,
                 "agent_mode": agent_mode or "default",
                 "session_id": session_id,
                 "work_path": work_path,
                 "extra_work_paths": extra_work_paths,
-                "message_id": message_id
+                "message_id": message_id,
+                "agent_profile": agent_profile,
+                "current_agent_profile": agent_profile,
+                "agent_team_id": request_overrides.get("current_agent_team_id") if request_overrides else None,
+                "current_agent_team_id": request_overrides.get("current_agent_team_id") if request_overrides else None,
             })
 
             async for step in self.strategy.execute(

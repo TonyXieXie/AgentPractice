@@ -142,12 +142,14 @@ export async function updateToolsConfig(update: ToolsConfig): Promise<ToolsConfi
 
 export async function getAgentPrompt(params?: {
     profileId?: string;
+    teamId?: string;
     sessionId?: string;
     includeTools?: boolean;
     agentType?: string;
 }): Promise<AgentPromptResponse> {
     const query = new URLSearchParams();
     if (params?.profileId) query.set('profile_id', params.profileId);
+    if (params?.teamId) query.set('team_id', params.teamId);
     if (params?.sessionId) query.set('session_id', params.sessionId);
     if (params?.includeTools !== undefined) query.set('include_tools', params.includeTools ? 'true' : 'false');
     if (params?.agentType) query.set('agent_type', params.agentType);

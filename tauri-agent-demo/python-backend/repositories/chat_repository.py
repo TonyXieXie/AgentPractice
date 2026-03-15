@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from database import db
@@ -57,13 +58,14 @@ def get_message_details(session_id: str, message_id: int) -> Optional[Dict[str, 
 def update_message_content(session_id: str, message_id: int, content: str) -> None:
     conn = db.get_connection()
     cursor = conn.cursor()
+    now = datetime.now().isoformat()
     cursor.execute(
         '''
         UPDATE chat_messages
-        SET content = ?
+        SET content = ?, timestamp = ?
         WHERE id = ? AND session_id = ?
         ''',
-        (content, message_id, session_id),
+        (content, now, message_id, session_id),
     )
     conn.commit()
     conn.close()
@@ -77,15 +79,17 @@ def update_message_content_and_metadata(
 ) -> None:
     conn = db.get_connection()
     cursor = conn.cursor()
+    now = datetime.now().isoformat()
     cursor.execute(
         '''
         UPDATE chat_messages
-        SET content = ?, metadata = ?
+        SET content = ?, metadata = ?, timestamp = ?
         WHERE id = ? AND session_id = ?
         ''',
         (
             content,
             json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
+            now,
             message_id,
             session_id,
         ),
@@ -122,8 +126,15 @@ def get_attachment(attachment_id: int) -> Optional[Dict[str, Any]]:
     return db.get_attachment(attachment_id)
 
 
-def save_agent_step(message_id: int, step_type: str, content: str, sequence: int, metadata: Optional[Dict[str, Any]] = None) -> int:
-    return db.save_agent_step(message_id, step_type, content, sequence, metadata or {})
+def save_agent_step(
+    message_id: int,
+    step_type: str,
+    content: str,
+    sequence: int,
+    metadata: Optional[Dict[str, Any]] = None,
+    agent_profile: Optional[str] = None
+) -> int:
+    return db.save_agent_step(message_id, step_type, content, sequence, metadata or {}, agent_profile=agent_profile)
 
 
 def list_agent_steps(session_id: str) -> List[Dict[str, Any]]:
@@ -132,6 +143,14 @@ def list_agent_steps(session_id: str) -> List[Dict[str, Any]]:
 
 def list_agent_steps_for_messages(session_id: str, message_ids: List[int]) -> List[Dict[str, Any]]:
     return db.get_session_agent_steps_for_messages(session_id, message_ids)
+
+
+def list_agent_steps_for_profile_after(
+    session_id: str,
+    agent_profile: str,
+    after_step_id: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    return db.get_agent_steps_for_profile_after(session_id, agent_profile, after_step_id)
 
 
 def get_file_snapshot(session_id: str, message_id: int) -> Optional[Dict[str, Any]]:
@@ -154,6 +173,7 @@ def save_llm_call(
     session_id: str,
     message_id: Optional[int],
     agent_type: Optional[str],
+    agent_profile: Optional[str],
     iteration: Optional[int],
     stream: bool,
     api_profile: str,
@@ -168,6 +188,7 @@ def save_llm_call(
         session_id=session_id,
         message_id=message_id,
         agent_type=agent_type,
+        agent_profile=agent_profile,
         iteration=iteration,
         stream=stream,
         api_profile=api_profile,
@@ -198,6 +219,7 @@ def save_session_tool_call_history(
     success: bool,
     message_id: Optional[int] = None,
     agent_type: Optional[str] = None,
+    agent_profile: Optional[str] = None,
     iteration: Optional[int] = None,
     failure_reason: Optional[str] = None,
 ) -> int:
@@ -205,6 +227,7 @@ def save_session_tool_call_history(
         session_id=session_id,
         message_id=message_id,
         agent_type=agent_type,
+        agent_profile=agent_profile,
         iteration=iteration,
         tool_name=tool_name,
         success=success,
@@ -216,8 +239,14 @@ def get_tool_stats(session_id: str) -> Dict[str, Any]:
     return db.get_session_tool_stats(session_id)
 
 
-def save_tool_call(message_id: int, tool_name: str, tool_input: str, tool_output: str) -> int:
-    return db.save_tool_call(message_id, tool_name, tool_input, tool_output)
+def save_tool_call(
+    message_id: int,
+    tool_name: str,
+    tool_input: str,
+    tool_output: str,
+    agent_profile: Optional[str] = None
+) -> int:
+    return db.save_tool_call(message_id, tool_name, tool_input, tool_output, agent_profile=agent_profile)
 
 
 def get_llm_call_metas_after(session_id: str, after_id: int = 0) -> List[Dict[str, Any]]:
@@ -238,3 +267,21 @@ def update_session_context(
     last_compressed_llm_call_id: Optional[int],
 ) -> None:
     db.update_session_context(session_id, context_summary, last_compressed_llm_call_id)
+
+
+def get_agent_private_context(session_id: str, agent_profile: str) -> Optional[Dict[str, Any]]:
+    return db.get_agent_private_context(session_id, agent_profile)
+
+
+def upsert_agent_private_context(
+    session_id: str,
+    agent_profile: str,
+    context_summary: Optional[str],
+    last_compressed_step_id: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    return db.upsert_agent_private_context(
+        session_id,
+        agent_profile,
+        context_summary,
+        last_compressed_step_id,
+    )

@@ -14,6 +14,14 @@ def get_session(session_id: str, include_count: bool = True) -> Optional[ChatSes
     return db.get_session(session_id, include_count=include_count)
 
 
+def get_sessions_by_runtime_team(team_id: str) -> List[ChatSession]:
+    return db.get_sessions_by_runtime_team(team_id)
+
+
+def get_session_by_runtime_team_role(team_id: str, role_key: str) -> Optional[ChatSession]:
+    return db.get_session_by_runtime_team_role(team_id, role_key)
+
+
 def create_session(session: ChatSessionCreate) -> ChatSession:
     return db.create_session(session)
 

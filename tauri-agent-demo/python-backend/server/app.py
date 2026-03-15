@@ -11,6 +11,7 @@ from .routers.chat import router as chat_router
 from .routers.configs import router as configs_router
 from .routers.pty import router as pty_router
 from .routers.sessions import router as sessions_router
+from .routers.teams import router as teams_router
 from .routers.tools import router as tools_router
 from tools.base import ToolRegistry
 from tools.builtin import register_builtin_tools
@@ -36,6 +37,7 @@ def create_app() -> FastAPI:
     app.include_router(base_router)
     app.include_router(configs_router)
     app.include_router(sessions_router)
+    app.include_router(teams_router)
     app.include_router(chat_router)
     app.include_router(pty_router)
     app.include_router(tools_router)

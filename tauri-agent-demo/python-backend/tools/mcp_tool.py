@@ -95,6 +95,14 @@ class MCPTool(Tool):
             schema = self.tool_meta.get("input_schema")
         self.parameters = _build_parameters_from_schema(schema)
 
+    def clone(self, context: Optional[Dict[str, Any]] = None) -> Optional["Tool"]:
+        return MCPTool(
+            server_cfg=dict(self.server_cfg),
+            tool_meta=dict(self.tool_meta),
+            safe_name=self.name,
+            display_name=self.display_name
+        )
+
     async def execute(self, input_data: str) -> str:
         args: Any = {}
         if input_data is not None and str(input_data).strip():

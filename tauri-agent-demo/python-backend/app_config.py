@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from runtime_paths import get_app_config_path as resolve_runtime_app_config_path
 
@@ -91,6 +91,57 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 "name": "File References",
                 "type": "output_format",
                 "prompt": "File References: When referencing files in your response, make sure to include the relevant start line and always follow the below rules:\n- Use inline code to make file paths clickable.\n- Each reference should have a stand alone path. Even if it's the same file.\n- Accepted: absolute, workspace-relative, a/ or b/ diff prefixes, or bare filename/suffix.\n- Line/column (1-based, optional): :line[:column] or #Lline[Ccolumn] (column defaults to 1).\n- Do not use URIs like file://, vscode://, or https://.\n- Do not provide range of lines.\n- Examples: src/app.ts, src/app.ts:42, b/server/index.js#L10, C:\\repo\\project\\main.rs:12:5"
+            },
+            {
+                "id": "read_only_tools",
+                "name": "Read Only Tools",
+                "type": "tooling",
+                "tools": ["rg", "search", "read_file", "list_files", "code_ast"],
+                "prompt": "Use read-only tools to inspect the repository before making recommendations."
+            },
+            {
+                "id": "handoff_tool",
+                "name": "Handoff Tool",
+                "type": "tooling",
+                "tools": ["handoff"],
+                "prompt": "When another specialist should continue, use handoff instead of continuing outside your role."
+            },
+            {
+                "id": "shell_exec",
+                "name": "Shell Execution",
+                "type": "tooling",
+                "tools": ["run_shell"],
+                "prompt": "Use shell commands when validation or test execution is required."
+            },
+            {
+                "id": "planner_workflow",
+                "name": "Planner Workflow",
+                "type": "workflow",
+                "prompt": "Break the request into concrete tasks, decide which agent should own each task, and hand off once the plan is ready. Do not modify files directly."
+            },
+            {
+                "id": "planner_constraints",
+                "name": "Planner Constraints",
+                "type": "constraints",
+                "prompt": "Stay focused on scoping, sequencing, and delegation. Do not claim implementation or test results you did not personally verify."
+            },
+            {
+                "id": "coder_workflow",
+                "name": "Coder Workflow",
+                "type": "workflow",
+                "prompt": "Implement the agreed changes, inspect existing code before editing, and leave the repository in a runnable state when possible."
+            },
+            {
+                "id": "tester_workflow",
+                "name": "Tester Workflow",
+                "type": "workflow",
+                "prompt": "Validate the implementation by running relevant checks or tests, summarize failures precisely, and hand off when fixes are required."
+            },
+            {
+                "id": "tester_constraints",
+                "name": "Tester Constraints",
+                "type": "constraints",
+                "prompt": "Focus on verification and diagnosis. Do not modify project files directly."
             }
         ],
         "profiles": [
@@ -107,6 +158,95 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 "description": "Spawnable profile for delegated tasks.",
                 "abilities": ["tools_all", "rg_search", "apply_patch", "pty_status", "code_map", "tool_json", "output_concise", "file_references"],
                 "spawnable": True
+            },
+            {
+                "id": "planner",
+                "name": "Planner",
+                "description": "Breaks down user requests into a plan and hands work to the right specialist.",
+                "abilities": [
+                    "read_only_tools",
+                    "handoff_tool",
+                    "rg_search",
+                    "pty_status",
+                    "code_map",
+                    "tool_json",
+                    "output_concise",
+                    "file_references",
+                    "planner_workflow",
+                    "planner_constraints"
+                ],
+                "spawnable": False
+            },
+            {
+                "id": "coder",
+                "name": "Coder",
+                "description": "Implements code changes and repository updates.",
+                "abilities": [
+                    "tools_all",
+                    "rg_search",
+                    "apply_patch",
+                    "pty_status",
+                    "code_map",
+                    "tool_json",
+                    "output_concise",
+                    "file_references",
+                    "coder_workflow"
+                ],
+                "spawnable": False
+            },
+            {
+                "id": "tester",
+                "name": "Tester",
+                "description": "Runs tests, validates behavior, and reports failures without editing code.",
+                "abilities": [
+                    "read_only_tools",
+                    "shell_exec",
+                    "handoff_tool",
+                    "rg_search",
+                    "pty_status",
+                    "code_map",
+                    "tool_json",
+                    "output_concise",
+                    "file_references",
+                    "tester_workflow",
+                    "tester_constraints"
+                ],
+                "spawnable": False
+            }
+        ],
+        "team": {
+            "execution_mode": "single_session",
+            "default_agent": "default",
+            "members": [
+                {
+                    "profile_id": "default",
+                    "handoff_to": ["subagent", "planner", "coder", "tester"]
+                },
+                {
+                    "profile_id": "subagent",
+                    "handoff_to": ["default"]
+                },
+                {
+                    "profile_id": "planner",
+                    "handoff_to": ["coder", "tester", "default"]
+                },
+                {
+                    "profile_id": "coder",
+                    "handoff_to": ["planner", "tester", "default"]
+                },
+                {
+                    "profile_id": "tester",
+                    "handoff_to": ["planner", "coder", "default"]
+                }
+            ]
+        },
+        "teams": [
+            {
+                "id": "delivery",
+                "name": "Delivery Team",
+                "description": "Planner -> Coder -> Tester",
+                "leader_profile_id": "planner",
+                "member_profile_ids": ["planner", "coder", "tester"]
             }
         ],
         "default_profile": "default"
@@ -445,6 +585,171 @@ def _normalize_mcp_config(mcp: Any) -> Dict[str, Any]:
     return {"servers": normalized_servers}
 
 
+def _normalize_team_member(
+    value: Any,
+    index: int,
+    valid_profiles: set,
+    seen_profiles: set
+) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"agent.team.members[{index}] must be an object")
+    profile_id = str(value.get("profile_id") or "").strip()
+    if not profile_id:
+        raise ValueError(f"agent.team.members[{index}].profile_id is required")
+    if profile_id not in valid_profiles:
+        raise ValueError(f"agent.team.members[{index}].profile_id must exist in agent.profiles")
+    if profile_id in seen_profiles:
+        raise ValueError("agent.team.members.profile_id must be unique")
+    seen_profiles.add(profile_id)
+
+    raw_targets = value.get("handoff_to") or []
+    if not isinstance(raw_targets, list):
+        raise ValueError(f"agent.team.members[{index}].handoff_to must be a list of profile ids")
+    targets: List[str] = []
+    for item in raw_targets:
+        target = str(item or "").strip()
+        if not target:
+            continue
+        if target == profile_id:
+            raise ValueError(f"agent.team.members[{index}].handoff_to cannot include itself")
+        if target not in targets:
+            targets.append(target)
+
+    return {
+        "profile_id": profile_id,
+        "handoff_to": targets
+    }
+
+
+def _normalize_team_config(team: Any, agent: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(team, dict):
+        raise ValueError("agent.team must be an object")
+
+    profiles = agent.get("profiles")
+    if not isinstance(profiles, list):
+        raise ValueError("agent.profiles must be a list before agent.team can be validated")
+    valid_profiles = {
+        str(profile.get("id") or "").strip()
+        for profile in profiles
+        if isinstance(profile, dict) and str(profile.get("id") or "").strip()
+    }
+
+    execution_mode = str(team.get("execution_mode") or "").strip().lower() or "single_session"
+    if execution_mode not in {"single_session", "multi_session"}:
+        raise ValueError("agent.team.execution_mode must be 'single_session' or 'multi_session'")
+
+    default_agent = str(team.get("default_agent") or "").strip()
+    if default_agent and default_agent not in valid_profiles:
+        raise ValueError("agent.team.default_agent must exist in agent.profiles")
+
+    raw_members = team.get("members")
+    if raw_members is None:
+        raw_members = []
+    if not isinstance(raw_members, list):
+        raise ValueError("agent.team.members must be a list")
+
+    seen_profiles: set = set()
+    members = [
+        _normalize_team_member(member, idx, valid_profiles, seen_profiles)
+        for idx, member in enumerate(raw_members)
+    ]
+    member_profiles = {member["profile_id"] for member in members}
+    if default_agent and members and default_agent not in member_profiles:
+        raise ValueError("agent.team.default_agent must reference a declared team member")
+    for idx, member in enumerate(members):
+        for target in member.get("handoff_to") or []:
+            if target not in member_profiles:
+                raise ValueError(
+                    f"agent.team.members[{idx}].handoff_to entries must reference declared team members"
+                )
+
+    normalized: Dict[str, Any] = {
+        "execution_mode": execution_mode,
+        "members": members,
+    }
+    if default_agent:
+        normalized["default_agent"] = default_agent
+    return normalized
+
+
+def _normalize_selectable_team(
+    value: Any,
+    index: int,
+    valid_profiles: set,
+    seen_team_ids: set
+) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"agent.teams[{index}] must be an object")
+
+    team_id = str(value.get("id") or "").strip()
+    if not team_id:
+        raise ValueError(f"agent.teams[{index}].id is required")
+    if team_id in seen_team_ids:
+        raise ValueError("agent.teams.id must be unique")
+    seen_team_ids.add(team_id)
+
+    name = str(value.get("name") or "").strip() or team_id
+    description = value.get("description")
+    if description is not None and not isinstance(description, str):
+        raise ValueError(f"agent.teams[{index}].description must be a string")
+    description = description.strip() if isinstance(description, str) else None
+
+    leader_profile_id = str(value.get("leader_profile_id") or "").strip()
+    if not leader_profile_id:
+        raise ValueError(f"agent.teams[{index}].leader_profile_id is required")
+    if leader_profile_id not in valid_profiles:
+        raise ValueError(f"agent.teams[{index}].leader_profile_id must exist in agent.profiles")
+
+    raw_members = value.get("member_profile_ids")
+    if not isinstance(raw_members, list):
+        raise ValueError(f"agent.teams[{index}].member_profile_ids must be a list")
+
+    member_profile_ids: List[str] = []
+    for item in raw_members:
+        profile_id = str(item or "").strip()
+        if not profile_id:
+            continue
+        if profile_id not in valid_profiles:
+            raise ValueError(f"agent.teams[{index}].member_profile_ids entries must exist in agent.profiles")
+        if profile_id not in member_profile_ids:
+            member_profile_ids.append(profile_id)
+
+    if not member_profile_ids:
+        raise ValueError(f"agent.teams[{index}].member_profile_ids must not be empty")
+    if leader_profile_id not in member_profile_ids:
+        raise ValueError(f"agent.teams[{index}].leader_profile_id must be included in member_profile_ids")
+
+    normalized: Dict[str, Any] = {
+        "id": team_id,
+        "name": name,
+        "leader_profile_id": leader_profile_id,
+        "member_profile_ids": member_profile_ids,
+    }
+    if description:
+        normalized["description"] = description
+    return normalized
+
+
+def _normalize_selectable_teams(teams: Any, agent: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(teams, list):
+        raise ValueError("agent.teams must be a list")
+
+    profiles = agent.get("profiles")
+    if not isinstance(profiles, list):
+        raise ValueError("agent.profiles must be a list before agent.teams can be validated")
+    valid_profiles = {
+        str(profile.get("id") or "").strip()
+        for profile in profiles
+        if isinstance(profile, dict) and str(profile.get("id") or "").strip()
+    }
+
+    seen_team_ids: set = set()
+    return [
+        _normalize_selectable_team(team, idx, valid_profiles, seen_team_ids)
+        for idx, team in enumerate(teams)
+    ]
+
+
 def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(config)
     llm = dict(normalized.get("llm", {}))
@@ -470,6 +775,10 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         agent["code_map"] = _coerce_code_map(agent["code_map"])
     if "mcp" in agent:
         agent["mcp"] = _normalize_mcp_config(agent["mcp"])
+    if "team" in agent:
+        agent["team"] = _normalize_team_config(agent["team"], agent)
+    if "teams" in agent:
+        agent["teams"] = _normalize_selectable_teams(agent["teams"], agent)
     normalized["agent"] = agent
     return normalized
 

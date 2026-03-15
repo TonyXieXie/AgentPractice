@@ -18,6 +18,7 @@ import {
   ReasoningEffort,
   AgentMode,
   AgentConfig,
+  AgentTargetSelection,
   ContextEstimate,
   SkillSummary
 } from './types';
@@ -177,6 +178,7 @@ type QueueItem = {
   configId: string;
   agentMode: AgentMode;
   agentProfileId?: string | null;
+  agentTeamId?: string | null;
   workPath?: string;
   extraWorkPaths?: string[];
   enqueuedAt: number;
@@ -235,6 +237,7 @@ function App() {
   const [currentConfig, setCurrentConfig] = useState<LLMConfig | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [currentSessionParentId, setCurrentSessionParentId] = useState<string | null>(null);
+  const [currentSessionTeamId, setCurrentSessionTeamId] = useState<string | null>(null);
   const [currentWorkPath, setCurrentWorkPath] = useState('');
   const [showConfigManager, setShowConfigManager] = useState(false);
   const [sessionRefreshTrigger, setSessionRefreshTrigger] = useState(0);
@@ -269,7 +272,8 @@ function App() {
   const debugRefreshRef = useRef<Record<string, { last: number; timer: number | null }>>({});
   const [agentMode, setAgentMode] = useState<AgentMode>('default');
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null);
-  const [currentAgentProfileId, setCurrentAgentProfileId] = useState<string | null>(null);
+  const [selectedAgentTarget, setSelectedAgentTarget] = useState<AgentTargetSelection | null>(null);
+  const [currentActiveAgentProfileId, setCurrentActiveAgentProfileId] = useState<string | null>(null);
 
   const commandItems = useMemo<CommandItem[]>(
     () =>
@@ -338,6 +342,7 @@ function App() {
   const containerPaddingRef = useRef<{ top: number; bottom: number }>({ top: 0, bottom: 0 });
   const workPathBySessionRef = useRef<Record<string, string>>({});
   const currentSessionIdRef = useRef<string | null>(null);
+  const selectedAgentTargetRef = useRef<AgentTargetSelection | null>(null);
   const queueBySessionRef = useRef<Record<string, QueueItem[]>>({});
   const inFlightBySessionRef = useRef<Record<string, InFlightState>>({});
   const pendingPermissionBySessionRef = useRef<Record<string, ToolPermissionRequest | null>>({});
@@ -350,7 +355,9 @@ function App() {
   const astNotifyRef = useRef<{ timer: number | null; paths: Set<string> }>({ timer: null, paths: new Set() });
   const appWindow = useMemo(() => getCurrentWindow(), []);
   const {
-    resolveAgentProfileId,
+    resolveAgentTeam,
+    resolveAgentTargetSelection,
+    resolveSelectionActiveProfileId,
     loadDefaultConfig,
     loadAllConfigs,
     loadAgentConfig,
@@ -359,7 +366,8 @@ function App() {
     setShowConfigManager,
     setAllConfigs,
     setAgentConfig,
-    setCurrentAgentProfileId,
+    setSelectedAgentTarget,
+    setCurrentActiveAgentProfileId,
     setSkills,
   });
 
@@ -483,6 +491,10 @@ function App() {
   useEffect(() => {
     currentSessionIdRef.current = currentSessionId;
   }, [currentSessionId]);
+
+  useEffect(() => {
+    selectedAgentTargetRef.current = selectedAgentTarget;
+  }, [selectedAgentTarget]);
 
   const isImageFile = (file: File) => {
     if (file.type && file.type.startsWith('image/')) return true;
@@ -1632,6 +1644,15 @@ function App() {
     }
   };
 
+  const applyIncomingActiveAgent = useCallback((sessionId: string, profileId?: string | null) => {
+    if (!sessionId || !profileId) return;
+    if (sessionId !== currentSessionIdRef.current) return;
+    setCurrentActiveAgentProfileId(profileId);
+    if (selectedAgentTargetRef.current?.kind !== 'team') {
+      setSelectedAgentTarget({ kind: 'profile', id: profileId });
+    }
+  }, []);
+
   useAppShellSessionChannel({
     currentSessionId,
     getSessionKey,
@@ -1639,6 +1660,7 @@ function App() {
     updateSessionMessages,
     markSessionUnread,
     setSessionRefreshTrigger,
+    applyIncomingActiveAgent,
   });
 
   useAppShellPtyStream({
@@ -1761,6 +1783,7 @@ function App() {
           config_id: item.configId,
           agent_mode: item.agentMode,
           agent_profile: item.agentProfileId || undefined,
+          agent_team_id: item.agentTeamId || undefined,
           work_path: item.workPath || undefined,
           extra_work_paths: item.extraWorkPaths && item.extraWorkPaths.length > 0 ? item.extraWorkPaths : undefined,
           attachments: attachmentPayload,
@@ -1780,8 +1803,33 @@ function App() {
           continue;
         }
 
+        if ('message' in chunk && (chunk as any).message && typeof (chunk as any).message.id === 'number') {
+          const payload = chunk as { session_id?: string; message?: Message; active_agent_profile?: string | null };
+          const payloadSessionId = payload.session_id || newSessionId || undefined;
+          if (payloadSessionId && payload.message) {
+            const sessionKey = getSessionKey(payloadSessionId);
+            updateSessionMessages(sessionKey, (prev) => {
+              if (prev.some((msg) => msg.id === payload.message?.id)) return prev;
+              return [...prev, payload.message as Message];
+            });
+            if (payloadSessionId === currentSessionIdRef.current) {
+              const handoffTeamId = payload.message.metadata?.event_type === 'handoff'
+                ? (typeof payload.message.metadata?.team_id === 'string' ? payload.message.metadata.team_id : null)
+                : null;
+              if (handoffTeamId) {
+                setCurrentSessionTeamId(handoffTeamId);
+              }
+            }
+            applyIncomingActiveAgent(payloadSessionId, payload.active_agent_profile);
+            setSessionRefreshTrigger((prev) => prev + 1);
+          }
+          continue;
+        }
+
         if ('session_id' in chunk && typeof chunk.session_id === 'string') {
           newSessionId = chunk.session_id;
+          const activeAgentProfile = (chunk as any).active_agent_profile;
+          applyIncomingActiveAgent(chunk.session_id, activeAgentProfile);
           const incomingUserId = (chunk as any).user_message_id;
           const incomingAssistantId = (chunk as any).assistant_message_id;
           if (typeof incomingAssistantId === 'number') {
@@ -1830,6 +1878,8 @@ function App() {
             currentSessionIdRef.current = newSessionId;
             setCurrentSessionId(newSessionId);
             setCurrentSessionParentId(null);
+            setCurrentSessionTeamId(null);
+            applyIncomingActiveAgent(newSessionId, activeAgentProfile);
             setSessionRefreshTrigger((prev) => prev + 1);
           }
           if (activeSessionKey === DRAFT_SESSION_KEY && newSessionId) {
@@ -2340,6 +2390,58 @@ function App() {
     }
   };
 
+  const handleAgentTargetChange = async (nextTarget: AgentTargetSelection) => {
+    const resolvedTarget = resolveAgentTargetSelection(agentConfig, nextTarget);
+    if (!resolvedTarget) return;
+    const sessionId = currentSessionIdRef.current;
+    if (!sessionId) {
+      setSelectedAgentTarget(resolvedTarget);
+      setCurrentActiveAgentProfileId(
+        resolveSelectionActiveProfileId(agentConfig, resolvedTarget, null)
+      );
+      setShowProfileSelector(false);
+      return;
+    }
+    if (currentSessionTeamId) {
+      alert('Runtime team sessions use a fixed role binding. Switch in the session list instead of changing the agent/team target.');
+      setShowProfileSelector(false);
+      return;
+    }
+    if (
+      resolvedSelectedAgentTarget?.kind === resolvedTarget.kind &&
+      resolvedSelectedAgentTarget?.id === resolvedTarget.id
+    ) {
+      setShowProfileSelector(false);
+      return;
+    }
+    if (isStreamingCurrent) {
+      alert('请先停止当前输出，再切换 Agent/Team。');
+      return;
+    }
+
+    const updatePayload =
+      resolvedTarget.kind === 'team'
+        ? { agent_team_id: resolvedTarget.id }
+        : { agent_profile: resolvedTarget.id, agent_team_id: null };
+
+    try {
+      const updated = await updateSession(sessionId, updatePayload);
+      const nextSelection = resolveAgentTargetSelection(
+        agentConfig,
+        updated.agent_team_id ? { kind: 'team', id: updated.agent_team_id } : { kind: 'profile', id: updated.agent_profile || '' }
+      );
+      setSelectedAgentTarget(nextSelection);
+      setCurrentActiveAgentProfileId(
+        resolveSelectionActiveProfileId(agentConfig, nextSelection, updated.agent_profile || null)
+      );
+      setSessionRefreshTrigger((prev) => prev + 1);
+      setShowProfileSelector(false);
+    } catch (error) {
+      console.error('Failed to switch agent target:', error);
+      alert('Failed to switch agent target.');
+    }
+  };
+
   const handleWorkPathPick = async () => {
     const selected = await pickWorkPath();
     if (!selected) return;
@@ -2748,7 +2850,8 @@ function App() {
       sessionKey,
       configId: currentConfig.id,
       agentMode,
-      agentProfileId: resolveAgentProfileId(agentConfig, currentAgentProfileId),
+      agentProfileId: resolvedSelectedAgentTarget?.kind === 'profile' ? resolvedSelectedAgentTarget.id : undefined,
+      agentTeamId: resolvedSelectedAgentTarget?.kind === 'team' ? resolvedSelectedAgentTarget.id : undefined,
       workPath,
       extraWorkPaths,
       enqueuedAt: Date.now(),
@@ -2766,8 +2869,8 @@ function App() {
   };
 
   const handleSend = async () => {
-    if (isChildSession) {
-      alert('子agent会话为只读，无法发送消息。');
+    if (isInputReadonly) {
+      alert(inputReadonlyHint || '当前会话为只读，无法发送消息。');
       return;
     }
     const baseMessage = inputMsg.trim();
@@ -2993,7 +3096,8 @@ function App() {
         perfMeta.sessionFetchMs = (performance.now() - sessionFetchStart).toFixed(1);
       }
       mark('session');
-      setCurrentSessionParentId(session.parent_session_id || null);
+      setCurrentSessionParentId(session.team_id ? null : (session.parent_session_id || null));
+      setCurrentSessionTeamId(session.team_id || null);
       const sessionWorkPath = session.work_path || '';
       workPathBySessionRef.current[session.id] = sessionWorkPath;
       setCurrentWorkPath(sessionWorkPath);
@@ -3005,7 +3109,14 @@ function App() {
       if (sessionWorkPath) {
         scheduleAstNotify(sessionWorkPath, [sessionWorkPath]);
       }
-      setCurrentAgentProfileId(resolveAgentProfileId(agentConfig, session.agent_profile || null));
+      const nextSelection = resolveAgentTargetSelection(
+        agentConfig,
+        session.agent_team_id ? { kind: 'team', id: session.agent_team_id } : { kind: 'profile', id: session.agent_profile || '' }
+      );
+      setSelectedAgentTarget(nextSelection);
+      setCurrentActiveAgentProfileId(
+        resolveSelectionActiveProfileId(agentConfig, nextSelection, session.agent_profile || null)
+      );
       mark('session-apply');
 
       if (!cached || cached.length === 0) {
@@ -3091,6 +3202,10 @@ function App() {
     currentSessionIdRef.current = null;
     setCurrentSessionId(null);
     setCurrentSessionParentId(null);
+    setCurrentSessionTeamId(null);
+    setCurrentActiveAgentProfileId(
+      resolveSelectionActiveProfileId(agentConfig, selectedAgentTargetRef.current, null)
+    );
     setSessionMessages(DRAFT_SESSION_KEY, []);
     setLlmCalls([]);
     setToolStats(null);
@@ -3187,7 +3302,7 @@ function App() {
   };
 
   const currentSessionKey = getSessionKey(currentSessionId);
-  const isChildSession = Boolean(currentSessionParentId);
+  const isChildSession = Boolean(currentSessionParentId && !currentSessionTeamId);
   const isStreamingCurrent = useMemo(
     () => Boolean(inFlightBySessionRef.current[currentSessionKey]),
     [currentSessionKey, inFlightTick]
@@ -3466,9 +3581,48 @@ function App() {
     [currentSessionKey, permissionTick]
   );
   const agentProfiles = agentConfig?.profiles || [];
-  const resolvedAgentProfileId = resolveAgentProfileId(agentConfig, currentAgentProfileId);
-  const currentAgentProfile = agentProfiles.find((profile) => profile.id === resolvedAgentProfileId) || null;
+  const agentTeams = agentConfig?.teams || [];
+  const resolvedSelectedAgentTarget = resolveAgentTargetSelection(agentConfig, selectedAgentTarget);
+  const selectedAgentTeam =
+    resolvedSelectedAgentTarget?.kind === 'team'
+      ? resolveAgentTeam(agentConfig, resolvedSelectedAgentTarget.id)
+      : null;
+  const selectedAgentProfileId =
+    resolvedSelectedAgentTarget?.kind === 'profile' ? resolvedSelectedAgentTarget.id : null;
+  const selectedAgentProfile =
+    selectedAgentProfileId ? agentProfiles.find((profile) => profile.id === selectedAgentProfileId) || null : null;
+  const resolvedActiveAgentProfileId = resolveSelectionActiveProfileId(
+    agentConfig,
+    resolvedSelectedAgentTarget,
+    currentActiveAgentProfileId
+  );
+  const currentActiveAgentProfile =
+    agentProfiles.find((profile) => profile.id === resolvedActiveAgentProfileId) || null;
+  const currentRoleProfileId = currentActiveAgentProfileId || resolvedActiveAgentProfileId || null;
+  const currentTeamLeaderProfileId = currentSessionTeamId ? selectedAgentTeam?.leader_profile_id || null : null;
+  const currentTeamLeaderProfile =
+    currentTeamLeaderProfileId
+      ? agentProfiles.find((profile) => profile.id === currentTeamLeaderProfileId) || null
+      : null;
+  const isReadonlyTeamRoleSession = Boolean(
+    currentSessionTeamId &&
+      currentTeamLeaderProfileId &&
+      currentRoleProfileId &&
+      currentRoleProfileId !== currentTeamLeaderProfileId
+  );
+  const inputReadonlyHint = isChildSession
+    ? '子agent会话仅供查看'
+    : isReadonlyTeamRoleSession
+      ? `该 role session 仅供查看协作历史；新的用户任务请在 leader session (${currentTeamLeaderProfile?.name || currentTeamLeaderProfileId}) 发起`
+      : null;
+  const isInputReadonly = Boolean(isChildSession || isReadonlyTeamRoleSession);
   const currentReasoning = (currentConfig?.reasoning_effort || 'medium') as ReasoningEffort;
+  const agentSelectorPrimaryLabel =
+    selectedAgentTeam?.name || selectedAgentProfile?.name || resolvedActiveAgentProfileId || 'Profile';
+  const agentSelectorSecondaryLabel =
+    selectedAgentTeam && currentActiveAgentProfile
+      ? `Active: ${currentActiveAgentProfile.name || currentActiveAgentProfile.id}`
+      : null;
   const workPathDisplay = useMemo(() => formatWorkPath(currentWorkPath), [currentWorkPath]);
   const visibleMessages = useMemo(() => {
     if (renderMessages.length === 0) return [];
@@ -3628,6 +3782,7 @@ function App() {
           inFlightBySession={inFlightBySession}
           unreadBySession={unreadBySession}
           pendingPermissionBySession={pendingPermissionBySession}
+          agentConfig={agentConfig}
         />
       )}
 
@@ -3851,8 +4006,8 @@ function App() {
               </div>
             )}
 
-            {isChildSession && (
-              <div className="input-readonly-hint">子agent会话仅供查看</div>
+            {inputReadonlyHint && (
+              <div className="input-readonly-hint">{inputReadonlyHint}</div>
             )}
 
             {showCommandSuggestions && (
@@ -3978,11 +4133,11 @@ function App() {
               placeholder={
                 !currentConfig
                   ? 'Please configure an LLM'
-                  : isChildSession
-                    ? '子agent会话为只读'
+                  : isInputReadonly
+                    ? '当前会话为只读'
                     : 'Type a message...'
               }
-              disabled={!currentConfig || isChildSession}
+              disabled={!currentConfig || isInputReadonly}
               ref={inputRef}
               rows={1}
             />
@@ -4065,7 +4220,7 @@ function App() {
                     )}
                   </div>
 
-                  {agentProfiles.length > 0 && (
+                  {(agentProfiles.length > 0 || agentTeams.length > 0) && (
                     <div className="agent-profile-selector-inline">
                       <button
                         type="button"
@@ -4074,34 +4229,80 @@ function App() {
                           e.stopPropagation();
                           setShowProfileSelector(!showProfileSelector);
                         }}
-                        disabled={!currentConfig}
-                        aria-label={`Agent profile: ${currentAgentProfile?.name || resolvedAgentProfileId || ''}`}
-                        title={`Agent profile: ${currentAgentProfile?.name || resolvedAgentProfileId || ''}`}
+                        disabled={!currentConfig || isStreamingCurrent}
+                        aria-label={`Agent target: ${agentSelectorPrimaryLabel}`}
+                        title={
+                          agentSelectorSecondaryLabel
+                            ? `${agentSelectorPrimaryLabel} | ${agentSelectorSecondaryLabel}`
+                            : agentSelectorPrimaryLabel
+                        }
                       >
-                        <span className="selector-text">
-                          {currentAgentProfile?.name || resolvedAgentProfileId || 'Profile'}
+                        <span className="selector-copy">
+                          <span className="selector-text">{agentSelectorPrimaryLabel}</span>
+                          {agentSelectorSecondaryLabel && (
+                            <span className="selector-subtext">{agentSelectorSecondaryLabel}</span>
+                          )}
                         </span>
                         <span className="dropdown-arrow">{'\u25be'}</span>
                       </button>
 
                       {showProfileSelector && (
                         <div className="agent-profile-dropdown-inline">
-                          {agentProfiles.map((profile) => (
-                            <div
-                              key={profile.id}
-                              className={`agent-profile-option ${profile.id === resolvedAgentProfileId ? 'active' : ''}`}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setCurrentAgentProfileId(profile.id);
-                                setShowProfileSelector(false);
-                              }}
-                            >
-                              <div className="agent-profile-name">{profile.name}</div>
-                              {profile.id === agentConfig?.default_profile && (
-                                <div className="agent-profile-meta">Default</div>
-                              )}
-                            </div>
-                          ))}
+                          {agentTeams.length > 0 && (
+                            <>
+                              <div className="agent-profile-section-label">Teams</div>
+                              {agentTeams.map((team) => {
+                                const leaderProfile =
+                                  agentProfiles.find((profile) => profile.id === team.leader_profile_id) || null;
+                                const isActive =
+                                  resolvedSelectedAgentTarget?.kind === 'team' &&
+                                  resolvedSelectedAgentTarget.id === team.id;
+                                return (
+                                  <div
+                                    key={team.id}
+                                    className={`agent-profile-option ${isActive ? 'active' : ''}`}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void handleAgentTargetChange({ kind: 'team', id: team.id });
+                                    }}
+                                  >
+                                    <div className="agent-profile-name">{team.name || team.id}</div>
+                                    <div className="agent-profile-meta">
+                                      Leader: {leaderProfile?.name || team.leader_profile_id}
+                                    </div>
+                                    <div className="agent-profile-meta">
+                                      Members: {team.member_profile_ids.length}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </>
+                          )}
+                          {agentProfiles.length > 0 && (
+                            <>
+                              <div className="agent-profile-section-label">Profiles</div>
+                              {agentProfiles.map((profile) => (
+                                <div
+                                  key={profile.id}
+                                  className={`agent-profile-option ${
+                                    resolvedSelectedAgentTarget?.kind === 'profile' &&
+                                    resolvedSelectedAgentTarget.id === profile.id
+                                      ? 'active'
+                                      : ''
+                                  }`}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void handleAgentTargetChange({ kind: 'profile', id: profile.id });
+                                  }}
+                                >
+                                  <div className="agent-profile-name">{profile.name}</div>
+                                  <div className="agent-profile-meta">
+                                    {profile.id === agentConfig?.default_profile ? 'Default profile' : 'Direct profile'}
+                                  </div>
+                                </div>
+                              ))}
+                            </>
+                          )}
                         </div>
                       )}
                     </div>
@@ -4286,7 +4487,7 @@ function App() {
                   type="button"
                   className="send-btn"
                   onClick={handleSend}
-                  disabled={isChildSession || !currentConfig || (!inputMsg.trim() && pendingAttachments.length === 0)}
+                  disabled={isInputReadonly || !currentConfig || (!inputMsg.trim() && pendingAttachments.length === 0)}
                   aria-label="Send"
                   title="Send"
                 >
