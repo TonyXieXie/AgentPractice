@@ -174,6 +174,7 @@ const MeasuredMessage = ({ rowKey, className, onHeight, children }: MeasuredMess
 };
 
 const HANDOFF_CHANGED_FILES_LINE_RE = /\n?Changed files:\s*[^\n]*/gi;
+const HANDOFF_ARTIFACT_OWNER_LINE_RE = /\n?Artifacts from \[[^\]]+\]\.\s*/gi;
 
 function extractHandoffChangedFilesSummary(content: string): string {
   const matches = content.match(HANDOFF_CHANGED_FILES_LINE_RE);
@@ -183,7 +184,17 @@ function extractHandoffChangedFilesSummary(content: string): string {
 }
 
 function stripHandoffChangedFilesLine(content: string): string {
-  return content.replace(HANDOFF_CHANGED_FILES_LINE_RE, '').trim();
+  return content
+    .replace(HANDOFF_CHANGED_FILES_LINE_RE, '')
+    .replace(HANDOFF_ARTIFACT_OWNER_LINE_RE, '')
+    .trim();
+}
+
+function shouldDisplayHandoffArtifacts(fromRoleKey: unknown, artifactOwnerRoleKey: unknown): boolean {
+  const fromRole = typeof fromRoleKey === 'string' ? fromRoleKey.trim().toLowerCase() : '';
+  const artifactOwner = typeof artifactOwnerRoleKey === 'string' ? artifactOwnerRoleKey.trim().toLowerCase() : '';
+  if (!artifactOwner || !fromRole) return false;
+  return artifactOwner === fromRole;
 }
 
 function normalizeChangedFiles(value: unknown): ChangedFileSummary[] {
@@ -1750,8 +1761,9 @@ function App() {
         teamSessions: currentTeamSessions,
         groupedHandoffs: currentGroupedHandoffs,
         messagesBySession: messagesCacheRef.current,
+        inFlightBySession,
       }),
-    [currentGroupedHandoffs, currentSessionTeamId, currentTeamSessions, sessionRefreshTrigger]
+    [currentGroupedHandoffs, currentSessionTeamId, currentTeamSessions, inFlightBySession, sessionRefreshTrigger]
   );
 
   const executingBySession = useMemo(() => {
@@ -4161,6 +4173,13 @@ function App() {
                       msg.role === 'assistant' && (eventType === 'handoff' || eventType === 'delegated_result');
                     const isHandoffCard = msg.role === 'assistant' && eventType === 'handoff';
                     const handoffId = typeof messageMetadata.handoff_id === 'string' ? messageMetadata.handoff_id : '';
+                    const fromRoleKey = typeof messageMetadata.from_agent === 'string' ? messageMetadata.from_agent : '';
+                    const artifactOwnerRoleKey =
+                      typeof messageMetadata.artifact_owner_role_key === 'string'
+                        ? messageMetadata.artifact_owner_role_key
+                        : '';
+                    const showHandoffArtifacts =
+                      isHandoffCard && shouldDisplayHandoffArtifacts(fromRoleKey, artifactOwnerRoleKey);
                     const artifactOwnerLabel = isHandoffCard
                       ? (
                           typeof messageMetadata.artifact_owner_label === 'string'
@@ -4178,8 +4197,8 @@ function App() {
                                       : ''
                         )
                       : '';
-                    const changedFiles = isHandoffCard ? normalizeChangedFiles(messageMetadata.changed_files) : [];
-                    const artifactSummary = isHandoffCard
+                    const changedFiles = showHandoffArtifacts ? normalizeChangedFiles(messageMetadata.changed_files) : [];
+                    const artifactSummary = showHandoffArtifacts
                       ? (
                           typeof messageMetadata.artifact_summary === 'string'
                             ? messageMetadata.artifact_summary.trim()

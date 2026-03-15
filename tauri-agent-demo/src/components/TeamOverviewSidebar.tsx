@@ -42,7 +42,14 @@ const getChangedFileBadge = (status: string) => {
   return 'M';
 };
 
-const getArtifactOwnerLabel = (item: GroupedHandoffItem) => item.artifact_owner_role_key || item.to_role_key || item.from_role_key || 'unknown';
+const getArtifactOwnerLabel = (item: GroupedHandoffItem) => item.artifact_owner_role_key || '';
+
+const shouldDisplayHandoffArtifacts = (item: GroupedHandoffItem) => {
+  const fromRole = (item.from_role_key || '').trim().toLowerCase();
+  const artifactOwner = (item.artifact_owner_role_key || '').trim().toLowerCase();
+  if (!artifactOwner || !fromRole) return false;
+  return artifactOwner === fromRole;
+};
 
 const getMemberStatusLabel = (member: TeamOverviewMemberState) => {
   if (member.has_permission) return 'Permission';
@@ -52,13 +59,16 @@ const getMemberStatusLabel = (member: TeamOverviewMemberState) => {
 };
 
 function HandoffCard({ item }: { item: GroupedHandoffItem }) {
-  const changedFiles = item.changed_files || [];
+  const showArtifacts = shouldDisplayHandoffArtifacts(item);
+  const changedFiles = showArtifacts ? item.changed_files || [] : [];
   const hasDetails = Boolean(item.reason || item.work_summary || item.error);
   const artifactOwnerLabel = getArtifactOwnerLabel(item);
   const changedFilesLabel =
     changedFiles.length > 0
       ? `${artifactOwnerLabel} changed ${changedFiles.length} file${changedFiles.length === 1 ? '' : 's'}`
-      : item.artifact_summary || '';
+      : showArtifacts
+        ? item.artifact_summary || ''
+        : '';
 
   return (
     <article className={`team-handoff-card ${item.latest_event_kind}`}>

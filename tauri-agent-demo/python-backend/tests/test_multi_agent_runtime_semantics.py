@@ -158,6 +158,32 @@ class MultiAgentRuntimeSemanticsTests(unittest.TestCase):
         self.assertIn("leader session (planner)", error_events[0]["content"])
         self.assertTrue(state.done)
 
+    def test_team_runtime_disables_react_iteration_limit_for_leader(self):
+        session = self._create_session(
+            title="Planner Root",
+            agent_profile="planner",
+            agent_team_id="delivery",
+        )
+        state = _DummyState()
+        captured_limits = []
+
+        class FakeExecutor:
+            async def run(self, user_input, history, session_id, request_overrides):
+                yield AgentStep(step_type="answer", content="Leader answer", metadata={})
+
+        def fake_create_agent_executor(*args, **kwargs):
+            captured_limits.append(kwargs.get("max_iterations"))
+            return FakeExecutor()
+
+        self._patch_attr(chat_agent_runtime, "create_agent_executor", fake_create_agent_executor)
+
+        asyncio.run(chat_agent_runtime.run_agent_stream(ChatRequest(message="Handle the team task", session_id=session.id), state))
+
+        self.assertEqual(captured_limits, [None])
+        messages = session_repository.list_messages(session.id)
+        assistant_messages = [message for message in messages if message.role == "assistant"]
+        self.assertEqual(assistant_messages[-1].content, "Leader answer")
+
     def test_leader_continues_after_delegated_result_in_multi_session_mode(self):
         session = self._create_session(
             title="Planner Root",

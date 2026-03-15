@@ -100,6 +100,7 @@ type DeriveCurrentTeamExecutorParams = {
   teamSessions: ChatSession[];
   groupedHandoffs: GroupedHandoffItem[];
   messagesBySession: Record<string, Message[]>;
+  inFlightBySession: Record<string, boolean>;
 };
 
 export const deriveCurrentTeamExecutor = ({
@@ -107,13 +108,24 @@ export const deriveCurrentTeamExecutor = ({
   teamSessions,
   groupedHandoffs,
   messagesBySession,
+  inFlightBySession,
 }: DeriveCurrentTeamExecutorParams): SessionExecutionStatus | null => {
   if (!teamId || teamSessions.length === 0) return null;
+
+  const hasTeamRequestInFlight = teamSessions.some((session) => Boolean(inFlightBySession[session.id]));
+  const activeHandoff = groupedHandoffs.find((item) => !item.has_terminal_state) || null;
+  if (!hasTeamRequestInFlight && !activeHandoff) {
+    return null;
+  }
 
   const streamingCandidates = teamSessions
     .map((session) => {
       const cached = messagesBySession[session.id] || [];
-      const streamingMessage = [...cached].reverse().find((message) => message?.metadata?.agent_streaming === true);
+      const latestAssistantMessage = [...cached]
+        .reverse()
+        .find((message) => message?.role === 'assistant');
+      const streamingMessage =
+        latestAssistantMessage?.metadata?.agent_streaming === true ? latestAssistantMessage : null;
       if (!streamingMessage) return null;
       return {
         session,
@@ -134,7 +146,6 @@ export const deriveCurrentTeamExecutor = ({
     };
   }
 
-  const activeHandoff = groupedHandoffs.find((item) => !item.has_terminal_state);
   if (!activeHandoff) return null;
 
   const targetSessionId =

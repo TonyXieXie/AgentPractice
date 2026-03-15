@@ -477,11 +477,13 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
                 private_after_step_id=private_after_step_id,
             )
 
+            turn_react_max_iterations = None if current_team_id else react_max_iterations
+
             executor = create_agent_executor(
                 agent_type=agent_type,
                 llm_client=llm_client,
                 tools=tools,
-                max_iterations=react_max_iterations,
+                max_iterations=turn_react_max_iterations,
                 system_prompt=system_prompt,
             )
 

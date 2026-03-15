@@ -13,6 +13,7 @@ import re
 import time
 import traceback
 from datetime import datetime
+from itertools import count
 from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
 
 import httpx
@@ -253,9 +254,23 @@ class ReActAgent(AgentStrategy):
     - Continues until reaching a final answer
     """
 
-    def __init__(self, max_iterations: int = 5, system_prompt: Optional[str] = None):
-        self.max_iterations = max_iterations
+    def __init__(self, max_iterations: Optional[int] = 5, system_prompt: Optional[str] = None):
+        normalized_max_iterations: Optional[int]
+        if max_iterations is None:
+            normalized_max_iterations = None
+        else:
+            try:
+                parsed_max_iterations = int(max_iterations)
+            except (TypeError, ValueError):
+                parsed_max_iterations = 5
+            normalized_max_iterations = parsed_max_iterations if parsed_max_iterations > 0 else None
+        self.max_iterations = normalized_max_iterations
         self.system_prompt = system_prompt or ""
+
+    def _iterate_indices(self):
+        if self.max_iterations is None:
+            return count()
+        return range(self.max_iterations)
     
     def _merge_debug_context(
         self,
@@ -721,7 +736,7 @@ class ReActAgent(AgentStrategy):
         call_seq = 0
         max_no_answer_attempts = 3
 
-        for iteration in range(self.max_iterations):
+        for iteration in self._iterate_indices():
             no_answer_attempts = 0
             while True:
                 current_call_seq = call_seq
@@ -1555,11 +1570,12 @@ class ReActAgent(AgentStrategy):
                     )
                     return
 
-        yield AgentStep(
-            step_type="answer",
-            content="Sorry, I could not complete the task within the limit.",
-            metadata={"agent_type": "react", "iterations": self.max_iterations, "max_iterations_reached": True}
-        )
+        if self.max_iterations is not None:
+            yield AgentStep(
+                step_type="answer",
+                content="Sorry, I could not complete the task within the limit.",
+                metadata={"agent_type": "react", "iterations": self.max_iterations, "max_iterations_reached": True}
+            )
 
     async def _execute_text_react(
         self,
@@ -1664,7 +1680,7 @@ class ReActAgent(AgentStrategy):
 
             return False, None
 
-        for iteration in range(self.max_iterations):
+        for iteration in self._iterate_indices():
             current_call_seq = call_seq
             prompt = self.build_prompt(user_input, history, tools, {
                 "scratchpad": scratchpad,
@@ -1905,11 +1921,12 @@ class ReActAgent(AgentStrategy):
                     metadata={"iteration": iteration, "warning": "no_action"}
                 )
 
-        yield AgentStep(
-            step_type="answer",
-            content="Sorry, I could not complete the task within the limit.",
-            metadata={"agent_type": "react", "iterations": self.max_iterations, "max_iterations_reached": True}
-        )
+        if self.max_iterations is not None:
+            yield AgentStep(
+                step_type="answer",
+                content="Sorry, I could not complete the task within the limit.",
+                metadata={"agent_type": "react", "iterations": self.max_iterations, "max_iterations_reached": True}
+            )
 
     def build_prompt(
         self,
@@ -3160,4 +3177,4 @@ class ReActAgent(AgentStrategy):
             pass
 
     def get_max_iterations(self) -> int:
-        return self.max_iterations
+        return self.max_iterations if self.max_iterations is not None else 0

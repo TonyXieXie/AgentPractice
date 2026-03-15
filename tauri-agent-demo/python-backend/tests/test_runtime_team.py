@@ -272,7 +272,10 @@ class RuntimeTeamTests(unittest.TestCase):
             if message.role == "user" and isinstance(message.metadata, dict) and message.metadata.get("delegated_turn")
         ]
         self.assertEqual(len(delegated_user_messages), 1)
-        self.assertEqual(delegated_user_messages[0].content, "User asked for the implementation.")
+        self.assertIn("Delegated task for role coder.", delegated_user_messages[0].content)
+        self.assertIn("Delegation reason: Implement the change", delegated_user_messages[0].content)
+        self.assertIn("Original user request:\nUser asked for the implementation.", delegated_user_messages[0].content)
+        self.assertNotEqual(delegated_user_messages[0].content, "User asked for the implementation.")
         self.assertEqual(
             delegated_user_messages[0].metadata.get("work_summary"),
             "Reviewed the request and prepared the implementation plan.",
@@ -309,7 +312,7 @@ class RuntimeTeamTests(unittest.TestCase):
                 to_agent="coder",
                 reason="Implement the follow-up",
                 work_summary="Prepared the follow-up task for implementation.",
-                task_payload="User asked for the follow-up.",
+                task_payload="User asked for the implementation.",
             )
         )
         self.assertEqual(second["status"], "ok")
@@ -324,6 +327,21 @@ class RuntimeTeamTests(unittest.TestCase):
             if isinstance(message.metadata, dict) and message.metadata.get("event_type") == "handoff"
         ]
         self.assertEqual(len(second_handoff_messages), 2)
+        delegated_user_messages_after_reuse = [
+            message for message in session_repository.list_messages(reused_target.id)
+            if message.role == "user" and isinstance(message.metadata, dict) and message.metadata.get("delegated_turn")
+        ]
+        self.assertEqual(len(delegated_user_messages_after_reuse), 2)
+        self.assertIn("Delegation reason: Implement the follow-up", delegated_user_messages_after_reuse[-1].content)
+        self.assertIn(
+            "Completed upstream work before handoff:\nPrepared the follow-up task for implementation.",
+            delegated_user_messages_after_reuse[-1].content,
+        )
+        self.assertIn(
+            "Original user request:\nUser asked for the implementation.",
+            delegated_user_messages_after_reuse[-1].content,
+        )
+        self.assertNotEqual(delegated_user_messages_after_reuse[-1].content, "User asked for the implementation.")
 
     def test_nested_handoff_links_parent_chain(self):
         source = self._create_session(title="Planner Root", agent_profile="planner")
@@ -740,6 +758,90 @@ class RuntimeTeamTests(unittest.TestCase):
         self.assertEqual(assistant_final_event["message"]["id"], assistant_message_id)
         self.assertFalse(assistant_final_event["message"]["metadata"].get("agent_streaming"))
         self.assertIn("Completed work", assistant_final_event["message"]["content"])
+
+    def test_role_session_turn_disables_react_iteration_limit_for_team_session(self):
+        target = self._create_session(
+            title="Coder Role",
+            agent_profile="coder",
+            agent_team_id="delivery",
+            team_id="runtime-team-1",
+            role_key="coder",
+        )
+
+        class DummyHub:
+            def __init__(self):
+                self.events = []
+
+            async def emit(self, session_id, payload):
+                self.events.append((session_id, payload))
+
+        captured_limits = []
+
+        class FakeExecutor:
+            async def run(self, user_input, history, session_id, request_overrides):
+                yield AgentStep(step_type="answer", content="Completed work", metadata={})
+
+        coordinator = TeamCoordinator(copy.deepcopy(self.app_config))
+        self._patch_attr(team_coordinator_module, "get_ws_hub", lambda: DummyHub())
+        self._patch_attr(team_coordinator_module, "create_llm_client", lambda config: type("DummyClient", (), {"config": config})())
+        self._patch_attr(
+            team_coordinator_module,
+            "maybe_compress_context",
+            _async_return(
+                lambda **kwargs: (
+                    kwargs.get("current_summary", ""),
+                    kwargs.get("last_compressed_call_id"),
+                    kwargs.get("last_message_id"),
+                    False,
+                )
+            ),
+        )
+        self._patch_attr(
+            team_coordinator_module,
+            "maybe_compress_private_context",
+            _async_return(
+                lambda **kwargs: (
+                    kwargs.get("current_summary", ""),
+                    kwargs.get("last_compressed_step_id"),
+                    False,
+                )
+            ),
+        )
+        self._patch_attr(team_coordinator_module, "build_history_for_llm", lambda *args, **kwargs: [])
+        self._patch_attr(
+            team_coordinator_module,
+            "build_agent_prompt_and_tools",
+            lambda profile_id, _tools, include_tools=True, extra_context=None, exclude_ability_ids=None: (
+                f"Prompt for {profile_id}",
+                [],
+                profile_id,
+                [],
+            ),
+        )
+        self._patch_attr(team_coordinator_module, "build_live_pty_prompt", lambda _session_id: "")
+        self._patch_attr(team_coordinator_module, "append_reasoning_summary_prompt", lambda prompt, _summary: prompt)
+
+        def fake_create_agent_executor(*args, **kwargs):
+            captured_limits.append(kwargs.get("max_iterations"))
+            return FakeExecutor()
+
+        self._patch_attr(team_coordinator_module, "create_agent_executor", fake_create_agent_executor)
+
+        result = asyncio.run(
+            coordinator._run_role_session_turn(
+                session_id=target.id,
+                source_role="planner",
+                target_role="coder",
+                leader_role="planner",
+                reason="Implement the change",
+                work_summary="Planner reviewed the task and defined the coding work.",
+                task_payload="User asked for the implementation.",
+                handoff_id="handoff-no-limit-1",
+            )
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(captured_limits, [None])
 
     def test_role_session_turn_stops_local_execution_after_handoff(self):
         target = self._create_session(

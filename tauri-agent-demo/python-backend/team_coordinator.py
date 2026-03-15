@@ -584,9 +584,6 @@ class TeamCoordinator:
         work_summary: str,
         task_payload: str,
     ) -> str:
-        preferred_content = _normalize_text(task_payload)
-        if preferred_content:
-            return message_processor.preprocess_user_message(preferred_content)
         return message_processor.preprocess_user_message(
             self._build_delegated_user_message(source_role, target_role, leader_role, reason, work_summary, task_payload)
         )
@@ -988,11 +985,13 @@ class TeamCoordinator:
                 private_after_step_id=private_after_step_id,
             )
 
+            turn_react_max_iterations = None if current_team_id else react_max_iterations
+
             executor = create_agent_executor(
                 agent_type="react",
                 llm_client=llm_client,
                 tools=tools,
-                max_iterations=react_max_iterations,
+                max_iterations=turn_react_max_iterations,
                 system_prompt=system_prompt,
             )
 
