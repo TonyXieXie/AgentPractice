@@ -25,6 +25,12 @@ class PromptBuilderTeamPrefixTests(unittest.TestCase):
                         "abilities": [],
                     },
                     {
+                        "id": "analyst",
+                        "name": "Analyst",
+                        "description": "Analyze code paths, produce UML and flowchart artifacts, and flag doc/code mismatches.",
+                        "abilities": [],
+                    },
+                    {
                         "id": "coder",
                         "name": "Coder",
                         "description": "Implement the approved changes in the repository.",
@@ -42,7 +48,7 @@ class PromptBuilderTeamPrefixTests(unittest.TestCase):
                         "id": "delivery",
                         "name": "Delivery Team",
                         "leader_profile_id": "planner",
-                        "member_profile_ids": ["planner", "coder", "tester"],
+                        "member_profile_ids": ["planner", "analyst", "coder", "tester"],
                     }
                 ],
             }
@@ -61,7 +67,7 @@ class PromptBuilderTeamPrefixTests(unittest.TestCase):
         self.assertEqual(ability_ids, [])
         self.assertTrue(prompt.startswith("You are [Coder], a team member of Delivery Team."))
         self.assertIn("The leader role is: planner (Planner).", prompt)
-        self.assertIn("Your teammates are: planner (Planner), tester (Tester).", prompt)
+        self.assertIn("Your teammates are: planner (Planner), analyst (Analyst), tester (Tester).", prompt)
         self.assertIn("Your responsibility is: Implement the approved changes in the repository.", prompt)
         self.assertIn("Only the leader may decide that the user's overall task is complete.", prompt)
         self.assertIn("do not tell the user the task is fully complete", prompt)
@@ -69,6 +75,68 @@ class PromptBuilderTeamPrefixTests(unittest.TestCase):
         self.assertIn("explicitly mention the key modified files", prompt)
         self.assertIn("hand off back to the leader with a concise work summary", prompt)
         self.assertIn("You are a helpful assistant.", prompt)
+
+    def test_selected_team_prefix_supports_analyst_specialist(self):
+        app_config = {
+            "agent": {
+                "base_system_prompt": "You are a helpful assistant.",
+                "default_profile": "planner",
+                "profiles": [
+                    {
+                        "id": "planner",
+                        "name": "Planner",
+                        "description": "Own planning and delegation across the delivery workflow.",
+                        "abilities": [],
+                    },
+                    {
+                        "id": "analyst",
+                        "name": "Analyst",
+                        "description": "Analyze code paths, produce UML and flowchart artifacts, and flag doc/code mismatches.",
+                        "abilities": [],
+                    },
+                    {
+                        "id": "coder",
+                        "name": "Coder",
+                        "description": "Implement the approved changes in the repository.",
+                        "abilities": [],
+                    },
+                    {
+                        "id": "tester",
+                        "name": "Tester",
+                        "description": "Validate behavior and report regressions.",
+                        "abilities": [],
+                    },
+                ],
+                "teams": [
+                    {
+                        "id": "delivery",
+                        "name": "Delivery Team",
+                        "leader_profile_id": "planner",
+                        "member_profile_ids": ["planner", "analyst", "coder", "tester"],
+                    }
+                ],
+            }
+        }
+
+        with patch("agents.prompt_builder.get_app_config", return_value=app_config):
+            prompt, tools, resolved_id, ability_ids = build_agent_prompt_and_tools(
+                "analyst",
+                [],
+                include_tools=False,
+                extra_context={"active_team_id": "delivery"},
+            )
+
+        self.assertEqual(tools, [])
+        self.assertEqual(resolved_id, "analyst")
+        self.assertEqual(ability_ids, [])
+        self.assertTrue(prompt.startswith("You are [Analyst], a team member of Delivery Team."))
+        self.assertIn("The leader role is: planner (Planner).", prompt)
+        self.assertIn("Your teammates are: planner (Planner), coder (Coder), tester (Tester).", prompt)
+        self.assertIn(
+            "Your responsibility is: Analyze code paths, produce UML and flowchart artifacts, and flag doc/code mismatches.",
+            prompt,
+        )
+        self.assertIn("hand off back to the leader with a concise work summary", prompt)
 
     def test_legacy_team_prefix_uses_generic_name_and_fallback_responsibility(self):
         app_config = {

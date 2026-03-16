@@ -1497,6 +1497,10 @@ class TeamCoordinator:
             result_artifact_owner_role_key = _normalize_text(result.get("artifact_owner_role_key")) or None
             if not result_artifact_summary:
                 result_artifact_summary = _build_artifact_summary(result_changed_files)
+            if (result_artifact_summary or result_changed_files) and not result_artifact_owner_session_id:
+                result_artifact_owner_session_id = target_session.id
+            if (result_artifact_summary or result_changed_files) and not result_artifact_owner_role_key:
+                result_artifact_owner_role_key = to_agent
             if result.get("status") == "returned_to_leader":
                 returning_role = _normalize_text(result.get("from_role_key")) or to_agent
                 leader_target = _normalize_text(result.get("to_role_key")) or (leader_role or from_agent)

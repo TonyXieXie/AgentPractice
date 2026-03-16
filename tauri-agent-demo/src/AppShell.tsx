@@ -217,6 +217,42 @@ function getChangedFileBadge(status: string): string {
   return 'M';
 }
 
+function buildCompletedAssistantPreviewSteps(message: Message, steps: AgentStep[]): AgentStep[] {
+  const messageContent = typeof message.content === 'string' ? message.content.trim() : '';
+  if (messageContent) {
+    return [{ step_type: 'answer', content: messageContent }];
+  }
+
+  for (let i = steps.length - 1; i >= 0; i -= 1) {
+    const step = steps[i];
+    const content = typeof step?.content === 'string' ? step.content.trim() : '';
+    if (!content) continue;
+    if (step.step_type === 'answer') {
+      return [{ ...step, content }];
+    }
+  }
+
+  const answerDeltaContent = steps
+    .filter((step) => step.step_type === 'answer_delta' && typeof step.content === 'string')
+    .map((step) => step.content)
+    .join('')
+    .trim();
+  if (answerDeltaContent) {
+    return [{ step_type: 'answer', content: answerDeltaContent }];
+  }
+
+  for (let i = steps.length - 1; i >= 0; i -= 1) {
+    const step = steps[i];
+    const content = typeof step?.content === 'string' ? step.content.trim() : '';
+    if (!content) continue;
+    if (step.step_type === 'error') {
+      return [{ ...step, content }];
+    }
+  }
+
+  return [];
+}
+
 type PendingAttachment = {
   id: string;
   name: string;
@@ -3593,17 +3629,38 @@ function App() {
     [currentSessionKey, inFlightTick]
   );
   const displayMessages = useMemo(
-    () =>
-      messages.filter((msg) => {
+    () => {
+      const completedHandoffIds = new Set(
+        messages.flatMap((msg) => {
+          const metadata = ((msg as any)?.metadata || {}) as Record<string, unknown>;
+          const eventType = typeof metadata.event_type === 'string' ? metadata.event_type : '';
+          const handoffId = typeof metadata.handoff_id === 'string' ? metadata.handoff_id.trim() : '';
+          if (msg.role === 'assistant' && eventType === 'delegated_result' && handoffId) {
+            return [handoffId];
+          }
+          return [];
+        })
+      );
+
+      return messages.filter((msg) => {
         const metadata = ((msg as any)?.metadata || {}) as Record<string, unknown>;
         if (metadata?.skill_prompt) return false;
+        const eventType = typeof metadata.event_type === 'string' ? metadata.event_type : '';
+        const handoffId = typeof metadata.handoff_id === 'string' ? metadata.handoff_id.trim() : '';
+        const isCompletedHandoffMessage =
+          msg.role === 'assistant' &&
+          eventType === 'handoff' &&
+          handoffId.length > 0 &&
+          completedHandoffIds.has(handoffId);
+        if (isCompletedHandoffMessage) return false;
         const isPersistentPtyMessage =
           msg.role === 'assistant' &&
           typeof metadata?.pty_id === 'string' &&
           metadata.pty_id.trim().length > 0 &&
           parseBooleanMeta(metadata?.persistent) === true;
         return !isPersistentPtyMessage;
-      }),
+      });
+    },
     [messages]
   );
 
@@ -4163,7 +4220,7 @@ function App() {
                     const showPermission = Boolean(currentPendingPermission && msg.id === latestAssistantId);
                     const previousUser = (() => {
                       for (let i = index - 1; i >= 0; i -= 1) {
-                        if (messages[i]?.role === 'user') return messages[i];
+                        if (renderMessages[i]?.role === 'user') return renderMessages[i];
                       }
                       return null;
                     })();
@@ -4206,6 +4263,15 @@ function App() {
                         )
                       : '';
                     const handoffBody = isHandoffCard ? stripHandoffChangedFilesLine(String(msg.content || '')) : String(msg.content || '');
+                    const completedPreviewSteps =
+                      msg.role === 'assistant' && !isEventMessage && steps.length > 0 && !streaming && !showPermission
+                        ? buildCompletedAssistantPreviewSteps(msg, steps)
+                        : [];
+                    const showCompletedAssistantPreview = completedPreviewSteps.length > 0;
+                    const showFullAgentStepView =
+                      msg.role === 'assistant' &&
+                      !isEventMessage &&
+                      (showPermission || streaming || (steps.length > 0 && !showCompletedAssistantPreview));
                     const displayTimestamp =
                       isHandoffCard && handoffId
                         ? currentTeamHandoffDisplayTimeById.get(handoffId) || msg.timestamp
@@ -4219,7 +4285,7 @@ function App() {
                         className={`message ${msg.role}`}
                       >
                         <div className="message-content">
-                          {msg.role === 'assistant' && !isEventMessage && (steps.length > 0 || showPermission) ? (
+                          {showFullAgentStepView ? (
                             <AgentStepView
                               steps={steps}
                               sessionId={msg.session_id || currentSessionId || undefined}
@@ -4245,6 +4311,61 @@ function App() {
                               ptyInteraction={ptyInteraction}
                               resolveStepPtyBinding={resolveStepPtyBinding}
                             />
+                          ) : msg.role === 'assistant' && !isEventMessage && showCompletedAssistantPreview ? (
+                            <div className="assistant-process-stack">
+                              <div className="assistant-final-preview">
+                                <AgentStepView
+                                  steps={completedPreviewSteps}
+                                  sessionId={msg.session_id || currentSessionId || undefined}
+                                  messageId={msg.id}
+                                  onRollbackMessage={
+                                    previousUser?.id ? () => handleRollback(previousUser.id) : undefined
+                                  }
+                                  onRetryMessage={
+                                    previousUser?.content
+                                      ? () => handleRetryMessage(previousUser.id, previousUser.content)
+                                      : undefined
+                                  }
+                                  onOpenWorkFile={openWorkdirForFile}
+                                  currentWorkPath={currentWorkPath}
+                                  ptyInteraction={ptyInteraction}
+                                  resolveStepPtyBinding={resolveStepPtyBinding}
+                                />
+                              </div>
+                              <details className="assistant-process-panel">
+                                <summary className="assistant-process-summary">
+                                  <span>过程详情</span>
+                                  <span className="assistant-process-count">{`${steps.length} 步`}</span>
+                                </summary>
+                                <div className="assistant-process-body">
+                                  <AgentStepView
+                                    steps={steps}
+                                    sessionId={msg.session_id || currentSessionId || undefined}
+                                    messageId={msg.id}
+                                    streaming={streaming}
+                                    pendingPermission={showPermission ? currentPendingPermission : null}
+                                    onPermissionDecision={handlePermissionDecision}
+                                    permissionBusy={currentPermissionBusy}
+                                    onRollbackMessage={
+                                      previousUser?.id ? () => handleRollback(previousUser.id) : undefined
+                                    }
+                                    onRetryMessage={
+                                      previousUser?.content
+                                        ? () => handleRetryMessage(previousUser.id, previousUser.content)
+                                        : undefined
+                                    }
+                                    onRevertPatch={handleRevertPatch}
+                                    patchRevertBusy={patchRevertBusy}
+                                    onOpenWorkFile={openWorkdirForFile}
+                                    currentWorkPath={currentWorkPath}
+                                    debugActive={showDebugPanel}
+                                    onOpenDebugCall={(iteration) => handleOpenDebugCall(msg.id, iteration)}
+                                    ptyInteraction={ptyInteraction}
+                                    resolveStepPtyBinding={resolveStepPtyBinding}
+                                  />
+                                </div>
+                              </details>
+                            </div>
                           ) : msg.role === 'user' ? (
                             <>
                               {msg.content && <div className="message-text">{msg.content}</div>}

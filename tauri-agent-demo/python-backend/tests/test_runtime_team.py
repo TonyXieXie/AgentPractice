@@ -15,6 +15,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 import database
 import team_coordinator as team_coordinator_module
+from agent_team import AgentTeam
 from agents.base import AgentStep
 from fastapi import HTTPException
 from models import ChatMessageCreate, ChatSessionCreate, ChatSessionUpdate, LLMConfigCreate
@@ -31,6 +32,7 @@ def _build_app_config():
             "default_profile": "planner",
             "profiles": [
                 {"id": "planner", "name": "Planner", "abilities": []},
+                {"id": "analyst", "name": "Analyst", "abilities": []},
                 {"id": "coder", "name": "Coder", "abilities": []},
                 {"id": "tester", "name": "Tester", "abilities": []},
             ],
@@ -38,9 +40,10 @@ def _build_app_config():
                 "execution_mode": "multi_session",
                 "default_agent": "planner",
                 "members": [
-                    {"profile_id": "planner", "handoff_to": ["coder", "tester"]},
-                    {"profile_id": "coder", "handoff_to": ["planner", "tester"]},
-                    {"profile_id": "tester", "handoff_to": ["planner", "coder"]},
+                    {"profile_id": "planner", "handoff_to": ["analyst", "coder", "tester"]},
+                    {"profile_id": "analyst", "handoff_to": ["planner", "coder", "tester"]},
+                    {"profile_id": "coder", "handoff_to": ["planner", "analyst", "tester"]},
+                    {"profile_id": "tester", "handoff_to": ["planner", "analyst", "coder"]},
                 ],
             },
             "teams": [
@@ -48,7 +51,7 @@ def _build_app_config():
                     "id": "delivery",
                     "name": "Delivery Team",
                     "leader_profile_id": "planner",
-                    "member_profile_ids": ["planner", "coder", "tester"],
+                    "member_profile_ids": ["planner", "analyst", "coder", "tester"],
                 }
             ],
         }
@@ -101,6 +104,19 @@ class RuntimeTeamTests(unittest.TestCase):
         coordinator = TeamCoordinator(copy.deepcopy(self.app_config))
         coordinator._run_role_session_turn = types.MethodType(runner, coordinator)
         return coordinator
+
+    def test_delivery_team_exposes_analyst_specialist(self):
+        team = AgentTeam(copy.deepcopy(self.app_config))
+
+        self.assertEqual(
+            team.get_team_member_ids("delivery"),
+            ["planner", "analyst", "coder", "tester"],
+        )
+        self.assertEqual(team.get_team_leader_id("delivery"), "planner")
+        self.assertEqual(
+            team.list_handoff_target_ids("analyst", active_team_id="delivery"),
+            ["planner", "coder", "tester"],
+        )
 
     def test_create_session_api_strips_runtime_team_fields(self):
         created = session_service.create_session(

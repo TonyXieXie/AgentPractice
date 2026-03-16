@@ -114,6 +114,13 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 "prompt": "Use shell commands when validation or test execution is required."
             },
             {
+                "id": "analysis_artifacts",
+                "name": "Analysis Artifacts",
+                "type": "tooling",
+                "tools": ["write_file", "apply_patch", "run_shell"],
+                "prompt": "Persist analysis artifacts instead of leaving them only in chat. Prefer versionable diagram sources such as Mermaid or PlantUML, save them under docs/analysis/ or docs/diagrams/, and render SVG/PNG when a local renderer is available. If no renderer is installed, archive the diagram source together with a short README so it can be rendered later."
+            },
+            {
                 "id": "planner_workflow",
                 "name": "Planner Workflow",
                 "type": "workflow",
@@ -142,6 +149,18 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 "name": "Tester Constraints",
                 "type": "constraints",
                 "prompt": "Focus on verification and diagnosis. Do not modify project files directly."
+            },
+            {
+                "id": "analyst_workflow",
+                "name": "Analyst Workflow",
+                "type": "workflow",
+                "prompt": "Focus on code comprehension, architecture tracing, and discrepancy analysis. Prefer flowcharts, UML diagrams, and dependency notes when they clarify behavior. When documenting findings, include exact file references and summarize the runtime path, key branches, inputs and outputs, and side effects."
+            },
+            {
+                "id": "analyst_constraints",
+                "name": "Analyst Constraints",
+                "type": "constraints",
+                "prompt": "Do not change production code as part of analysis unless the task explicitly asks for implementation. When documentation and code disagree, mark the mismatch explicitly in the archived analysis output with the conflicting file references and the observed code behavior. Prefer adding annotations or companion notes over silently rewriting existing documents."
             }
         ],
         "profiles": [
@@ -174,6 +193,26 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                     "file_references",
                     "planner_workflow",
                     "planner_constraints"
+                ],
+                "spawnable": False
+            },
+            {
+                "id": "analyst",
+                "name": "Analyst",
+                "description": "Analyzes code paths, produces flowcharts and UML artifacts, archives analysis outputs, and flags documentation mismatches against code.",
+                "abilities": [
+                    "read_only_tools",
+                    "analysis_artifacts",
+                    "handoff_tool",
+                    "rg_search",
+                    "shell_exec",
+                    "pty_status",
+                    "code_map",
+                    "tool_json",
+                    "output_concise",
+                    "file_references",
+                    "analyst_workflow",
+                    "analyst_constraints"
                 ],
                 "spawnable": False
             },
@@ -220,7 +259,7 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
             "members": [
                 {
                     "profile_id": "default",
-                    "handoff_to": ["subagent", "planner", "coder", "tester"]
+                    "handoff_to": ["subagent", "planner", "analyst", "coder", "tester"]
                 },
                 {
                     "profile_id": "subagent",
@@ -228,15 +267,19 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 },
                 {
                     "profile_id": "planner",
-                    "handoff_to": ["coder", "tester", "default"]
+                    "handoff_to": ["analyst", "coder", "tester", "default"]
+                },
+                {
+                    "profile_id": "analyst",
+                    "handoff_to": ["planner", "coder", "tester", "default"]
                 },
                 {
                     "profile_id": "coder",
-                    "handoff_to": ["planner", "tester", "default"]
+                    "handoff_to": ["planner", "analyst", "tester", "default"]
                 },
                 {
                     "profile_id": "tester",
-                    "handoff_to": ["planner", "coder", "default"]
+                    "handoff_to": ["planner", "analyst", "coder", "default"]
                 }
             ]
         },
@@ -244,9 +287,9 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
             {
                 "id": "delivery",
                 "name": "Delivery Team",
-                "description": "Planner -> Coder -> Tester",
+                "description": "Planner -> Analyst -> Coder -> Tester",
                 "leader_profile_id": "planner",
-                "member_profile_ids": ["planner", "coder", "tester"]
+                "member_profile_ids": ["planner", "analyst", "coder", "tester"]
             }
         ],
         "default_profile": "default"

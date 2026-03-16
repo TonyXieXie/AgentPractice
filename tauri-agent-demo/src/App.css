@@ -669,6 +669,61 @@ body[data-platform="mac"] .app-titlebar {
   white-space: pre-wrap;
 }
 
+.assistant-process-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.assistant-process-panel {
+  margin: 0;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 12px;
+  background: rgba(148, 163, 184, 0.05);
+  overflow: hidden;
+}
+
+.assistant-process-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  color: #dbe5f0;
+  font-size: 0.92rem;
+}
+
+.assistant-process-summary::-webkit-details-marker {
+  display: none;
+}
+
+.assistant-process-summary::after {
+  content: '▾';
+  margin-left: 8px;
+  font-size: 0.8rem;
+  color: #9fb2c8;
+  transition: transform 0.18s ease;
+}
+
+.assistant-process-panel[open] .assistant-process-summary::after {
+  transform: rotate(180deg);
+}
+
+.assistant-process-count {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.5);
+  color: #9fb2c8;
+  font-size: 0.78rem;
+}
+
+.assistant-process-body {
+  padding: 0 12px 12px;
+}
+
 .message.system .message-content {
   background: rgba(157, 179, 199, 0.08);
   color: #c9d4df;
