@@ -22,12 +22,7 @@ GRAPH_START = "__start__"
 GRAPH_END = "__end__"
 _TEMPLATE_PATTERN = re.compile(r"\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}")
 _RESERVED_STATE_ROOTS = {"input", "messages"}
-_DEFAULT_GRAPH_NODE_INPUT = (
-    "You are executing a graph node. "
-    "Use graph_state.describe first to inspect the current state, then use graph_state.get or graph_state.set as needed. "
-    "Do not rely on any direct user message outside the graph state. "
-    "When you are finished, respond with a concise summary of what you concluded or changed."
-)
+_DEFAULT_GRAPH_NODE_INPUT_TEMPLATE = "{{state.input.user_message}}"
 
 
 def get_graph_definition(app_config: Dict[str, Any], graph_id: Optional[str]) -> Dict[str, Any]:
@@ -237,27 +232,6 @@ def _get_effective_state_schema(app_config: Dict[str, Any], graph: Dict[str, Any
     return deepcopy(graph_schema) if isinstance(graph_schema, list) else []
 
 
-def _build_user_state_message(
-    user_input: str,
-    *,
-    attachments: Optional[Any],
-    user_content: Optional[Any],
-) -> Dict[str, Any]:
-    message: Dict[str, Any] = {
-        "kind": "message",
-        "role": "user",
-        "author": "user",
-        "content": user_input,
-        "status": "received",
-        "timestamp": datetime.now().isoformat(),
-    }
-    if attachments is not None:
-        message["attachments"] = deepcopy(attachments)
-    if user_content is not None:
-        message["user_content"] = deepcopy(user_content)
-    return message
-
-
 def _append_state_message(state: Any, message: Dict[str, Any]) -> Any:
     current_messages = _resolve_path(state, "messages")
     if isinstance(current_messages, list):
@@ -281,11 +255,7 @@ def _inject_runtime_state(
         next_state = _set_state_path(next_state, "input.attachments", deepcopy(attachments))
     if user_content is not None:
         next_state = _set_state_path(next_state, "input.user_content", deepcopy(user_content))
-    return _set_state_path(
-        next_state,
-        "messages",
-        [_build_user_state_message(user_input, attachments=attachments, user_content=user_content)],
-    )
+    return _set_state_path(next_state, "messages", [])
 
 
 class GraphRunner:
@@ -422,24 +392,52 @@ class GraphRunner:
         ]
         mutable_summary = ", ".join(mutable_paths) if mutable_paths else "(no mutable fields configured)"
         return (
-            "## Graph State Mode\n"
-            "- The current user request is stored at `state.input.user_message`.\n"
+            "## State Context\n"
+            "- The current request is stored at `state.input.user_message`.\n"
             "- Additional multimodal context may be available at `state.input.attachments` and `state.input.user_content`.\n"
-            "- Treat graph state as your only source of current-turn context.\n"
+            "- Treat `state` as the source of current-turn context.\n"
             "- Use the `graph_state` tool to inspect state and to update only fields marked mutable.\n"
             f"- Mutable state fields: {mutable_summary}\n"
-            "- `state.input.*` and `state.messages` are runtime-managed and read-only.\n"
-            "- The runtime appends a summary entry to `state.messages` after each react node."
+            "- `state.input.*` and `state.messages` are read-only.\n"
+            "- `state.messages` stores prior assistant summaries in order and is maintained automatically."
         )
 
     def _build_react_node_input(self, node: Dict[str, Any]) -> str:
         template_context = self._build_template_context()
         raw_template = node.get("input_template")
         if raw_template is None or (isinstance(raw_template, str) and not raw_template.strip()):
-            return _DEFAULT_GRAPH_NODE_INPUT
+            raw_template = _DEFAULT_GRAPH_NODE_INPUT_TEMPLATE
         rendered_input = render_template(raw_template, template_context)
         node_input = _value_to_text(rendered_input).strip()
-        return node_input or _DEFAULT_GRAPH_NODE_INPUT
+        if node_input:
+            return node_input
+        fallback_input = render_template(_DEFAULT_GRAPH_NODE_INPUT_TEMPLATE, template_context)
+        return _value_to_text(fallback_input).strip()
+
+    def _build_react_history(self) -> List[Dict[str, str]]:
+        state_messages = _resolve_path(self.state, "messages")
+        if not isinstance(state_messages, list):
+            return []
+
+        history: List[Dict[str, str]] = []
+        for item in state_messages:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("role") or "").lower() != "assistant":
+                continue
+            content = _value_to_text(item.get("content")).strip()
+            if not content:
+                continue
+            author = _value_to_text(
+                item.get("author") or item.get("profile_id") or item.get("node_id") or "assistant"
+            ).strip()
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": f"[{author}] {content}" if author else content,
+                }
+            )
+        return history
 
     def _set_graph_state_path(self, path: str, value: Any) -> None:
         self.state = _set_state_path(self.state, path, value)
@@ -464,10 +462,11 @@ class GraphRunner:
                 or node_result.error.get("content")
                 or node_result.error
             ).strip()
+        author = _value_to_text(node.get("name") or self._active_node_profile_id or node.get("id")).strip()
         message = {
             "kind": "message",
             "role": "assistant",
-            "author": node.get("name") or self._active_node_profile_id or node.get("id"),
+            "author": author,
             "node_id": node.get("id"),
             "profile_id": self._active_node_profile_id,
             "content": content,
@@ -507,6 +506,7 @@ class GraphRunner:
                 "node_id": node_id,
                 "node_type": node_type,
                 "node_status": node_status,
+                "profile_id": self._active_node_profile_id,
             }
         )
         if edge_id:
@@ -542,6 +542,10 @@ class GraphRunner:
         request_overrides = dict(self.request_overrides)
         debug_ctx = dict(request_overrides.get("_debug") or {})
         debug_ctx["agent_type"] = "react"
+        debug_ctx["graph_run_id"] = self.graph_run.id if self.graph_run else None
+        debug_ctx["graph_id"] = self.graph_id
+        debug_ctx["node_id"] = node.get("id")
+        debug_ctx["profile_id"] = resolved_profile_id
         request_overrides["_debug"] = debug_ctx
         request_overrides.pop("user_content", None)
         request_overrides.pop("_post_user_messages", None)
@@ -565,7 +569,7 @@ class GraphRunner:
 
         async for raw_step in executor.run(
             user_input=node_input,
-            history=self.history,
+            history=self._build_react_history(),
             session_id=self.session.id,
             request_overrides=request_overrides,
         ):

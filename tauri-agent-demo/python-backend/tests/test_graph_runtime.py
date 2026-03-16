@@ -289,6 +289,7 @@ class GraphRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         received_inputs = []
         received_overrides = []
+        received_histories = []
 
         with (
             mock.patch.object(runtime_module, "session_repository", repo),
@@ -301,6 +302,7 @@ class GraphRunnerTests(unittest.IsolatedAsyncioTestCase):
                     lambda user_input, run_kwargs: (
                         received_inputs.append(user_input),
                         received_overrides.append(dict(run_kwargs.get("request_overrides", {}))),
+                        received_histories.append(copy.deepcopy(run_kwargs.get("history", []))),
                         [AgentStep(step_type="answer", content="state-first-ok", metadata={})],
                     )[-1]
                 ),
@@ -323,17 +325,27 @@ class GraphRunnerTests(unittest.IsolatedAsyncioTestCase):
             steps = [step async for step in runner.run()]
 
         self.assertEqual(steps[-1].content, "state-first-ok")
-        self.assertEqual(received_inputs, [runtime_module._DEFAULT_GRAPH_NODE_INPUT])
+        self.assertEqual(received_inputs, ["hello"])
+        self.assertEqual(received_histories, [[]])
         self.assertNotIn("user_content", received_overrides[0])
         self.assertNotIn("_post_user_messages", received_overrides[0])
 
         graph_run = next(iter(repo.graph_runs.values()))
         self.assertEqual(graph_run.state_json["input"]["user_message"], "hello")
         self.assertEqual(graph_run.state_json["input"]["user_content"], [{"type": "text", "text": "hello"}])
-        self.assertEqual(graph_run.state_json["messages"][0]["role"], "user")
-        self.assertEqual(graph_run.state_json["messages"][0]["content"], "hello")
-        self.assertEqual(graph_run.state_json["messages"][-1]["author"], "planner")
-        self.assertEqual(graph_run.state_json["messages"][-1]["content"], "state-first-ok")
+        self.assertEqual(graph_run.state_json["messages"], [
+            {
+                "kind": "message",
+                "role": "assistant",
+                "author": "planner",
+                "node_id": "answer",
+                "profile_id": "planner",
+                "content": "state-first-ok",
+                "status": "completed",
+                "timestamp": graph_run.state_json["messages"][0]["timestamp"],
+            }
+        ])
+        self.assertEqual(steps[-1].metadata["profile_id"], "planner")
 
     async def test_graph_state_updates_are_visible_and_persisted(self) -> None:
         repo = FakeSessionRepository(self.session)
@@ -393,10 +405,94 @@ class GraphRunnerTests(unittest.IsolatedAsyncioTestCase):
         graph_run = next(iter(repo.graph_runs.values()))
         self.assertEqual(graph_run.state_json["plan"]["current_task"], "implemented")
         self.assertEqual(graph_run.state_json["messages"][-1]["author"], "coder")
+        self.assertEqual(steps[-1].metadata["profile_id"], "coder")
 
         node_run = next(iter(repo.graph_node_runs.values()))
         self.assertEqual(node_run.state_patch_json, {"plan": {"current_task": "implemented"}})
         self.assertEqual(node_run.output_json["output"], "updated-state")
+
+    async def test_react_history_uses_assistant_messages_with_author_prefix(self) -> None:
+        repo = FakeSessionRepository(self.session)
+        app_config = copy.deepcopy(self.base_app_config)
+        app_config["agent"]["graphs"] = [
+            {
+                "id": "graph_under_test",
+                "name": "Assistant History",
+                "initial_state": {},
+                "nodes": [
+                    {
+                        "id": "planner",
+                        "type": "react_agent",
+                        "name": "Planner",
+                        "profile_id": "planner",
+                        "input_template": "plan={{state.input.user_message}}",
+                    },
+                    {
+                        "id": "coder",
+                        "type": "react_agent",
+                        "name": "Coder",
+                        "profile_id": "coder",
+                        "input_template": "implement={{state.input.user_message}}",
+                        "output_path": "final.answer",
+                    },
+                ],
+                "edges": [
+                    {"id": "start_to_planner", "source": "__start__", "target": "planner"},
+                    {"id": "planner_to_coder", "source": "planner", "target": "coder"},
+                    {"id": "coder_to_end", "source": "coder", "target": "__end__"},
+                ],
+            }
+        ]
+
+        seen_inputs = []
+        seen_histories = []
+        profile_sequence = ["planner", "coder"]
+
+        def create_executor(**kwargs):
+            current_profile = profile_sequence[len(seen_inputs)]
+            return FakeExecutor(
+                lambda user_input, run_kwargs: (
+                    seen_inputs.append(user_input),
+                    seen_histories.append(copy.deepcopy(run_kwargs.get("history", []))),
+                    [AgentStep(step_type="answer", content=f"{current_profile}-done", metadata={})],
+                )[-1]
+            )
+
+        with (
+            mock.patch.object(runtime_module, "session_repository", repo),
+            mock.patch.object(
+                runtime_module,
+                "build_agent_prompt_and_tools",
+                side_effect=[("system", [], "planner", []), ("system", [], "coder", [])],
+            ),
+            mock.patch.object(runtime_module, "append_reasoning_summary_prompt", side_effect=lambda prompt, summary: prompt),
+            mock.patch.object(runtime_module, "create_agent_executor", side_effect=create_executor),
+        ):
+            runner = GraphRunner(
+                app_config=app_config,
+                session=self.session,
+                request=self.request,
+                config=self.config,
+                llm_client=object(),
+                graph_id="graph_under_test",
+                user_message_id=31,
+                assistant_message_id=32,
+                user_input="ship feature",
+                history=[{"role": "user", "content": "legacy history should not be used"}],
+                request_overrides={},
+            )
+            steps = [step async for step in runner.run()]
+
+        self.assertEqual(seen_inputs, ["plan=ship feature", "implement=ship feature"])
+        self.assertEqual(seen_histories, [[], [{"role": "assistant", "content": "[Planner] planner-done"}]])
+        self.assertEqual(steps[-1].content, "coder-done")
+        self.assertEqual(steps[-1].metadata["profile_id"], "coder")
+
+        graph_run = next(iter(repo.graph_runs.values()))
+        self.assertEqual(
+            [message["author"] for message in graph_run.state_json["messages"]],
+            ["Planner", "Coder"],
+        )
 
     async def test_error_edge_routes_to_recovery_node(self) -> None:
         tool = EchoTool(fail=True)
@@ -533,7 +629,13 @@ class GraphRunnerTests(unittest.IsolatedAsyncioTestCase):
             assistant_message_id=8,
             graph_id="graph_under_test",
             request_text="hello",
-            state_json={"tool": {"value": "42"}},
+            state_json={
+                "tool": {"value": "42"},
+                "messages": [
+                    {"role": "user", "author": "user", "content": "hello"},
+                    {"role": "assistant", "author": "Planner", "content": "outlined plan"},
+                ],
+            },
             active_node_id="answer",
             status="running",
             hop_count=1,
@@ -588,6 +690,8 @@ class GraphRunnerTests(unittest.IsolatedAsyncioTestCase):
             }
         ]
 
+        received_histories = []
+
         with (
             mock.patch.object(runtime_module, "session_repository", repo),
             mock.patch.object(runtime_module, "build_agent_prompt_and_tools", return_value=("system", [], None, [])),
@@ -596,9 +700,10 @@ class GraphRunnerTests(unittest.IsolatedAsyncioTestCase):
                 runtime_module,
                 "create_agent_executor",
                 side_effect=lambda **kwargs: FakeExecutor(
-                    lambda user_input: [
-                        AgentStep(step_type="answer", content=f"resume:{user_input}", metadata={})
-                    ]
+                    lambda user_input, run_kwargs: (
+                        received_histories.append(copy.deepcopy(run_kwargs.get("history", []))),
+                        [AgentStep(step_type="answer", content=f"resume:{user_input}", metadata={})],
+                    )[-1]
                 ),
             ),
         ):
@@ -620,6 +725,7 @@ class GraphRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(steps[-1].content, "resume:value=42")
         self.assertEqual(steps[-1].metadata["edge_id"], "tool_to_answer")
+        self.assertEqual(received_histories, [[{"role": "assistant", "content": "[Planner] outlined plan"}]])
         updated_run = repo.graph_runs[existing_graph_run.id]
         self.assertEqual(updated_run.status, "completed")
         self.assertEqual(updated_run.active_node_id, GRAPH_END)

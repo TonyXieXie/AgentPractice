@@ -271,24 +271,28 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                         "type": "react_agent",
                         "name": "Planner",
                         "profile_id": "planner",
+                        "input_template": "{{state.input.user_message}}",
                     },
                     {
                         "id": "coder",
                         "type": "react_agent",
                         "name": "Coder",
                         "profile_id": "coder",
+                        "input_template": "{{state.input.user_message}}",
                     },
                     {
                         "id": "reviewer",
                         "type": "react_agent",
                         "name": "Reviewer",
                         "profile_id": "reviewer",
+                        "input_template": "{{state.input.user_message}}",
                     },
                     {
                         "id": "tester",
                         "type": "react_agent",
                         "name": "Tester",
                         "profile_id": "tester",
+                        "input_template": "{{state.input.user_message}}",
                         "output_path": "last_answer",
                     }
                 ],

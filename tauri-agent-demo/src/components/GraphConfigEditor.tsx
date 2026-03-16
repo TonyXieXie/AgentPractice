@@ -229,6 +229,7 @@ function createStarterGraph(existingGraphs: GraphDefinition[]): GraphDefinition 
                 id: reactNodeId,
                 type: 'react_agent',
                 name: 'Main Agent',
+                input_template: '{{state.input.user_message}}',
                 output_path: 'last_answer',
                 ui: {
                     position: { x: 320, y: 110 },
@@ -1178,6 +1179,7 @@ export default function GraphConfigEditor({
                         : nodeType === 'tool_call'
                             ? 'Tool Node'
                             : 'Router Node',
+                ...(nodeType === 'react_agent' ? { input_template: '{{state.input.user_message}}' } : {}),
                 ...(nodeType === 'tool_call' ? { tool_name: sortedTools[0]?.name || '' } : {}),
                 ui: { position: getNextNodePosition(currentGraph) },
             };
@@ -2318,7 +2320,7 @@ export default function GraphConfigEditor({
                                                 <div className="form-error">{currentNodeInputTemplateError}</div>
                                             ) : (
                                                 <small>
-                                                    Leave blank to use the default state-first instruction. {'{{input}}'}
+                                                    Leave blank to fall back to {'{{state.input.user_message}}'}. {'{{input}}'}
                                                     {' '}and {'{{request.*}}'} are invalid in graph mode.
                                                 </small>
                                             )}
