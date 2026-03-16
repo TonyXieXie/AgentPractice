@@ -1,9 +1,12 @@
 @echo off
-title Frontend - Tauri Desktop App
+setlocal EnableExtensions EnableDelayedExpansion
+set "TAURI_AGENT_PORT=%~1"
+if not defined TAURI_AGENT_PORT set "TAURI_AGENT_PORT=8000"
+title Frontend - Tauri Desktop App (!TAURI_AGENT_PORT!)
 cd /d "%~dp0"
 set "TAURI_AGENT_DATA_DIR=%~dp0.tauri-agent-data"
 set "TAURI_AGENT_EXTERNAL_BACKEND=1"
-set "VITE_API_BASE_URL=http://127.0.0.1:8000"
+set "VITE_API_BASE_URL=http://127.0.0.1:%TAURI_AGENT_PORT%"
 cls
 echo ========================================
 echo   Tauri Desktop App (Frontend)

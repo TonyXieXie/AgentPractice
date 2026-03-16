@@ -3,6 +3,26 @@ export type LLMProfile = 'openai' | 'openai_compatible' | 'deepseek' | 'zhipu';
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 export type ReasoningSummary = 'auto' | 'concise' | 'detailed';
 export type AgentMode = 'default' | 'super';
+export type GraphNodeType = 'react_agent' | 'tool_call' | 'router';
+
+export interface GraphCanvasPosition {
+    x: number;
+    y: number;
+}
+
+export interface GraphViewportState {
+    x: number;
+    y: number;
+    zoom: number;
+}
+
+export interface GraphNodeUI {
+    position?: GraphCanvasPosition;
+}
+
+export interface GraphDefinitionUI {
+    viewport?: GraphViewportState;
+}
 
 export interface ToolDefinition {
     name: string;
@@ -90,6 +110,57 @@ export interface CodeMapConfig {
     weight_mentions?: number;
 }
 
+export interface GraphNode {
+    id: string;
+    type: GraphNodeType;
+    name?: string;
+    description?: string;
+    profile_id?: string;
+    max_iterations?: number;
+    input_template?: any;
+    output_path?: string;
+    tool_name?: string;
+    args_template?: any;
+    ui?: GraphNodeUI;
+}
+
+export interface GraphEdge {
+    id?: string;
+    source: string;
+    target: string;
+    condition?: string;
+    priority?: number;
+    label?: string;
+}
+
+export type StateFieldType = 'string' | 'number' | 'boolean' | 'object' | 'array' | 'any';
+
+export interface StateFieldDefinition {
+    path: string;
+    type: StateFieldType;
+    mutable?: boolean;
+}
+
+export interface StatePreset {
+    id: string;
+    name: string;
+    description?: string;
+    state?: any;
+    state_schema?: StateFieldDefinition[];
+}
+
+export interface GraphDefinition {
+    id: string;
+    name: string;
+    initial_state?: any;
+    state_schema?: StateFieldDefinition[];
+    state_preset_id?: string;
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+    max_hops?: number;
+    ui?: GraphDefinitionUI;
+}
+
 export interface AgentConfig {
     base_system_prompt?: string;
     react_max_iterations?: number;
@@ -100,6 +171,9 @@ export interface AgentConfig {
     profiles?: AgentProfile[];
     default_profile?: string;
     subagent_profile?: string;
+    graphs?: GraphDefinition[];
+    default_graph_id?: string;
+    state_presets?: StatePreset[];
 }
 
 export interface ContextConfig {
@@ -217,6 +291,7 @@ export interface ChatSession {
     config_id: string;
     work_path?: string | null;
     agent_profile?: string | null;
+    graph_id?: string | null;
     parent_session_id?: string | null;
     context_summary?: string | null;
     last_compressed_llm_call_id?: number | null;
@@ -232,6 +307,7 @@ export interface ChatSessionCreate {
     config_id: string;
     work_path?: string | null;
     agent_profile?: string | null;
+    graph_id?: string | null;
     parent_session_id?: string | null;
 }
 
@@ -240,6 +316,7 @@ export interface ChatSessionUpdate {
     work_path?: string | null;
     config_id?: string;
     agent_profile?: string | null;
+    graph_id?: string | null;
     parent_session_id?: string | null;
 }
 
@@ -413,6 +490,7 @@ export interface ChatRequest {
     config_id?: string;
     work_path?: string | null;
     agent_profile?: string | null;
+    graph_id?: string | null;
     extra_work_paths?: string[] | null;
     agent_mode?: AgentMode;
     shell_unrestricted?: boolean;

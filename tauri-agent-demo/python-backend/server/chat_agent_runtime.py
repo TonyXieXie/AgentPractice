@@ -5,20 +5,16 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException
 
 from agents.base import AgentStep
-from agents.executor import create_agent_executor
-from agents.prompt_builder import build_agent_prompt_and_tools
 from app_config import get_app_config
 from code_map import build_code_map_prompt
 from context_compress import build_history_for_llm, maybe_compress_context
+from graph_runtime import GraphRunner, resolve_graph_id
 from llm_client import create_llm_client
 from message_processor import message_processor
 from models import ChatMessageCreate, ChatRequest, ChatSessionCreate, ChatSessionUpdate
 from repositories import chat_repository, config_repository, session_repository
 from skills import build_skill_prompt_sections, extract_skill_invocations, get_enabled_skills
 from stream_control import stream_stop_registry
-from tools.base import ToolRegistry
-
-from .agent_prompt_support import append_reasoning_summary_prompt, build_live_pty_prompt
 from .chat_support import (
     build_llm_user_content,
     collect_prepared_attachments,
@@ -67,6 +63,7 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
                     config_id=config_id,
                     work_path=request.work_path,
                     agent_profile=request.agent_profile,
+                    graph_id=request.graph_id,
                 )
             )
             new_session_created = True
@@ -77,6 +74,18 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
         if not config:
             raise HTTPException(status_code=404, detail="Config not found")
 
+        app_config = get_app_config()
+        resolved_graph_id = resolve_graph_id(
+            app_config,
+            request.graph_id,
+            getattr(session, "graph_id", None),
+        )
+        if resolved_graph_id != getattr(session, "graph_id", None):
+            session = session_repository.update_session(
+                session.id,
+                ChatSessionUpdate(graph_id=resolved_graph_id),
+            ) or session
+
         processed_message = message_processor.preprocess_user_message(request.message)
         if new_session_created:
             provisional_title = fallback_title(processed_message)
@@ -86,14 +95,34 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
         prepared_attachments, llm_image_urls = collect_prepared_attachments(request.attachments)
         user_content = build_llm_user_content(processed_message, llm_image_urls)
 
-        user_msg = chat_repository.create_message(
-            ChatMessageCreate(
-                session_id=session.id,
-                role="user",
-                content=processed_message,
-            )
+        existing_graph_run = session_repository.get_latest_incomplete_graph_run(
+            session.id,
+            request_text=processed_message,
         )
-        saved_attachments = save_prepared_attachments(user_msg.id, prepared_attachments)
+        if existing_graph_run and existing_graph_run.graph_id != resolved_graph_id:
+            existing_graph_run = None
+
+        user_message_id: Optional[int] = None
+        saved_attachments = []
+        if existing_graph_run and existing_graph_run.user_message_id and existing_graph_run.assistant_message_id:
+            user_message_id = int(existing_graph_run.user_message_id)
+            assistant_msg_id = int(existing_graph_run.assistant_message_id)
+            if not chat_repository.get_message(session.id, user_message_id):
+                existing_graph_run = None
+                assistant_msg_id = None
+
+        if existing_graph_run is None:
+            user_msg = chat_repository.create_message(
+                ChatMessageCreate(
+                    session_id=session.id,
+                    role="user",
+                    content=processed_message,
+                )
+            )
+            user_message_id = user_msg.id
+            saved_attachments = save_prepared_attachments(user_message_id, prepared_attachments)
+        else:
+            user_msg = chat_repository.get_message_details(session.id, user_message_id) or {"id": user_message_id}
 
         context_summary = getattr(session, "context_summary", None) or ""
         last_compressed_call_id = getattr(session, "last_compressed_llm_call_id", None)
@@ -103,7 +132,6 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
             else None
         )
 
-        app_config = get_app_config()
         llm_app_config = app_config.get("llm", {}) if isinstance(app_config, dict) else {}
         global_reasoning_summary = llm_app_config.get("reasoning_summary")
         if global_reasoning_summary:
@@ -112,17 +140,6 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
             except Exception:
                 pass
 
-        agent_type = request.agent_type_override if hasattr(request, "agent_type_override") else getattr(session, "agent_type", "react")
-        profile_id = request.agent_profile or getattr(session, "agent_profile", None)
-        include_tools = agent_type != "simple"
-        pty_prompt = build_live_pty_prompt(session.id)
-        system_prompt, tools, resolved_profile_id, ability_ids = build_agent_prompt_and_tools(
-            profile_id,
-            ToolRegistry.get_all(),
-            include_tools=include_tools,
-            extra_context={"pty_sessions": pty_prompt},
-            exclude_ability_ids=["code_map"],
-        )
         enabled_skills = get_enabled_skills()
         invoked_skill_names = extract_skill_invocations(processed_message, max_count=1)
         invoked_skills = []
@@ -133,9 +150,6 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
                 if skill:
                     invoked_skills.append(skill)
         skills_prompt = build_skill_prompt_sections([], invoked_skills)
-        system_prompt = append_reasoning_summary_prompt(system_prompt, global_reasoning_summary)
-        if resolved_profile_id and resolved_profile_id != getattr(session, "agent_profile", None):
-            session_repository.update_session(session.id, ChatSessionUpdate(agent_profile=resolved_profile_id))
 
         llm_client = create_llm_client(config)
         agent_config = app_config.get("agent", {}) if isinstance(app_config, dict) else {}
@@ -144,27 +158,11 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
         code_map_cfg = agent_config.get("code_map", {}) if isinstance(agent_config, dict) else {}
         code_map_enabled = bool(code_map_cfg.get("enabled", True))
         code_map_prompt = None
-        if "code_map" in ability_ids and ast_enabled and code_map_enabled:
+        if ast_enabled and code_map_enabled:
             code_map_prompt = build_code_map_prompt(
                 session.id,
                 request.work_path or getattr(session, "work_path", None),
             )
-        react_max_iterations = agent_config.get("react_max_iterations", 50)
-        try:
-            react_max_iterations = int(react_max_iterations)
-        except (TypeError, ValueError):
-            react_max_iterations = 50
-
-        try:
-            executor = create_agent_executor(
-                agent_type=agent_type,
-                llm_client=llm_client,
-                tools=tools,
-                max_iterations=react_max_iterations,
-                system_prompt=system_prompt,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
 
         sequence = 0
         final_answer = None
@@ -176,41 +174,15 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
             "tail_chars": int(context_config.get("long_data_tail_chars", 800) or 800),
         }
 
-        pending_compress_step = None
-        if agent_type != "react":
-            updated_summary, updated_call_id, updated_message_id, did_compress = await maybe_compress_context(
-                session_id=session.id,
-                config=config,
-                app_config=app_config,
-                llm_client=llm_client,
-                current_summary=context_summary,
-                last_compressed_call_id=last_compressed_call_id,
-                current_user_message_id=user_msg.id,
-                current_user_text=processed_message,
-            )
-            if did_compress:
-                context_summary = updated_summary
-                last_compressed_call_id = updated_call_id
-                last_compressed_message_id = updated_message_id
-                try:
-                    chat_repository.update_session_context(session.id, context_summary, last_compressed_call_id)
-                except Exception as exc:
-                    print(f"[Context Compress] Failed to update session context: {exc}")
-                pending_compress_step = AgentStep(
-                    step_type="observation",
-                    content="Compressing previous context...",
-                    metadata={"context_compress": True},
-                )
-
         history_for_llm = build_history_for_llm(
             session.id,
             last_compressed_message_id,
-            user_msg.id,
+            int(user_message_id),
             context_summary,
             code_map_prompt,
             prompt_truncation_cfg,
         )
-        if skills_prompt:
+        if skills_prompt and existing_graph_run is None:
             skill_meta = {"skill_prompt": True}
             if invoked_skills:
                 skill_meta["skill_name"] = invoked_skills[0].name
@@ -224,21 +196,23 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
                 )
             )
 
-        temp_assistant_msg = chat_repository.create_message(
-            ChatMessageCreate(
-                session_id=session.id,
-                role="assistant",
-                content="",
+        if existing_graph_run is None:
+            temp_assistant_msg = chat_repository.create_message(
+                ChatMessageCreate(
+                    session_id=session.id,
+                    role="assistant",
+                    content="",
+                )
             )
-        )
-        assistant_msg_id = temp_assistant_msg.id
+            assistant_msg_id = temp_assistant_msg.id
         stop_event = stream_stop_registry.create(assistant_msg_id)
         init_payload = {
             "session_id": session.id,
-            "user_message_id": user_msg.id,
+            "user_message_id": int(user_message_id),
             "assistant_message_id": assistant_msg_id,
-            "user_attachments": saved_attachments,
         }
+        if saved_attachments:
+            init_payload["user_attachments"] = saved_attachments
         await state.set_init_payload(init_payload)
         await state.emit(init_payload)
         request_overrides: Dict[str, Any] = {
@@ -250,39 +224,35 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
                 "summary": context_summary,
                 "last_call_id": last_compressed_call_id,
                 "last_message_id": last_compressed_message_id,
-                "current_user_message_id": user_msg.id,
+                "current_user_message_id": int(user_message_id),
             },
         }
         if request.extra_work_paths:
             request_overrides["extra_work_paths"] = [str(path) for path in request.extra_work_paths if path]
-        if llm_image_urls:
-            request_overrides["user_content"] = user_content
         if request.agent_mode is not None:
             request_overrides["agent_mode"] = request.agent_mode
         if request.shell_unrestricted is not None:
             request_overrides["shell_unrestricted"] = request.shell_unrestricted
-        if code_map_prompt:
-            request_overrides["_code_map_prompt"] = code_map_prompt
-        if skills_prompt:
+        if llm_image_urls:
+            request_overrides["user_content"] = user_content
+        if skills_prompt and existing_graph_run is None:
             request_overrides["_post_user_messages"] = [{"role": "user", "content": skills_prompt}]
-
-        if pending_compress_step:
-            chat_repository.save_agent_step(
-                message_id=assistant_msg_id,
-                step_type=pending_compress_step.step_type,
-                content=pending_compress_step.content,
-                sequence=sequence,
-                metadata=pending_compress_step.metadata,
-            )
-            await state.emit(pending_compress_step.to_dict())
-            sequence += 1
-
-        step_iter = executor.run(
+        step_iter = GraphRunner(
+            app_config=app_config,
+            session=session,
+            request=request,
+            config=config,
+            llm_client=llm_client,
+            graph_id=resolved_graph_id,
+            user_message_id=int(user_message_id),
+            assistant_message_id=int(assistant_msg_id),
             user_input=processed_message,
             history=history_for_llm,
-            session_id=session.id,
             request_overrides=request_overrides,
-        )
+            code_map_prompt=code_map_prompt,
+            user_content=user_content if llm_image_urls else None,
+            existing_graph_run=existing_graph_run,
+        ).run()
         step_queue: asyncio.Queue = asyncio.Queue()
 
         async def _produce_steps() -> None:

@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Optional
 
 from database import db
-from models import ChatMessage, ChatSession, ChatSessionCreate, ChatSessionUpdate
+from models import ChatMessage, ChatSession, ChatSessionCreate, ChatSessionUpdate, GraphNodeRun, GraphRun
 
 from . import chat_repository
 
@@ -94,3 +94,71 @@ def update_session_context(
 
 def update_context_estimate(session_id: str, estimate: Optional[Dict[str, Any]]) -> Optional[ChatSession]:
     return db.update_session_context_estimate(session_id, estimate)
+
+
+def create_graph_run(graph_run: GraphRun) -> GraphRun:
+    return db.create_graph_run(graph_run)
+
+
+def get_graph_run(graph_run_id: str) -> Optional[GraphRun]:
+    return db.get_graph_run(graph_run_id)
+
+
+def get_latest_incomplete_graph_run(session_id: str, request_text: Optional[str] = None) -> Optional[GraphRun]:
+    return db.get_latest_incomplete_graph_run(session_id, request_text=request_text)
+
+
+def update_graph_run(
+    graph_run_id: str,
+    *,
+    state_json: Optional[Any] = None,
+    active_node_id: Optional[str] = None,
+    status: Optional[str] = None,
+    hop_count: Optional[int] = None,
+    last_result: Optional[Dict[str, Any]] = None,
+    error: Optional[Dict[str, Any]] = None,
+    completed_at: Optional[str] = None,
+) -> Optional[GraphRun]:
+    return db.update_graph_run(
+        graph_run_id,
+        state_json=state_json,
+        active_node_id=active_node_id,
+        status=status,
+        hop_count=hop_count,
+        last_result=last_result,
+        error=error,
+        completed_at=completed_at,
+    )
+
+
+def create_graph_node_run(node_run: GraphNodeRun) -> GraphNodeRun:
+    return db.create_graph_node_run(node_run)
+
+
+def get_graph_node_run(graph_node_run_id: str) -> Optional[GraphNodeRun]:
+    return db.get_graph_node_run(graph_node_run_id)
+
+
+def update_graph_node_run(
+    graph_node_run_id: str,
+    *,
+    status: Optional[str] = None,
+    output_json: Optional[Dict[str, Any]] = None,
+    state_patch_json: Optional[Dict[str, Any]] = None,
+    error_json: Optional[Dict[str, Any]] = None,
+    completed_at: Optional[str] = None,
+    duration_ms: Optional[int] = None,
+) -> Optional[GraphNodeRun]:
+    return db.update_graph_node_run(
+        graph_node_run_id,
+        status=status,
+        output_json=output_json,
+        state_patch_json=state_patch_json,
+        error_json=error_json,
+        completed_at=completed_at,
+        duration_ms=duration_ms,
+    )
+
+
+def list_graph_node_runs(graph_run_id: str) -> List[GraphNodeRun]:
+    return db.get_graph_node_runs(graph_run_id)

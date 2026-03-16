@@ -98,12 +98,12 @@ function Get-PythonVersion([string[]]$cmd) {
     return $null
 }
 
-function Invoke-PythonCommand([string[]]$cmd, [string[]]$args) {
+function Invoke-PythonCommand([string[]]$cmd, [string[]]$pythonArgs) {
     if (-not $cmd -or $cmd.Length -eq 0) { return }
     if ($cmd.Length -gt 1) {
-        & $cmd[0] @($cmd[1..($cmd.Length - 1)]) @args
+        & $cmd[0] @($cmd[1..($cmd.Length - 1)]) @pythonArgs
     } else {
-        & $cmd[0] @args
+        & $cmd[0] @pythonArgs
     }
 }
 
@@ -212,9 +212,13 @@ if (-not (Test-Path $venvPython)) {
         $pyVer = Get-PythonVersion $pythonCmd
         if ($pyVer -and $pyVer -ge [version]"3.10.0") {
             Write-Host "System Python found: v$pyVer"
-            $pythonOk = $true
             Write-Host "Creating venv..."
             Invoke-PythonCommand $pythonCmd @("-m", "venv", $venvRoot)
+            if (Test-Path $venvPython) {
+                $pythonOk = $true
+            } else {
+                Write-Host "Virtual environment creation failed."
+            }
         } else {
             Write-Host "System Python version is too old or unknown."
         }
@@ -228,8 +232,13 @@ if (-not (Test-Path $venvPython)) {
                 if ($pythonCmd) {
                     Write-Host "Creating venv..."
                     Invoke-PythonCommand $pythonCmd @("-m", "venv", $venvRoot)
-                    $pythonOk = $true
-                    $installed.Add("Python 3.12")
+                    if (Test-Path $venvPython) {
+                        $pythonOk = $true
+                        $installed.Add("Python 3.12")
+                    } else {
+                        Write-Host "Virtual environment creation failed."
+                        $missing.Add("Python 3.12")
+                    }
                 } else {
                     $missing.Add("Python 3.12")
                 }

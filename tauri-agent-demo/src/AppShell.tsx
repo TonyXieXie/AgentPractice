@@ -78,6 +78,8 @@ import {
   resolveRelativePath,
   stripExistingSkillCommands,
 } from './features/appShell/helpers';
+import { openGraphStudioWindow } from './features/graphStudio/window';
+import { GRAPH_STUDIO_SYNC_KEY, readGraphStudioUpdateMarker } from './features/graphStudio/sync';
 import { useAppShellBootstrap } from './features/appShell/useBootstrap';
 import { useAppShellPtyStream } from './features/appShell/usePtyStream';
 import { useAppShellSessionChannel } from './features/appShell/useSessionChannel';
@@ -177,6 +179,7 @@ type QueueItem = {
   configId: string;
   agentMode: AgentMode;
   agentProfileId?: string | null;
+  graphId?: string | null;
   workPath?: string;
   extraWorkPaths?: string[];
   enqueuedAt: number;
@@ -270,6 +273,7 @@ function App() {
   const [agentMode, setAgentMode] = useState<AgentMode>('default');
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null);
   const [currentAgentProfileId, setCurrentAgentProfileId] = useState<string | null>(null);
+  const [currentGraphId, setCurrentGraphId] = useState<string | null>(null);
 
   const commandItems = useMemo<CommandItem[]>(
     () =>
@@ -296,6 +300,7 @@ function App() {
 
   const astEnabled = agentConfig?.ast_enabled ?? true;
   const [showProfileSelector, setShowProfileSelector] = useState(false);
+  const [showGraphSelector, setShowGraphSelector] = useState(false);
   const [showReasoningSelector, setShowReasoningSelector] = useState(false);
   const [showAgentModeSelector, setShowAgentModeSelector] = useState(false);
   const [queueTick, setQueueTick] = useState(0);
@@ -326,6 +331,7 @@ function App() {
   const userScrollRef = useRef(false);
   const lastUserScrollAtRef = useRef(0);
   const lastScrollTopRef = useRef(0);
+  const graphStudioUpdateRef = useRef(readGraphStudioUpdateMarker());
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const INPUT_MAX_HEIGHT = 240;
   const resizeInputRef = useRef<number | null>(null);
@@ -483,6 +489,48 @@ function App() {
   useEffect(() => {
     currentSessionIdRef.current = currentSessionId;
   }, [currentSessionId]);
+
+  useEffect(() => {
+    const graphs = agentConfig?.graphs || [];
+    if (!graphs.length) {
+      if (currentGraphId !== null) {
+        setCurrentGraphId(null);
+      }
+      return;
+    }
+    const desired =
+      currentGraphId && graphs.some((graph) => graph.id === currentGraphId)
+        ? currentGraphId
+        : (agentConfig?.default_graph_id || graphs[0]?.id || null);
+    if (desired !== currentGraphId) {
+      setCurrentGraphId(desired);
+    }
+  }, [agentConfig, currentGraphId]);
+
+  useEffect(() => {
+    const syncGraphConfig = () => {
+      const nextMarker = readGraphStudioUpdateMarker();
+      if (!nextMarker || nextMarker === graphStudioUpdateRef.current) {
+        return;
+      }
+      graphStudioUpdateRef.current = nextMarker;
+      void loadAgentConfig();
+    };
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== GRAPH_STUDIO_SYNC_KEY) {
+        return;
+      }
+      syncGraphConfig();
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('focus', syncGraphConfig);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('focus', syncGraphConfig);
+    };
+  }, [loadAgentConfig]);
 
   const isImageFile = (file: File) => {
     if (file.type && file.type.startsWith('image/')) return true;
@@ -823,7 +871,7 @@ function App() {
   }, [scheduleScrollToBottom]);
 
   useEffect(() => {
-    if (!showConfigSelector && !showReasoningSelector && !showAgentModeSelector && !showProfileSelector) return;
+    if (!showConfigSelector && !showReasoningSelector && !showAgentModeSelector && !showProfileSelector && !showGraphSelector) return;
     const handleClickOutside = (event: MouseEvent) => {
       const target = event.target as HTMLElement;
       if (showConfigSelector && !target.closest('.model-selector-inline')) {
@@ -838,6 +886,9 @@ function App() {
       if (showProfileSelector && !target.closest('.agent-profile-selector-inline')) {
         setShowProfileSelector(false);
       }
+      if (showGraphSelector && !target.closest('.agent-profile-selector-inline')) {
+        setShowGraphSelector(false);
+      }
     };
 
     document.addEventListener('click', handleClickOutside);
@@ -845,7 +896,7 @@ function App() {
     return () => {
       document.removeEventListener('click', handleClickOutside);
     };
-  }, [showConfigSelector, showReasoningSelector, showAgentModeSelector, showProfileSelector]);
+  }, [showConfigSelector, showReasoningSelector, showAgentModeSelector, showProfileSelector, showGraphSelector]);
 
   useEffect(() => {
     showDebugPanelRef.current = showDebugPanel;
@@ -1761,6 +1812,7 @@ function App() {
           config_id: item.configId,
           agent_mode: item.agentMode,
           agent_profile: item.agentProfileId || undefined,
+          graph_id: item.graphId || undefined,
           work_path: item.workPath || undefined,
           extra_work_paths: item.extraWorkPaths && item.extraWorkPaths.length > 0 ? item.extraWorkPaths : undefined,
           attachments: attachmentPayload,
@@ -2327,6 +2379,25 @@ function App() {
     }
   };
 
+  const handleGraphChange = async (graphId: string) => {
+    try {
+      const sessionId = currentSessionIdRef.current;
+      if (sessionId) {
+        await updateSession(sessionId, { graph_id: graphId });
+        setSessionRefreshTrigger((prev) => prev + 1);
+      }
+      setCurrentGraphId(graphId);
+      setShowGraphSelector(false);
+    } catch (error) {
+      console.error('Failed to switch graph:', error);
+      alert('Failed to switch graph.');
+    }
+  };
+
+  const handleOpenGraphStudio = useCallback(() => {
+    void openGraphStudioWindow();
+  }, []);
+
   const handleReasoningChange = async (value: ReasoningEffort) => {
     if (!currentConfig) return;
     try {
@@ -2749,6 +2820,7 @@ function App() {
       configId: currentConfig.id,
       agentMode,
       agentProfileId: resolveAgentProfileId(agentConfig, currentAgentProfileId),
+      graphId: currentGraphId,
       workPath,
       extraWorkPaths,
       enqueuedAt: Date.now(),
@@ -3006,6 +3078,7 @@ function App() {
         scheduleAstNotify(sessionWorkPath, [sessionWorkPath]);
       }
       setCurrentAgentProfileId(resolveAgentProfileId(agentConfig, session.agent_profile || null));
+      setCurrentGraphId(session.graph_id || agentConfig?.default_graph_id || agentConfig?.graphs?.[0]?.id || null);
       mark('session-apply');
 
       if (!cached || cached.length === 0) {
@@ -3468,6 +3541,13 @@ function App() {
   const agentProfiles = agentConfig?.profiles || [];
   const resolvedAgentProfileId = resolveAgentProfileId(agentConfig, currentAgentProfileId);
   const currentAgentProfile = agentProfiles.find((profile) => profile.id === resolvedAgentProfileId) || null;
+  const graphOptions = agentConfig?.graphs || [];
+  const resolvedGraphId =
+    (currentGraphId && graphOptions.some((graph) => graph.id === currentGraphId) ? currentGraphId : null)
+    || agentConfig?.default_graph_id
+    || graphOptions[0]?.id
+    || null;
+  const currentGraph = graphOptions.find((graph) => graph.id === resolvedGraphId) || null;
   const currentReasoning = (currentConfig?.reasoning_effort || 'medium') as ReasoningEffort;
   const workPathDisplay = useMemo(() => formatWorkPath(currentWorkPath), [currentWorkPath]);
   const visibleMessages = useMemo(() => {
@@ -3621,6 +3701,7 @@ function App() {
           onSelectSession={handleSelectSession}
           onNewChat={handleNewChat}
           onOpenConfig={() => setShowConfigManager(true)}
+          onOpenGraphStudio={handleOpenGraphStudio}
           onToggleDebug={toggleDebugPanel}
           onToggleSidebar={toggleSidebar}
           debugActive={showDebugPanel}
@@ -4065,11 +4146,11 @@ function App() {
                     )}
                   </div>
 
-                  {agentProfiles.length > 0 && (
-                    <div className="agent-profile-selector-inline">
-                      <button
-                        type="button"
-                        className={`agent-profile-selector-btn ${showProfileSelector ? 'active' : ''}`}
+                    {agentProfiles.length > 0 && (
+                      <div className="agent-profile-selector-inline">
+                        <button
+                          type="button"
+                          className={`agent-profile-selector-btn ${showProfileSelector ? 'active' : ''}`}
                         onClick={(e) => {
                           e.stopPropagation();
                           setShowProfileSelector(!showProfileSelector);
@@ -4103,9 +4184,61 @@ function App() {
                             </div>
                           ))}
                         </div>
-                      )}
-                    </div>
-                  )}
+                        )}
+                      </div>
+                    )}
+
+                    {graphOptions.length > 0 && (
+                      <div className="agent-profile-selector-inline">
+                        <button
+                          type="button"
+                          className={`agent-profile-selector-btn ${showGraphSelector ? 'active' : ''}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setShowGraphSelector(!showGraphSelector);
+                          }}
+                          disabled={!currentConfig}
+                          aria-label={`Graph: ${currentGraph?.name || resolvedGraphId || ''}`}
+                          title={`Graph: ${currentGraph?.name || resolvedGraphId || ''}`}
+                        >
+                          <span className="selector-text">
+                            {currentGraph?.name || resolvedGraphId || 'Graph'}
+                          </span>
+                          <span className="dropdown-arrow">{'\u25be'}</span>
+                        </button>
+
+                        {showGraphSelector && (
+                          <div className="agent-profile-dropdown-inline">
+                            {graphOptions.map((graph) => (
+                              <div
+                                key={graph.id}
+                                className={`agent-profile-option ${graph.id === resolvedGraphId ? 'active' : ''}`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleGraphChange(graph.id);
+                                }}
+                              >
+                                <div className="agent-profile-name">{graph.name}</div>
+                                {graph.id === agentConfig?.default_graph_id && (
+                                  <div className="agent-profile-meta">Default</div>
+                                )}
+                              </div>
+                            ))}
+                            <div
+                              className="agent-profile-option"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setShowGraphSelector(false);
+                                handleOpenGraphStudio();
+                              }}
+                            >
+                              <div className="agent-profile-name">Open Graph Studio</div>
+                              <div className="agent-profile-meta">Edit and create graphs</div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
 
                   <div className="reasoning-selector-inline">
                     <button

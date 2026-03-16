@@ -2,7 +2,9 @@
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 set PYTHONUTF8=1
-title Backend Server - FastAPI
+set "TAURI_AGENT_PORT=%~1"
+if not defined TAURI_AGENT_PORT set "TAURI_AGENT_PORT=8000"
+title Backend Server - FastAPI (!TAURI_AGENT_PORT!)
 cd /d "%~dp0python-backend"
 set "TAURI_AGENT_DATA_DIR=%~dp0.tauri-agent-data"
 set "PTY_DEBUG=1"
@@ -15,7 +17,8 @@ echo   Backend Server (FastAPI)
 echo ========================================
 echo.
 echo [Info] Runtime data dir: %TAURI_AGENT_DATA_DIR%
-echo Starting FastAPI server on port 8000 (auto-reload)...
+echo [Info] Backend port: %TAURI_AGENT_PORT%
+echo Starting FastAPI server on port %TAURI_AGENT_PORT% (auto-reload)...
 echo Press Ctrl+C to stop the server
 echo.
 echo ========================================
@@ -33,7 +36,7 @@ if not exist "%PY%" (
   "!SYS_PY!" -m venv "%~dp0python-backend\venv"
   "%~dp0python-backend\venv\Scripts\python.exe" -m pip install -r "%~dp0python-backend\requirements.txt"
 )
-"%PY%" -m uvicorn main:app --reload --host 127.0.0.1 --port 8000 --no-use-colors
+"%PY%" -m uvicorn main:app --reload --host 127.0.0.1 --port %TAURI_AGENT_PORT% --no-use-colors
 pause
 goto :eof
 

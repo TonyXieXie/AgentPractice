@@ -118,6 +118,8 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 6px 10px;
     text-transform: uppercase;
     color: #8b949e;
     margin-bottom: 6px;
@@ -129,6 +131,8 @@
     display: flex;
     align-items: center;
     gap: 6px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
 }
 
 .context-compress-badge {
@@ -167,6 +171,138 @@
 .agent-step-header-actions .observation-toggle {
     align-self: center;
     margin: 0;
+}
+
+.graph-step-badges {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+}
+
+.graph-step-badges.compact {
+    gap: 3px;
+}
+
+.graph-step-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    background: rgba(148, 163, 184, 0.08);
+    color: #dbe7f3;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
+}
+
+.graph-step-badges.compact .graph-step-badge {
+    padding: 2px 7px;
+}
+
+.graph-step-badge-label {
+    color: #8fa4bc;
+    font-size: 0.56rem;
+    letter-spacing: 0.08em;
+}
+
+.graph-step-badge-value {
+    color: inherit;
+    font-size: 0.62rem;
+    letter-spacing: 0.04em;
+    text-transform: none;
+}
+
+.graph-step-badge.graph {
+    border-color: rgba(96, 165, 250, 0.35);
+    background: rgba(37, 99, 235, 0.14);
+    color: #dbeafe;
+}
+
+.graph-step-badge.node {
+    border-color: rgba(94, 234, 212, 0.32);
+    background: rgba(13, 148, 136, 0.14);
+    color: #ccfbf1;
+}
+
+.graph-step-badge.edge {
+    border-color: rgba(250, 204, 21, 0.32);
+    background: rgba(161, 98, 7, 0.16);
+    color: #fef3c7;
+}
+
+.graph-step-badge.node-type.react-agent {
+    border-color: rgba(129, 140, 248, 0.34);
+    background: rgba(67, 56, 202, 0.16);
+    color: #e0e7ff;
+}
+
+.graph-step-badge.node-type.tool-call {
+    border-color: rgba(74, 222, 128, 0.34);
+    background: rgba(21, 128, 61, 0.16);
+    color: #dcfce7;
+}
+
+.graph-step-badge.node-type.router {
+    border-color: rgba(244, 114, 182, 0.32);
+    background: rgba(190, 24, 93, 0.16);
+    color: #fce7f3;
+}
+
+.graph-step-badge.node-status.running {
+    border-color: rgba(45, 212, 191, 0.42);
+    background: rgba(13, 148, 136, 0.18);
+    color: #ccfbf1;
+}
+
+.graph-step-badge.node-status.completed {
+    border-color: rgba(74, 222, 128, 0.34);
+    background: rgba(22, 101, 52, 0.16);
+    color: #dcfce7;
+}
+
+.graph-step-badge.node-status.error,
+.graph-step-badge.node-status.failed {
+    border-color: rgba(248, 113, 113, 0.42);
+    background: rgba(153, 27, 27, 0.18);
+    color: #fee2e2;
+}
+
+.graph-step-badge.node-status.skipped {
+    border-color: rgba(251, 191, 36, 0.36);
+    background: rgba(146, 64, 14, 0.18);
+    color: #fde68a;
+}
+
+.graph-step-status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: currentColor;
+    opacity: 0.88;
+    flex: 0 0 auto;
+}
+
+.graph-step-badge.node-status.running .graph-step-status-dot {
+    box-shadow: 0 0 0 0 rgba(45, 212, 191, 0.45);
+    animation: graph-step-pulse 1.6s ease-out infinite;
+}
+
+@keyframes graph-step-pulse {
+    0% {
+        box-shadow: 0 0 0 0 rgba(45, 212, 191, 0.42);
+        transform: scale(0.96);
+    }
+
+    70% {
+        box-shadow: 0 0 0 8px rgba(45, 212, 191, 0);
+        transform: scale(1);
+    }
+
+    100% {
+        box-shadow: 0 0 0 0 rgba(45, 212, 191, 0);
+        transform: scale(0.96);
+    }
 }
 
 .agent-step-category {

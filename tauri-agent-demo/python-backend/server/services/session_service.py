@@ -3,6 +3,8 @@ from typing import Optional
 
 from fastapi import HTTPException, Query
 
+from app_config import get_app_config
+from graph_runtime import resolve_graph_id
 from ghost_snapshot import restore_snapshot
 from models import ChatSessionCreate, ChatSessionUpdate, RollbackRequest
 from repositories import config_repository, session_repository
@@ -28,6 +30,11 @@ def create_session(session: ChatSessionCreate):
     config = config_repository.get_config(session.config_id)
     if not config:
         raise HTTPException(status_code=404, detail="Config not found")
+    if session.graph_id is not None:
+        try:
+            session.graph_id = resolve_graph_id(get_app_config(), session.graph_id, None)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     created = session_repository.create_session(session)
     schedule_ast_scan(created.work_path)
     return created
@@ -36,6 +43,14 @@ def create_session(session: ChatSessionCreate):
 def update_session(session_id: str, update: ChatSessionUpdate):
     if update.config_id is not None and not config_repository.get_config(update.config_id):
         raise HTTPException(status_code=404, detail="Config not found")
+    if update.graph_id is not None:
+        current = session_repository.get_session(session_id, include_count=False)
+        if not current:
+            raise HTTPException(status_code=404, detail="Session not found")
+        try:
+            update.graph_id = resolve_graph_id(get_app_config(), update.graph_id, getattr(current, "graph_id", None))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     session = session_repository.update_session(session_id, update)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")

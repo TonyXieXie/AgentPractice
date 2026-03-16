@@ -475,6 +475,20 @@ type GroupOptions = {
     onOpenDebugCall?: (iteration: number) => void;
 };
 
+type GraphStepMeta = {
+    graphId: string;
+    graphRunId: string;
+    nodeId: string;
+    nodeType: string;
+    nodeTypeClass: string;
+    nodeTypeLabel: string;
+    nodeStatus: string;
+    nodeStatusClass: string;
+    nodeStatusLabel: string;
+    edgeId: string;
+    hasGraphMeta: boolean;
+};
+
 const getIterationValue = (step: AgentStep): number | null => {
     const raw = (step.metadata as any)?.iteration;
     if (typeof raw === 'number') {
@@ -545,6 +559,118 @@ const groupStepElements = (items: StepItem[], options?: GroupOptions) => {
     flush();
     return groups;
 };
+
+const EMPTY_GRAPH_STEP_META: GraphStepMeta = {
+    graphId: '',
+    graphRunId: '',
+    nodeId: '',
+    nodeType: '',
+    nodeTypeClass: '',
+    nodeTypeLabel: '',
+    nodeStatus: '',
+    nodeStatusClass: '',
+    nodeStatusLabel: '',
+    edgeId: '',
+    hasGraphMeta: false
+};
+
+const readGraphMetaString = (metadata: AgentStep['metadata'], key: string) => {
+    const value = metadata?.[key];
+    return typeof value === 'string' && value.trim() ? value.trim() : '';
+};
+
+const toGraphClassToken = (value: string) =>
+    value
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+
+const formatGraphLabel = (value: string) => value.replace(/[_-]+/g, ' ').trim();
+
+const getGraphNodeTypeLabel = (value: string) => {
+    const normalized = value.trim().toLowerCase();
+    switch (normalized) {
+        case 'react_agent':
+            return 'react';
+        case 'tool_call':
+            return 'tool';
+        case 'router':
+            return 'router';
+        default:
+            return formatGraphLabel(value);
+    }
+};
+
+const getGraphStepMeta = (step?: AgentStep | null): GraphStepMeta => {
+    if (!step) return EMPTY_GRAPH_STEP_META;
+    const graphId = readGraphMetaString(step.metadata, 'graph_id');
+    const graphRunId = readGraphMetaString(step.metadata, 'graph_run_id');
+    const nodeId = readGraphMetaString(step.metadata, 'node_id');
+    const nodeType = readGraphMetaString(step.metadata, 'node_type');
+    const nodeStatus = readGraphMetaString(step.metadata, 'node_status');
+    const edgeId = readGraphMetaString(step.metadata, 'edge_id');
+    const hasGraphMeta = Boolean(graphId || graphRunId || nodeId || nodeType || nodeStatus || edgeId);
+
+    if (!hasGraphMeta) return EMPTY_GRAPH_STEP_META;
+
+    return {
+        graphId,
+        graphRunId,
+        nodeId,
+        nodeType,
+        nodeTypeClass: toGraphClassToken(nodeType),
+        nodeTypeLabel: getGraphNodeTypeLabel(nodeType),
+        nodeStatus,
+        nodeStatusClass: toGraphClassToken(nodeStatus),
+        nodeStatusLabel: formatGraphLabel(nodeStatus),
+        edgeId,
+        hasGraphMeta
+    };
+};
+
+function GraphStepBadges({ meta, compact = false }: { meta: GraphStepMeta; compact?: boolean }) {
+    if (!meta.hasGraphMeta) return null;
+
+    return (
+        <div
+            className={`graph-step-badges${compact ? ' compact' : ''}`}
+            title={meta.graphRunId ? `Graph run ${meta.graphRunId}` : undefined}
+        >
+            {meta.graphId && (
+                <span className="graph-step-badge graph">
+                    <span className="graph-step-badge-label">graph</span>
+                    <span className="graph-step-badge-value">{meta.graphId}</span>
+                </span>
+            )}
+            {meta.nodeId && (
+                <span className="graph-step-badge node">
+                    <span className="graph-step-badge-label">node</span>
+                    <span className="graph-step-badge-value">{meta.nodeId}</span>
+                </span>
+            )}
+            {meta.nodeType && (
+                <span className={`graph-step-badge node-type ${meta.nodeTypeClass || 'unknown'}`}>
+                    <span className="graph-step-badge-label">type</span>
+                    <span className="graph-step-badge-value">{meta.nodeTypeLabel || meta.nodeType}</span>
+                </span>
+            )}
+            {meta.nodeStatus && (
+                <span className={`graph-step-badge node-status ${meta.nodeStatusClass || 'unknown'}`}>
+                    <span className="graph-step-status-dot" aria-hidden="true" />
+                    <span className="graph-step-badge-label">status</span>
+                    <span className="graph-step-badge-value">{meta.nodeStatusLabel || meta.nodeStatus}</span>
+                </span>
+            )}
+            {meta.edgeId && (
+                <span className="graph-step-badge edge">
+                    <span className="graph-step-badge-label">edge</span>
+                    <span className="graph-step-badge-value">{meta.edgeId}</span>
+                </span>
+            )}
+        </div>
+    );
+}
 
 type LinkToken =
     | { type: 'text'; value: string }
@@ -768,6 +894,36 @@ function AgentStepView({
         });
         return indexByPty;
     }, [steps]);
+    const latestGraphMeta = useMemo(() => {
+        let fallback: GraphStepMeta | null = null;
+        for (let index = steps.length - 1; index >= 0; index -= 1) {
+            const meta = getGraphStepMeta(steps[index]);
+            if (!meta.hasGraphMeta) continue;
+            if (!fallback) fallback = meta;
+            if (meta.nodeStatusClass === 'running') {
+                return meta;
+            }
+        }
+        return fallback;
+    }, [steps]);
+    const streamingGraphCopy = useMemo(() => {
+        if (!latestGraphMeta?.hasGraphMeta) return 'Waiting for next step...';
+        const nodeLabel = latestGraphMeta.nodeId || latestGraphMeta.nodeTypeLabel || 'graph node';
+        if (latestGraphMeta.nodeStatusClass === 'running') {
+            return latestGraphMeta.graphId
+                ? `Executing ${nodeLabel} in ${latestGraphMeta.graphId}...`
+                : `Executing ${nodeLabel}...`;
+        }
+        if (latestGraphMeta.nodeStatusClass === 'error') {
+            return `Graph paused at ${nodeLabel}.`;
+        }
+        if (latestGraphMeta.edgeId) {
+            return `Waiting after edge ${latestGraphMeta.edgeId}...`;
+        }
+        return latestGraphMeta.graphId
+            ? `Waiting for next node in ${latestGraphMeta.graphId}...`
+            : 'Waiting for next graph node...';
+    }, [latestGraphMeta]);
 
     useEffect(() => {
         steps.forEach((step, index) => {
@@ -2115,6 +2271,7 @@ function AgentStepView({
                 const patchExpanded = isApplyPatch ? expandedPatches[stepKey] ?? patchExpandedDefault : false;
                 const showObservationToggle = isObservation && observationHasMore && !isApplyPatch;
                 const isObservationExpanded = isAstObservation ? (expandedObservations[stepKey] ?? true) : !!expandedObservations[stepKey];
+                const graphStepMeta = getGraphStepMeta(step);
 
                 return {
                     iteration,
@@ -2133,6 +2290,7 @@ function AgentStepView({
                                             <span className="agent-step-failure-icon" title="Failed">X</span>
                                         )}
                                         <span className="agent-step-type">{step.step_type}</span>
+                                        <GraphStepBadges meta={graphStepMeta} />
                                         {showObservationToggle && (
                                             <button
                                                 type="button"
@@ -2473,10 +2631,13 @@ function AgentStepView({
                 <div className="agent-step status">
                     <div className="agent-step-header">
                         <span className="agent-step-category">Streaming</span>
-                        <span className="agent-step-type">in-progress</span>
+                        <div className="agent-step-header-actions">
+                            {latestGraphMeta?.hasGraphMeta && <GraphStepBadges meta={latestGraphMeta} compact />}
+                            <span className="agent-step-type">in-progress</span>
+                        </div>
                     </div>
                     <div className="agent-step-content">
-                        <span className="content-text">Waiting for next step...</span>
+                        <span className="content-text">{streamingGraphCopy}</span>
                     </div>
                 </div>
             )}

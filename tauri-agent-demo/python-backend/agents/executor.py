@@ -100,13 +100,18 @@ class AgentExecutor:
             elif request_overrides and request_overrides.get("shell_unrestricted") is not None:
                 shell_unrestricted = bool(request_overrides.get("shell_unrestricted"))
 
+            graph_state_context = None
+            if request_overrides and request_overrides.get("_graph_state_context") is not None:
+                graph_state_context = request_overrides.get("_graph_state_context")
+
             token = set_tool_context({
                 "shell_unrestricted": shell_unrestricted,
                 "agent_mode": agent_mode or "default",
                 "session_id": session_id,
                 "work_path": work_path,
                 "extra_work_paths": extra_work_paths,
-                "message_id": message_id
+                "message_id": message_id,
+                "graph_state": graph_state_context,
             })
 
             async for step in self.strategy.execute(

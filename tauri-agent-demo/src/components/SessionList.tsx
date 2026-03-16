@@ -9,6 +9,7 @@ interface SessionListProps {
     onSelectSession: (sessionId: string) => void;
     onNewChat: () => void;
     onOpenConfig: () => void;
+    onOpenGraphStudio: () => void;
     onToggleDebug: () => void;
     onToggleSidebar?: () => void;
     debugActive: boolean;
@@ -23,6 +24,7 @@ export default function SessionList({
     onSelectSession,
     onNewChat,
     onOpenConfig,
+    onOpenGraphStudio,
     onToggleDebug,
     onToggleSidebar,
     debugActive,
@@ -297,6 +299,30 @@ export default function SessionList({
                             </svg>
                         </button>
                     )}
+                    <button
+                        className="header-btn"
+                        onClick={onOpenGraphStudio}
+                        title="Open Graph Studio"
+                        aria-label="Open Graph Studio"
+                    >
+                        <svg
+                            className="header-icon"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                        >
+                            <circle cx="6" cy="6" r="2.5" />
+                            <circle cx="18" cy="6" r="2.5" />
+                            <circle cx="12" cy="18" r="2.5" />
+                            <path d="M8.3 7.3l7.4 0" />
+                            <path d="M7.7 8.2l3.1 6.1" />
+                            <path d="M16.3 8.2l-3.1 6.1" />
+                        </svg>
+                    </button>
                     <button
                         className="header-btn"
                         onClick={onOpenConfig}

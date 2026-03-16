@@ -7,6 +7,8 @@ from typing import Any, Dict
 from fastapi import HTTPException
 from fastapi.responses import Response, StreamingResponse
 
+from app_config import get_app_config
+from graph_runtime import resolve_graph_id
 from ghost_snapshot import restore_snapshot
 from llm_client import create_llm_client
 from message_processor import message_processor
@@ -44,6 +46,12 @@ async def chat(request: ChatRequest):
                 raise HTTPException(status_code=404, detail="Session not found")
             if request.agent_profile is not None and request.agent_profile != getattr(session, "agent_profile", None):
                 session = session_repository.update_session(session.id, ChatSessionUpdate(agent_profile=request.agent_profile)) or session
+            if request.graph_id is not None and request.graph_id != getattr(session, "graph_id", None):
+                try:
+                    resolved_graph_id = resolve_graph_id(get_app_config(), request.graph_id, getattr(session, "graph_id", None))
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
+                session = session_repository.update_session(session.id, ChatSessionUpdate(graph_id=resolved_graph_id)) or session
         else:
             config_id = request.config_id
             if not config_id:
@@ -56,12 +64,19 @@ async def chat(request: ChatRequest):
                 else:
                     config_id = default_config.id
 
+            graph_id = None
+            if request.graph_id is not None:
+                try:
+                    graph_id = resolve_graph_id(get_app_config(), request.graph_id, None)
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
             session = session_repository.create_session(
                 ChatSessionCreate(
                     title="New Chat",
                     config_id=config_id,
                     work_path=request.work_path,
                     agent_profile=request.agent_profile,
+                    graph_id=graph_id,
                 )
             )
             new_session_created = True
@@ -165,14 +180,27 @@ async def chat_stream(request: ChatRequest):
                 raise HTTPException(status_code=404, detail="Session not found")
             if request.agent_profile is not None and request.agent_profile != getattr(session, "agent_profile", None):
                 session = session_repository.update_session(session.id, ChatSessionUpdate(agent_profile=request.agent_profile)) or session
+            if request.graph_id is not None and request.graph_id != getattr(session, "graph_id", None):
+                try:
+                    resolved_graph_id = resolve_graph_id(get_app_config(), request.graph_id, getattr(session, "graph_id", None))
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
+                session = session_repository.update_session(session.id, ChatSessionUpdate(graph_id=resolved_graph_id)) or session
         else:
             config_id = request.config_id if request.config_id else config_repository.list_configs()[0].id
+            graph_id = None
+            if request.graph_id is not None:
+                try:
+                    graph_id = resolve_graph_id(get_app_config(), request.graph_id, None)
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
             session = session_repository.create_session(
                 ChatSessionCreate(
                     title="New Chat",
                     config_id=config_id,
                     work_path=request.work_path,
                     agent_profile=request.agent_profile,
+                    graph_id=graph_id,
                 )
             )
             new_session_created = True

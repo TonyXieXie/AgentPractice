@@ -1,9 +1,20 @@
 import json
 import os
+import re
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
+
+from graph_runtime.expression import validate_edge_expression
 
 from runtime_paths import get_app_config_path as resolve_runtime_app_config_path
+
+GRAPH_START = "__start__"
+GRAPH_END = "__end__"
+DEFAULT_GRAPH_ID = "default_linear_react"
+STATE_FIELD_TYPES = {"string", "number", "boolean", "object", "array", "any"}
+RESERVED_STATE_ROOTS = {"input", "messages"}
+GRAPH_TEMPLATE_ROOTS = {"state", "result", "session"}
+_GRAPH_TEMPLATE_PATTERN = re.compile(r"\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}")
 
 
 _DEFAULT_APP_CONFIG: Dict[str, Any] = {
@@ -91,6 +102,69 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 "name": "File References",
                 "type": "output_format",
                 "prompt": "File References: When referencing files in your response, make sure to include the relevant start line and always follow the below rules:\n- Use inline code to make file paths clickable.\n- Each reference should have a stand alone path. Even if it's the same file.\n- Accepted: absolute, workspace-relative, a/ or b/ diff prefixes, or bare filename/suffix.\n- Line/column (1-based, optional): :line[:column] or #Lline[Ccolumn] (column defaults to 1).\n- Do not use URIs like file://, vscode://, or https://.\n- Do not provide range of lines.\n- Examples: src/app.ts, src/app.ts:42, b/server/index.js#L10, C:\\repo\\project\\main.rs:12:5"
+            },
+            {
+                "id": "read_only_tools",
+                "name": "Read Only Tools",
+                "type": "tooling",
+                "tools": ["rg", "search", "read_file", "list_files", "code_ast"],
+                "prompt": "Use read-only tools to inspect the repository before making recommendations."
+            },
+            {
+                "id": "handoff_tool",
+                "name": "Handoff Tool",
+                "type": "tooling",
+                "tools": ["handoff"],
+                "prompt": "When another specialist should continue, use handoff instead of continuing outside your role."
+            },
+            {
+                "id": "shell_exec",
+                "name": "Shell Execution",
+                "type": "tooling",
+                "tools": ["run_shell"],
+                "prompt": "Use shell commands when validation or test execution is required."
+            },
+            {
+                "id": "planner_workflow",
+                "name": "Planner Workflow",
+                "type": "workflow",
+                "prompt": "Break the request into concrete tasks, decide which agent should own each task, and hand off once the plan is ready. Do not modify files directly."
+            },
+            {
+                "id": "planner_constraints",
+                "name": "Planner Constraints",
+                "type": "constraints",
+                "prompt": "Stay focused on scoping, sequencing, and delegation. Do not claim implementation or test results you did not personally verify."
+            },
+            {
+                "id": "coder_workflow",
+                "name": "Coder Workflow",
+                "type": "workflow",
+                "prompt": "Implement the agreed changes, inspect existing code before editing, and leave the repository in a runnable state when possible."
+            },
+            {
+                "id": "reviewer_workflow",
+                "name": "Reviewer Workflow",
+                "type": "workflow",
+                "prompt": "Review the implementation critically, look for bugs and regressions, and hand off with precise findings. Do not edit project files directly."
+            },
+            {
+                "id": "reviewer_constraints",
+                "name": "Reviewer Constraints",
+                "type": "constraints",
+                "prompt": "Focus on code review, risk identification, and actionable feedback. Validate claims against the repository or command output before reporting them."
+            },
+            {
+                "id": "tester_workflow",
+                "name": "Tester Workflow",
+                "type": "workflow",
+                "prompt": "Validate the implementation by running relevant checks or tests, summarize failures precisely, and hand off when fixes are required."
+            },
+            {
+                "id": "tester_constraints",
+                "name": "Tester Constraints",
+                "type": "constraints",
+                "prompt": "Focus on verification and diagnosis. Do not modify project files directly."
             }
         ],
         "profiles": [
@@ -107,9 +181,152 @@ _DEFAULT_APP_CONFIG: Dict[str, Any] = {
                 "description": "Spawnable profile for delegated tasks.",
                 "abilities": ["tools_all", "rg_search", "apply_patch", "pty_status", "code_map", "tool_json", "output_concise", "file_references"],
                 "spawnable": True
+            },
+            {
+                "id": "planner",
+                "name": "Planner",
+                "description": "Breaks down user requests into a plan and routes work to the right specialist.",
+                "abilities": ["read_only_tools", "handoff_tool", "rg_search", "pty_status", "code_map", "tool_json", "output_concise", "file_references", "planner_workflow", "planner_constraints"],
+                "spawnable": False
+            },
+            {
+                "id": "coder",
+                "name": "Coder",
+                "description": "Implements code changes and repository updates.",
+                "abilities": ["tools_all", "rg_search", "apply_patch", "pty_status", "code_map", "tool_json", "output_concise", "file_references", "coder_workflow"],
+                "spawnable": False
+            },
+            {
+                "id": "reviewer",
+                "name": "Reviewer",
+                "description": "Reviews implementations, highlights risks, and decides whether work is ready for validation.",
+                "abilities": ["read_only_tools", "handoff_tool", "rg_search", "shell_exec", "pty_status", "code_map", "tool_json", "output_concise", "file_references", "reviewer_workflow", "reviewer_constraints"],
+                "spawnable": False
+            },
+            {
+                "id": "tester",
+                "name": "Tester",
+                "description": "Runs tests, validates behavior, and reports failures without editing code.",
+                "abilities": ["read_only_tools", "shell_exec", "handoff_tool", "rg_search", "pty_status", "code_map", "tool_json", "output_concise", "file_references", "tester_workflow", "tester_constraints"],
+                "spawnable": False
             }
         ],
-        "default_profile": "default"
+        "team": {
+            "execution_mode": "single_session",
+            "members": [
+                {
+                    "profile_id": "default",
+                    "handoff_to": ["subagent", "planner", "coder", "reviewer", "tester"]
+                },
+                {
+                    "profile_id": "subagent",
+                    "handoff_to": ["default"]
+                },
+                {
+                    "profile_id": "planner",
+                    "handoff_to": ["coder", "reviewer", "tester", "default"]
+                },
+                {
+                    "profile_id": "coder",
+                    "handoff_to": ["reviewer", "tester", "planner", "default"]
+                },
+                {
+                    "profile_id": "reviewer",
+                    "handoff_to": ["coder", "tester", "planner", "default"]
+                },
+                {
+                    "profile_id": "tester",
+                    "handoff_to": ["planner", "coder", "reviewer", "default"]
+                }
+            ],
+            "default_agent": "default"
+        },
+        "teams": [
+            {
+                "id": "delivery",
+                "name": "Delivery Team",
+                "leader_profile_id": "planner",
+                "member_profile_ids": ["planner", "coder", "reviewer", "tester"],
+                "description": "Planner -> Coder -> Reviewer -> Tester"
+            }
+        ],
+        "default_profile": "default",
+        "state_presets": [],
+        "graphs": [
+            {
+                "id": DEFAULT_GRAPH_ID,
+                "name": "Default Delivery Graph",
+                "initial_state": {
+                    "message": None,
+                    "current_task": None,
+                },
+                "state_schema": [
+                    {"path": "message", "type": "string"},
+                    {"path": "current_task", "type": "string"},
+                ],
+                "max_hops": 100,
+                "nodes": [
+                    {
+                        "id": "planner",
+                        "type": "react_agent",
+                        "name": "Planner",
+                        "profile_id": "planner",
+                    },
+                    {
+                        "id": "coder",
+                        "type": "react_agent",
+                        "name": "Coder",
+                        "profile_id": "coder",
+                    },
+                    {
+                        "id": "reviewer",
+                        "type": "react_agent",
+                        "name": "Reviewer",
+                        "profile_id": "reviewer",
+                    },
+                    {
+                        "id": "tester",
+                        "type": "react_agent",
+                        "name": "Tester",
+                        "profile_id": "tester",
+                        "output_path": "last_answer",
+                    }
+                ],
+                "edges": [
+                    {
+                        "id": "start_to_planner",
+                        "source": GRAPH_START,
+                        "target": "planner",
+                        "priority": 0,
+                    },
+                    {
+                        "id": "planner_to_coder",
+                        "source": "planner",
+                        "target": "coder",
+                        "priority": 0,
+                    },
+                    {
+                        "id": "coder_to_reviewer",
+                        "source": "coder",
+                        "target": "reviewer",
+                        "priority": 0,
+                    },
+                    {
+                        "id": "reviewer_to_tester",
+                        "source": "reviewer",
+                        "target": "tester",
+                        "priority": 0,
+                    },
+                    {
+                        "id": "tester_to_end",
+                        "source": "tester",
+                        "target": GRAPH_END,
+                        "priority": 0,
+                    },
+                ],
+            }
+        ],
+        "default_graph_id": DEFAULT_GRAPH_ID,
     }
 }
 
@@ -210,6 +427,480 @@ def _coerce_int_min(value: Any, field: str, min_value: int) -> int:
     if parsed < min_value:
         raise ValueError(f"{field} must be >= {min_value}")
     return parsed
+
+
+def _clone_json_value(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _coerce_float(value: Any, field: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be a number")
+
+
+def _normalize_graph_node_ui(value: Any, field: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
+    normalized: Dict[str, Any] = {}
+    position = value.get("position")
+    if position is not None:
+        if not isinstance(position, dict):
+            raise ValueError(f"{field}.position must be an object")
+        normalized["position"] = {
+            "x": _coerce_float(position.get("x"), f"{field}.position.x"),
+            "y": _coerce_float(position.get("y"), f"{field}.position.y"),
+        }
+    return normalized
+
+
+def _normalize_graph_definition_ui(value: Any, field: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
+    normalized: Dict[str, Any] = {}
+    viewport = value.get("viewport")
+    if viewport is not None:
+        if not isinstance(viewport, dict):
+            raise ValueError(f"{field}.viewport must be an object")
+        zoom = _coerce_float(viewport.get("zoom"), f"{field}.viewport.zoom")
+        if zoom <= 0:
+            raise ValueError(f"{field}.viewport.zoom must be > 0")
+        normalized["viewport"] = {
+            "x": _coerce_float(viewport.get("x"), f"{field}.viewport.x"),
+            "y": _coerce_float(viewport.get("y"), f"{field}.viewport.y"),
+            "zoom": zoom,
+        }
+    return normalized
+
+
+def _normalize_state_preset(
+    value: Any,
+    preset_index: int,
+    seen_ids: Set[str],
+    seen_names: Set[str],
+) -> Dict[str, Any]:
+    field_prefix = f"agent.state_presets[{preset_index}]"
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_prefix} must be an object")
+
+    preset_id = _ensure_non_empty_string(value.get("id"), f"{field_prefix}.id")
+    if preset_id in seen_ids:
+        raise ValueError("agent.state_presets.id must be unique")
+    seen_ids.add(preset_id)
+
+    preset_name = _ensure_non_empty_string(value.get("name"), f"{field_prefix}.name")
+    normalized_name = preset_name.lower()
+    if normalized_name in seen_names:
+        raise ValueError("agent.state_presets.name must be unique")
+    seen_names.add(normalized_name)
+
+    normalized_schema = _normalize_state_schema(
+        value.get("state_schema"),
+        f"{field_prefix}.state_schema",
+    )
+    state_value = _clone_json_value(value.get("state", {}))
+    _validate_no_reserved_state_roots(state_value, f"{field_prefix}.state")
+    normalized: Dict[str, Any] = {
+        "id": preset_id,
+        "name": preset_name,
+        "state": state_value,
+        "state_schema": normalized_schema,
+    }
+
+    description = _normalize_optional_string(value.get("description"), f"{field_prefix}.description")
+    if description is not None:
+        normalized["description"] = description
+
+    return normalized
+
+
+def _normalize_state_schema_path(value: Any, field: str) -> str:
+    path = _ensure_non_empty_string(value, field)
+    normalized = ".".join(part.strip() for part in path.split(".") if part.strip())
+    if not normalized:
+        raise ValueError(f"{field} is required")
+    return normalized
+
+
+def _state_path_root(path: str) -> str:
+    return str(path).split(".", 1)[0]
+
+
+def _is_reserved_state_path(path: str) -> bool:
+    return _state_path_root(path) in RESERVED_STATE_ROOTS
+
+
+def _validate_no_reserved_state_roots(value: Any, field: str) -> None:
+    if not isinstance(value, dict):
+        return
+    conflicts = sorted(str(key) for key in value.keys() if str(key) in RESERVED_STATE_ROOTS)
+    if conflicts:
+        raise ValueError(
+            f"{field} cannot define reserved runtime state root(s): {', '.join(conflicts)}"
+        )
+
+
+def _validate_graph_template_roots(value: Any, field: str) -> None:
+    if isinstance(value, str):
+        for match in _GRAPH_TEMPLATE_PATTERN.finditer(value):
+            expression = str(match.group(1) or "").strip()
+            if not expression:
+                continue
+            root = expression.split(".", 1)[0]
+            if root not in GRAPH_TEMPLATE_ROOTS:
+                raise ValueError(
+                    f"{field} only supports template roots: {', '.join(sorted(GRAPH_TEMPLATE_ROOTS))}"
+                )
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_graph_template_roots(item, f"{field}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _validate_graph_template_roots(item, f"{field}.{key}")
+
+
+def _normalize_state_schema(value: Any, field: str) -> List[Dict[str, Any]]:
+    if value is None:
+        value = []
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list")
+
+    normalized: List[Dict[str, Any]] = []
+    seen_paths: Set[str] = set()
+    for index, item in enumerate(value):
+        item_field = f"{field}[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{item_field} must be an object")
+        path = _normalize_state_schema_path(item.get("path"), f"{item_field}.path")
+        if path in seen_paths:
+            raise ValueError(f"{field}.path must be unique")
+        seen_paths.add(path)
+        field_type = _ensure_non_empty_string(item.get("type"), f"{item_field}.type").lower()
+        if field_type not in STATE_FIELD_TYPES:
+            raise ValueError(
+                f"{item_field}.type must be one of: {', '.join(sorted(STATE_FIELD_TYPES))}"
+            )
+        if _is_reserved_state_path(path):
+            raise ValueError(f"{item_field}.path cannot use reserved runtime state path '{path}'")
+        mutable = False
+        if item.get("mutable") is not None:
+            mutable = _coerce_bool(item.get("mutable"), f"{item_field}.mutable")
+        normalized.append({"path": path, "type": field_type, "mutable": mutable})
+    return normalized
+
+
+def _default_graph_definition() -> Dict[str, Any]:
+    agent_defaults = _DEFAULT_APP_CONFIG.get("agent", {})
+    graphs = agent_defaults.get("graphs") if isinstance(agent_defaults, dict) else None
+    if isinstance(graphs, list) and graphs:
+        return _clone_json_value(graphs[0])
+    raise ValueError("Default graph definition is missing")
+
+
+def _ensure_non_empty_string(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field} is required")
+    return normalized
+
+
+def _normalize_optional_string(value: Any, field: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    normalized = value.strip()
+    return normalized or None
+
+
+def _normalize_graph_node(value: Any, graph_index: int, node_index: int, seen_ids: Set[str]) -> Dict[str, Any]:
+    field_prefix = f"agent.graphs[{graph_index}].nodes[{node_index}]"
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_prefix} must be an object")
+
+    node_id = _ensure_non_empty_string(value.get("id"), f"{field_prefix}.id")
+    if node_id in (GRAPH_START, GRAPH_END):
+        raise ValueError(f"{field_prefix}.id cannot use reserved id {node_id}")
+    if node_id in seen_ids:
+        raise ValueError(f"{field_prefix}.id must be unique within the graph")
+    seen_ids.add(node_id)
+
+    node_type = _ensure_non_empty_string(value.get("type"), f"{field_prefix}.type")
+    if node_type not in ("react_agent", "tool_call", "router"):
+        raise ValueError(f"{field_prefix}.type must be one of: react_agent, tool_call, router")
+
+    normalized: Dict[str, Any] = {
+        "id": node_id,
+        "type": node_type,
+    }
+
+    for key in ("name", "description", "profile_id", "output_path", "tool_name"):
+        normalized_value = _normalize_optional_string(value.get(key), f"{field_prefix}.{key}")
+        if normalized_value is not None:
+            normalized[key] = normalized_value
+
+    if normalized.get("output_path") and _is_reserved_state_path(str(normalized.get("output_path"))):
+        raise ValueError(
+            f"{field_prefix}.output_path cannot target reserved runtime state path '{normalized['output_path']}'"
+        )
+
+    if "input_template" in value:
+        normalized["input_template"] = value.get("input_template")
+    if "args_template" in value:
+        normalized["args_template"] = value.get("args_template")
+
+    if value.get("max_iterations") is not None:
+        normalized["max_iterations"] = _coerce_int_min(
+            value.get("max_iterations"),
+            f"{field_prefix}.max_iterations",
+            1,
+        )
+    if value.get("ui") is not None:
+        normalized_ui = _normalize_graph_node_ui(value.get("ui"), f"{field_prefix}.ui")
+        if normalized_ui:
+            normalized["ui"] = normalized_ui
+
+    if node_type == "tool_call":
+        if not normalized.get("tool_name"):
+            raise ValueError(f"{field_prefix}.tool_name is required for tool_call nodes")
+    else:
+        normalized.pop("tool_name", None)
+
+    if node_type == "react_agent":
+        if "args_template" in normalized:
+            normalized.pop("args_template", None)
+        normalized.pop("tool_name", None)
+    else:
+        normalized.pop("profile_id", None)
+        normalized.pop("max_iterations", None)
+        if node_type != "router":
+            normalized.pop("input_template", None)
+
+    if node_type == "router":
+        normalized.pop("profile_id", None)
+        normalized.pop("max_iterations", None)
+        normalized.pop("tool_name", None)
+        normalized.pop("args_template", None)
+        normalized.pop("input_template", None)
+        normalized.pop("output_path", None)
+
+    if "input_template" in normalized:
+        _validate_graph_template_roots(normalized["input_template"], f"{field_prefix}.input_template")
+    if "args_template" in normalized:
+        _validate_graph_template_roots(normalized["args_template"], f"{field_prefix}.args_template")
+
+    return normalized
+
+
+def _normalize_graph_edge(
+    value: Any,
+    graph_index: int,
+    edge_index: int,
+    valid_node_ids: Set[str],
+) -> Dict[str, Any]:
+    field_prefix = f"agent.graphs[{graph_index}].edges[{edge_index}]"
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_prefix} must be an object")
+
+    source = _ensure_non_empty_string(value.get("source"), f"{field_prefix}.source")
+    target = _ensure_non_empty_string(value.get("target"), f"{field_prefix}.target")
+    if source == GRAPH_END:
+        raise ValueError(f"{field_prefix}.source cannot be {GRAPH_END}")
+    if target == GRAPH_START:
+        raise ValueError(f"{field_prefix}.target cannot be {GRAPH_START}")
+    if source != GRAPH_START and source not in valid_node_ids:
+        raise ValueError(f"{field_prefix}.source references unknown node '{source}'")
+    if target != GRAPH_END and target not in valid_node_ids:
+        raise ValueError(f"{field_prefix}.target references unknown node '{target}'")
+
+    edge_id = _normalize_optional_string(value.get("id"), f"{field_prefix}.id")
+    if edge_id is None:
+        edge_id = f"{source}_to_{target}_{edge_index}"
+
+    priority = 0
+    if value.get("priority") is not None:
+        priority = _coerce_int_min(value.get("priority"), f"{field_prefix}.priority", 0)
+
+    condition = _normalize_optional_string(value.get("condition"), f"{field_prefix}.condition")
+    if condition is not None:
+        validate_edge_expression(condition)
+
+    normalized: Dict[str, Any] = {
+        "id": edge_id,
+        "source": source,
+        "target": target,
+        "priority": priority,
+    }
+    if condition is not None:
+        normalized["condition"] = condition
+    label = _normalize_optional_string(value.get("label"), f"{field_prefix}.label")
+    if label is not None:
+        normalized["label"] = label
+    return normalized
+
+
+def _graph_has_path_to_end(
+    outgoing: Dict[str, List[Dict[str, Any]]],
+    current: str,
+    visiting: Optional[Set[str]] = None,
+    visited: Optional[Set[str]] = None,
+) -> bool:
+    if current == GRAPH_END:
+        return True
+    visiting = visiting or set()
+    visited = visited or set()
+    if current in visiting:
+        return False
+    if current in visited:
+        return False
+    visiting.add(current)
+    for edge in outgoing.get(current, []):
+        target = edge.get("target")
+        if isinstance(target, str) and _graph_has_path_to_end(outgoing, target, visiting, visited):
+            return True
+    visiting.remove(current)
+    visited.add(current)
+    return False
+
+
+def _normalize_graph_definition(
+    value: Any,
+    graph_index: int,
+    preset_ids: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    field_prefix = f"agent.graphs[{graph_index}]"
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_prefix} must be an object")
+
+    graph_id = _ensure_non_empty_string(value.get("id"), f"{field_prefix}.id")
+    graph_name = _ensure_non_empty_string(value.get("name"), f"{field_prefix}.name")
+
+    max_hops = 100
+    if value.get("max_hops") is not None:
+        max_hops = _coerce_int_range(value.get("max_hops"), f"{field_prefix}.max_hops", 1, 10000)
+    normalized_ui = None
+    if value.get("ui") is not None:
+        normalized_ui = _normalize_graph_definition_ui(value.get("ui"), f"{field_prefix}.ui")
+
+    raw_nodes = value.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        raise ValueError(f"{field_prefix}.nodes must be a non-empty list")
+
+    node_ids: Set[str] = set()
+    normalized_nodes = [
+        _normalize_graph_node(node, graph_index, node_index, node_ids)
+        for node_index, node in enumerate(raw_nodes)
+    ]
+
+    raw_edges = value.get("edges")
+    if not isinstance(raw_edges, list) or not raw_edges:
+        raise ValueError(f"{field_prefix}.edges must be a non-empty list")
+
+    normalized_edges = [
+        _normalize_graph_edge(edge, graph_index, edge_index, node_ids)
+        for edge_index, edge in enumerate(raw_edges)
+    ]
+
+    edge_ids: Set[str] = set()
+    fallback_by_source: Dict[str, int] = {}
+    outgoing: Dict[str, List[Dict[str, Any]]] = {}
+    has_start_edge = False
+    for edge in normalized_edges:
+        edge_id = edge["id"]
+        if edge_id in edge_ids:
+            raise ValueError(f"{field_prefix}.edges.id must be unique within the graph")
+        edge_ids.add(edge_id)
+
+        source = edge["source"]
+        outgoing.setdefault(source, []).append(edge)
+        if source == GRAPH_START:
+            has_start_edge = True
+        if not edge.get("condition"):
+            fallback_by_source[source] = fallback_by_source.get(source, 0) + 1
+            if fallback_by_source[source] > 1:
+                raise ValueError(
+                    f"{field_prefix}.edges allows at most one fallback edge per source node"
+                )
+
+    if not has_start_edge:
+        raise ValueError(f"{field_prefix} must define at least one edge from {GRAPH_START}")
+
+    if not _graph_has_path_to_end(outgoing, GRAPH_START):
+        raise ValueError(f"{field_prefix} must have a path from {GRAPH_START} to {GRAPH_END}")
+
+    initial_state = _clone_json_value(value.get("initial_state", {}))
+    _validate_no_reserved_state_roots(initial_state, f"{field_prefix}.initial_state")
+    normalized_graph = {
+        "id": graph_id,
+        "name": graph_name,
+        "initial_state": initial_state,
+        "state_schema": _normalize_state_schema(
+            value.get("state_schema"),
+            f"{field_prefix}.state_schema",
+        ),
+        "nodes": normalized_nodes,
+        "edges": normalized_edges,
+        "max_hops": max_hops,
+    }
+    state_preset_id = _normalize_optional_string(value.get("state_preset_id"), f"{field_prefix}.state_preset_id")
+    if state_preset_id is not None:
+        if preset_ids is not None and state_preset_id not in preset_ids:
+            raise ValueError(f"{field_prefix}.state_preset_id references unknown preset '{state_preset_id}'")
+        normalized_graph["state_preset_id"] = state_preset_id
+    if normalized_ui:
+        normalized_graph["ui"] = normalized_ui
+    return normalized_graph
+
+
+def _normalize_graphs(agent: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(agent)
+    raw_state_presets = normalized.get("state_presets")
+    if raw_state_presets is None:
+        raw_state_presets = []
+    if not isinstance(raw_state_presets, list):
+        raise ValueError("agent.state_presets must be a list")
+
+    preset_ids: Set[str] = set()
+    preset_names: Set[str] = set()
+    normalized["state_presets"] = [
+        _normalize_state_preset(preset, preset_index, preset_ids, preset_names)
+        for preset_index, preset in enumerate(raw_state_presets)
+    ]
+
+    raw_graphs = normalized.get("graphs")
+    if raw_graphs is None:
+        raw_graphs = []
+    if not isinstance(raw_graphs, list):
+        raise ValueError("agent.graphs must be a list")
+
+    if not raw_graphs:
+        normalized["graphs"] = [_default_graph_definition()]
+    else:
+        graph_ids: Set[str] = set()
+        normalized_graphs = []
+        for graph_index, graph in enumerate(raw_graphs):
+            normalized_graph = _normalize_graph_definition(graph, graph_index, preset_ids)
+            graph_id = normalized_graph["id"]
+            if graph_id in graph_ids:
+                raise ValueError("agent.graphs.id must be unique")
+            graph_ids.add(graph_id)
+            normalized_graphs.append(normalized_graph)
+        normalized["graphs"] = normalized_graphs
+
+    default_graph_id = normalized.get("default_graph_id")
+    if default_graph_id is None:
+        default_graph_id = normalized["graphs"][0]["id"]
+    default_graph_id = _ensure_non_empty_string(default_graph_id, "agent.default_graph_id")
+    available_graph_ids = {graph["id"] for graph in normalized["graphs"]}
+    if default_graph_id not in available_graph_ids:
+        raise ValueError("agent.default_graph_id must reference an existing graph")
+    normalized["default_graph_id"] = default_graph_id
+    return normalized
 
 
 def _normalize_context_config(context: Dict[str, Any]) -> Dict[str, Any]:
@@ -470,6 +1161,7 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         agent["code_map"] = _coerce_code_map(agent["code_map"])
     if "mcp" in agent:
         agent["mcp"] = _normalize_mcp_config(agent["mcp"])
+    agent = _normalize_graphs(agent)
     normalized["agent"] = agent
     return normalized
 

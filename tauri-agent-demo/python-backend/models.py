@@ -5,6 +5,9 @@ from typing import Optional, Dict, Any, Literal, List
 LLMApiFormat = Literal["openai_chat_completions", "openai_responses"]
 LLMProfile = Literal["openai", "openai_compatible", "deepseek", "zhipu"]
 AgentMode = Literal["default", "super"]
+GraphNodeType = Literal["react_agent", "tool_call", "router"]
+
+
 class LLMConfig(BaseModel):
     id: Optional[str] = None
     name: str
@@ -95,6 +98,7 @@ class ChatSession(BaseModel):
     config_id: str
     work_path: Optional[str] = None
     agent_profile: Optional[str] = None
+    graph_id: Optional[str] = None
     parent_session_id: Optional[str] = None
     context_summary: Optional[str] = None
     last_compressed_llm_call_id: Optional[int] = None
@@ -110,6 +114,7 @@ class ChatSessionCreate(BaseModel):
     config_id: str
     work_path: Optional[str] = None
     agent_profile: Optional[str] = None
+    graph_id: Optional[str] = None
     parent_session_id: Optional[str] = None
 
 
@@ -118,6 +123,7 @@ class ChatSessionUpdate(BaseModel):
     work_path: Optional[str] = None
     config_id: Optional[str] = None
     agent_profile: Optional[str] = None
+    graph_id: Optional[str] = None
     parent_session_id: Optional[str] = None
 
 
@@ -136,6 +142,7 @@ class ChatRequest(BaseModel):
     config_id: Optional[str] = None
     work_path: Optional[str] = None
     agent_profile: Optional[str] = None
+    graph_id: Optional[str] = None
     extra_work_paths: Optional[List[str]] = None
     agent_mode: Optional[AgentMode] = None
     shell_unrestricted: Optional[bool] = None
@@ -149,6 +156,102 @@ class ChatResponse(BaseModel):
     reply: str
     session_id: str
     message_id: int
+
+
+class GraphNode(BaseModel):
+    id: str
+    type: GraphNodeType
+    name: Optional[str] = None
+    description: Optional[str] = None
+    profile_id: Optional[str] = None
+    max_iterations: Optional[int] = Field(default=None, ge=1)
+    input_template: Optional[Any] = None
+    output_path: Optional[str] = None
+    tool_name: Optional[str] = None
+    args_template: Optional[Any] = None
+    ui: Optional[Dict[str, Any]] = None
+
+
+class GraphEdge(BaseModel):
+    id: Optional[str] = None
+    source: str
+    target: str
+    condition: Optional[str] = None
+    priority: int = 0
+    label: Optional[str] = None
+
+
+class StateFieldDefinition(BaseModel):
+    path: str
+    type: Literal["string", "number", "boolean", "object", "array", "any"]
+    mutable: bool = False
+
+
+class StatePreset(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    state: Any = Field(default_factory=dict)
+    state_schema: List[StateFieldDefinition] = Field(default_factory=list)
+
+
+class GraphDefinition(BaseModel):
+    id: str
+    name: str
+    initial_state: Any = Field(default_factory=dict)
+    state_schema: List[StateFieldDefinition] = Field(default_factory=list)
+    state_preset_id: Optional[str] = None
+    nodes: List[GraphNode] = Field(default_factory=list)
+    edges: List[GraphEdge] = Field(default_factory=list)
+    max_hops: int = Field(default=100, ge=1, le=10000)
+    ui: Optional[Dict[str, Any]] = None
+
+
+class EdgeExpressionContext(BaseModel):
+    state: Any = Field(default_factory=dict)
+    result: Any = None
+
+
+class NodeResult(BaseModel):
+    status: str
+    output: Any = None
+    state_patch: Dict[str, Any] = Field(default_factory=dict)
+    steps: List[Dict[str, Any]] = Field(default_factory=list)
+    error: Optional[Dict[str, Any]] = None
+
+
+class GraphRun(BaseModel):
+    id: Optional[str] = None
+    session_id: str
+    user_message_id: Optional[int] = None
+    assistant_message_id: Optional[int] = None
+    graph_id: str
+    request_text: Optional[str] = None
+    state_json: Any = Field(default_factory=dict)
+    active_node_id: Optional[str] = None
+    status: str
+    hop_count: int = 0
+    last_result: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    completed_at: Optional[str] = None
+
+
+class GraphNodeRun(BaseModel):
+    id: Optional[str] = None
+    graph_run_id: str
+    node_id: str
+    node_type: GraphNodeType
+    sequence: int
+    status: str
+    input_json: Optional[Any] = None
+    output_json: Optional[Any] = None
+    state_patch_json: Optional[Any] = None
+    error_json: Optional[Any] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    duration_ms: Optional[int] = None
 
 
 class ExportRequest(BaseModel):

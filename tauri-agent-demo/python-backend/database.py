@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 import sqlite3
 import uuid
-from models import LLMConfig, LLMConfigCreate, LLMConfigUpdate, ChatMessage, ChatMessageCreate, ChatSession, ChatSessionCreate, ChatSessionUpdate
+from models import GraphNodeRun, GraphRun, LLMConfig, LLMConfigCreate, LLMConfigUpdate, ChatMessage, ChatMessageCreate, ChatSession, ChatSessionCreate, ChatSessionUpdate
 from runtime_paths import get_database_path
 
 DATABASE_PATH = str(get_database_path())
@@ -180,6 +180,11 @@ class Database:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN context_estimate_at TEXT')
         except sqlite3.OperationalError:
             pass
+
+        try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN graph_id TEXT')
+        except sqlite3.OperationalError:
+            pass
         
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chat_messages (
@@ -295,6 +300,46 @@ class Database:
             )
         ''')
 
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS graph_runs (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_message_id INTEGER,
+                assistant_message_id INTEGER,
+                graph_id TEXT NOT NULL,
+                request_text TEXT,
+                state_json TEXT NOT NULL,
+                active_node_id TEXT,
+                status TEXT NOT NULL,
+                hop_count INTEGER NOT NULL DEFAULT 0,
+                last_result_json TEXT,
+                error_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS graph_node_runs (
+                id TEXT PRIMARY KEY,
+                graph_run_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                input_json TEXT,
+                output_json TEXT,
+                state_patch_json TEXT,
+                error_json TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                duration_ms INTEGER,
+                FOREIGN KEY (graph_run_id) REFERENCES graph_runs(id) ON DELETE CASCADE
+            )
+        ''')
+
         try:
             cursor.execute('ALTER TABLE tool_permission_requests ADD COLUMN session_id TEXT')
         except sqlite3.OperationalError:
@@ -327,6 +372,11 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_message ON file_snapshots(session_id, message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_history_session ON session_tool_call_history(session_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tool_history_session_tool ON session_tool_call_history(session_id, tool_name)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_graph ON chat_sessions(graph_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_graph_runs_session ON graph_runs(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_graph_runs_status ON graph_runs(status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_graph_runs_assistant ON graph_runs(assistant_message_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_graph_node_runs_run ON graph_node_runs(graph_run_id, sequence)')
         
         conn.commit()
         conn.close()
@@ -509,6 +559,46 @@ class Database:
         conn.commit()
         conn.close()
         return deleted
+
+    def _json_dumps(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        return json.dumps(value, ensure_ascii=False)
+
+    def _json_loads(self, value: Any, default: Any = None) -> Any:
+        if value in (None, ""):
+            return default
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+
+    def _row_to_chat_session(self, row: sqlite3.Row) -> ChatSession:
+        data = dict(row)
+        estimate_raw = data.get("context_estimate")
+        if estimate_raw:
+            try:
+                data["context_estimate"] = json.loads(estimate_raw)
+            except Exception:
+                data["context_estimate"] = None
+        return ChatSession(**data)
+
+    def _row_to_graph_run(self, row: sqlite3.Row) -> GraphRun:
+        data = dict(row)
+        data["state_json"] = self._json_loads(data.get("state_json"), {})
+        data["last_result"] = self._json_loads(data.get("last_result_json"), None)
+        data["error"] = self._json_loads(data.get("error_json"), None)
+        data.pop("last_result_json", None)
+        data.pop("error_json", None)
+        return GraphRun(**data)
+
+    def _row_to_graph_node_run(self, row: sqlite3.Row) -> GraphNodeRun:
+        data = dict(row)
+        data["input_json"] = self._json_loads(data.get("input_json"), None)
+        data["output_json"] = self._json_loads(data.get("output_json"), None)
+        data["state_patch_json"] = self._json_loads(data.get("state_patch_json"), None)
+        data["error_json"] = self._json_loads(data.get("error_json"), None)
+        return GraphNodeRun(**data)
     
     # ==================== Sessions ====================
     
@@ -521,9 +611,19 @@ class Database:
         now = datetime.now().isoformat()
 
         cursor.execute('''
-            INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, parent_session_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (session_id, session.title, session.config_id, session.work_path, session.agent_profile, session.parent_session_id, now, now))
+            INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, graph_id, parent_session_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            session_id,
+            session.title,
+            session.config_id,
+            session.work_path,
+            session.agent_profile,
+            session.graph_id,
+            session.parent_session_id,
+            now,
+            now,
+        ))
         
         conn.commit()
         conn.close()
@@ -548,14 +648,7 @@ class Database:
         conn.close()
         
         if row:
-            data = dict(row)
-            estimate_raw = data.get("context_estimate")
-            if estimate_raw:
-                try:
-                    data["context_estimate"] = json.loads(estimate_raw)
-                except Exception:
-                    data["context_estimate"] = None
-            return ChatSession(**data)
+            return self._row_to_chat_session(row)
         return None
     
     def get_all_sessions(self) -> List[ChatSession]:
@@ -573,14 +666,7 @@ class Database:
         conn.close()
         sessions: List[ChatSession] = []
         for row in rows:
-            data = dict(row)
-            estimate_raw = data.get("context_estimate")
-            if estimate_raw:
-                try:
-                    data["context_estimate"] = json.loads(estimate_raw)
-                except Exception:
-                    data["context_estimate"] = None
-            sessions.append(ChatSession(**data))
+            sessions.append(self._row_to_chat_session(row))
         return sessions
     
     def update_session(self, session_id: str, update: ChatSessionUpdate) -> Optional[ChatSession]:
@@ -605,6 +691,10 @@ class Database:
         if update.agent_profile is not None:
             fields.append("agent_profile = ?")
             values.append(update.agent_profile)
+
+        if update.graph_id is not None:
+            fields.append("graph_id = ?")
+            values.append(update.graph_id)
 
         if update.parent_session_id is not None:
             fields.append("parent_session_id = ?")
@@ -637,8 +727,8 @@ class Database:
 
             cursor.execute(
                 '''
-                INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, parent_session_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, graph_id, parent_session_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 (
                     new_session_id,
@@ -646,6 +736,7 @@ class Database:
                     source['config_id'],
                     source['work_path'],
                     source['agent_profile'],
+                    source['graph_id'] if 'graph_id' in source.keys() else None,
                     None,
                     now,
                     now,
@@ -926,6 +1017,16 @@ class Database:
                 SELECT id FROM chat_messages WHERE session_id = ?
             )
         ''', (session_id,))
+        cursor.execute(
+            '''
+            DELETE FROM graph_node_runs
+            WHERE graph_run_id IN (
+                SELECT id FROM graph_runs WHERE session_id = ?
+            )
+            ''',
+            (session_id,)
+        )
+        cursor.execute('DELETE FROM graph_runs WHERE session_id = ?', (session_id,))
         cursor.execute('DELETE FROM session_tool_call_history WHERE session_id = ?', (session_id,))
         cursor.execute('DELETE FROM chat_messages WHERE session_id = ?', (session_id,))
         cursor.execute('DELETE FROM chat_sessions WHERE id = ?', (session_id,))
@@ -933,6 +1034,245 @@ class Database:
         conn.commit()
         conn.close()
         return deleted
+
+    # ==================== Graph Runs ====================
+
+    def create_graph_run(self, graph_run: GraphRun) -> GraphRun:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        run_id = graph_run.id or str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        cursor.execute(
+            '''
+            INSERT INTO graph_runs (
+                id, session_id, user_message_id, assistant_message_id, graph_id, request_text,
+                state_json, active_node_id, status, hop_count, last_result_json, error_json,
+                created_at, updated_at, completed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                run_id,
+                graph_run.session_id,
+                graph_run.user_message_id,
+                graph_run.assistant_message_id,
+                graph_run.graph_id,
+                graph_run.request_text,
+                self._json_dumps(graph_run.state_json if graph_run.state_json is not None else {}) or "{}",
+                graph_run.active_node_id,
+                graph_run.status,
+                int(graph_run.hop_count or 0),
+                self._json_dumps(graph_run.last_result),
+                self._json_dumps(graph_run.error),
+                graph_run.created_at or now,
+                graph_run.updated_at or now,
+                graph_run.completed_at,
+            )
+        )
+        conn.commit()
+        conn.close()
+        return self.get_graph_run(run_id)
+
+    def get_graph_run(self, graph_run_id: str) -> Optional[GraphRun]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM graph_runs WHERE id = ?', (graph_run_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return self._row_to_graph_run(row)
+
+    def get_latest_incomplete_graph_run(
+        self,
+        session_id: str,
+        request_text: Optional[str] = None,
+    ) -> Optional[GraphRun]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if request_text is not None:
+            cursor.execute(
+                '''
+                SELECT *
+                FROM graph_runs
+                WHERE session_id = ? AND status = ? AND request_text = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                ''',
+                (session_id, "running", request_text)
+            )
+        else:
+            cursor.execute(
+                '''
+                SELECT *
+                FROM graph_runs
+                WHERE session_id = ? AND status = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                ''',
+                (session_id, "running")
+            )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return self._row_to_graph_run(row)
+
+    def update_graph_run(
+        self,
+        graph_run_id: str,
+        *,
+        state_json: Optional[Any] = None,
+        active_node_id: Optional[str] = None,
+        status: Optional[str] = None,
+        hop_count: Optional[int] = None,
+        last_result: Optional[Dict[str, Any]] = None,
+        error: Optional[Dict[str, Any]] = None,
+        completed_at: Optional[str] = None,
+    ) -> Optional[GraphRun]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        fields: List[str] = []
+        values: List[Any] = []
+        if state_json is not None:
+            fields.append("state_json = ?")
+            values.append(self._json_dumps(state_json) or "{}")
+        if active_node_id is not None:
+            fields.append("active_node_id = ?")
+            values.append(active_node_id)
+        if status is not None:
+            fields.append("status = ?")
+            values.append(status)
+        if hop_count is not None:
+            fields.append("hop_count = ?")
+            values.append(int(hop_count))
+        if last_result is not None:
+            fields.append("last_result_json = ?")
+            values.append(self._json_dumps(last_result))
+        if error is not None:
+            fields.append("error_json = ?")
+            values.append(self._json_dumps(error))
+        if completed_at is not None:
+            fields.append("completed_at = ?")
+            values.append(completed_at)
+        if not fields:
+            conn.close()
+            return self.get_graph_run(graph_run_id)
+        fields.append("updated_at = ?")
+        values.append(datetime.now().isoformat())
+        values.append(graph_run_id)
+        cursor.execute(
+            f"UPDATE graph_runs SET {', '.join(fields)} WHERE id = ?",
+            values,
+        )
+        conn.commit()
+        conn.close()
+        return self.get_graph_run(graph_run_id)
+
+    def create_graph_node_run(self, node_run: GraphNodeRun) -> GraphNodeRun:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        node_run_id = node_run.id or str(uuid.uuid4())
+        started_at = node_run.started_at or datetime.now().isoformat()
+        cursor.execute(
+            '''
+            INSERT INTO graph_node_runs (
+                id, graph_run_id, node_id, node_type, sequence, status,
+                input_json, output_json, state_patch_json, error_json,
+                started_at, completed_at, duration_ms
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                node_run_id,
+                node_run.graph_run_id,
+                node_run.node_id,
+                node_run.node_type,
+                int(node_run.sequence),
+                node_run.status,
+                self._json_dumps(node_run.input_json),
+                self._json_dumps(node_run.output_json),
+                self._json_dumps(node_run.state_patch_json),
+                self._json_dumps(node_run.error_json),
+                started_at,
+                node_run.completed_at,
+                node_run.duration_ms,
+            )
+        )
+        conn.commit()
+        conn.close()
+        return self.get_graph_node_run(node_run_id)
+
+    def get_graph_node_run(self, graph_node_run_id: str) -> Optional[GraphNodeRun]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM graph_node_runs WHERE id = ?', (graph_node_run_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return self._row_to_graph_node_run(row)
+
+    def update_graph_node_run(
+        self,
+        graph_node_run_id: str,
+        *,
+        status: Optional[str] = None,
+        output_json: Optional[Dict[str, Any]] = None,
+        state_patch_json: Optional[Dict[str, Any]] = None,
+        error_json: Optional[Dict[str, Any]] = None,
+        completed_at: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+    ) -> Optional[GraphNodeRun]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        fields: List[str] = []
+        values: List[Any] = []
+        if status is not None:
+            fields.append("status = ?")
+            values.append(status)
+        if output_json is not None:
+            fields.append("output_json = ?")
+            values.append(self._json_dumps(output_json))
+        if state_patch_json is not None:
+            fields.append("state_patch_json = ?")
+            values.append(self._json_dumps(state_patch_json))
+        if error_json is not None:
+            fields.append("error_json = ?")
+            values.append(self._json_dumps(error_json))
+        if completed_at is not None:
+            fields.append("completed_at = ?")
+            values.append(completed_at)
+        if duration_ms is not None:
+            fields.append("duration_ms = ?")
+            values.append(duration_ms)
+        if not fields:
+            conn.close()
+            return self.get_graph_node_run(graph_node_run_id)
+        values.append(graph_node_run_id)
+        cursor.execute(
+            f"UPDATE graph_node_runs SET {', '.join(fields)} WHERE id = ?",
+            values,
+        )
+        conn.commit()
+        conn.close()
+        return self.get_graph_node_run(graph_node_run_id)
+
+    def get_graph_node_runs(self, graph_run_id: str) -> List[GraphNodeRun]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT *
+            FROM graph_node_runs
+            WHERE graph_run_id = ?
+            ORDER BY sequence ASC, started_at ASC
+            ''',
+            (graph_run_id,)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [self._row_to_graph_node_run(row) for row in rows]
     
     # ==================== Messages ====================
     
@@ -1791,6 +2131,34 @@ class Database:
                 WHERE session_id = ? AND id >= ?
             )
         ''', (session_id, message_id))
+
+        cursor.execute(
+            '''
+            DELETE FROM graph_node_runs
+            WHERE graph_run_id IN (
+                SELECT id
+                FROM graph_runs
+                WHERE session_id = ?
+                  AND (
+                    (user_message_id IS NOT NULL AND user_message_id >= ?)
+                    OR (assistant_message_id IS NOT NULL AND assistant_message_id >= ?)
+                  )
+            )
+            ''',
+            (session_id, message_id, message_id)
+        )
+
+        cursor.execute(
+            '''
+            DELETE FROM graph_runs
+            WHERE session_id = ?
+              AND (
+                (user_message_id IS NOT NULL AND user_message_id >= ?)
+                OR (assistant_message_id IS NOT NULL AND assistant_message_id >= ?)
+              )
+            ''',
+            (session_id, message_id, message_id)
+        )
 
         cursor.execute('''
             DELETE FROM chat_messages

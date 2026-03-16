@@ -33,6 +33,7 @@ import {
 } from '../api';
 import { exportConfigFile, importConfigFile } from '../configExchange';
 import { normalizeAstImportLanguages, normalizeAstImportList } from '../features/config/helpers';
+import { openGraphStudioWindow } from '../features/graphStudio/window';
 import ConfirmDialog from './ConfirmDialog';
 import './ConfigManager.css';
 
@@ -183,6 +184,11 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                 : (profile.id === subagentProfileValue);
             return { ...profile, spawnable };
         });
+        const graphs = Array.isArray(raw.graphs) ? raw.graphs : [];
+        const statePresets = Array.isArray(raw.state_presets) ? raw.state_presets : [];
+        const defaultGraphId = typeof raw.default_graph_id === 'string' && raw.default_graph_id.trim()
+            ? raw.default_graph_id.trim()
+            : (graphs[0]?.id || '');
         return {
             ...raw,
             base_system_prompt: raw.base_system_prompt ?? '',
@@ -190,7 +196,10 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             abilities: Array.isArray(raw.abilities) ? raw.abilities : [],
             profiles: normalizedProfiles,
             default_profile: raw.default_profile ?? '',
-            subagent_profile: subagentProfileValue
+            subagent_profile: subagentProfileValue,
+            graphs,
+            default_graph_id: defaultGraphId,
+            state_presets: statePresets,
         };
     };
 
@@ -285,7 +294,8 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             setGlobalContextLongTailChars(String(longTail));
         }
         setGlobalMcpServers(normalizeMcpServers(data?.agent?.mcp));
-        setAgentConfig(normalizeAgentConfig(data?.agent));
+        const normalizedAgent = normalizeAgentConfig(data?.agent);
+        setAgentConfig(normalizedAgent);
         setMcpRefreshed(false);
         setMcpRefreshError(null);
     };
@@ -1295,7 +1305,8 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                 }
             }
             if (updated?.agent) {
-                setAgentConfig(normalizeAgentConfig(updated.agent));
+                const nextAgent = normalizeAgentConfig(updated.agent);
+                setAgentConfig(nextAgent);
                 setGlobalMcpServers(normalizeMcpServers(updated.agent.mcp));
             }
             setGlobalSaved(true);
@@ -1594,7 +1605,6 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
         const incomingSubagentProfile = hasIncomingSubagentProfile
             ? (typeof incomingRaw.subagent_profile === 'string' ? incomingRaw.subagent_profile.trim() : '')
             : '';
-
         return {
             ...currentNormalized,
             base_system_prompt: typeof incomingRaw.base_system_prompt === 'string'
@@ -1605,7 +1615,10 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
             default_profile: defaultProfile,
             subagent_profile: hasIncomingSubagentProfile
                 ? incomingSubagentProfile
-                : currentNormalized.subagent_profile
+                : currentNormalized.subagent_profile,
+            graphs: currentNormalized.graphs,
+            default_graph_id: currentNormalized.default_graph_id,
+            state_presets: currentNormalized.state_presets,
         };
     };
 
@@ -1615,8 +1628,10 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
         setAgentSaved(false);
         try {
             const normalized = normalizeAgentConfig(agentConfig);
-            const updated = await updateAppConfig({ agent: normalized });
-            setAgentConfig(normalizeAgentConfig(updated?.agent));
+            const { graphs: _graphs, default_graph_id: _defaultGraphId, ...agentWithoutGraphs } = normalized;
+            const updated = await updateAppConfig({ agent: agentWithoutGraphs });
+            const nextAgent = normalizeAgentConfig(updated?.agent);
+            setAgentConfig(nextAgent);
             setAgentSaved(true);
             onConfigCreated?.();
         } catch (error: any) {
@@ -2804,6 +2819,37 @@ export default function ConfigManager({ onClose, onConfigCreated, currentSession
                                 </select>
                                 <small>
                                     spawn_subagent 可选择任意允许作为子agent的 profile；仅当未指定 profile_id 且可选 profile 只有一个时会自动使用。
+                                </small>
+                            </div>
+
+                            <div className="agent-section">
+                                <div className="agent-section-header">
+                                    <h4>Graphs</h4>
+                                    <button
+                                        type="button"
+                                        className="add-btn add-inline"
+                                        onClick={() => {
+                                            void openGraphStudioWindow();
+                                        }}
+                                    >
+                                        Open Graph Studio
+                                    </button>
+                                </div>
+                                <div className="agent-list">
+                                    <div className="agent-item">
+                                        <div className="agent-info">
+                                            <h4>{(agentConfig.graphs || []).length} graphs configured</h4>
+                                            <p className="agent-detail">
+                                                <strong>Default:</strong>{' '}
+                                                {(agentConfig.graphs || []).find((graph) => graph.id === agentConfig.default_graph_id)?.name
+                                                    || agentConfig.default_graph_id
+                                                    || '自动选择'}
+                                            </p>
+                                        </div>
+                                    </div>
+                                </div>
+                                <small>
+                                    Graph 节点和连线编辑已移动到独立窗口。使用 Graph Studio 管理已有 graph，或创建新的 graph。
                                 </small>
                             </div>
 
