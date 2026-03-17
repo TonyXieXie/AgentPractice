@@ -329,6 +329,7 @@ class GraphRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received_histories, [[]])
         self.assertNotIn("user_content", received_overrides[0])
         self.assertNotIn("_post_user_messages", received_overrides[0])
+        self.assertTrue(received_overrides[0]["_graph_history_after_user"])
 
         graph_run = next(iter(repo.graph_runs.values()))
         self.assertEqual(graph_run.state_json["input"]["user_message"], "hello")
@@ -484,7 +485,7 @@ class GraphRunnerTests(unittest.IsolatedAsyncioTestCase):
             steps = [step async for step in runner.run()]
 
         self.assertEqual(seen_inputs, ["plan=ship feature", "implement=ship feature"])
-        self.assertEqual(seen_histories, [[], [{"role": "assistant", "content": "[Planner] planner-done"}]])
+        self.assertEqual(seen_histories, [[], [{"role": "assistant", "content": "[Planner] planner-done", "_after_user": True}]])
         self.assertEqual(steps[-1].content, "coder-done")
         self.assertEqual(steps[-1].metadata["profile_id"], "coder")
 
@@ -725,7 +726,7 @@ class GraphRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(steps[-1].content, "resume:value=42")
         self.assertEqual(steps[-1].metadata["edge_id"], "tool_to_answer")
-        self.assertEqual(received_histories, [[{"role": "assistant", "content": "[Planner] outlined plan"}]])
+        self.assertEqual(received_histories, [[{"role": "assistant", "content": "[Planner] outlined plan", "_after_user": True}]])
         updated_run = repo.graph_runs[existing_graph_run.id]
         self.assertEqual(updated_run.status, "completed")
         self.assertEqual(updated_run.active_node_id, GRAPH_END)

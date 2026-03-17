@@ -327,6 +327,7 @@ class ReActAgent(AgentStrategy):
         if request_overrides and request_overrides.get("user_content") is not None:
             user_content = request_overrides.get("user_content")
         user_message_content = user_content if user_content is not None else user_input
+        history_after_user = bool(request_overrides and request_overrides.get("_graph_history_after_user"))
         post_user_messages: List[Dict[str, Any]] = []
         if request_overrides and isinstance(request_overrides.get("_post_user_messages"), list):
             for item in request_overrides.get("_post_user_messages") or []:
@@ -349,6 +350,13 @@ class ReActAgent(AgentStrategy):
             pre_history: List[Dict[str, Any]] = []
             post_history: List[Dict[str, Any]] = []
             for msg in history or []:
+                if history_after_user:
+                    if isinstance(msg, dict):
+                        cleaned = {k: v for k, v in msg.items() if k != "_after_user"}
+                        post_history.append(cleaned)
+                    else:
+                        post_history.append(msg)
+                    continue
                 if isinstance(msg, dict) and msg.get("_after_user"):
                     cleaned = {k: v for k, v in msg.items() if k != "_after_user"}
                     post_history.append(cleaned)

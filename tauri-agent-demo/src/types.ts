@@ -320,6 +320,17 @@ export interface ChatSessionUpdate {
     parent_session_id?: string | null;
 }
 
+export interface LLMCallDebugInfo {
+    message_id?: number | null;
+    agent_type?: string | null;
+    iteration?: number | null;
+    graph_run_id?: string | null;
+    graph_id?: string | null;
+    node_id?: string | null;
+    node_type?: string | null;
+    profile_id?: string | null;
+}
+
 export interface LLMCall {
     id: number;
     session_id: string;
@@ -334,8 +345,24 @@ export interface LLMCall {
     response_json?: Record<string, any> | null;
     response_text?: string | null;
     processed_json?: Record<string, any> | null;
+    debug?: LLMCallDebugInfo | null;
     created_at: string;
 }
+
+export interface DebugFocusTarget {
+    key: string;
+    messageId?: number;
+    iteration?: number;
+    callId?: number;
+    occurrenceIndex?: number;
+    graphRunId?: string;
+    graphId?: string;
+    nodeId?: string;
+    nodeType?: string;
+    profileId?: string;
+}
+
+export type DebugFocusRequest = Omit<DebugFocusTarget, 'key'>;
 
 export interface SessionToolStatsItem {
     tool_name: string;

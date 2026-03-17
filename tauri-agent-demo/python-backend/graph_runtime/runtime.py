@@ -435,6 +435,7 @@ class GraphRunner:
                 {
                     "role": "assistant",
                     "content": f"[{author}] {content}" if author else content,
+                    "_after_user": True,
                 }
             )
         return history
@@ -499,11 +500,13 @@ class GraphRunner:
         edge_id: Optional[str],
     ) -> AgentStep:
         metadata = dict(step.metadata or {})
+        node_name = str(self.nodes.get(str(node_id), {}).get("name") or "").strip()
         metadata.update(
             {
                 "graph_run_id": self.graph_run.id if self.graph_run else None,
                 "graph_id": self.graph_id,
                 "node_id": node_id,
+                "node_name": node_name or node_id,
                 "node_type": node_type,
                 "node_status": node_status,
                 "profile_id": self._active_node_profile_id,
@@ -549,6 +552,7 @@ class GraphRunner:
         request_overrides["_debug"] = debug_ctx
         request_overrides.pop("user_content", None)
         request_overrides.pop("_post_user_messages", None)
+        request_overrides["_graph_history_after_user"] = True
         request_overrides["_graph_state_context"] = self._build_graph_state_context(node)
         if self.code_map_prompt and "code_map" in ability_ids:
             request_overrides["_code_map_prompt"] = self.code_map_prompt

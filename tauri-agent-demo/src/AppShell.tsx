@@ -13,6 +13,8 @@ import {
   MessageAttachment,
   LLMConfig,
   LLMCall,
+  DebugFocusRequest,
+  DebugFocusTarget,
   SessionToolStats,
   ToolPermissionRequest,
   ReasoningEffort,
@@ -78,6 +80,7 @@ import {
   resolveRelativePath,
   stripExistingSkillCommands,
 } from './features/appShell/helpers';
+import { resolveLLMCallFocusTarget } from './debugFocus';
 import { openGraphStudioWindow } from './features/graphStudio/window';
 import { GRAPH_STUDIO_SYNC_KEY, readGraphStudioUpdateMarker } from './features/graphStudio/sync';
 import { useAppShellBootstrap } from './features/appShell/useBootstrap';
@@ -260,7 +263,7 @@ function App() {
   const panelWidthRef = useRef({ pty: DEFAULT_PTY_PANEL_WIDTH, debug: DEFAULT_DEBUG_PANEL_WIDTH });
   const panelOpenRef = useRef({ pty: false, debug: false });
   const panelAppliedRef = useRef({ pty: 0, debug: 0 });
-  const [debugFocus, setDebugFocus] = useState<{ key: string; messageId: number; iteration: number; callId?: number } | null>(null);
+  const [debugFocus, setDebugFocus] = useState<DebugFocusTarget | null>(null);
   const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
   const [toolStats, setToolStats] = useState<SessionToolStats | null>(null);
   const [pendingContextEstimate, setPendingContextEstimate] = useState<PendingContextEstimate | null>(null);
@@ -274,6 +277,16 @@ function App() {
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null);
   const [currentAgentProfileId, setCurrentAgentProfileId] = useState<string | null>(null);
   const [currentGraphId, setCurrentGraphId] = useState<string | null>(null);
+  const currentGraphNodeNames = useMemo(() => {
+    const graph = agentConfig?.graphs?.find((item) => item.id === currentGraphId);
+    if (!graph) return undefined;
+    return Object.fromEntries(
+      (graph.nodes || [])
+        .filter((node) => typeof node.id === 'string' && node.id.trim().length > 0)
+        .map((node) => [node.id, (node.name || '').trim()])
+        .filter((entry) => entry[1].length > 0)
+    );
+  }, [agentConfig, currentGraphId]);
 
   const commandItems = useMemo<CommandItem[]>(
     () =>
@@ -2356,11 +2369,22 @@ function App() {
     debugRefreshRef.current[key] = entry;
   };
 
-  const handleOpenDebugCall = (messageId: number, iteration: number) => {
+  const handleOpenDebugCall = (request: DebugFocusRequest) => {
     if (!showDebugPanel) return;
-    const call = llmCalls.find((item) => item.message_id === messageId && item.iteration === iteration);
-    const key = `${messageId}-${iteration}-${call?.id ?? 'none'}-${Date.now()}`;
-    setDebugFocus({ key, messageId, iteration, callId: call?.id });
+    const call = resolveLLMCallFocusTarget(llmCalls, request);
+    const key = [
+      request.messageId ?? 'msg',
+      request.iteration ?? 'iter',
+      request.nodeId || 'node',
+      request.occurrenceIndex ?? 'idx',
+      call?.id ?? request.callId ?? 'none',
+      Date.now(),
+    ].join('-');
+    setDebugFocus({
+      key,
+      ...request,
+      callId: call?.id ?? request.callId,
+    });
   };
 
   const handleSwitchConfig = async (configId: string) => {
@@ -3776,6 +3800,7 @@ function App() {
                               steps={steps}
                               sessionId={msg.session_id || currentSessionId || undefined}
                               messageId={msg.id}
+                              graphNodeNames={currentGraphNodeNames}
                               streaming={streaming}
                               pendingPermission={showPermission ? currentPendingPermission : null}
                               onPermissionDecision={handlePermissionDecision}
@@ -3793,7 +3818,7 @@ function App() {
                               onOpenWorkFile={openWorkdirForFile}
                               currentWorkPath={currentWorkPath}
                               debugActive={showDebugPanel}
-                              onOpenDebugCall={(iteration) => handleOpenDebugCall(msg.id, iteration)}
+                              onOpenDebugCall={handleOpenDebugCall}
                               ptyInteraction={ptyInteraction}
                               resolveStepPtyBinding={resolveStepPtyBinding}
                             />

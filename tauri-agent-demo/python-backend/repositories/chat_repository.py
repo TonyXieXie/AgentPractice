@@ -163,6 +163,7 @@ def save_llm_call(
     response_json: Optional[Dict[str, Any]],
     response_text: Optional[str],
     processed_json: Optional[Dict[str, Any]],
+    debug_json: Optional[Dict[str, Any]] = None,
 ) -> int:
     return db.save_llm_call(
         session_id=session_id,
@@ -177,6 +178,7 @@ def save_llm_call(
         response_json=response_json,
         response_text=response_text,
         processed_json=processed_json,
+        debug_json=debug_json,
     )
 
 

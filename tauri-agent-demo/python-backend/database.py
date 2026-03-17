@@ -256,6 +256,7 @@ class Database:
                 response_json TEXT,
                 response_text TEXT,
                 processed_json TEXT,
+                debug_json TEXT,
                 created_at TEXT NOT NULL
             )
         ''')
@@ -347,6 +348,11 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE llm_calls ADD COLUMN api_profile TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE llm_calls ADD COLUMN debug_json TEXT')
         except sqlite3.OperationalError:
             pass
         
@@ -1877,7 +1883,8 @@ class Database:
         request_json: Dict[str, Any],
         response_json: Dict[str, Any],
         response_text: str,
-        processed_json: Optional[Dict[str, Any]] = None
+        processed_json: Optional[Dict[str, Any]] = None,
+        debug_json: Optional[Dict[str, Any]] = None
     ) -> int:
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -1886,8 +1893,8 @@ class Database:
             INSERT INTO llm_calls (
                 session_id, message_id, agent_type, iteration, stream,
                 api_type, api_profile, api_format, model, request_json, response_json,
-                response_text, processed_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                response_text, processed_json, debug_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             session_id,
             message_id,
@@ -1902,6 +1909,7 @@ class Database:
             json.dumps(response_json) if response_json is not None else None,
             response_text,
             json.dumps(processed_json) if processed_json is not None else None,
+            json.dumps(debug_json) if debug_json is not None else None,
             timestamp
         ))
         llm_call_id = cursor.lastrowid
@@ -1947,6 +1955,7 @@ class Database:
                 "response_json": json.loads(row["response_json"]) if row["response_json"] else None,
                 "response_text": row["response_text"],
                 "processed_json": json.loads(row["processed_json"]) if row["processed_json"] else None,
+                "debug": json.loads(row["debug_json"]) if "debug_json" in row.keys() and row["debug_json"] else None,
                 "created_at": row["created_at"],
             })
         return results

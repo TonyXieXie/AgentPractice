@@ -309,6 +309,7 @@ class LLMClient:
         message_id = debug_ctx.get("message_id")
         agent_type = debug_ctx.get("agent_type")
         iteration = debug_ctx.get("iteration")
+        debug_json = self._build_debug_record(debug_ctx)
 
         response_payload = response_json if self._should_store_raw(debug_ctx) else None
         llm_call_id = chat_repository.save_llm_call(
@@ -323,10 +324,35 @@ class LLMClient:
             request_json=request_payload,
             response_json=response_payload,
             response_text=response_text,
-            processed_json=None
+            processed_json=None,
+            debug_json=debug_json
         )
         debug_ctx["llm_call_id"] = llm_call_id
         return llm_call_id
+
+    def _build_debug_record(self, debug_ctx: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(debug_ctx, dict):
+            return None
+        record: Dict[str, Any] = {}
+        for key in (
+            "message_id",
+            "agent_type",
+            "iteration",
+            "graph_run_id",
+            "graph_id",
+            "node_id",
+            "node_type",
+            "profile_id",
+        ):
+            value = debug_ctx.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    continue
+            record[key] = value
+        return record or None
 
     def _apply_reasoning_params(self, request_payload: Dict[str, Any]) -> None:
         profile = self._get_profile()

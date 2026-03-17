@@ -2244,12 +2244,13 @@ export default function GraphConfigEditor({
                                     </button>
                                 </div>
                                 <div className="form-group">
-                                    <label>Node ID</label>
+                                    <label>Internal ID</label>
                                     <input
                                         type="text"
                                         value={currentNode.id}
-                                        onChange={(event) => updateNodeField(currentNode.id, 'id', event.target.value)}
+                                        readOnly
                                     />
+                                    <small>Runtime key used internally for graph wiring and execution.</small>
                                 </div>
                                 <div className="form-group">
                                     <label>Name</label>

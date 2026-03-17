@@ -17,6 +17,7 @@ import { openPath, openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { API_BASE_URL } from '../shared/api/base';
 import type { AgentStep } from '../shared/api/agent';
 import { ToolPermissionRequest, AstPayload } from '../types';
+import type { DebugFocusRequest } from '../types';
 import { usePtySessionSnapshot } from '../ptyStore';
 import { stripAnsiForDisplay } from '../ptyAnsi';
 import type { PtyInteractionController, ResolveStepPtyBinding } from './ptyInteraction';
@@ -31,6 +32,7 @@ interface AgentStepViewProps {
     steps: AgentStep[];
     sessionId?: string;
     messageId?: number;
+    graphNodeNames?: Record<string, string>;
     streaming?: boolean;
     pendingPermission?: ToolPermissionRequest | null;
     onPermissionDecision?: (status: 'approved' | 'approved_once' | 'denied') => void;
@@ -42,7 +44,7 @@ interface AgentStepViewProps {
     onOpenWorkFile?: (filePath: string, line?: number, column?: number) => void;
     currentWorkPath?: string;
     debugActive?: boolean;
-    onOpenDebugCall?: (iteration: number) => void;
+    onOpenDebugCall?: (target: DebugFocusRequest) => void;
     ptyInteraction?: PtyInteractionController;
     resolveStepPtyBinding?: ResolveStepPtyBinding;
 }
@@ -467,18 +469,21 @@ function splitDiffByFile(diff: string, fallbackPath?: string): DiffChunk[] {
 
 type StepItem = {
     iteration: number | null;
+    step: AgentStep;
     element: ReactElement;
 };
 
 type GroupOptions = {
     debugActive?: boolean;
-    onOpenDebugCall?: (iteration: number) => void;
+    messageId?: number;
+    onOpenDebugCall?: (target: DebugFocusRequest) => void;
 };
 
 type GraphStepMeta = {
     graphId: string;
     graphRunId: string;
     nodeId: string;
+    nodeName: string;
     nodeType: string;
     nodeTypeClass: string;
     nodeTypeLabel: string;
@@ -501,29 +506,59 @@ const getIterationValue = (step: AgentStep): number | null => {
     return null;
 };
 
+const buildDebugFocusRequest = (
+    messageId: number | undefined,
+    step: AgentStep | null,
+    iteration: number,
+    occurrenceIndex: number
+): DebugFocusRequest | null => {
+    if (typeof messageId !== 'number') return null;
+    return {
+        messageId,
+        iteration,
+        occurrenceIndex,
+        graphRunId: readGraphMetaString(step?.metadata, 'graph_run_id'),
+        graphId: readGraphMetaString(step?.metadata, 'graph_id'),
+        nodeId: readGraphMetaString(step?.metadata, 'node_id'),
+        nodeType: readGraphMetaString(step?.metadata, 'node_type'),
+        profileId: readGraphMetaString(step?.metadata, 'profile_id'),
+    };
+};
+
 const groupStepElements = (items: StepItem[], options?: GroupOptions) => {
     const groups: ReactElement[] = [];
     let currentIteration: number | null = null;
     let currentElements: ReactElement[] = [];
+    let currentDebugStep: AgentStep | null = null;
+    const occurrenceByIteration = new Map<number, number>();
     const showDebug = Boolean(options?.debugActive && options?.onOpenDebugCall);
 
     const flush = () => {
         if (currentIteration === null || currentElements.length === 0) {
             currentElements = [];
             currentIteration = null;
+            currentDebugStep = null;
             return;
         }
         const iterationValue = currentIteration;
         const iterationLabel = `Round ${iterationValue + 1}`;
+        const occurrenceIndex = occurrenceByIteration.get(iterationValue) ?? 0;
+        occurrenceByIteration.set(iterationValue, occurrenceIndex + 1);
+        const debugTarget = buildDebugFocusRequest(
+            options?.messageId,
+            currentDebugStep,
+            iterationValue,
+            occurrenceIndex
+        );
         groups.push(
             <div key={`group-${iterationValue}-${groups.length}`} className="agent-step-group">
                 <div className="agent-step-group-header">
                     <span className="agent-step-group-label">{iterationLabel}</span>
-                    {showDebug && (
+                    {showDebug && debugTarget && (
                         <button
                             type="button"
                             className="agent-step-group-debug"
-                            onClick={() => options?.onOpenDebugCall?.(iterationValue)}
+                            onClick={() => options?.onOpenDebugCall?.(debugTarget)}
                             aria-label={`Open debug for ${iterationLabel}`}
                             title="Open debug"
                         >
@@ -536,6 +571,7 @@ const groupStepElements = (items: StepItem[], options?: GroupOptions) => {
         );
         currentElements = [];
         currentIteration = null;
+        currentDebugStep = null;
     };
 
     items.forEach((item, idx) => {
@@ -553,6 +589,9 @@ const groupStepElements = (items: StepItem[], options?: GroupOptions) => {
             flush();
             currentIteration = item.iteration;
         }
+        if (!currentDebugStep) {
+            currentDebugStep = item.step;
+        }
         currentElements.push(item.element);
     });
 
@@ -564,6 +603,7 @@ const EMPTY_GRAPH_STEP_META: GraphStepMeta = {
     graphId: '',
     graphRunId: '',
     nodeId: '',
+    nodeName: '',
     nodeType: '',
     nodeTypeClass: '',
     nodeTypeLabel: '',
@@ -602,15 +642,16 @@ const getGraphNodeTypeLabel = (value: string) => {
     }
 };
 
-const getGraphStepMeta = (step?: AgentStep | null): GraphStepMeta => {
+const getGraphStepMeta = (step?: AgentStep | null, graphNodeNames?: Record<string, string>): GraphStepMeta => {
     if (!step) return EMPTY_GRAPH_STEP_META;
     const graphId = readGraphMetaString(step.metadata, 'graph_id');
     const graphRunId = readGraphMetaString(step.metadata, 'graph_run_id');
     const nodeId = readGraphMetaString(step.metadata, 'node_id');
+    const nodeName = readGraphMetaString(step.metadata, 'node_name');
     const nodeType = readGraphMetaString(step.metadata, 'node_type');
     const nodeStatus = readGraphMetaString(step.metadata, 'node_status');
     const edgeId = readGraphMetaString(step.metadata, 'edge_id');
-    const hasGraphMeta = Boolean(graphId || graphRunId || nodeId || nodeType || nodeStatus || edgeId);
+    const hasGraphMeta = Boolean(graphId || graphRunId || nodeId || nodeName || nodeType || nodeStatus || edgeId);
 
     if (!hasGraphMeta) return EMPTY_GRAPH_STEP_META;
 
@@ -618,6 +659,7 @@ const getGraphStepMeta = (step?: AgentStep | null): GraphStepMeta => {
         graphId,
         graphRunId,
         nodeId,
+        nodeName: nodeName || graphNodeNames?.[nodeId] || nodeId,
         nodeType,
         nodeTypeClass: toGraphClassToken(nodeType),
         nodeTypeLabel: getGraphNodeTypeLabel(nodeType),
@@ -635,37 +677,18 @@ function GraphStepBadges({ meta, compact = false }: { meta: GraphStepMeta; compa
     return (
         <div
             className={`graph-step-badges${compact ? ' compact' : ''}`}
-            title={meta.graphRunId ? `Graph run ${meta.graphRunId}` : undefined}
+            title={meta.nodeName || meta.nodeId || undefined}
         >
-            {meta.graphId && (
-                <span className="graph-step-badge graph">
-                    <span className="graph-step-badge-label">graph</span>
-                    <span className="graph-step-badge-value">{meta.graphId}</span>
-                </span>
-            )}
-            {meta.nodeId && (
+            {(meta.nodeName || meta.nodeId) && (
                 <span className="graph-step-badge node">
                     <span className="graph-step-badge-label">node</span>
-                    <span className="graph-step-badge-value">{meta.nodeId}</span>
+                    <span className="graph-step-badge-value">{meta.nodeName || meta.nodeId}</span>
                 </span>
             )}
             {meta.nodeType && (
                 <span className={`graph-step-badge node-type ${meta.nodeTypeClass || 'unknown'}`}>
                     <span className="graph-step-badge-label">type</span>
                     <span className="graph-step-badge-value">{meta.nodeTypeLabel || meta.nodeType}</span>
-                </span>
-            )}
-            {meta.nodeStatus && (
-                <span className={`graph-step-badge node-status ${meta.nodeStatusClass || 'unknown'}`}>
-                    <span className="graph-step-status-dot" aria-hidden="true" />
-                    <span className="graph-step-badge-label">status</span>
-                    <span className="graph-step-badge-value">{meta.nodeStatusLabel || meta.nodeStatus}</span>
-                </span>
-            )}
-            {meta.edgeId && (
-                <span className="graph-step-badge edge">
-                    <span className="graph-step-badge-label">edge</span>
-                    <span className="graph-step-badge-value">{meta.edgeId}</span>
                 </span>
             )}
         </div>
@@ -849,6 +872,7 @@ function AgentStepView({
     steps,
     sessionId,
     messageId,
+    graphNodeNames,
     streaming,
     pendingPermission,
     onPermissionDecision,
@@ -897,7 +921,7 @@ function AgentStepView({
     const latestGraphMeta = useMemo(() => {
         let fallback: GraphStepMeta | null = null;
         for (let index = steps.length - 1; index >= 0; index -= 1) {
-            const meta = getGraphStepMeta(steps[index]);
+            const meta = getGraphStepMeta(steps[index], graphNodeNames);
             if (!meta.hasGraphMeta) continue;
             if (!fallback) fallback = meta;
             if (meta.nodeStatusClass === 'running') {
@@ -905,24 +929,17 @@ function AgentStepView({
             }
         }
         return fallback;
-    }, [steps]);
+    }, [steps, graphNodeNames]);
     const streamingGraphCopy = useMemo(() => {
         if (!latestGraphMeta?.hasGraphMeta) return 'Waiting for next step...';
-        const nodeLabel = latestGraphMeta.nodeId || latestGraphMeta.nodeTypeLabel || 'graph node';
+        const nodeLabel = latestGraphMeta.nodeName || latestGraphMeta.nodeId || latestGraphMeta.nodeTypeLabel || 'graph node';
         if (latestGraphMeta.nodeStatusClass === 'running') {
-            return latestGraphMeta.graphId
-                ? `Executing ${nodeLabel} in ${latestGraphMeta.graphId}...`
-                : `Executing ${nodeLabel}...`;
+            return `Executing ${nodeLabel}...`;
         }
         if (latestGraphMeta.nodeStatusClass === 'error') {
             return `Graph paused at ${nodeLabel}.`;
         }
-        if (latestGraphMeta.edgeId) {
-            return `Waiting after edge ${latestGraphMeta.edgeId}...`;
-        }
-        return latestGraphMeta.graphId
-            ? `Waiting for next node in ${latestGraphMeta.graphId}...`
-            : 'Waiting for next graph node...';
+        return 'Waiting for next node...';
     }, [latestGraphMeta]);
 
     useEffect(() => {
@@ -2271,10 +2288,11 @@ function AgentStepView({
                 const patchExpanded = isApplyPatch ? expandedPatches[stepKey] ?? patchExpandedDefault : false;
                 const showObservationToggle = isObservation && observationHasMore && !isApplyPatch;
                 const isObservationExpanded = isAstObservation ? (expandedObservations[stepKey] ?? true) : !!expandedObservations[stepKey];
-                const graphStepMeta = getGraphStepMeta(step);
+                const graphStepMeta = getGraphStepMeta(step, graphNodeNames);
 
                 return {
                     iteration,
+                    step,
                     element: (
                         <Fragment key={`${step.step_type}-${index}`}>
                         <div className={`agent-step ${category}${isAction ? ' action' : ''}${isContextCompress ? ' compression' : ''}`}>
@@ -2512,7 +2530,7 @@ function AgentStepView({
                     )
                 };
             });
-        return groupStepElements(items, { debugActive, onOpenDebugCall });
+        return groupStepElements(items, { debugActive, onOpenDebugCall, messageId });
     };
 
     return (

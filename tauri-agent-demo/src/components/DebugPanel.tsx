@@ -1,6 +1,8 @@
 ﻿import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { runAstTool, getAstCache, getAstCacheFile, getCodeMap } from '../shared/api/config';
 import { Message, LLMCall, AstPayload, AstRequest, AgentMode, AstCacheResponse, AstCacheFile, CodeMapResponse, SessionToolStats } from '../types';
+import type { DebugFocusTarget } from '../types';
+import { resolveLLMCallFocusTarget } from '../debugFocus';
 import AstViewer from './AstViewer';
 import './DebugPanel.css';
 
@@ -11,7 +13,7 @@ interface DebugPanelProps {
     onClose: () => void;
     onWidthChange?: (width: number) => void;
     initialWidth?: number;
-    focusTarget?: { key: string; messageId?: number; iteration?: number; callId?: number } | null;
+    focusTarget?: DebugFocusTarget | null;
     currentSessionId?: string | null;
     workPath?: string | null;
     extraWorkPaths?: string[] | null;
@@ -293,14 +295,7 @@ function DebugPanel({
     useEffect(() => {
         if (!focusTarget) return;
         if (suppressedFocusKey && focusTarget.key === suppressedFocusKey) return;
-        const { callId, messageId, iteration } = focusTarget;
-        let targetCall: LLMCall | undefined;
-        if (typeof callId === 'number') {
-            targetCall = llmCalls.find((item) => item.id === callId);
-        }
-        if (!targetCall && typeof messageId === 'number' && typeof iteration === 'number') {
-            targetCall = llmCalls.find((item) => item.message_id === messageId && item.iteration === iteration);
-        }
+        const targetCall = resolveLLMCallFocusTarget(llmCalls, focusTarget);
         if (!targetCall) return;
         const messageKey = typeof targetCall.message_id === 'number' ? `msg-${targetCall.message_id}` : null;
         if (messageKey) {
