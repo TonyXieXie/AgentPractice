@@ -61,6 +61,7 @@ async def chat(request: ChatRequest):
                     title="New Chat",
                     config_id=config_id,
                     work_path=request.work_path,
+                    agent_type="simple",
                     agent_profile=request.agent_profile,
                 )
             )
@@ -172,6 +173,7 @@ async def chat_stream(request: ChatRequest):
                     title="New Chat",
                     config_id=config_id,
                     work_path=request.work_path,
+                    agent_type="simple",
                     agent_profile=request.agent_profile,
                 )
             )

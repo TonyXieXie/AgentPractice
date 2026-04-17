@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any, Literal, List
 LLMApiFormat = Literal["openai_chat_completions", "openai_responses"]
 LLMProfile = Literal["openai", "openai_compatible", "deepseek", "zhipu"]
 AgentMode = Literal["default", "super"]
+AgentType = Literal["simple", "react"]
 class LLMConfig(BaseModel):
     id: Optional[str] = None
     name: str
@@ -94,6 +95,7 @@ class ChatSession(BaseModel):
     title: str
     config_id: str
     work_path: Optional[str] = None
+    agent_type: Optional[AgentType] = "react"
     agent_profile: Optional[str] = None
     parent_session_id: Optional[str] = None
     context_summary: Optional[str] = None
@@ -109,6 +111,7 @@ class ChatSessionCreate(BaseModel):
     title: str = "New Chat"
     config_id: str
     work_path: Optional[str] = None
+    agent_type: Optional[AgentType] = "react"
     agent_profile: Optional[str] = None
     parent_session_id: Optional[str] = None
 
@@ -117,6 +120,7 @@ class ChatSessionUpdate(BaseModel):
     title: Optional[str] = None
     work_path: Optional[str] = None
     config_id: Optional[str] = None
+    agent_type: Optional[AgentType] = None
     agent_profile: Optional[str] = None
     parent_session_id: Optional[str] = None
 

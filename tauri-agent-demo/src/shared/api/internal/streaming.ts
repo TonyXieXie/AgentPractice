@@ -53,6 +53,13 @@ export interface AgentStreamKeepalive {
     keepalive: true;
 }
 
+export interface AgentStreamResyncRequired {
+    resync_required: true;
+    reason?: string;
+    stream_id?: string;
+    latest_seq?: number;
+}
+
 export interface PtyStreamInitEvent {
     stream_id: string;
     session_id: string;
@@ -226,7 +233,13 @@ export async function* sendMessageAgentStream(
                                 lastSeq = parsed.seq;
                             }
 
-                            if (parsed.done) {
+                            if (parsed.resync_required) {
+                                const reason = String(parsed.reason || 'unknown');
+                                const error = new Error(`Agent stream resync required: ${reason}`);
+                                (error as any).code = 'AGENT_STREAM_RESYNC_REQUIRED';
+                                (error as any).latestSeq = parsed.latest_seq;
+                                throw error;
+                            } else if (parsed.done) {
                                 sawDone = true;
                                 yield parsed;
                                 return;

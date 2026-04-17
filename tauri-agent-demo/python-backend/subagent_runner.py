@@ -187,6 +187,7 @@ def prepare_subagent_session(
         title=child_title,
         config_id=parent.config_id,
         work_path=getattr(parent, "work_path", None),
+        agent_type="react",
         agent_profile=subagent_profile_id,
         parent_session_id=parent_session_id
     ))

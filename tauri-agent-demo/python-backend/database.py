@@ -147,6 +147,43 @@ class Database:
             pass
 
         try:
+            cursor.execute('''
+                UPDATE chat_sessions
+                SET agent_type = ?
+                WHERE agent_type IS NULL
+            ''', ("react",))
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('''
+                UPDATE chat_sessions
+                SET agent_type = ?
+                WHERE agent_type = ?
+                  AND id IN (
+                      SELECT DISTINCT session_id
+                      FROM llm_calls
+                      WHERE session_id IS NOT NULL AND agent_type = ?
+                  )
+            ''', ("react", "simple", "react"))
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('''
+                UPDATE chat_sessions
+                SET agent_type = ?
+                WHERE agent_type = ?
+                  AND id IN (
+                      SELECT DISTINCT m.session_id
+                      FROM agent_steps s
+                      JOIN chat_messages m ON m.id = s.message_id
+                  )
+            ''', ("react", "simple"))
+        except sqlite3.OperationalError:
+            pass
+
+        try:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN work_path TEXT')
         except sqlite3.OperationalError:
             pass
@@ -519,11 +556,12 @@ class Database:
 
         session_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
+        agent_type = getattr(session, "agent_type", None) or "react"
 
         cursor.execute('''
-            INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, parent_session_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (session_id, session.title, session.config_id, session.work_path, session.agent_profile, session.parent_session_id, now, now))
+            INSERT INTO chat_sessions (id, title, config_id, work_path, agent_type, agent_profile, parent_session_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (session_id, session.title, session.config_id, session.work_path, agent_type, session.agent_profile, session.parent_session_id, now, now))
         
         conn.commit()
         conn.close()
@@ -549,6 +587,7 @@ class Database:
         
         if row:
             data = dict(row)
+            data["agent_type"] = data.get("agent_type") or "react"
             estimate_raw = data.get("context_estimate")
             if estimate_raw:
                 try:
@@ -574,6 +613,7 @@ class Database:
         sessions: List[ChatSession] = []
         for row in rows:
             data = dict(row)
+            data["agent_type"] = data.get("agent_type") or "react"
             estimate_raw = data.get("context_estimate")
             if estimate_raw:
                 try:
@@ -601,6 +641,10 @@ class Database:
         if update.config_id is not None:
             fields.append("config_id = ?")
             values.append(update.config_id)
+
+        if update.agent_type is not None:
+            fields.append("agent_type = ?")
+            values.append(update.agent_type)
 
         if update.agent_profile is not None:
             fields.append("agent_profile = ?")
@@ -634,17 +678,19 @@ class Database:
             new_session_id = str(uuid.uuid4())
             now = datetime.now().isoformat()
             new_title = title or source['title']
+            source_agent_type = source['agent_type'] if 'agent_type' in source.keys() and source['agent_type'] else "react"
 
             cursor.execute(
                 '''
-                INSERT INTO chat_sessions (id, title, config_id, work_path, agent_profile, parent_session_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_sessions (id, title, config_id, work_path, agent_type, agent_profile, parent_session_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 (
                     new_session_id,
                     new_title,
                     source['config_id'],
                     source['work_path'],
+                    source_agent_type,
                     source['agent_profile'],
                     None,
                     now,

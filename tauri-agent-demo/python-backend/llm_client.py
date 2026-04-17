@@ -1,8 +1,16 @@
 from typing import Optional, List, Dict, Any, Tuple
 import asyncio
+import json
+from datetime import datetime
+from threading import Lock
 import httpx
 from models import LLMConfig
 from app_config import get_app_config
+from runtime_paths import get_runtime_dir
+
+
+_BACKEND_DEBUG_LOG_LOCK = Lock()
+_BACKEND_DEBUG_LOG_NAME = "backend-debug.log"
 
 
 class LLMTransientError(Exception):
@@ -19,6 +27,8 @@ class LLMClient:
         self.config = config
         self.timeout = self._resolve_timeout()
         self.max_retries, self.retry_base_delay, self.retry_max_delay = self._resolve_retry_policy()
+        self._seen_unhandled_chat_delta_keys: set[Tuple[str, ...]] = set()
+        self._seen_unhandled_responses_event_types: set[str] = set()
 
     def _resolve_timeout(self) -> float:
         app_config = get_app_config()
@@ -271,6 +281,138 @@ class LLMClient:
                     return self._coerce_text(delta.get(key))
         return ""
 
+    def _format_debug_hint(self, debug_ctx: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(debug_ctx, dict):
+            return ""
+        parts: List[str] = []
+        for key in ("session_id", "message_id", "iteration", "agent_type", "llm_call_id"):
+            value = debug_ctx.get(key)
+            if value is None or value == "":
+                continue
+            parts.append(f"{key}={value}")
+        return f" ({', '.join(parts)})" if parts else ""
+
+    def _emit_debug_log(self, message: str) -> None:
+        print(message, flush=True)
+        try:
+            log_path = get_runtime_dir() / _BACKEND_DEBUG_LOG_NAME
+            line = f"{datetime.now().astimezone().isoformat()} {message}"
+            with _BACKEND_DEBUG_LOG_LOCK:
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+                    handle.write("\n")
+        except Exception:
+            # Debug logging must never break LLM request handling.
+            pass
+
+    def _log_raw_sse_line(
+        self,
+        line: str,
+        debug_ctx: Optional[Dict[str, Any]],
+        stream_kind: str,
+    ) -> None:
+        try:
+            serialized = json.dumps("" if line is None else str(line), ensure_ascii=False)
+        except Exception:
+            serialized = repr(line)
+        self._emit_debug_log(
+            f"[LLM SSE Raw] kind={stream_kind}{self._format_debug_hint(debug_ctx)} line={serialized}"
+        )
+
+    def _log_raw_sse_chunk(
+        self,
+        chunk: str,
+        debug_ctx: Optional[Dict[str, Any]],
+        stream_kind: str,
+    ) -> None:
+        try:
+            text = "" if chunk is None else str(chunk)
+            serialized = json.dumps(text, ensure_ascii=False)
+            chunk_len = len(text)
+        except Exception:
+            serialized = repr(chunk)
+            try:
+                chunk_len = len(chunk)  # type: ignore[arg-type]
+            except Exception:
+                chunk_len = -1
+        self._emit_debug_log(
+            f"[LLM SSE Chunk] kind={stream_kind} len={chunk_len}"
+            f"{self._format_debug_hint(debug_ctx)} chunk={serialized}"
+        )
+
+    async def _iter_sse_lines(
+        self,
+        response: httpx.Response,
+        debug_ctx: Optional[Dict[str, Any]],
+        stream_kind: str,
+    ):
+        buffer = ""
+        async for chunk in response.aiter_text():
+            self._log_raw_sse_chunk(chunk, debug_ctx, stream_kind)
+            if not chunk:
+                continue
+            buffer += chunk
+            while True:
+                newline_index = buffer.find("\n")
+                if newline_index < 0:
+                    break
+                line = buffer[:newline_index]
+                if line.endswith("\r"):
+                    line = line[:-1]
+                yield line
+                buffer = buffer[newline_index + 1:]
+        if buffer:
+            if buffer.endswith("\r"):
+                buffer = buffer[:-1]
+            yield buffer
+
+    def _log_unhandled_chat_delta(self, delta: Dict[str, Any], debug_ctx: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(delta, dict) or not delta:
+            return
+        known_keys = {
+            "role",
+            "content",
+            "reasoning",
+            "reasoning_content",
+            "thinking",
+            "thinking_content",
+            "analysis",
+            "tool_calls",
+            "type",
+            "text",
+            "delta",
+            "value",
+        }
+        unknown_keys = tuple(sorted(str(key) for key in delta.keys() if str(key) not in known_keys))
+        if not unknown_keys or unknown_keys in self._seen_unhandled_chat_delta_keys:
+            return
+        self._seen_unhandled_chat_delta_keys.add(unknown_keys)
+        delta_type = str(delta.get("type", "") or "").lower() or "(empty)"
+        sample = {key: delta.get(key) for key in unknown_keys[:3]}
+        self._emit_debug_log(
+            f"[LLM Stream] Unhandled chat delta keys={list(unknown_keys)} delta_type={delta_type}"
+            f"{self._format_debug_hint(debug_ctx)} sample={sample}"
+        )
+
+    def _log_unhandled_responses_event_type(self, event: Dict[str, Any], debug_ctx: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(event, dict):
+            return
+        event_type = str(event.get("type", "") or "").strip()
+        if not event_type or event_type in self._seen_unhandled_responses_event_types:
+            return
+        self._seen_unhandled_responses_event_types.add(event_type)
+        extra_parts: List[str] = []
+        if event.get("output_index") is not None:
+            extra_parts.append(f"output_index={event.get('output_index')}")
+        item = event.get("item") or event.get("output_item")
+        if isinstance(item, dict) and item.get("type"):
+            extra_parts.append(f"item_type={item.get('type')}")
+        suffix = f" {' '.join(extra_parts)}" if extra_parts else ""
+        self._emit_debug_log(
+            f"[LLM Stream] Unhandled responses event_type={event_type}{suffix}"
+            f"{self._format_debug_hint(debug_ctx)}"
+        )
+
     def _get_debug_context(self, request_overrides: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not request_overrides:
             return None
@@ -283,6 +425,19 @@ class LLMClient:
         if not request_overrides:
             return None
         return request_overrides.get("_stop_event")
+
+    def _apply_stream_tool_params(
+        self,
+        request_payload: Dict[str, Any],
+        request_overrides: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not request_overrides:
+            return
+        if request_overrides.get("tools") is not None:
+            request_payload["tools"] = request_overrides["tools"]
+            request_payload["tool_stream"] = bool(request_overrides.get("tool_stream", True))
+        if request_overrides.get("tool_choice") is not None:
+            request_payload["tool_choice"] = request_overrides["tool_choice"]
 
     def _should_store_raw(self, debug_ctx: Optional[Dict[str, Any]]) -> bool:
         if not debug_ctx:
@@ -340,7 +495,7 @@ class LLMClient:
                 "effort": reasoning_effort,
                 "summary": reasoning_summary
             }
-            print(f"[Reasoning Mode] effort={reasoning_effort}, summary={reasoning_summary}")
+            self._emit_debug_log(f"[Reasoning Mode] effort={reasoning_effort}, summary={reasoning_summary}")
 
         if profile == "deepseek" and "reasoner" in model_lower:
             request_payload.pop("temperature", None)
@@ -368,7 +523,7 @@ class LLMClient:
         log_text = detail_text
         if len(log_text) > 4000:
             log_text = log_text[:4000] + "...<truncated>"
-        print(f"[LLM HTTP Error] {exc} | status={status} | body={log_text}")
+        self._emit_debug_log(f"[LLM HTTP Error] {exc} | status={status} | body={log_text}")
         return detail_text, detail_json, status
 
     async def _chat_openai(self, messages: List[Dict[str, Any]], request_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -435,7 +590,7 @@ class LLMClient:
                 usage = data.get("usage", {})
                 reasoning_tokens = usage.get("reasoning_tokens", 0)
                 if reasoning_tokens > 0:
-                    print(f"[Reasoning Tokens] {reasoning_tokens} tokens used for reasoning")
+                    self._emit_debug_log(f"[Reasoning Tokens] {reasoning_tokens} tokens used for reasoning")
 
                 response_text = self._extract_chat_response_text(data)
                 llm_call_id = None
@@ -472,11 +627,7 @@ class LLMClient:
             "max_tokens": self.config.max_tokens,
             "stream": True
         }
-        if request_overrides:
-            if request_overrides.get("tools") is not None:
-                request_payload["tools"] = request_overrides["tools"]
-            if request_overrides.get("tool_choice") is not None:
-                request_payload["tool_choice"] = request_overrides["tool_choice"]
+        self._apply_stream_tool_params(request_payload, request_overrides)
         debug_ctx = self._get_debug_context(request_overrides)
         events: List[Dict[str, Any]] = []
         full_text = ""
@@ -523,7 +674,7 @@ class LLMClient:
                                 if self._is_rate_limited(status):
                                     raise LLMTransientError(f"Rate limited (HTTP {status}).", status_code=status, cause=exc) from exc
                                 raise
-                            async for line in response.aiter_lines():
+                            async for line in self._iter_sse_lines(response, debug_ctx, "chat_completions_text"):
                                 if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                                     stopped = True
                                     break
@@ -585,11 +736,7 @@ class LLMClient:
             "max_tokens": self.config.max_tokens,
             "stream": True
         }
-        if request_overrides:
-            if request_overrides.get("tools") is not None:
-                request_payload["tools"] = request_overrides["tools"]
-            if request_overrides.get("tool_choice") is not None:
-                request_payload["tool_choice"] = request_overrides["tool_choice"]
+        self._apply_stream_tool_params(request_payload, request_overrides)
         debug_ctx = self._get_debug_context(request_overrides)
         events: List[Dict[str, Any]] = []
         full_text = ""
@@ -637,7 +784,7 @@ class LLMClient:
                                 if self._is_rate_limited(status):
                                     raise LLMTransientError(f"Rate limited (HTTP {status}).", status_code=status, cause=exc) from exc
                                 raise
-                            async for line in response.aiter_lines():
+                            async for line in self._iter_sse_lines(response, debug_ctx, "chat_completions_events"):
                                 if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                                     stopped = True
                                     break
@@ -657,6 +804,7 @@ class LLMClient:
                                     continue
                                 delta = choices[0].get("delta", {}) or {}
                                 delta_type = str(delta.get("type", "") or "").lower()
+                                self._log_unhandled_chat_delta(delta, debug_ctx)
 
                                 if "content" in delta:
                                     text_delta = self._coerce_text(delta.get("content"))
@@ -892,7 +1040,7 @@ class LLMClient:
                                 if self._is_rate_limited(status):
                                     raise LLMTransientError(f"Rate limited (HTTP {status}).", status_code=status, cause=exc) from exc
                                 raise
-                            async for line in response.aiter_lines():
+                            async for line in self._iter_sse_lines(response, debug_ctx, "responses_text"):
                                 if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                                     stopped = True
                                     break
@@ -1014,7 +1162,7 @@ class LLMClient:
                                 if self._is_rate_limited(status):
                                     raise LLMTransientError(f"Rate limited (HTTP {status}).", status_code=status, cause=exc) from exc
                                 raise
-                            async for line in response.aiter_lines():
+                            async for line in self._iter_sse_lines(response, debug_ctx, "responses_events"):
                                 if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                                     stopped = True
                                     break
@@ -1110,6 +1258,8 @@ class LLMClient:
                                 if event_type in ("response.completed", "response.done"):
                                     last_response = event.get("response")
                                     continue
+
+                                self._log_unhandled_responses_event_type(event, debug_ctx)
                             if stopped:
                                 pass
                 except httpx.RequestError as exc:

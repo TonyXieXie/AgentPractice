@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 DEFAULT_KEEPALIVE_SEC = 15
-DEFAULT_MAX_EVENTS = 2000
+DEFAULT_MAX_EVENTS = 12000
 DEFAULT_TTL_SEC = 600
 
 
@@ -82,12 +82,13 @@ class StreamState:
         async with self._cond:
             self._cond.notify_all()
 
-    async def _snapshot_since(self, last_seq: int) -> Tuple[List[Tuple[int, str]], int, bool]:
+    async def _snapshot_since(self, last_seq: int) -> Tuple[List[Tuple[int, str]], int, Optional[int], bool]:
         async with self._lock:
             events = [(seq, data) for seq, data in self._events if seq > last_seq]
             latest_seq = self._seq
+            oldest_seq = self._events[0][0] if self._events else None
             done = self._done
-        return events, latest_seq, done
+        return events, latest_seq, oldest_seq, done
 
     async def stream(self, last_seq: Optional[int]) -> Any:
         cursor = int(last_seq or 0)
@@ -100,7 +101,16 @@ class StreamState:
                 encoded = json.dumps(init_payload, ensure_ascii=False)
                 yield f"data: {encoded}\n\n"
         while True:
-            events, latest_seq, done = await self._snapshot_since(cursor)
+            events, latest_seq, oldest_seq, done = await self._snapshot_since(cursor)
+            if oldest_seq is not None and cursor > 0 and cursor < (oldest_seq - 1):
+                resync_payload = {
+                    "resync_required": True,
+                    "reason": "seq_gap",
+                    "stream_id": self.stream_id,
+                    "latest_seq": latest_seq,
+                }
+                yield f"data: {json.dumps(resync_payload, ensure_ascii=False)}\n\n"
+                return
             for seq, data in events:
                 cursor = seq
                 yield f"data: {data}\n\n"

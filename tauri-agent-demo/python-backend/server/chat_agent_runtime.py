@@ -50,6 +50,11 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
                     session.id,
                     ChatSessionUpdate(agent_profile=request.agent_profile),
                 ) or session
+            if getattr(session, "agent_type", None) != "react":
+                session = session_repository.update_session(
+                    session.id,
+                    ChatSessionUpdate(agent_type="react"),
+                ) or session
         else:
             config_id = request.config_id
             if not config_id:
@@ -66,6 +71,7 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
                     title="New Chat",
                     config_id=config_id,
                     work_path=request.work_path,
+                    agent_type="react",
                     agent_profile=request.agent_profile,
                 )
             )
@@ -112,7 +118,7 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
             except Exception:
                 pass
 
-        agent_type = request.agent_type_override if hasattr(request, "agent_type_override") else getattr(session, "agent_type", "react")
+        agent_type = request.agent_type_override if hasattr(request, "agent_type_override") else "react"
         profile_id = request.agent_profile or getattr(session, "agent_profile", None)
         include_tools = agent_type != "simple"
         pty_prompt = build_live_pty_prompt(session.id)

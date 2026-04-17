@@ -2145,8 +2145,7 @@ function App() {
       );
 
       if (newSessionId) {
-        setSessionRefreshTrigger((prev) => prev + 1);
-        await refreshSessionDebug(newSessionId);
+        await refreshStreamSessionState(newSessionId);
       }
 
       markSessionUnread(activeSessionKey);
@@ -2156,6 +2155,15 @@ function App() {
       if (aborted || stopped) {
         // User stopped streaming or aborted
       } else {
+        const recovered =
+          newSessionId && typeof currentAssistantId === 'number'
+            ? await waitForPersistedAssistantContent(newSessionId, currentAssistantId)
+            : false;
+        if (recovered) {
+          markSessionUnread(newSessionId || activeSessionKey);
+          return;
+        }
+
         const inflight = inFlightBySessionRef.current[activeSessionKey];
         const lastEventAt = inflight?.lastEventAt;
         const stalledForMs = lastEventAt ? Date.now() - lastEventAt : null;
@@ -3311,6 +3319,40 @@ function App() {
     },
     [hydrateMessagesWithSteps]
   );
+
+  const refreshStreamSessionState = async (sessionId: string) => {
+    if (!sessionId) return;
+    setSessionRefreshTrigger((prev) => prev + 1);
+    const [messagesResult, debugResult] = await Promise.allSettled([
+      refreshSessionMessages(sessionId),
+      refreshSessionDebug(sessionId),
+    ]);
+    if (messagesResult.status === 'rejected') {
+      console.error('Failed to refresh session messages after stream:', messagesResult.reason);
+    }
+    if (debugResult.status === 'rejected') {
+      console.error('Failed to refresh session debug after stream:', debugResult.reason);
+    }
+  };
+
+  const waitForPersistedAssistantContent = async (sessionId: string, assistantId: number) => {
+    if (!sessionId || !Number.isFinite(assistantId)) return false;
+    const delays = [0, 400, 1200];
+    for (const delay of delays) {
+      if (delay > 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, delay));
+      }
+      await refreshStreamSessionState(sessionId);
+      const synced = messagesCacheRef.current[getSessionKey(sessionId)] || [];
+      const persisted = synced.some(
+        (msg) => msg.id === assistantId && msg.role === 'assistant' && Boolean(msg.content?.trim())
+      );
+      if (persisted) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   useEffect(() => {
     const timer = window.setInterval(() => {

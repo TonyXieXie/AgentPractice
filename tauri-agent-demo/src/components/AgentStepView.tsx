@@ -739,6 +739,7 @@ function AgentStepView({
     resolveStepPtyBinding
 }: AgentStepViewProps) {
     const ptySnapshot = usePtySessionSnapshot(sessionId);
+    const [processCollapsed, setProcessCollapsed] = useState(false);
     const [expandedObservations, setExpandedObservations] = useState<Record<string, boolean>>({});
     const [translatedSearchSteps, setTranslatedSearchSteps] = useState<Record<string, boolean>>({});
     const [expandedErrors, setExpandedErrors] = useState<Record<string, boolean>>({});
@@ -751,12 +752,17 @@ function AgentStepView({
     const [patchSummaryExpanded, setPatchSummaryExpanded] = useState(false);
     const mermaidRootRef = useRef<HTMLDivElement | null>(null);
     const mermaidInitializedRef = useRef(false);
+    const autoCollapsedMessageRef = useRef<string | null>(null);
     const [fileValidationTick, setFileValidationTick] = useState(0);
     const fileExistsCacheRef = useRef<Map<string, FileCheckEntry>>(new Map());
     const pendingFileChecksRef = useRef<Set<string>>(new Set());
     const MERMAID_MIN_SCALE = 0.2;
     const MERMAID_MAX_SCALE = 4;
     const MERMAID_ZOOM_STEP = 0.15;
+    const hasFinalStep = useMemo(
+        () => steps.some((step) => (STEP_CATEGORY[step.step_type] || 'other') === 'final'),
+        [steps]
+    );
     const latestRunShellIndexByPty = useMemo(() => {
         const indexByPty = new Map<string, number>();
         steps.forEach((step, index) => {
@@ -792,6 +798,19 @@ function AgentStepView({
             window.removeEventListener('blur', dismiss);
         };
     }, [fileMenu]);
+
+    useEffect(() => {
+        const messageKey = messageId != null ? String(messageId) : `session:${sessionId || 'na'}`;
+        if (streaming) {
+            setProcessCollapsed(false);
+            autoCollapsedMessageRef.current = null;
+            return;
+        }
+        if (!hasFinalStep) return;
+        if (autoCollapsedMessageRef.current === messageKey) return;
+        autoCollapsedMessageRef.current = messageKey;
+        setProcessCollapsed(true);
+    }, [hasFinalStep, messageId, sessionId, streaming]);
 
 
 
@@ -1850,6 +1869,14 @@ function AgentStepView({
         : -1;
 
     const showPatchSummary = !streaming && patchAggregate.summary.length > 0;
+    const processStepCount = useMemo(() => {
+        const nonFinalSteps = steps.reduce((count, step) => {
+            const category = STEP_CATEGORY[step.step_type] || 'other';
+            return category === 'final' ? count : count + 1;
+        }, 0);
+        return nonFinalSteps + (showPatchSummary ? 1 : 0);
+    }, [showPatchSummary, steps]);
+    const canCollapseProcess = hasFinalStep && processStepCount > 0;
 
     useEffect(() => {
         if (showPatchSummary) {
@@ -1905,9 +1932,17 @@ function AgentStepView({
         </div>
     ) : null;
 
-    const renderGroupedSteps = () => {
+    const renderGroupedSteps = (options?: { includeFinal?: boolean; includeProcess?: boolean }) => {
+        const includeFinal = options?.includeFinal ?? true;
+        const includeProcess = options?.includeProcess ?? true;
         const items = steps.map((step, index) => {
                 const category = STEP_CATEGORY[step.step_type] || 'other';
+                if (category === 'final' && !includeFinal) {
+                    return null;
+                }
+                if (category !== 'final' && !includeProcess) {
+                    return null;
+                }
                 const iteration = getIterationValue(step);
                 const stepKey = `${step.step_type}-${index}`;
                 const isObservation = step.step_type === 'observation';
@@ -2353,15 +2388,26 @@ function AgentStepView({
                         </Fragment>
                     )
                 };
-            });
+            }).filter((item): item is StepItem => item !== null);
         return groupStepElements(items, { debugActive, onOpenDebugCall });
     };
 
     return (
         <>
+            {canCollapseProcess && (
+                <div className="agent-process-toggle-row">
+                    <button
+                        type="button"
+                        className={`agent-process-toggle${processCollapsed ? ' collapsed' : ''}`}
+                        onClick={() => setProcessCollapsed((prev) => !prev)}
+                    >
+                        {processCollapsed ? `展开步骤过程 (${processStepCount})` : '收起步骤过程'}
+                    </button>
+                </div>
+            )}
             <div className="agent-steps" ref={mermaidRootRef}>
-            {renderGroupedSteps()}
-            {showPatchSummary && (
+            {renderGroupedSteps({ includeProcess: !processCollapsed, includeFinal: true })}
+            {!processCollapsed && showPatchSummary && (
                 <div className="agent-step tool">
                     <div className="agent-step-header">
                         <span className="agent-step-category">Tool Call</span>

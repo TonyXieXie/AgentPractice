@@ -216,6 +216,7 @@ export interface ChatSession {
     title: string;
     config_id: string;
     work_path?: string | null;
+    agent_type?: string | null;
     agent_profile?: string | null;
     parent_session_id?: string | null;
     context_summary?: string | null;
@@ -231,6 +232,7 @@ export interface ChatSessionCreate {
     title?: string;
     config_id: string;
     work_path?: string | null;
+    agent_type?: string | null;
     agent_profile?: string | null;
     parent_session_id?: string | null;
 }
@@ -239,6 +241,7 @@ export interface ChatSessionUpdate {
     title?: string;
     work_path?: string | null;
     config_id?: string;
+    agent_type?: string | null;
     agent_profile?: string | null;
     parent_session_id?: string | null;
 }
