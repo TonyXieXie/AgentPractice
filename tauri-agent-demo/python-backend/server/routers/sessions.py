@@ -2,7 +2,7 @@ from typing import List
 
 from fastapi import APIRouter
 
-from models import ChatMessage, ChatSession
+from models import BranchSessionCreateRequest, BranchSessionCreateResponse, ChatMessage, ChatSession
 from server.services import base_service
 from server.services import session_service
 
@@ -13,6 +13,12 @@ router.add_api_route("/sessions/{session_id}", session_service.get_session, meth
 router.add_api_route("/sessions", session_service.create_session, methods=["POST"], response_model=ChatSession)
 router.add_api_route("/sessions/{session_id}", session_service.update_session, methods=["PUT"], response_model=ChatSession)
 router.add_api_route("/sessions/{session_id}/copy", session_service.copy_session, methods=["POST"], response_model=ChatSession)
+router.add_api_route(
+    "/sessions/{session_id}/branches",
+    session_service.create_branch_session,
+    methods=["POST"],
+    response_model=BranchSessionCreateResponse,
+)
 router.add_api_route("/sessions/{session_id}", session_service.delete_session, methods=["DELETE"])
 router.add_api_route("/sessions/{session_id}/messages", session_service.get_session_messages, methods=["GET"], response_model=List[ChatMessage])
 router.add_api_route("/sessions/{session_id}/llm_calls", session_service.get_session_llm_calls, methods=["GET"])

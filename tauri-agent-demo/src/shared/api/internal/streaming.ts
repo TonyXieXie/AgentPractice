@@ -5,6 +5,7 @@ export interface AgentStep {
     step_type: 'thought' | 'thought_delta' | 'action' | 'action_delta' | 'observation' | 'observation_delta' | 'answer' | 'answer_delta' | 'error' | 'context_estimate';
     content: string;
     metadata?: Record<string, any>;
+    sequence?: number;
 }
 
 export interface AgentStepWithMessage extends AgentStep {

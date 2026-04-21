@@ -3,6 +3,7 @@ export type LLMProfile = 'openai' | 'openai_compatible' | 'deepseek' | 'zhipu';
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 export type ReasoningSummary = 'auto' | 'concise' | 'detailed';
 export type AgentMode = 'default' | 'super';
+export type SessionKind = 'regular' | 'subagent' | 'branch';
 
 export interface ToolDefinition {
     name: string;
@@ -218,6 +219,7 @@ export interface ChatSession {
     work_path?: string | null;
     agent_type?: string | null;
     agent_profile?: string | null;
+    session_kind?: SessionKind | null;
     parent_session_id?: string | null;
     context_summary?: string | null;
     last_compressed_llm_call_id?: number | null;
@@ -234,6 +236,7 @@ export interface ChatSessionCreate {
     work_path?: string | null;
     agent_type?: string | null;
     agent_profile?: string | null;
+    session_kind?: SessionKind | null;
     parent_session_id?: string | null;
 }
 
@@ -243,7 +246,33 @@ export interface ChatSessionUpdate {
     config_id?: string;
     agent_type?: string | null;
     agent_profile?: string | null;
+    session_kind?: SessionKind | null;
     parent_session_id?: string | null;
+}
+
+export interface BranchLink {
+    id: string;
+    child_session_id: string;
+    step_sequence: number;
+    start_offset: number;
+    end_offset: number;
+    selected_text: string;
+    created_at: string;
+}
+
+export interface BranchSessionCreateRequest {
+    source_message_id: number;
+    source_step_sequence: number;
+    selection_start: number;
+    selection_end: number;
+    selected_text: string;
+}
+
+export interface BranchSessionCreateResponse {
+    branch_session: ChatSession;
+    source_message_id: number;
+    source_message_metadata: Record<string, any>;
+    existing: boolean;
 }
 
 export interface LLMCall {

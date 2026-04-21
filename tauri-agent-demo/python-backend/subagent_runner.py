@@ -189,6 +189,7 @@ def prepare_subagent_session(
         work_path=getattr(parent, "work_path", None),
         agent_type="react",
         agent_profile=subagent_profile_id,
+        session_kind="subagent",
         parent_session_id=parent_session_id
     ))
 

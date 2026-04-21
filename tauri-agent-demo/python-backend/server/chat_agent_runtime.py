@@ -73,6 +73,7 @@ async def run_agent_stream(request: ChatRequest, state: Any) -> None:
                     work_path=request.work_path,
                     agent_type="react",
                     agent_profile=request.agent_profile,
+                    session_kind="regular",
                 )
             )
             new_session_created = True

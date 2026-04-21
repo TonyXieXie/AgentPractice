@@ -11,6 +11,7 @@ type UseAppShellBootstrapParams = {
   setAgentConfig: Dispatch<SetStateAction<AgentConfig | null>>;
   setCurrentAgentProfileId: Dispatch<SetStateAction<string | null>>;
   setSkills: Dispatch<SetStateAction<SkillSummary[]>>;
+  skipDefaultConfig?: boolean;
 };
 
 export function useAppShellBootstrap({
@@ -20,6 +21,7 @@ export function useAppShellBootstrap({
   setAgentConfig,
   setCurrentAgentProfileId,
   setSkills,
+  skipDefaultConfig = false,
 }: UseAppShellBootstrapParams) {
   const resolveAgentProfileId = useCallback((config: AgentConfig | null, desired?: string | null) => {
     if (!config) return desired ?? null;
@@ -73,11 +75,13 @@ export function useAppShellBootstrap({
   }, [setSkills]);
 
   useEffect(() => {
-    void loadDefaultConfig();
+    if (!skipDefaultConfig) {
+      void loadDefaultConfig();
+    }
     void loadAllConfigs();
     void loadAgentConfig();
     void loadSkills();
-  }, [loadAgentConfig, loadAllConfigs, loadDefaultConfig, loadSkills]);
+  }, [loadAgentConfig, loadAllConfigs, loadDefaultConfig, loadSkills, skipDefaultConfig]);
 
   return {
     resolveAgentProfileId,

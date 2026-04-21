@@ -1,6 +1,7 @@
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
 import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
+import { listen } from '@tauri-apps/api/event';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { watchImmediate, type UnwatchFn } from '@tauri-apps/plugin-fs';
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
@@ -18,10 +19,14 @@ import {
   ReasoningEffort,
   AgentMode,
   AgentConfig,
+  BranchLink,
+  BranchSessionCreateRequest,
   ContextEstimate,
-  SkillSummary
+  SkillSummary,
+  SessionKind,
 } from './types';
 import {
+  createBranchSession,
   sendMessageAgentStream,
   getConfig,
   getSession,
@@ -64,11 +69,13 @@ import {
   findSkillInvocation,
   formatTokenCount,
   formatWorkPath,
+  getBranchWindowBounds,
   getLatestRequestPayload,
   getMainWindowBounds,
   getParentPath,
   getWorkdirWindowBounds,
   isAbsolutePath,
+  makeBranchLabel,
   makeWorkdirLabel,
   normalizeContextEstimate,
   normalizeFileHref,
@@ -84,6 +91,7 @@ import { useAppShellSessionChannel } from './features/appShell/useSessionChannel
 import { useToolPermissionPolling } from './features/appShell/useToolPermissionPolling';
 
 const DRAFT_SESSION_KEY = '__draft__';
+const BRANCH_WINDOW_BOUNDS_KEY = 'branchWindowBounds';
 
 const REASONING_OPTIONS: { value: ReasoningEffort; label: string }[] = [
   { value: 'none', label: 'none' },
@@ -219,7 +227,10 @@ type CommandItem = {
   insertText: string;
 };
 
-function App() {
+export type AppShellWindowMode = 'main' | 'branch';
+
+function App({ windowMode = 'main' }: { windowMode?: AppShellWindowMode }) {
+  const isBranchWindow = windowMode === 'branch';
   const [inputMsg, setInputMsg] = useState('');
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [activeSkill, setActiveSkill] = useState<SkillSummary | null>(null);
@@ -234,11 +245,13 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [currentConfig, setCurrentConfig] = useState<LLMConfig | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
-  const [currentSessionParentId, setCurrentSessionParentId] = useState<string | null>(null);
+  const [, setCurrentSessionParentId] = useState<string | null>(null);
+  const [currentSessionKind, setCurrentSessionKind] = useState<SessionKind | null>(null);
   const [currentWorkPath, setCurrentWorkPath] = useState('');
   const [showConfigManager, setShowConfigManager] = useState(false);
   const [sessionRefreshTrigger, setSessionRefreshTrigger] = useState(0);
   const [showSidebar, setShowSidebar] = useState(() => {
+    if (isBranchWindow) return false;
     try {
       const raw = localStorage.getItem(SIDEBAR_OPEN_KEY);
       if (raw !== null) {
@@ -338,6 +351,7 @@ function App() {
   const containerPaddingRef = useRef<{ top: number; bottom: number }>({ top: 0, bottom: 0 });
   const workPathBySessionRef = useRef<Record<string, string>>({});
   const currentSessionIdRef = useRef<string | null>(null);
+  const currentConfigRef = useRef<LLMConfig | null>(null);
   const queueBySessionRef = useRef<Record<string, QueueItem[]>>({});
   const inFlightBySessionRef = useRef<Record<string, InFlightState>>({});
   const pendingPermissionBySessionRef = useRef<Record<string, ToolPermissionRequest | null>>({});
@@ -348,7 +362,27 @@ function App() {
   const lastWorkFileOpenRef = useRef<{ key: string; at: number } | null>(null);
   const astWatchRef = useRef<UnwatchFn | null>(null);
   const astNotifyRef = useRef<{ timer: number | null; paths: Set<string> }>({ timer: null, paths: new Set() });
+  const branchWindowInitializedRef = useRef(false);
+  const branchInitialPromptHandledRef = useRef(false);
+  const branchSelectSessionRef = useRef<null | ((sessionId: string, options?: { forceReload?: boolean; skipStash?: boolean }) => Promise<void>)>(null);
+  const branchEnqueueMessageRef = useRef<null | ((message: string, sessionId: string | null, attachments?: PendingAttachment[]) => Promise<void>)>(null);
   const appWindow = useMemo(() => getCurrentWindow(), []);
+  const initialBranchSessionId = useMemo(() => {
+    if (!isBranchWindow) return null;
+    const params = new URLSearchParams(window.location.search);
+    return params.get('session');
+  }, [isBranchWindow]);
+  const initialBranchDraftPrompt = useMemo(() => {
+    if (!isBranchWindow) return '';
+    const params = new URLSearchParams(window.location.search);
+    return params.get('draft') || '';
+  }, [isBranchWindow]);
+  const initialBranchAutoSend = useMemo(() => {
+    if (!isBranchWindow) return false;
+    const params = new URLSearchParams(window.location.search);
+    const value = String(params.get('autoSend') || '').trim().toLowerCase();
+    return value === '1' || value === 'true';
+  }, [isBranchWindow]);
   const {
     resolveAgentProfileId,
     loadDefaultConfig,
@@ -361,15 +395,17 @@ function App() {
     setAgentConfig,
     setCurrentAgentProfileId,
     setSkills,
+    skipDefaultConfig: isBranchWindow,
   });
 
   useEffect(() => {
+    if (isBranchWindow) return;
     try {
       localStorage.setItem(SIDEBAR_OPEN_KEY, showSidebar ? '1' : '0');
     } catch {
       // ignore
     }
-  }, [showSidebar]);
+  }, [isBranchWindow, showSidebar]);
 
   const toggleSidebar = useCallback(() => {
     setShowSidebar((prev) => !prev);
@@ -475,14 +511,18 @@ function App() {
   }, [appWindow]);
 
   useEffect(() => {
-    const bounds = getMainWindowBounds();
+    const bounds = isBranchWindow ? getBranchWindowBounds() : getMainWindowBounds();
     if (!bounds?.width || !bounds?.height) return;
     appWindow.setSize(new LogicalSize(bounds.width, bounds.height)).catch(() => undefined);
-  }, [appWindow]);
+  }, [appWindow, isBranchWindow]);
 
   useEffect(() => {
     currentSessionIdRef.current = currentSessionId;
   }, [currentSessionId]);
+
+  useEffect(() => {
+    currentConfigRef.current = currentConfig;
+  }, [currentConfig]);
 
   const isImageFile = (file: File) => {
     if (file.type && file.type.startsWith('image/')) return true;
@@ -617,6 +657,7 @@ function App() {
   useEffect(() => {
     let timer: number | null = null;
     let unlisten: (() => void) | null = null;
+    const boundsStorageKey = isBranchWindow ? BRANCH_WINDOW_BOUNDS_KEY : MAIN_WINDOW_BOUNDS_KEY;
 
     const saveBounds = async () => {
       try {
@@ -627,7 +668,7 @@ function App() {
           width: Math.max(800, Math.round(size.width)),
           height: Math.max(600, Math.round(size.height)),
         };
-        localStorage.setItem(MAIN_WINDOW_BOUNDS_KEY, JSON.stringify(payload));
+        localStorage.setItem(boundsStorageKey, JSON.stringify(payload));
       } catch {
         // ignore
       }
@@ -650,7 +691,7 @@ function App() {
       if (unlisten) unlisten();
       window.removeEventListener('beforeunload', scheduleSave);
     };
-  }, [appWindow]);
+  }, [appWindow, isBranchWindow]);
 
   const handleTitlebarMinimize = async () => {
     try {
@@ -1830,6 +1871,7 @@ function App() {
             currentSessionIdRef.current = newSessionId;
             setCurrentSessionId(newSessionId);
             setCurrentSessionParentId(null);
+            setCurrentSessionKind('regular');
             setSessionRefreshTrigger((prev) => prev + 1);
           }
           if (activeSessionKey === DRAFT_SESSION_KEY && newSessionId) {
@@ -1921,10 +1963,16 @@ function App() {
               if (streamingIndex >= 0) {
                 nextSteps[streamingIndex] = {
                   ...nextSteps[streamingIndex],
-                  content: buffer
+                  content: buffer,
+                  sequence: nextSteps[streamingIndex].sequence ?? step.sequence
                 };
               } else {
-                nextSteps.push({ step_type: 'answer', content: buffer, metadata: { streaming: true, stream_key: streamKey } });
+                nextSteps.push({
+                  step_type: 'answer',
+                  content: buffer,
+                  metadata: { streaming: true, stream_key: streamKey },
+                  sequence: step.sequence,
+                });
               }
 
               nextMetadata.agent_steps = nextSteps;
@@ -1959,16 +2007,23 @@ function App() {
                 nextSteps[streamingIndex] = {
                   ...nextSteps[streamingIndex],
                   content: buffer,
-                  metadata: { ...(nextSteps[streamingIndex].metadata || {}), stream_key: streamKey, streaming: true }
+                  metadata: { ...(nextSteps[streamingIndex].metadata || {}), stream_key: streamKey, streaming: true },
+                  sequence: nextSteps[streamingIndex].sequence ?? step.sequence
                 };
               } else if (fallbackIndex >= 0) {
                 nextSteps[fallbackIndex] = {
                   step_type: 'thought',
                   content: buffer,
-                  metadata: { ...(nextSteps[fallbackIndex].metadata || {}), stream_key: streamKey, streaming: true }
+                  metadata: { ...(nextSteps[fallbackIndex].metadata || {}), stream_key: streamKey, streaming: true },
+                  sequence: nextSteps[fallbackIndex].sequence ?? step.sequence
                 };
               } else {
-                nextSteps.push({ step_type: 'thought', content: buffer, metadata: { stream_key: streamKey, streaming: true } });
+                nextSteps.push({
+                  step_type: 'thought',
+                  content: buffer,
+                  metadata: { stream_key: streamKey, streaming: true },
+                  sequence: step.sequence,
+                });
               }
 
               nextMetadata.agent_steps = nextSteps;
@@ -1993,13 +2048,15 @@ function App() {
                   nextSteps[streamingIndex] = {
                     ...nextSteps[streamingIndex],
                     content: display,
-                    metadata: { ...(nextSteps[streamingIndex].metadata || {}), stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay }
+                    metadata: { ...(nextSteps[streamingIndex].metadata || {}), stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay },
+                    sequence: nextSteps[streamingIndex].sequence ?? step.sequence
                   };
                 } else {
                   nextSteps.push({
                     step_type: 'action',
                     content: display,
-                    metadata: { stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay }
+                    metadata: { stream_key: streamKey, streaming: true, tool: toolName, tool_display: toolDisplay },
+                    sequence: step.sequence,
                   });
                 }
 
@@ -2048,7 +2105,8 @@ function App() {
                   nextSteps[streamingIndex] = {
                     ...nextSteps[streamingIndex],
                     content: buffer,
-                    metadata: mergedMetadata
+                    metadata: mergedMetadata,
+                    sequence: nextSteps[streamingIndex].sequence ?? step.sequence
                   };
                 } else {
                   nextSteps.push({
@@ -2060,7 +2118,8 @@ function App() {
                       streaming: true,
                       tool: toolName,
                       tool_display: toolDisplay
-                    }
+                    },
+                    sequence: step.sequence,
                   });
                 }
 
@@ -2327,6 +2386,7 @@ function App() {
         await updateSession(sessionId, { config_id: config.id });
         setSessionRefreshTrigger((prev) => prev + 1);
       }
+      currentConfigRef.current = config;
       setCurrentConfig(config);
       setShowConfigSelector(false);
     } catch (error) {
@@ -2611,6 +2671,88 @@ function App() {
     });
   };
 
+  const openBranchWindow = async (sessionId: string, draftPrompt?: string, autoSend?: boolean) => {
+    const trimmedSessionId = String(sessionId || '').trim();
+    if (!trimmedSessionId) return;
+    const label = makeBranchLabel(trimmedSessionId);
+    const payload = { target: label, sessionId: trimmedSessionId, draftPrompt, autoSend: Boolean(autoSend) };
+    const existing = await WebviewWindow.getByLabel(label);
+    if (existing) {
+      try {
+        await existing.show();
+        await existing.setFocus();
+      } catch {
+        // ignore focus errors
+      }
+      void existing.emit('branch:open', payload);
+      return;
+    }
+
+    const bounds = getBranchWindowBounds();
+    const params = new URLSearchParams({
+      window: 'branch',
+      session: trimmedSessionId,
+    });
+    if (draftPrompt) {
+      params.set('draft', draftPrompt);
+    }
+    if (autoSend) {
+      params.set('autoSend', '1');
+    }
+    const win = new WebviewWindow(label, {
+      title: 'GYY',
+      url: `/?${params.toString()}`,
+      width: bounds?.width ?? 1200,
+      height: bounds?.height ?? 950,
+      decorations: IS_MAC,
+    });
+
+    win.once('tauri://error', (event) => {
+      console.error('Failed to create branch window:', event);
+    });
+  };
+
+  const handleOpenBranchSession = async (sessionId: string) => {
+    await openBranchWindow(sessionId);
+  };
+
+  const handleCreateBranchFromAnswer = async (
+    payload: BranchSessionCreateRequest & { prompt: string }
+  ) => {
+    const sourceSessionId = currentSessionIdRef.current;
+    if (!sourceSessionId) {
+      throw new Error('No active session');
+    }
+    const prompt = String(payload.prompt || '').trim();
+    if (!prompt) {
+      throw new Error('Branch prompt is empty');
+    }
+    const response = await createBranchSession(sourceSessionId, {
+      source_message_id: payload.source_message_id,
+      source_step_sequence: payload.source_step_sequence,
+      selection_start: payload.selection_start,
+      selection_end: payload.selection_end,
+      selected_text: payload.selected_text,
+    });
+    const nextBranchLinks = Array.isArray(response.source_message_metadata?.branch_links)
+      ? (response.source_message_metadata.branch_links as BranchLink[])
+      : [];
+    updateSessionMessages(getSessionKey(sourceSessionId), (prev) =>
+      prev.map((msg) =>
+        msg.id === response.source_message_id
+          ? {
+              ...msg,
+              metadata: {
+                ...(msg.metadata || {}),
+                branch_links: nextBranchLinks,
+              },
+            }
+          : msg
+      )
+    );
+    await openBranchWindow(response.branch_session.id, prompt, true);
+  };
+
   const openWorkdirForFile = async (filePath: string, line?: number, column?: number) => {
     const parsed = parseFileLocation(filePath);
     const rawPath = parsed.path || filePath;
@@ -2726,7 +2868,8 @@ function App() {
 
   const enqueueMessage = async (message: string, sessionId: string | null, attachments: PendingAttachment[] = []) => {
     if (!message.trim() && attachments.length === 0) return;
-    if (!currentConfig) {
+    const activeConfig = currentConfigRef.current;
+    if (!activeConfig) {
       alert('Please configure an LLM first.');
       return;
     }
@@ -2754,7 +2897,7 @@ function App() {
       message,
       sessionId,
       sessionKey,
-      configId: currentConfig.id,
+      configId: activeConfig.id,
       agentMode,
       agentProfileId: resolveAgentProfileId(agentConfig, currentAgentProfileId),
       workPath,
@@ -3002,6 +3145,7 @@ function App() {
       }
       mark('session');
       setCurrentSessionParentId(session.parent_session_id || null);
+      setCurrentSessionKind((session.session_kind || 'regular') as SessionKind);
       const sessionWorkPath = session.work_path || '';
       workPathBySessionRef.current[session.id] = sessionWorkPath;
       setCurrentWorkPath(sessionWorkPath);
@@ -3071,6 +3215,7 @@ function App() {
         if (perfEnabled) {
           perfMeta.configCache = true;
         }
+        currentConfigRef.current = cachedConfig;
         setCurrentConfig(cachedConfig);
       } else {
         const configFetchStart = perfEnabled ? performance.now() : 0;
@@ -3079,6 +3224,7 @@ function App() {
           perfMeta.configFetchMs = (performance.now() - configFetchStart).toFixed(1);
           perfMeta.configCache = false;
         }
+        currentConfigRef.current = config;
         setCurrentConfig(config);
       }
       mark('config');
@@ -3090,6 +3236,98 @@ function App() {
     }
   };
 
+  useEffect(() => {
+    branchSelectSessionRef.current = handleSelectSession;
+  }, [handleSelectSession]);
+
+  useEffect(() => {
+    branchEnqueueMessageRef.current = enqueueMessage;
+  }, [enqueueMessage]);
+
+  useEffect(() => {
+    if (!isBranchWindow) return;
+    let cancelled = false;
+    const bootstrap = async () => {
+      const branchSessionId = String(initialBranchSessionId || '').trim();
+      if (!branchSessionId || branchWindowInitializedRef.current) return;
+      branchWindowInitializedRef.current = true;
+      try {
+        await handleSelectSession(branchSessionId, { skipStash: true });
+        const initialPrompt = initialBranchDraftPrompt.trim();
+        if (!branchInitialPromptHandledRef.current && initialPrompt) {
+          branchInitialPromptHandledRef.current = true;
+          window.history.replaceState(null, '', `/?window=branch&session=${encodeURIComponent(branchSessionId)}`);
+          if (initialBranchAutoSend) {
+            setInputMsg('');
+            await enqueueMessage(initialPrompt, branchSessionId);
+          } else {
+            setInputMsg(initialPrompt);
+            requestAnimationFrame(() => {
+              inputRef.current?.focus();
+              const caret = initialPrompt.length;
+              inputRef.current?.setSelectionRange(caret, caret);
+            });
+          }
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error('Failed to initialize branch window session:', error);
+        }
+      }
+    };
+    void bootstrap();
+    return () => {
+      cancelled = true;
+    };
+  }, [enqueueMessage, handleSelectSession, initialBranchAutoSend, initialBranchDraftPrompt, initialBranchSessionId, isBranchWindow]);
+
+  useEffect(() => {
+    if (!isBranchWindow) return;
+    let disposed = false;
+    let unlisten: null | (() => void) = null;
+    const register = async () => {
+      unlisten = await listen<{
+        target?: string;
+        sessionId?: string;
+        draftPrompt?: string;
+        autoSend?: boolean;
+      }>('branch:open', async (event) => {
+        if (disposed) return;
+        const payload = event.payload || {};
+        const nextSessionId = String(payload.sessionId || '').trim();
+        if (!nextSessionId) return;
+        const draftPrompt = typeof payload.draftPrompt === 'string' ? payload.draftPrompt : '';
+        const autoSend = Boolean(payload.autoSend);
+        try {
+          if (currentSessionIdRef.current !== nextSessionId || !currentConfigRef.current) {
+            await branchSelectSessionRef.current?.(nextSessionId, { skipStash: true });
+          }
+          if (!draftPrompt) return;
+          if (autoSend) {
+            setInputMsg('');
+            await branchEnqueueMessageRef.current?.(draftPrompt, nextSessionId);
+            return;
+          }
+          setInputMsg(draftPrompt);
+          requestAnimationFrame(() => {
+            inputRef.current?.focus();
+            const caret = draftPrompt.length;
+            inputRef.current?.setSelectionRange(caret, caret);
+          });
+        } catch (error) {
+          console.error('Failed to handle branch open event:', error);
+        }
+      });
+    };
+    void register();
+    return () => {
+      disposed = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [isBranchWindow]);
+
   const handleNewChat = async () => {
     const sourceKey = getCurrentSessionKey();
     const sourcePath = getSessionWorkPath(sourceKey);
@@ -3099,6 +3337,7 @@ function App() {
     currentSessionIdRef.current = null;
     setCurrentSessionId(null);
     setCurrentSessionParentId(null);
+    setCurrentSessionKind(null);
     setSessionMessages(DRAFT_SESSION_KEY, []);
     setLlmCalls([]);
     setToolStats(null);
@@ -3195,7 +3434,8 @@ function App() {
   };
 
   const currentSessionKey = getSessionKey(currentSessionId);
-  const isChildSession = Boolean(currentSessionParentId);
+  const isChildSession = currentSessionKind === 'subagent';
+  const debugPanelVisible = showDebugPanel && !isBranchWindow;
   const isStreamingCurrent = useMemo(
     () => Boolean(inFlightBySessionRef.current[currentSessionKey]),
     [currentSessionKey, inFlightTick]
@@ -3292,7 +3532,12 @@ function App() {
     const stepMap = new Map<number, AgentStep[]>();
     (steps as AgentStepWithMessage[]).forEach((step) => {
       const list = stepMap.get(step.message_id) || [];
-      list.push({ step_type: step.step_type as AgentStep['step_type'], content: step.content, metadata: step.metadata });
+      list.push({
+        step_type: step.step_type as AgentStep['step_type'],
+        content: step.content,
+        metadata: step.metadata,
+        sequence: step.sequence,
+      });
       stepMap.set(step.message_id, list);
     });
     return msgs.map((msg) => {
@@ -3643,7 +3888,7 @@ function App() {
         </div>
       </div>
       <div className="app-body">
-      {!showSidebar && (
+      {!isBranchWindow && !showSidebar && (
         <button
           type="button"
           className="sidebar-float-toggle"
@@ -3657,7 +3902,7 @@ function App() {
         </button>
       )}
       <div className="app-container">
-      {showSidebar && (
+      {!isBranchWindow && showSidebar && (
         <SessionList
           currentSessionId={currentSessionId}
           onSelectSession={handleSelectSession}
@@ -3665,7 +3910,7 @@ function App() {
           onOpenConfig={() => setShowConfigManager(true)}
           onToggleDebug={toggleDebugPanel}
           onToggleSidebar={toggleSidebar}
-          debugActive={showDebugPanel}
+          debugActive={debugPanelVisible}
           refreshTrigger={sessionRefreshTrigger}
           inFlightBySession={inFlightBySession}
           unreadBySession={unreadBySession}
@@ -3737,6 +3982,7 @@ function App() {
                               steps={steps}
                               sessionId={msg.session_id || currentSessionId || undefined}
                               messageId={msg.id}
+                              branchLinks={Array.isArray(msg.metadata?.branch_links) ? msg.metadata.branch_links as BranchLink[] : undefined}
                               streaming={streaming}
                               pendingPermission={showPermission ? currentPendingPermission : null}
                               onPermissionDecision={handlePermissionDecision}
@@ -3753,8 +3999,10 @@ function App() {
                               patchRevertBusy={patchRevertBusy}
                               onOpenWorkFile={openWorkdirForFile}
                               currentWorkPath={currentWorkPath}
-                              debugActive={showDebugPanel}
+                              debugActive={debugPanelVisible}
                               onOpenDebugCall={(iteration) => handleOpenDebugCall(msg.id, iteration)}
+                              onCreateBranch={handleCreateBranchFromAnswer}
+                              onOpenBranchSession={handleOpenBranchSession}
                               ptyInteraction={ptyInteraction}
                               resolveStepPtyBinding={resolveStepPtyBinding}
                             />
@@ -4030,7 +4278,7 @@ function App() {
             />
 
             <div className="input-footer">
-              {currentConfig && (
+              {currentConfig && !isBranchWindow && (
                 <div className="input-controls">
                   <div className="model-selector-inline">
                     <button
@@ -4248,6 +4496,7 @@ function App() {
               )}
 
               <div className="input-actions">
+                {!isBranchWindow && (
                 <button
                   type="button"
                   className={`pty-toggle-btn${showPtyPanel ? ' active' : ''}`}
@@ -4273,7 +4522,8 @@ function App() {
                     />
                   </svg>
                 </button>
-                {currentConfig && (
+                )}
+                {currentConfig && !isBranchWindow && (
                 <div
                   className={`context-usage${contextUsage.ratio >= 0.8 ? ' warn' : contextUsage.ratio >= 0.6 ? ' mid' : ''}`}
                   title={`Context ${Math.round(contextUsage.ratio * 100)}%\n总用量: ${formatTokenCount(contextUsage.usedTokens)} / ${formatTokenCount(contextUsage.maxTokens)}\n系统提示词: ${formatTokenCount(contextUsage.breakdown.system)}\n历史对话(含压缩): ${formatTokenCount(contextUsage.breakdown.history)}\n工具声明: ${formatTokenCount(contextUsage.breakdown.tools)}\n其余: ${formatTokenCount(contextUsage.breakdown.other)}`}
@@ -4361,7 +4611,7 @@ function App() {
           </div>
         </div>
       </div>
-      {showPtyPanel && (
+      {!isBranchWindow && showPtyPanel && (
         <PtyPanel
           sessionId={currentSessionId}
           onClose={closePtyPanel}
@@ -4371,7 +4621,7 @@ function App() {
           ptyInteraction={ptyInteraction}
         />
       )}
-      {showDebugPanel && (
+      {!isBranchWindow && showDebugPanel && (
         <DebugPanel
           messages={messages}
           llmCalls={llmCalls}

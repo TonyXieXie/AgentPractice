@@ -8,6 +8,7 @@ import {
     type MouseEventHandler,
     type ReactElement
 } from 'react';
+import { createPortal } from 'react-dom';
 import mermaid from 'mermaid';
 import MarkdownIt from 'markdown-it';
 import texmath from 'markdown-it-texmath';
@@ -16,7 +17,7 @@ import 'katex/dist/katex.min.css';
 import { openPath, openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { API_BASE_URL } from '../shared/api/base';
 import type { AgentStep } from '../shared/api/agent';
-import { ToolPermissionRequest, AstPayload } from '../types';
+import { ToolPermissionRequest, AstPayload, BranchLink, BranchSessionCreateRequest } from '../types';
 import { usePtySessionSnapshot } from '../ptyStore';
 import { stripAnsiForDisplay } from '../ptyAnsi';
 import type { PtyInteractionController, ResolveStepPtyBinding } from './ptyInteraction';
@@ -31,6 +32,7 @@ interface AgentStepViewProps {
     steps: AgentStep[];
     sessionId?: string;
     messageId?: number;
+    branchLinks?: BranchLink[];
     streaming?: boolean;
     pendingPermission?: ToolPermissionRequest | null;
     onPermissionDecision?: (status: 'approved' | 'approved_once' | 'denied') => void;
@@ -43,6 +45,8 @@ interface AgentStepViewProps {
     currentWorkPath?: string;
     debugActive?: boolean;
     onOpenDebugCall?: (iteration: number) => void;
+    onCreateBranch?: (payload: BranchSessionCreateRequest & { prompt: string }) => void | Promise<void>;
+    onOpenBranchSession?: (sessionId: string) => void | Promise<void>;
     ptyInteraction?: PtyInteractionController;
     resolveStepPtyBinding?: ResolveStepPtyBinding;
 }
@@ -134,6 +138,7 @@ const MERMAID_START_RE =
     /^(?:graph|flowchart|sequenceDiagram|classDiagram|stateDiagram(?:-v2)?|erDiagram|gantt|journey|pie|gitGraph|mindmap|timeline|quadrantChart|sankey-beta)\b/i;
 const MERMAID_HINT_RE =
     /(-->|==>|subgraph|participant|class|state|section|task|journey|pie|gantt|mindmap|timeline|quadrantChart|sankey|flowchart|graph)\b/i;
+const BRANCH_SKIP_SELECTOR = 'a, button, code, pre, .code-block-container, .mermaid, .mermaid-block';
 
 const injectMermaidFences = (content: string) => {
     if (!content) return content;
@@ -165,7 +170,17 @@ function renderMarkdownHtml(content: string) {
     return markdown.render(injectMermaidFences(normalized));
 }
 
-function RichContent({ content, onClick }: { content: string; onClick?: MouseEventHandler<HTMLDivElement> }) {
+function RichContent({
+    content,
+    onClick,
+    onContextMenu,
+    branchSequence
+}: {
+    content: string;
+    onClick?: MouseEventHandler<HTMLDivElement>;
+    onContextMenu?: MouseEventHandler<HTMLDivElement>;
+    branchSequence?: number | null;
+}) {
     const containerRef = useRef<HTMLDivElement | null>(null);
     const html = useMemo(() => renderMarkdownHtml(content), [content]);
 
@@ -177,7 +192,185 @@ function RichContent({ content, onClick }: { content: string; onClick?: MouseEve
         el.dataset.html = html;
     }, [html]);
 
-    return <div className="content-markdown" onClick={onClick} ref={containerRef} />;
+    return (
+        <div
+            className="content-markdown"
+            onClick={onClick}
+            onContextMenu={onContextMenu}
+            ref={containerRef}
+            data-branch-sequence={typeof branchSequence === 'number' ? String(branchSequence) : undefined}
+        />
+    );
+}
+
+function normalizeBranchLinks(rawLinks?: BranchLink[] | null) {
+    if (!Array.isArray(rawLinks)) return [] as BranchLink[];
+    return rawLinks.filter((item): item is BranchLink => {
+        return Boolean(
+            item &&
+                typeof item.id === 'string' &&
+                typeof item.child_session_id === 'string' &&
+                Number.isFinite(Number(item.step_sequence)) &&
+                Number.isFinite(Number(item.start_offset)) &&
+                Number.isFinite(Number(item.end_offset))
+        );
+    });
+}
+
+function resolveStepSequence(step: AgentStep) {
+    if (typeof step.sequence === 'number' && Number.isFinite(step.sequence)) {
+        return step.sequence;
+    }
+    const metadataSequence = Number((step.metadata || {})?.sequence);
+    return Number.isFinite(metadataSequence) ? metadataSequence : null;
+}
+
+function collectBranchableTextNodes(container: HTMLElement) {
+    const walker = document.createTreeWalker(
+        container,
+        NodeFilter.SHOW_TEXT,
+        {
+            acceptNode: (node: Node) => {
+                const text = node.nodeValue || '';
+                if (!text) return NodeFilter.FILTER_REJECT;
+                const parent = (node as Text).parentElement;
+                if (!parent) return NodeFilter.FILTER_REJECT;
+                if (parent.closest(BRANCH_SKIP_SELECTOR)) {
+                    return NodeFilter.FILTER_REJECT;
+                }
+                return NodeFilter.FILTER_ACCEPT;
+            }
+        } as unknown as NodeFilter
+    );
+    const nodes: Text[] = [];
+    while (walker.nextNode()) {
+        nodes.push(walker.currentNode as Text);
+    }
+    return nodes;
+}
+
+function getBranchableTextContent(container: HTMLElement) {
+    return collectBranchableTextNodes(container)
+        .map((node) => node.nodeValue || '')
+        .join('');
+}
+
+function safeComparePoint(range: Range, node: Text, offset: number) {
+    try {
+        return range.comparePoint(node, offset);
+    } catch {
+        return null;
+    }
+}
+
+function getSelectionOffsets(container: HTMLElement, range: Range) {
+    const textNodes = collectBranchableTextNodes(container);
+    if (!textNodes.length) return null;
+
+    let cumulative = 0;
+    let start: number | null = null;
+    let end: number | null = null;
+
+    for (const node of textNodes) {
+        const text = node.nodeValue || '';
+        const length = text.length;
+        const pointAtStart = safeComparePoint(range, node, 0);
+        const pointAtEnd = safeComparePoint(range, node, length);
+
+        if (pointAtEnd === -1) {
+            cumulative += length;
+            continue;
+        }
+
+        if (start === null && (range.intersectsNode(node) || pointAtStart === 0)) {
+            start = cumulative + (range.startContainer === node ? Math.min(range.startOffset, length) : 0);
+        }
+
+        if (range.endContainer === node) {
+            end = cumulative + Math.min(range.endOffset, length);
+            break;
+        }
+
+        if (start !== null && pointAtStart === 1) {
+            end = cumulative;
+            break;
+        }
+
+        cumulative += length;
+    }
+
+    if (start === null) return null;
+    if (end === null) {
+        end = cumulative;
+    }
+    if (end <= start) return null;
+    return { start, end };
+}
+
+function clearInjectedBranchLinks(container: HTMLElement) {
+    const links = Array.from(container.querySelectorAll<HTMLAnchorElement>('a.branch-link'));
+    links.forEach((link) => {
+        link.replaceWith(document.createTextNode(link.textContent || ''));
+    });
+    container.normalize();
+}
+
+function injectBranchLinksIntoContainer(container: HTMLElement, links: BranchLink[]) {
+    clearInjectedBranchLinks(container);
+    if (!links.length) return;
+
+    const sortedLinks = [...links]
+        .filter((item) => Number(item.end_offset) > Number(item.start_offset))
+        .sort((a, b) => Number(b.start_offset) - Number(a.start_offset));
+
+    sortedLinks.forEach((link) => {
+        const startOffset = Number(link.start_offset);
+        const endOffset = Number(link.end_offset);
+        const textNodes = collectBranchableTextNodes(container);
+        if (!textNodes.length) return;
+
+        let cumulative = 0;
+        textNodes.forEach((node) => {
+            const text = node.nodeValue || '';
+            const length = text.length;
+            const nodeStart = cumulative;
+            const nodeEnd = cumulative + length;
+            cumulative = nodeEnd;
+
+            if (nodeEnd <= startOffset || nodeStart >= endOffset) {
+                return;
+            }
+
+            const overlapStart = Math.max(startOffset, nodeStart) - nodeStart;
+            const overlapEnd = Math.min(endOffset, nodeEnd) - nodeStart;
+            if (overlapStart >= overlapEnd) {
+                return;
+            }
+
+            const before = text.slice(0, overlapStart);
+            const middle = text.slice(overlapStart, overlapEnd);
+            const after = text.slice(overlapEnd);
+            const fragment = document.createDocumentFragment();
+
+            if (before) {
+                fragment.appendChild(document.createTextNode(before));
+            }
+
+            const anchor = document.createElement('a');
+            anchor.className = 'branch-link';
+            anchor.href = '#';
+            anchor.dataset.branchSessionId = String(link.child_session_id || '');
+            anchor.dataset.branchLinkId = String(link.id || '');
+            anchor.textContent = middle;
+            fragment.appendChild(anchor);
+
+            if (after) {
+                fragment.appendChild(document.createTextNode(after));
+            }
+
+            node.parentNode?.replaceChild(fragment, node);
+        });
+    });
 }
 
 function looksLikeDiff(content: string) {
@@ -723,6 +916,7 @@ function AgentStepView({
     steps,
     sessionId,
     messageId,
+    branchLinks,
     streaming,
     pendingPermission,
     onPermissionDecision,
@@ -735,10 +929,23 @@ function AgentStepView({
     currentWorkPath,
     debugActive,
     onOpenDebugCall,
+    onCreateBranch,
+    onOpenBranchSession,
     ptyInteraction,
     resolveStepPtyBinding
 }: AgentStepViewProps) {
     const ptySnapshot = usePtySessionSnapshot(sessionId);
+    const normalizedBranchLinks = useMemo(() => normalizeBranchLinks(branchLinks), [branchLinks]);
+    const branchLinkSignature = useMemo(
+        () =>
+            normalizedBranchLinks
+                .map(
+                    (item) =>
+                        `${item.id}:${item.child_session_id}:${item.step_sequence}:${item.start_offset}:${item.end_offset}`
+                )
+                .join('|'),
+        [normalizedBranchLinks]
+    );
     const [processCollapsed, setProcessCollapsed] = useState(false);
     const [expandedObservations, setExpandedObservations] = useState<Record<string, boolean>>({});
     const [translatedSearchSteps, setTranslatedSearchSteps] = useState<Record<string, boolean>>({});
@@ -759,6 +966,19 @@ function AgentStepView({
     const MERMAID_MIN_SCALE = 0.2;
     const MERMAID_MAX_SCALE = 4;
     const MERMAID_ZOOM_STEP = 0.15;
+    const [branchMenu, setBranchMenu] = useState<{
+        x: number;
+        y: number;
+        source_step_sequence: number;
+        selection_start: number;
+        selection_end: number;
+        selected_text: string;
+    } | null>(null);
+    const [branchDraft, setBranchDraft] = useState<BranchSessionCreateRequest | null>(null);
+    const [branchPrompt, setBranchPrompt] = useState('');
+    const [branchPromptError, setBranchPromptError] = useState<string | null>(null);
+    const [branchBusy, setBranchBusy] = useState(false);
+    const branchPromptRef = useRef<HTMLTextAreaElement | null>(null);
     const hasFinalStep = useMemo(
         () => steps.some((step) => (STEP_CATEGORY[step.step_type] || 'other') === 'final'),
         [steps]
@@ -798,6 +1018,28 @@ function AgentStepView({
             window.removeEventListener('blur', dismiss);
         };
     }, [fileMenu]);
+
+    useEffect(() => {
+        if (!branchMenu) return;
+        const dismiss = () => setBranchMenu(null);
+        window.addEventListener('click', dismiss);
+        window.addEventListener('blur', dismiss);
+        window.addEventListener('scroll', dismiss, true);
+        return () => {
+            window.removeEventListener('click', dismiss);
+            window.removeEventListener('blur', dismiss);
+            window.removeEventListener('scroll', dismiss, true);
+        };
+    }, [branchMenu]);
+
+    useEffect(() => {
+        if (!branchDraft) return;
+        const frame = window.requestAnimationFrame(() => {
+            branchPromptRef.current?.focus();
+            branchPromptRef.current?.setSelectionRange(branchPrompt.length, branchPrompt.length);
+        });
+        return () => window.cancelAnimationFrame(frame);
+    }, [branchDraft, branchPrompt.length]);
 
     useEffect(() => {
         const messageKey = messageId != null ? String(messageId) : `session:${sessionId || 'na'}`;
@@ -1519,15 +1761,29 @@ function AgentStepView({
         });
     };
 
+    const injectBranchLinks = () => {
+        const root = mermaidRootRef.current;
+        if (!root) return;
+        const containers = root.querySelectorAll<HTMLElement>('.content-markdown[data-branch-sequence]');
+        containers.forEach((container) => {
+            const stepSequence = Number(container.dataset.branchSequence || '');
+            const linksForStep = normalizedBranchLinks.filter(
+                (item) => Number(item.step_sequence) === stepSequence
+            );
+            injectBranchLinksIntoContainer(container, linksForStep);
+        });
+    };
+
     useEffect(() => {
         if (!steps.length && !pendingPermission) return;
         const frame = window.requestAnimationFrame(() => {
             runMermaid();
             markFileCodeLinks();
             markFileTextLinks();
+            injectBranchLinks();
         });
         return () => window.cancelAnimationFrame(frame);
-    }, [steps, streaming, pendingPermission, fileValidationTick]);
+    }, [steps, streaming, pendingPermission, fileValidationTick, branchLinkSignature]);
 
     const patchAggregate = useMemo(() => {
         const entries: {
@@ -1784,6 +2040,15 @@ function AgentStepView({
         const target = event.target as HTMLElement;
         const link = target.closest<HTMLAnchorElement>('a');
         if (link && link.href) {
+            const branchSessionId = String(link.dataset.branchSessionId || '').trim();
+            if (branchSessionId) {
+                event.preventDefault();
+                event.stopPropagation();
+                if (onOpenBranchSession) {
+                    void onOpenBranchSession(branchSessionId);
+                }
+                return;
+            }
             const rawHref = link.getAttribute('href') || '';
             const href = rawHref || link.href;
             if (isFileHref(rawHref || href)) {
@@ -1818,6 +2083,98 @@ function AgentStepView({
                 }
                 void handleOpenFile(filePath, parsed.line, parsed.column);
             }
+        }
+    };
+
+    const handleBranchContextMenu =
+        (step: AgentStep): MouseEventHandler<HTMLDivElement> =>
+        (event) => {
+            const stepSequence = resolveStepSequence(step);
+            if (!onCreateBranch || messageId == null || step.step_type !== 'answer' || stepSequence === null) {
+                return;
+            }
+            const target = event.target as HTMLElement;
+            if (target.closest(BRANCH_SKIP_SELECTOR)) {
+                return;
+            }
+            const container = event.currentTarget;
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+                return;
+            }
+            const range = selection.getRangeAt(0);
+            const anchorNode = selection.anchorNode;
+            const focusNode = selection.focusNode;
+            if (!anchorNode || !focusNode || !container.contains(anchorNode) || !container.contains(focusNode)) {
+                return;
+            }
+            if (!container.contains(range.commonAncestorContainer)) {
+                return;
+            }
+
+            const offsets = getSelectionOffsets(container, range);
+            if (!offsets) {
+                return;
+            }
+            const fullText = getBranchableTextContent(container);
+            const selectedText = fullText.slice(offsets.start, offsets.end);
+            if (!selectedText.trim()) {
+                return;
+            }
+
+            event.preventDefault();
+            event.stopPropagation();
+            setBranchPromptError(null);
+            setBranchMenu({
+                x: event.clientX,
+                y: event.clientY,
+                source_step_sequence: stepSequence,
+                selection_start: offsets.start,
+                selection_end: offsets.end,
+                selected_text: selectedText
+            });
+        };
+
+    const handleOpenBranchPrompt = () => {
+        if (!branchMenu || messageId == null) return;
+        setBranchPromptError(null);
+        setBranchDraft({
+            source_message_id: messageId,
+            source_step_sequence: branchMenu.source_step_sequence,
+            selection_start: branchMenu.selection_start,
+            selection_end: branchMenu.selection_end,
+            selected_text: branchMenu.selected_text
+        });
+        setBranchPrompt(branchMenu.selected_text);
+        setBranchMenu(null);
+    };
+
+    const handleCloseBranchPrompt = () => {
+        if (branchBusy) return;
+        setBranchDraft(null);
+        setBranchPrompt('');
+        setBranchPromptError(null);
+    };
+
+    const handleSubmitBranch = async () => {
+        if (!branchDraft || !onCreateBranch) return;
+        const prompt = branchPrompt.trim();
+        if (!prompt) {
+            setBranchPromptError('请输入问题');
+            return;
+        }
+        setBranchBusy(true);
+        setBranchPromptError(null);
+        try {
+            await onCreateBranch({ ...branchDraft, prompt });
+            window.getSelection()?.removeAllRanges();
+            setBranchDraft(null);
+            setBranchPrompt('');
+        } catch (error) {
+            console.error('Failed to create branch session:', error);
+            setBranchPromptError('创建分支失败');
+        } finally {
+            setBranchBusy(false);
         }
     };
 
@@ -1945,6 +2302,10 @@ function AgentStepView({
                 }
                 const iteration = getIterationValue(step);
                 const stepKey = `${step.step_type}-${index}`;
+                const stepSequence = resolveStepSequence(step);
+                const canCreateBranch = Boolean(
+                    onCreateBranch && messageId != null && step.step_type === 'answer' && stepSequence !== null
+                );
                 const isObservation = step.step_type === 'observation';
                 const isAction = step.step_type === 'action' || step.step_type === 'action_delta';
                 const isError = step.step_type === 'error';
@@ -2333,6 +2694,8 @@ function AgentStepView({
                                                 handleMarkdownClick(event);
                                                 handleContentClick(event);
                                             }}
+                                            onContextMenu={canCreateBranch ? handleBranchContextMenu(step) : undefined}
+                                            branchSequence={canCreateBranch ? stepSequence : null}
                                         />
                                     )}
                                     {hasErrorDetails && (
@@ -2559,6 +2922,78 @@ function AgentStepView({
                 </button>
             </div>
             )}
+            {branchMenu &&
+                typeof document !== 'undefined' &&
+                createPortal(
+                    <div
+                        className="branch-context-menu"
+                        style={{
+                            top: Math.min(branchMenu.y, window.innerHeight - 80),
+                            left: Math.min(branchMenu.x, window.innerWidth - 180)
+                        }}
+                        onClick={(event) => event.stopPropagation()}
+                        onContextMenu={(event) => event.preventDefault()}
+                    >
+                        <button type="button" className="branch-context-item" onClick={handleOpenBranchPrompt}>
+                            提问
+                        </button>
+                    </div>,
+                    document.body
+                )}
+            {branchDraft &&
+                typeof document !== 'undefined' &&
+                createPortal(
+                    <div
+                        className="branch-prompt-backdrop"
+                        onClick={() => {
+                            handleCloseBranchPrompt();
+                        }}
+                    >
+                        <div className="branch-prompt-dialog" onClick={(event) => event.stopPropagation()}>
+                            <div className="branch-prompt-title">分支提问</div>
+                            <textarea
+                                ref={branchPromptRef}
+                                className="branch-prompt-input"
+                                value={branchPrompt}
+                                onChange={(event) => setBranchPrompt(event.currentTarget.value)}
+                                onKeyDown={(event) => {
+                                    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+                                        event.preventDefault();
+                                        void handleSubmitBranch();
+                                        return;
+                                    }
+                                    if (event.key === 'Escape' && !branchBusy) {
+                                        event.preventDefault();
+                                        handleCloseBranchPrompt();
+                                    }
+                                }}
+                                rows={5}
+                                placeholder="输入你想继续追问的问题"
+                                disabled={branchBusy}
+                            />
+                            {branchPromptError && <div className="branch-prompt-error">{branchPromptError}</div>}
+                            <div className="branch-prompt-actions">
+                                <button
+                                    type="button"
+                                    className="branch-prompt-btn secondary"
+                                    onClick={handleCloseBranchPrompt}
+                                    disabled={branchBusy}
+                                >
+                                    取消
+                                </button>
+                                <button
+                                    type="button"
+                                    className="branch-prompt-btn primary"
+                                    onClick={() => void handleSubmitBranch()}
+                                    disabled={branchBusy}
+                                >
+                                    {branchBusy ? '发送中...' : '发送'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>,
+                    document.body
+                )}
         </>
     );
 }

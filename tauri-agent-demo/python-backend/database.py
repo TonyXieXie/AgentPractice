@@ -22,6 +22,15 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    @staticmethod
+    def _normalize_session_kind(value: Any, parent_session_id: Optional[str] = None) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"regular", "subagent", "branch"}:
+            return normalized
+        if parent_session_id:
+            return "subagent"
+        return "regular"
     
     def init_database(self):
         """Initialize database tables"""
@@ -130,6 +139,7 @@ class Database:
                 config_id TEXT NOT NULL,
                 work_path TEXT,
                 agent_profile TEXT,
+                session_kind TEXT DEFAULT "regular",
                 parent_session_id TEXT,
                 context_summary TEXT,
                 last_compressed_llm_call_id INTEGER,
@@ -194,6 +204,11 @@ class Database:
             pass
 
         try:
+            cursor.execute('ALTER TABLE chat_sessions ADD COLUMN session_kind TEXT DEFAULT "regular"')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN parent_session_id TEXT')
         except sqlite3.OperationalError:
             pass
@@ -215,6 +230,20 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE chat_sessions ADD COLUMN context_estimate_at TEXT')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('''
+                UPDATE chat_sessions
+                SET session_kind = ?
+                WHERE session_kind IS NULL AND parent_session_id IS NOT NULL
+            ''', ("subagent",))
+            cursor.execute('''
+                UPDATE chat_sessions
+                SET session_kind = ?
+                WHERE session_kind IS NULL
+            ''', ("regular",))
         except sqlite3.OperationalError:
             pass
         
@@ -557,11 +586,28 @@ class Database:
         session_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
         agent_type = getattr(session, "agent_type", None) or "react"
+        session_kind = self._normalize_session_kind(
+            getattr(session, "session_kind", None),
+            getattr(session, "parent_session_id", None),
+        )
 
         cursor.execute('''
-            INSERT INTO chat_sessions (id, title, config_id, work_path, agent_type, agent_profile, parent_session_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (session_id, session.title, session.config_id, session.work_path, agent_type, session.agent_profile, session.parent_session_id, now, now))
+            INSERT INTO chat_sessions (
+                id, title, config_id, work_path, agent_type, agent_profile, session_kind, parent_session_id, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            session_id,
+            session.title,
+            session.config_id,
+            session.work_path,
+            agent_type,
+            session.agent_profile,
+            session_kind,
+            session.parent_session_id,
+            now,
+            now,
+        ))
         
         conn.commit()
         conn.close()
@@ -588,6 +634,7 @@ class Database:
         if row:
             data = dict(row)
             data["agent_type"] = data.get("agent_type") or "react"
+            data["session_kind"] = self._normalize_session_kind(data.get("session_kind"), data.get("parent_session_id"))
             estimate_raw = data.get("context_estimate")
             if estimate_raw:
                 try:
@@ -614,6 +661,7 @@ class Database:
         for row in rows:
             data = dict(row)
             data["agent_type"] = data.get("agent_type") or "react"
+            data["session_kind"] = self._normalize_session_kind(data.get("session_kind"), data.get("parent_session_id"))
             estimate_raw = data.get("context_estimate")
             if estimate_raw:
                 try:
@@ -650,6 +698,10 @@ class Database:
             fields.append("agent_profile = ?")
             values.append(update.agent_profile)
 
+        if update.session_kind is not None:
+            fields.append("session_kind = ?")
+            values.append(self._normalize_session_kind(update.session_kind, update.parent_session_id))
+
         if update.parent_session_id is not None:
             fields.append("parent_session_id = ?")
             values.append(update.parent_session_id)
@@ -682,8 +734,10 @@ class Database:
 
             cursor.execute(
                 '''
-                INSERT INTO chat_sessions (id, title, config_id, work_path, agent_type, agent_profile, parent_session_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_sessions (
+                    id, title, config_id, work_path, agent_type, agent_profile, session_kind, parent_session_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 (
                     new_session_id,
@@ -692,6 +746,7 @@ class Database:
                     source['work_path'],
                     source_agent_type,
                     source['agent_profile'],
+                    "regular",
                     None,
                     now,
                     now,
@@ -883,6 +938,289 @@ class Database:
                 ORDER BY id ASC
                 ''',
                 (session_id,)
+            )
+            for row in cursor.fetchall():
+                old_message_id = row['message_id']
+                new_message_id = message_id_map.get(old_message_id) if old_message_id is not None else None
+                cursor.execute(
+                    '''
+                    INSERT INTO session_tool_call_history (
+                        session_id, message_id, agent_type, iteration, tool_name, success, failure_reason, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        new_session_id,
+                        new_message_id,
+                        row['agent_type'],
+                        row['iteration'],
+                        row['tool_name'],
+                        row['success'],
+                        row['failure_reason'],
+                        row['created_at'],
+                    )
+                )
+
+            conn.commit()
+            return self.get_session(new_session_id)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def create_branch_session(
+        self,
+        source_session_id: str,
+        source_message_id: int,
+        title: Optional[str] = None,
+    ) -> Optional[ChatSession]:
+        """Clone a session up to a message boundary into a hidden branch session."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT * FROM chat_sessions WHERE id = ?', (source_session_id,))
+            source = cursor.fetchone()
+            if not source:
+                return None
+
+            cursor.execute(
+                '''
+                SELECT id, timestamp
+                FROM chat_messages
+                WHERE session_id = ? AND id = ?
+                ''',
+                (source_session_id, source_message_id),
+            )
+            source_message = cursor.fetchone()
+            if not source_message:
+                return None
+
+            new_session_id = str(uuid.uuid4())
+            now = datetime.now().isoformat()
+            new_title = title or source['title']
+            source_agent_type = source['agent_type'] if 'agent_type' in source.keys() and source['agent_type'] else "react"
+            source_timestamp = source_message['timestamp']
+
+            cursor.execute(
+                '''
+                INSERT INTO chat_sessions (
+                    id, title, config_id, work_path, agent_type, agent_profile, session_kind, parent_session_id,
+                    context_summary, last_compressed_llm_call_id, context_estimate, context_estimate_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    new_session_id,
+                    new_title,
+                    source['config_id'],
+                    source['work_path'],
+                    source_agent_type,
+                    source['agent_profile'],
+                    "branch",
+                    source_session_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    now,
+                    now,
+                )
+            )
+
+            cursor.execute(
+                '''
+                SELECT id, role, content, timestamp, metadata, raw_request, raw_response
+                FROM chat_messages
+                WHERE session_id = ? AND id <= ?
+                ORDER BY id ASC
+                ''',
+                (source_session_id, source_message_id)
+            )
+            messages = cursor.fetchall()
+            message_id_map: Dict[int, int] = {}
+            for row in messages:
+                cursor.execute(
+                    '''
+                    INSERT INTO chat_messages (session_id, role, content, timestamp, metadata, raw_request, raw_response)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        new_session_id,
+                        row['role'],
+                        row['content'],
+                        row['timestamp'],
+                        row['metadata'],
+                        row['raw_request'],
+                        row['raw_response'],
+                    )
+                )
+                message_id_map[row['id']] = cursor.lastrowid
+
+            message_ids = list(message_id_map.keys())
+            if message_ids:
+                placeholders = ",".join(["?"] * len(message_ids))
+
+                cursor.execute(
+                    f'''
+                    SELECT message_id, name, mime, width, height, size, data, created_at
+                    FROM message_attachments
+                    WHERE message_id IN ({placeholders})
+                    ORDER BY created_at ASC
+                    ''',
+                    message_ids
+                )
+                for row in cursor.fetchall():
+                    data = row['data']
+                    if isinstance(data, memoryview):
+                        data = data.tobytes()
+                    cursor.execute(
+                        '''
+                        INSERT INTO message_attachments (message_id, name, mime, width, height, size, data, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ''',
+                        (
+                            message_id_map[row['message_id']],
+                            row['name'],
+                            row['mime'],
+                            row['width'],
+                            row['height'],
+                            row['size'],
+                            data,
+                            row['created_at'],
+                        )
+                    )
+
+                cursor.execute(
+                    f'''
+                    SELECT message_id, step_type, content, metadata, sequence, timestamp
+                    FROM agent_steps
+                    WHERE message_id IN ({placeholders})
+                    ORDER BY message_id ASC, sequence ASC
+                    ''',
+                    message_ids
+                )
+                for row in cursor.fetchall():
+                    cursor.execute(
+                        '''
+                        INSERT INTO agent_steps (message_id, step_type, content, metadata, sequence, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ''',
+                        (
+                            message_id_map[row['message_id']],
+                            row['step_type'],
+                            row['content'],
+                            row['metadata'],
+                            row['sequence'],
+                            row['timestamp'],
+                        )
+                    )
+
+                cursor.execute(
+                    f'''
+                    SELECT message_id, tool_name, tool_input, tool_output, timestamp
+                    FROM tool_calls
+                    WHERE message_id IN ({placeholders})
+                    ORDER BY message_id ASC
+                    ''',
+                    message_ids
+                )
+                for row in cursor.fetchall():
+                    cursor.execute(
+                        '''
+                        INSERT INTO tool_calls (message_id, tool_name, tool_input, tool_output, timestamp)
+                        VALUES (?, ?, ?, ?, ?)
+                        ''',
+                        (
+                            message_id_map[row['message_id']],
+                            row['tool_name'],
+                            row['tool_input'],
+                            row['tool_output'],
+                            row['timestamp'],
+                        )
+                    )
+
+            cursor.execute(
+                '''
+                SELECT session_id, message_id, tree_hash, work_path, created_at
+                FROM file_snapshots
+                WHERE session_id = ? AND (message_id IS NULL OR message_id <= ?)
+                ORDER BY id ASC
+                ''',
+                (source_session_id, source_message_id)
+            )
+            for row in cursor.fetchall():
+                old_message_id = row['message_id']
+                new_message_id = message_id_map.get(old_message_id) if old_message_id is not None else None
+                cursor.execute(
+                    '''
+                    INSERT INTO file_snapshots (session_id, message_id, tree_hash, work_path, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        new_session_id,
+                        new_message_id,
+                        row['tree_hash'],
+                        row['work_path'],
+                        row['created_at'],
+                    )
+                )
+
+            cursor.execute(
+                '''
+                SELECT message_id, agent_type, iteration, stream, api_type, api_profile, api_format, model,
+                       request_json, response_json, response_text, processed_json, created_at
+                FROM llm_calls
+                WHERE session_id = ?
+                  AND (
+                      (message_id IS NOT NULL AND message_id <= ?)
+                      OR (message_id IS NULL AND created_at <= ?)
+                  )
+                ORDER BY id ASC
+                ''',
+                (source_session_id, source_message_id, source_timestamp)
+            )
+            for row in cursor.fetchall():
+                old_message_id = row['message_id']
+                new_message_id = message_id_map.get(old_message_id) if old_message_id is not None else None
+                cursor.execute(
+                    '''
+                    INSERT INTO llm_calls (
+                        session_id, message_id, agent_type, iteration, stream, api_type, api_profile, api_format, model,
+                        request_json, response_json, response_text, processed_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        new_session_id,
+                        new_message_id,
+                        row['agent_type'],
+                        row['iteration'],
+                        row['stream'],
+                        row['api_type'],
+                        row['api_profile'],
+                        row['api_format'],
+                        row['model'],
+                        row['request_json'],
+                        row['response_json'],
+                        row['response_text'],
+                        row['processed_json'],
+                        row['created_at'],
+                    )
+                )
+
+            cursor.execute(
+                '''
+                SELECT message_id, agent_type, iteration, tool_name, success, failure_reason, created_at
+                FROM session_tool_call_history
+                WHERE session_id = ?
+                  AND (
+                      (message_id IS NOT NULL AND message_id <= ?)
+                      OR (message_id IS NULL AND created_at <= ?)
+                  )
+                ORDER BY id ASC
+                ''',
+                (source_session_id, source_message_id, source_timestamp)
             )
             for row in cursor.fetchall():
                 old_message_id = row['message_id']

@@ -63,6 +63,7 @@ async def chat(request: ChatRequest):
                     work_path=request.work_path,
                     agent_type="simple",
                     agent_profile=request.agent_profile,
+                    session_kind="regular",
                 )
             )
             new_session_created = True
@@ -175,6 +176,7 @@ async def chat_stream(request: ChatRequest):
                     work_path=request.work_path,
                     agent_type="simple",
                     agent_profile=request.agent_profile,
+                    session_kind="regular",
                 )
             )
             new_session_created = True

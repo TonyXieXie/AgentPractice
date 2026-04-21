@@ -6,6 +6,7 @@ LLMApiFormat = Literal["openai_chat_completions", "openai_responses"]
 LLMProfile = Literal["openai", "openai_compatible", "deepseek", "zhipu"]
 AgentMode = Literal["default", "super"]
 AgentType = Literal["simple", "react"]
+SessionKind = Literal["regular", "subagent", "branch"]
 class LLMConfig(BaseModel):
     id: Optional[str] = None
     name: str
@@ -97,6 +98,7 @@ class ChatSession(BaseModel):
     work_path: Optional[str] = None
     agent_type: Optional[AgentType] = "react"
     agent_profile: Optional[str] = None
+    session_kind: Optional[SessionKind] = "regular"
     parent_session_id: Optional[str] = None
     context_summary: Optional[str] = None
     last_compressed_llm_call_id: Optional[int] = None
@@ -113,6 +115,7 @@ class ChatSessionCreate(BaseModel):
     work_path: Optional[str] = None
     agent_type: Optional[AgentType] = "react"
     agent_profile: Optional[str] = None
+    session_kind: Optional[SessionKind] = "regular"
     parent_session_id: Optional[str] = None
 
 
@@ -122,7 +125,23 @@ class ChatSessionUpdate(BaseModel):
     config_id: Optional[str] = None
     agent_type: Optional[AgentType] = None
     agent_profile: Optional[str] = None
+    session_kind: Optional[SessionKind] = None
     parent_session_id: Optional[str] = None
+
+
+class BranchSessionCreateRequest(BaseModel):
+    source_message_id: int
+    source_step_sequence: int
+    selection_start: int
+    selection_end: int
+    selected_text: str
+
+
+class BranchSessionCreateResponse(BaseModel):
+    branch_session: ChatSession
+    source_message_id: int
+    source_message_metadata: Dict[str, Any]
+    existing: bool
 
 
 class AttachmentInput(BaseModel):

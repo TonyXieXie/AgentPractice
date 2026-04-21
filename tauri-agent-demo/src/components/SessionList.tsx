@@ -91,7 +91,7 @@ export default function SessionList({
     const loadSessions = async () => {
         try {
             const data = await getSessions();
-            setSessions(data);
+            setSessions(data.filter((session) => session.session_kind !== 'branch'));
         } catch (error) {
             console.error('Failed to load sessions:', error);
         }

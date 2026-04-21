@@ -5,6 +5,7 @@ import type { ContextEstimate, LLMCall, Message, SkillSummary } from '../../type
 const IS_MAC = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent);
 const WORK_PATH_MAX_LENGTH = 200;
 const MAIN_WINDOW_BOUNDS_KEY = 'mainWindowBounds';
+const BRANCH_WINDOW_BOUNDS_KEY = 'branchWindowBounds';
 const WORKDIR_BOUNDS_KEY = 'workdirWindowBounds';
 const MAIN_DEFAULT_WIDTH = 1200;
 const MAIN_DEFAULT_HEIGHT = 950;
@@ -101,6 +102,22 @@ export const getWorkdirWindowBounds = (): WorkdirBounds | null => {
   }
 };
 
+export const getBranchWindowBounds = (): MainWindowBounds => {
+  const fallback = getMainWindowBounds();
+  try {
+    const raw = localStorage.getItem(BRANCH_WINDOW_BOUNDS_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<MainWindowBounds> | null;
+    if (!parsed || typeof parsed !== 'object') return fallback;
+    const next: MainWindowBounds = { ...fallback };
+    if (Number.isFinite(parsed.width)) next.width = Math.max(800, Math.round(parsed.width as number));
+    if (Number.isFinite(parsed.height)) next.height = Math.max(600, Math.round(parsed.height as number));
+    return next;
+  } catch {
+    return fallback;
+  }
+};
+
 export const hashPath = (value: string) => {
   let hash = 5381;
   for (let i = 0; i < value.length; i += 1) {
@@ -118,6 +135,8 @@ export const makeWorkdirLabel = (path: string) => {
   const safeBase = base || 'path';
   return `workdir-${safeBase}-${hashPath(normalized)}`;
 };
+
+export const makeBranchLabel = (sessionId: string) => `branch-${sessionId}`;
 
 export const formatWorkPath = (path: string) => {
   if (!path) return '点击选择工作路径';

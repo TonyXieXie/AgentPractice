@@ -1,4 +1,6 @@
-﻿import type {
+import type {
+  BranchSessionCreateRequest,
+  BranchSessionCreateResponse,
   ChatSession,
   ChatSessionCreate,
   ChatSessionUpdate,
@@ -64,6 +66,19 @@ export async function copySession(sessionId: string): Promise<ChatSession> {
     return response.json();
 }
 
+export async function createBranchSession(
+    sessionId: string,
+    payload: BranchSessionCreateRequest
+): Promise<BranchSessionCreateResponse> {
+    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/branches`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) throw new Error('Failed to create branch session');
+    return response.json();
+}
+
 export async function getSessionMessages(
     sessionId: string,
     options?: { limit?: number; beforeId?: number }
@@ -112,4 +127,3 @@ export async function getSessionAgentSteps(
     if (!response.ok) throw new Error('Failed to fetch agent steps');
     return response.json();
 }
-

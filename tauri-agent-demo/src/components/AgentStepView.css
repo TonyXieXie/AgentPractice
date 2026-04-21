@@ -1470,3 +1470,144 @@
     max-width: 100%;
     height: auto;
 }
+
+.content-markdown a.branch-link {
+    color: #fbbf24;
+    text-decoration: underline;
+    text-decoration-style: dashed;
+    text-underline-offset: 3px;
+}
+
+.content-markdown a.branch-link:hover {
+    color: #fde68a;
+}
+
+.branch-context-menu {
+    position: fixed;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 148px;
+    padding: 6px;
+    border-radius: 8px;
+    border: 1px solid rgba(245, 158, 11, 0.25);
+    background: rgba(15, 23, 42, 0.98);
+    box-shadow: 0 14px 32px rgba(15, 23, 42, 0.42);
+}
+
+.branch-context-item {
+    border: none;
+    background: transparent;
+    color: #f8fafc;
+    text-align: left;
+    padding: 7px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.8rem;
+}
+
+.branch-context-item:hover {
+    background: rgba(245, 158, 11, 0.14);
+    color: #fde68a;
+}
+
+.branch-prompt-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 45;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(2, 6, 23, 0.68);
+    backdrop-filter: blur(6px);
+}
+
+.branch-prompt-dialog {
+    width: min(560px, calc(100vw - 40px));
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px;
+    border-radius: 14px;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    background: linear-gradient(180deg, rgba(15, 23, 42, 0.98), rgba(17, 24, 39, 0.98));
+    box-shadow: 0 24px 48px rgba(2, 6, 23, 0.45);
+}
+
+.branch-prompt-title {
+    font-size: 0.94rem;
+    font-weight: 600;
+    color: #f8fafc;
+}
+
+.branch-prompt-input {
+    width: 100%;
+    min-height: 120px;
+    resize: vertical;
+    border-radius: 10px;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    background: rgba(15, 23, 42, 0.9);
+    color: #e5e7eb;
+    padding: 12px 14px;
+    font: inherit;
+    line-height: 1.5;
+    outline: none;
+}
+
+.branch-prompt-input:focus {
+    border-color: rgba(245, 158, 11, 0.45);
+    box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.12);
+}
+
+.branch-prompt-input:disabled {
+    opacity: 0.72;
+    cursor: not-allowed;
+}
+
+.branch-prompt-error {
+    color: #fca5a5;
+    font-size: 0.78rem;
+}
+
+.branch-prompt-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+}
+
+.branch-prompt-btn {
+    min-width: 92px;
+    border-radius: 999px;
+    padding: 8px 14px;
+    border: 1px solid transparent;
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.branch-prompt-btn.secondary {
+    background: rgba(148, 163, 184, 0.1);
+    border-color: rgba(148, 163, 184, 0.2);
+    color: #dbe7f5;
+}
+
+.branch-prompt-btn.secondary:hover:not(:disabled) {
+    background: rgba(148, 163, 184, 0.18);
+}
+
+.branch-prompt-btn.primary {
+    background: linear-gradient(135deg, rgba(245, 158, 11, 0.92), rgba(251, 191, 36, 0.92));
+    color: #111827;
+    font-weight: 600;
+}
+
+.branch-prompt-btn.primary:hover:not(:disabled) {
+    filter: brightness(1.04);
+}
+
+.branch-prompt-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}

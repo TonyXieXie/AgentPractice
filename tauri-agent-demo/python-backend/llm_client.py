@@ -345,9 +345,16 @@ class LLMClient:
         response: httpx.Response,
         debug_ctx: Optional[Dict[str, Any]],
         stream_kind: str,
+        stream_state: Optional[Dict[str, Any]] = None,
     ):
         buffer = ""
         async for chunk in response.aiter_text():
+            if stream_state is not None:
+                stream_state["chunk_count"] = int(stream_state.get("chunk_count", 0) or 0) + 1
+                chunk_len = len(chunk or "")
+                stream_state["text_bytes"] = int(stream_state.get("text_bytes", 0) or 0) + chunk_len
+                if chunk:
+                    stream_state["received_bytes"] = True
             self._log_raw_sse_chunk(chunk, debug_ctx, stream_kind)
             if not chunk:
                 continue
@@ -359,11 +366,15 @@ class LLMClient:
                 line = buffer[:newline_index]
                 if line.endswith("\r"):
                     line = line[:-1]
+                if stream_state is not None:
+                    stream_state["line_count"] = int(stream_state.get("line_count", 0) or 0) + 1
                 yield line
                 buffer = buffer[newline_index + 1:]
         if buffer:
             if buffer.endswith("\r"):
                 buffer = buffer[:-1]
+            if stream_state is not None:
+                stream_state["line_count"] = int(stream_state.get("line_count", 0) or 0) + 1
             yield buffer
 
     def _log_unhandled_chat_delta(self, delta: Dict[str, Any], debug_ctx: Optional[Dict[str, Any]]) -> None:
@@ -425,6 +436,80 @@ class LLMClient:
         if not request_overrides:
             return None
         return request_overrides.get("_stop_event")
+
+    def _stream_has_partial_data(
+        self,
+        *,
+        stream_state: Optional[Dict[str, Any]] = None,
+        response_text: str = "",
+        events: Optional[List[Dict[str, Any]]] = None,
+        tool_call_count: int = 0,
+        response_obj: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if isinstance(stream_state, dict) and stream_state.get("received_bytes"):
+            return True
+        if response_text:
+            return True
+        if events:
+            return True
+        if tool_call_count > 0:
+            return True
+        if response_obj:
+            return True
+        return False
+
+    def _raise_partial_stream_error(
+        self,
+        *,
+        exc: httpx.RequestError,
+        stream_kind: str,
+        attempt: int,
+        debug_ctx: Optional[Dict[str, Any]],
+        request_payload: Dict[str, Any],
+        response_text: str,
+        events: Optional[List[Dict[str, Any]]] = None,
+        stream_state: Optional[Dict[str, Any]] = None,
+        tool_call_count: int = 0,
+        response_obj: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        partial_meta = {
+            "stream_kind": stream_kind,
+            "attempt": attempt + 1,
+            "received_bytes": bool((stream_state or {}).get("received_bytes")),
+            "chunk_count": int((stream_state or {}).get("chunk_count", 0) or 0),
+            "line_count": int((stream_state or {}).get("line_count", 0) or 0),
+            "text_bytes": int((stream_state or {}).get("text_bytes", 0) or 0),
+            "response_text_chars": len(response_text or ""),
+            "events_count": len(events or []),
+            "tool_call_count": int(tool_call_count),
+            "has_response_object": bool(response_obj),
+        }
+        self._emit_debug_log(
+            f"[LLM Stream Interrupted] kind={stream_kind}{self._format_debug_hint(debug_ctx)} "
+            f"attempt={attempt + 1} partial={partial_meta} error={exc}"
+        )
+        if debug_ctx:
+            error_payload: Dict[str, Any] = {
+                "type": "partial_stream_interrupted",
+                "message": str(exc),
+                "partial": partial_meta,
+            }
+            response_json: Dict[str, Any] = {"error": error_payload}
+            if events:
+                response_json["events"] = events
+            if response_obj:
+                response_json["response"] = response_obj
+            self._save_llm_call(
+                debug_ctx,
+                stream=True,
+                request_payload=request_payload,
+                response_json=response_json,
+                response_text=response_text,
+            )
+        raise LLMTransientError(
+            f"Partial stream interrupted after receiving data; automatic retry disabled. Network error: {exc}",
+            cause=exc,
+        ) from exc
 
     def _apply_stream_tool_params(
         self,
@@ -639,6 +724,7 @@ class LLMClient:
             for attempt in range(self.max_retries + 1):
                 should_retry = False
                 retry_status = None
+                stream_state = {"received_bytes": False, "chunk_count": 0, "line_count": 0, "text_bytes": 0}
                 try:
                     async with client.stream(
                         "POST",
@@ -674,7 +760,12 @@ class LLMClient:
                                 if self._is_rate_limited(status):
                                     raise LLMTransientError(f"Rate limited (HTTP {status}).", status_code=status, cause=exc) from exc
                                 raise
-                            async for line in self._iter_sse_lines(response, debug_ctx, "chat_completions_text"):
+                            async for line in self._iter_sse_lines(
+                                response,
+                                debug_ctx,
+                                "chat_completions_text",
+                                stream_state=stream_state,
+                            ):
                                 if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                                     stopped = True
                                     break
@@ -700,6 +791,21 @@ class LLMClient:
                             if stopped:
                                 return
                 except httpx.RequestError as exc:
+                    if self._stream_has_partial_data(
+                        stream_state=stream_state,
+                        response_text=full_text,
+                        events=events,
+                    ):
+                        self._raise_partial_stream_error(
+                            exc=exc,
+                            stream_kind="chat_completions_text",
+                            attempt=attempt,
+                            debug_ctx=debug_ctx,
+                            request_payload=request_payload,
+                            response_text=full_text,
+                            events=events,
+                            stream_state=stream_state,
+                        )
                     if attempt < self.max_retries:
                         await asyncio.sleep(self._get_retry_delay(attempt, is_network=True))
                         continue
@@ -749,6 +855,7 @@ class LLMClient:
             for attempt in range(self.max_retries + 1):
                 should_retry = False
                 retry_status = None
+                stream_state = {"received_bytes": False, "chunk_count": 0, "line_count": 0, "text_bytes": 0}
                 try:
                     async with client.stream(
                         "POST",
@@ -784,7 +891,12 @@ class LLMClient:
                                 if self._is_rate_limited(status):
                                     raise LLMTransientError(f"Rate limited (HTTP {status}).", status_code=status, cause=exc) from exc
                                 raise
-                            async for line in self._iter_sse_lines(response, debug_ctx, "chat_completions_events"):
+                            async for line in self._iter_sse_lines(
+                                response,
+                                debug_ctx,
+                                "chat_completions_events",
+                                stream_state=stream_state,
+                            ):
                                 if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                                     stopped = True
                                     break
@@ -858,6 +970,23 @@ class LLMClient:
                             if stopped:
                                 pass
                 except httpx.RequestError as exc:
+                    if self._stream_has_partial_data(
+                        stream_state=stream_state,
+                        response_text=full_text,
+                        events=events,
+                        tool_call_count=len(tool_calls),
+                    ):
+                        self._raise_partial_stream_error(
+                            exc=exc,
+                            stream_kind="chat_completions_events",
+                            attempt=attempt,
+                            debug_ctx=debug_ctx,
+                            request_payload=request_payload,
+                            response_text=full_text,
+                            events=events,
+                            stream_state=stream_state,
+                            tool_call_count=len(tool_calls),
+                        )
                     if attempt < self.max_retries:
                         await asyncio.sleep(self._get_retry_delay(attempt, is_network=True))
                         continue
@@ -1005,6 +1134,7 @@ class LLMClient:
             for attempt in range(self.max_retries + 1):
                 should_retry = False
                 retry_status = None
+                stream_state = {"received_bytes": False, "chunk_count": 0, "line_count": 0, "text_bytes": 0}
                 try:
                     async with client.stream(
                         "POST",
@@ -1040,7 +1170,12 @@ class LLMClient:
                                 if self._is_rate_limited(status):
                                     raise LLMTransientError(f"Rate limited (HTTP {status}).", status_code=status, cause=exc) from exc
                                 raise
-                            async for line in self._iter_sse_lines(response, debug_ctx, "responses_text"):
+                            async for line in self._iter_sse_lines(
+                                response,
+                                debug_ctx,
+                                "responses_text",
+                                stream_state=stream_state,
+                            ):
                                 if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                                     stopped = True
                                     break
@@ -1066,6 +1201,21 @@ class LLMClient:
                             if stopped:
                                 return
                 except httpx.RequestError as exc:
+                    if self._stream_has_partial_data(
+                        stream_state=stream_state,
+                        response_text=full_text,
+                        events=events,
+                    ):
+                        self._raise_partial_stream_error(
+                            exc=exc,
+                            stream_kind="responses_text",
+                            attempt=attempt,
+                            debug_ctx=debug_ctx,
+                            request_payload=request_payload,
+                            response_text=full_text,
+                            events=events,
+                            stream_state=stream_state,
+                        )
                     if attempt < self.max_retries:
                         await asyncio.sleep(self._get_retry_delay(attempt, is_network=True))
                         continue
@@ -1127,6 +1277,7 @@ class LLMClient:
             for attempt in range(self.max_retries + 1):
                 should_retry = False
                 retry_status = None
+                stream_state = {"received_bytes": False, "chunk_count": 0, "line_count": 0, "text_bytes": 0}
                 try:
                     async with client.stream(
                         "POST",
@@ -1162,7 +1313,12 @@ class LLMClient:
                                 if self._is_rate_limited(status):
                                     raise LLMTransientError(f"Rate limited (HTTP {status}).", status_code=status, cause=exc) from exc
                                 raise
-                            async for line in self._iter_sse_lines(response, debug_ctx, "responses_events"):
+                            async for line in self._iter_sse_lines(
+                                response,
+                                debug_ctx,
+                                "responses_events",
+                                stream_state=stream_state,
+                            ):
                                 if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                                     stopped = True
                                     break
@@ -1263,6 +1419,25 @@ class LLMClient:
                             if stopped:
                                 pass
                 except httpx.RequestError as exc:
+                    if self._stream_has_partial_data(
+                        stream_state=stream_state,
+                        response_text=full_text,
+                        events=events,
+                        tool_call_count=len(tool_calls_by_index),
+                        response_obj=last_response,
+                    ):
+                        self._raise_partial_stream_error(
+                            exc=exc,
+                            stream_kind="responses_events",
+                            attempt=attempt,
+                            debug_ctx=debug_ctx,
+                            request_payload=request_payload,
+                            response_text=full_text,
+                            events=events,
+                            stream_state=stream_state,
+                            tool_call_count=len(tool_calls_by_index),
+                            response_obj=last_response,
+                        )
                     if attempt < self.max_retries:
                         await asyncio.sleep(self._get_retry_delay(attempt, is_network=True))
                         continue
